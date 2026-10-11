@@ -6,7 +6,7 @@
 # MODIFIED: 취약점 1 완벽 방어 - 통신 실패 및 결측치 발생 시에도 타임스탬프 원자적 갱신으로 60초 TTL 쿨다운 강제 (IP 밴 차단 락온)
 # MODIFIED: 치명적 취약점 방어 - NQ=F 세션 시프트 직후 데이터 프레임 증발 시 발생하는 IndexError 원천 소각 (df.empty 검증망 주입)
 # MODIFIED: NQ=F 1d 자정 롤오버 왜곡 방어 - 45분 갭 필터링 경계값 원자적 하드 락온 (>= 45분)
-# NEW: 초과 Case 68 방어 - 사용자 선택형 동적 익절 스위칭을 위한 profit_mode 필드 원자적 증축 (기본값 AUTO)
+# MODIFIED: 초과 Case 68 방어 - 역캐리 주범 AUTO 모드 소각 및 수동 고정 모드(MANUAL_0.5) 기본값 강제 매핑 락온
 
 import os
 import json
@@ -67,7 +67,7 @@ class AssassinLedger:
         async with GlobalThrottle.get_file_lock(filepath):
             def _read():
                 if not os.path.exists(filepath):
-                    return 0.0, 100.0, 0.5, "", False, True, 0.0, "", "", 0.0, 0.0, 0.0, "AUTO"
+                    return 0.0, 100.0, 0.5, "", False, True, 0.0, "", "", 0.0, 0.0, 0.0, "MANUAL_0.5"
                 try:
                     with open(filepath, "r", encoding="utf-8") as f:
                         data = json.load(f)
@@ -84,10 +84,10 @@ class AssassinLedger:
                             float(data.get("entry_time", 0.0)),
                             float(data.get("nq_entry_price", 0.0)),
                             float(data.get("nq_entry_amp", 0.0)),
-                            str(data.get("profit_mode", "AUTO"))
+                            str(data.get("profit_mode", "MANUAL_0.5"))
                         )
                 except Exception:
-                    return 0.0, 100.0, 0.5, "", False, True, 0.0, "", "", 0.0, 0.0, 0.0, "AUTO"
+                    return 0.0, 100.0, 0.5, "", False, True, 0.0, "", "", 0.0, 0.0, 0.0, "MANUAL_0.5"
             return await asyncio.to_thread(_read)
 
     @classmethod
@@ -138,7 +138,6 @@ class AssassinLedger:
                 if nq_entry_amp is not None: data["nq_entry_amp"] = nq_entry_amp
                 if profit_mode is not None: data["profit_mode"] = profit_mode
                 
-                # 낡은 플래그 데드코드 원자적 파기
                 for obsolete_key in ["pre_first_flag", "force_downgrade", "force_downgrade_0_6", "is_stage_3", "cond_order_id", "session_mode"]:
                     data.pop(obsolete_key, None)
                 
