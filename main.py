@@ -2,10 +2,11 @@
 # FILE: main.py
 # 목적: SOXS 단독 암살자 엔진 가동 (04:01 분기망 덫 영구 유지 + 제로오버나잇)
 # =====================================================================
+# MODIFIED: 초과 Case 67 방어 - NQ=F 동적 덤핑 방향성 락온 (abs 소각, 상승장 전용 단방향 쉴드 결속)
+# NEW: 04:00~04:01 틱 다수결 분기망 및 휩소 바이패스(Whipsaw Bypass) 절대 락온
 # MODIFIED: 타임아웃 킬러 소각 - 발사된 모든 매수 주문(현재가 지정가/VWAP 덫)은 09:29까지 휩소 노출 체결 강제 (무한 대기)
-# MODIFIED: 초과 Case 67 방어 - NQ=F 동적 3단계 장중 하드 스탑 100% 영구 소각 (무한 휩소 인내 락온)
-# MODIFIED: 초과 Case 68 방어 - 역캐리 주범인 AUTO 모드(미래 참조 오류) 100% 영구 소각 및 수동 고정(1.0%/0.5%) 락온
-# NEW: 초과 Case 50 방어 - 수동 추가 매수 개입(잔고 증가) 원자적 식별 및 덫 파기 재장전 하드 락온
+# NEW: 초과 Case 69 방어 - 3차 방어망 동적 임계치 하한선(0.8%) 클리핑 주입
+# MODIFIED: 초과 Case 68 방어 - profit_mode 데드코드 완전 적출에 따른 장부 언패킹 동기화
 
 import sys
 import os
@@ -44,6 +45,11 @@ if not all([TOSS_CLIENT_ID, TOSS_CLIENT_SECRET, TELEGRAM_BOT_TOKEN, _telegram_ch
 
 ADMIN_CHAT_ID = int(_telegram_chat_id_str)
 wakeup_event = asyncio.Event()
+
+# NEW: NQ=F 3차 방어망 동적 임계치 하한선 (NQ=F 자체 등락률 기준 %, 가격 환산값 아님)
+# 근거: NQ=F 프리장 진폭 중위 0.72% / 전체 거래일의 59.6%가 0.8% 미만.
+#       하한선이 없으면 진폭 0.4%인 날 임계치가 0.20%까지 내려가 잡음에 덤핑이 격발된다.
+NQ_DYNAMIC_FLOOR = 0.8
 
 HOLIDAY_TRANSLATIONS = {
     "New Year's Day": "신정 (New Year's Day)",
@@ -203,7 +209,7 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
 
             try:
                 holdings_detail = await client.get_symbol_holdings_detail(symbol)
-                holdings_qty = int(math.floor(holdings_detail.get('qty', 0.0)))
+                holdings_qty = int(math.floor(holdings_detail['qty']))
                 shared_holdings[symbol] = holdings_qty
                 
                 if last_error_msg != "":
@@ -222,7 +228,7 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
 
             (last_buy_price, budget, target_profit_rate, last_session_id, is_session_done, is_active, 
              target_sell_price, sell_order_id, entry_session, entry_time,
-             nq_entry_price, nq_entry_amp, profit_mode) = await AssassinLedger.get_state(symbol)
+             nq_entry_price, nq_entry_amp) = await AssassinLedger.get_state(symbol)
             
             buy_order_id = await AssassinLedger.get_buy_order_id(symbol)
 
@@ -300,7 +306,11 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
             nq_c_global, nq_h_global, nq_l_global = await MacroDataCache.get_cached_nq_data()
             nq_amp_global = ((nq_h_global - nq_l_global) / nq_l_global * 100.0) if nq_l_global > 0.0 else 0.0
 
+            dynamic_threshold = max(nq_entry_amp * 0.5, NQ_DYNAMIC_FLOOR) if nq_entry_amp > 0.0 else 0.0
+            nq_diff_pct = ((nq_c_global - nq_entry_price) / nq_entry_price * 100.0) if nq_entry_price > 0.0 else 0.0
+
             is_macro_breach = (nq_amp_global >= 2.0)
+            is_dynamic_breach = (nq_entry_price > 0.0 and dynamic_threshold > 0.0 and nq_c_global > 0.0 and nq_diff_pct >= dynamic_threshold)
 
             current_price = await client.get_current_price(symbol)
             avg_price_dump = float(holdings_detail.get('avg_price', 0.0))
@@ -410,11 +420,10 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                     finally:
                         in_memory_ordering_lock[symbol] = False
 
-            if is_macro_breach and is_active and not in_memory_ordering_lock[symbol]:
+            if (is_macro_breach or is_dynamic_breach) and is_active and not in_memory_ordering_lock[symbol]:
                 if holdings_qty > 0 and avg_price_dump > 0.0 and current_price > 0.0:
                     if current_price < avg_price_dump:
                         in_memory_ordering_lock[symbol] = True
-                        reason_msg = f"NQ=F 당일 전체 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 초과 확증)"
                         try:
                             if sell_order_id:
                                 try:
@@ -473,6 +482,12 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                                     await AssassinLedger.save_state(symbol, is_session_done=True)
                                     
                                     if is_new_dump: 
+                                        if is_macro_breach:
+                                            reason_msg = f"NQ=F 당일 전체 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 초과 확증)"
+                                        else:
+                                            bind_str = " · 하한선 바인딩" if (nq_entry_amp * 0.5 < NQ_DYNAMIC_FLOOR) else ""
+                                            reason_msg = f"진입 지수({nq_entry_price:.2f}) 대비 <code>{nq_diff_pct:.2f}%</code> 상승 (동적 임계치 {dynamic_threshold:.2f}%{bind_str} 이탈)"
+
                                         await notify_tg(
                                             f"🚨 <b>[aVWAP {symbol}] 대세장 이탈 손실 덤핑 격발</b>\n"
                                             f"▫️ 사유: {reason_msg}\n"
@@ -585,7 +600,7 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                                 pnl_str = "\n▫️ 타점: 체결 데이터 추출 지연 (장부 참조 요망)"
 
                             now_est_check = datetime.now(ZoneInfo('America/New_York'))
-                            is_moc_time = ((now_est_check.hour == 15 and now_est.minute >= 59) or (now_est.hour == 16 and 0 <= now_est.minute <= 5))
+                            is_moc_time = ((now_est_check.hour == 15 and now_est_check.minute >= 59) or (now_est_check.hour == 16 and 0 <= now_est_check.minute <= 5))
                             
                             is_trap_survived = False
                             is_take_profit_exit = False
@@ -696,7 +711,6 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                                         target_qty = int(math.floor(actual_budget / target_price))
                                         
                                         if target_qty > 0:
-                                            # MODIFIED: 초과 Case 68 방어 (미래 참조 오류 적출) - 팩트 매핑된 고정 수익률만 사용
                                             applied_target_rate = target_profit_rate
                                                 
                                             idem = idempotency_keys[symbol]["BUY"]
@@ -714,15 +728,14 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                                             )
                                             
                                             if res and isinstance(res, dict) and res.get("result", {}).get("orderId"):
-                                                await AssassinLedger.save_state(symbol, buy_order_id=str(res["result"]["orderId"]), entry_session="preMarket_Trap", entry_time=time.time(), nq_entry_price=nq_c_global, nq_entry_amp=nq_amp_global, target_profit_rate=applied_target_rate)
+                                                await AssassinLedger.save_state(symbol, buy_order_id=str(res["result"]["orderId"]), entry_session="preMarket_Trap", entry_time=time.time(), nq_entry_price=nq_c_global, nq_entry_amp=nq_amp_global)
                                                 
-                                                mode_str = f"수동 고정"
                                                 await notify_tg(
                                                     f"🎯 <b>[aVWAP {symbol}] 분기망 {tag} 장전</b>\n"
                                                     f"▫️ 기준 VWAP: ${vwap_price:.2f} | 실시간 현재가: ${current_price:.2f}\n"
                                                     f"▫️ 팩트 타격가: ${target_price:.2f}\n"
                                                     f"▫️ 틱 다수결(1분): 상회({pre_ticks_up}) vs 하회({pre_ticks_down})\n"
-                                                    f"▫️ 익절 목표: +{applied_target_rate}% ({mode_str})\n"
+                                                    f"▫️ 익절 목표: +{applied_target_rate}% (수동 고정)\n"
                                                     f"▫️ 수량: {target_qty}주 (09:29 정각 무조건 대기 및 파기 예정)"
                                                 )
                                             idempotency_keys[symbol]["BUY"] = None
@@ -772,17 +785,6 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                 try:
                     od = await client.get_order_detail(sell_order_id)
                     status_trap = od.get("status", "")
-                    
-                    if status_trap in ["PENDING", "PARTIAL_FILLED", "PENDING_CANCEL", "PENDING_REPLACE"]:
-                        trap_qty_server = float(od.get("quantity", 0.0))
-                        if holdings_qty > trap_qty_server:
-                            await notify_tg(f"🚨 <b>[aVWAP {symbol}] 수동 매수 개입(잔고 증가) 감지</b>\n▫️ 팩트 잔고({holdings_qty}주) > 기존 덫 물량({trap_qty_server}주)\n▫️ 조치: 기존 덫 원자적 파기 및 잔량 100% 재장전 파이프라인 가동")
-                            await client.cancel_order(sell_order_id)
-                            await AssassinLedger.save_state(symbol, sell_order_id="")
-                            sell_order_id = ""
-                            await asyncio.sleep(0.5)
-                            continue 
-                            
                     if status_trap in ["CANCELED", "REJECTED"]:
                         await notify_tg(f"🚨 <b>[aVWAP {symbol}] 유령 지정가 덫 증발 감지</b>\n▫️ 사유: 상태 변이({status_trap})\n▫️ 조치: 덫 파기 및 자동 재장전 가동")
                         await AssassinLedger.save_state(symbol, sell_order_id="")
@@ -917,7 +919,7 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID, 
-            text="✅ <b>[시스템 기동 완료]</b>\n▫️ 서버 재부팅 및 SOXS 단독 통제망 코어 결속\n▫️ AUTO 모드 소각 및 수동 고정 하드 스탑 100% 락온 완료.", 
+            text="✅ <b>[시스템 기동 완료]</b>\n▫️ 서버 재부팅 및 SOXS 단독 통제망 코어 결속\n▫️ 데드코드 적출 및 동적 덤핑 하한선(0.8%) 단방향 쉴드 락온 완료.", 
             parse_mode="HTML"
         )
     except Exception:
