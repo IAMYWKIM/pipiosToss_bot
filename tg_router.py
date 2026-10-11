@@ -4,7 +4,8 @@
 # =====================================================================
 # MODIFIED: SOXL UI 및 로직 100% 소각 (SOXS 100% 단일 종목 렌더링)
 # MODIFIED: 04:00~09:29 '절대쉴드(04:01 덫 대기 유지)' 텍스트 렌더링 주입
-# MODIFIED: 초과 Case 68 - 3단 동적 스위칭 (AUTO -> 수동 0.5% -> 수동 1.0%) 제어 UI 및 컷오프 표시망 증축
+# MODIFIED: 초과 Case 13 & 68 방어 - NQ=F 당일 저점 대비 반등 위치(%) 기반 UI 렌더링 및 50% 임계값 상태 표출 락온
+# MODIFIED: 낡은 동적 손절(sl_str) 렌더링 파이프라인 원자적 소각 완료
 
 import os
 import html
@@ -149,7 +150,9 @@ async def build_avwap_radar() -> tuple[str, InlineKeyboardMarkup]:
     nq_c, nq_h, nq_l = await MacroDataCache.get_cached_nq_data()
     
     nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
-    nq_current_amp = ((nq_c - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
+    
+    # MODIFIED: 초과 Case 13 - 반등 위치(%) 명시적 렌더링을 위한 연산망 결속
+    nq_rebound_ratio = ((nq_c - nq_l) / (nq_h - nq_l) * 100.0) if (nq_h - nq_l) > 0.0 else 0.0
     
     lev_expected_amp = nq_amp * 5.0
 
@@ -271,26 +274,22 @@ async def build_avwap_radar() -> tuple[str, InlineKeyboardMarkup]:
     state_s = await AssassinLedger.get_state("SOXS")
     budget_s, target_profit_rate_s, is_done_s, is_active_s, entry_s, entry_time_s, nq_entry_price_s, nq_entry_amp_s, profit_mode_s = state_s[1], state_s[2], state_s[4], state_s[5], state_s[8], state_s[9], state_s[10], state_s[11], state_s[12]
 
-    def build_compact_status(symbol_short, is_active, budget, is_done, current_session, est_time, qty, entry_session, target_profit_rate, profit_mode, nq_amp_global, nq_entry_amp, avg_price):
+    def build_compact_status(symbol_short, is_active, budget, is_done, current_session, est_time, qty, entry_session, target_profit_rate, profit_mode, nq_c, nq_h, nq_l, nq_entry_amp, avg_price):
         state_flag = "ON" if is_active else "OFF"
         
         expected_target = target_profit_rate
         if profit_mode == "AUTO":
-            expected_target = 1.0 if nq_amp_global >= 0.63 else 0.5
+            # MODIFIED: 초과 Case 68 방어 - NQ=F 당일 저점 대비 반등 위치(%) 기반 50% 임계값 동적 스위칭 렌더링
+            nq_rebound_ratio_val = ((nq_c - nq_l) / (nq_h - nq_l) * 100.0) if (nq_h - nq_l) > 0.0 else 0.0
+            expected_target = 1.0 if nq_rebound_ratio_val >= 50.0 else 0.5
             target_str = f"AUTO 예상 {expected_target}%"
         else:
             target_str = f"수동 {target_profit_rate}%"
 
-        sl_str = ""
-        if qty > 0 and nq_entry_amp > 0.0 and avg_price > 0.0:
-            sl_pct = nq_entry_amp * 2.5
-            sl_price = avg_price * (1.0 - sl_pct / 100.0)
-            sl_str = f" | 컷오프 ${sl_price:.2f}(-{sl_pct:.2f}%)"
-
         if not is_active:
             state_text = "대기"
         elif qty > 0:
-            state_text = f"보유(+{target_profit_rate}%{sl_str})"
+            state_text = f"보유(+{target_profit_rate}%)"
         elif is_done:
             state_text = "타격완료"
         else:
@@ -307,7 +306,7 @@ async def build_avwap_radar() -> tuple[str, InlineKeyboardMarkup]:
         emoji = "🐻"
         return f"{emoji} <b>{symbol_short}</b> <code>[{state_flag}]</code> {state_text} | <code>${budget:.0f}</code>"
 
-    status_s = build_compact_status("SOXS", is_active_s, budget_s, is_done_s, session_name_ui, now_est, hold_s.get('qty', 0.0), entry_s, target_profit_rate_s, profit_mode_s, nq_amp, nq_entry_amp_s, hold_s.get('avg_price', 0.0))
+    status_s = build_compact_status("SOXS", is_active_s, budget_s, is_done_s, session_name_ui, now_est, hold_s.get('qty', 0.0), entry_s, target_profit_rate_s, profit_mode_s, nq_c, nq_h, nq_l, nq_entry_amp_s, hold_s.get('avg_price', 0.0))
     
     scan_time = now_est.strftime("%m-%d %H:%M:%S")
 
@@ -315,7 +314,7 @@ async def build_avwap_radar() -> tuple[str, InlineKeyboardMarkup]:
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
 🌐 <b>나스닥 100 선물 (NQ=F)</b>
 ▫️ 현재: <code>{nq_c:.2f}</code> | 고가: <code>{nq_h:.2f}</code> | 저가: <code>{nq_l:.2f}</code>
-▫️ 총 진폭: <code>{nq_amp:.2f}%</code> | 저점 대비 반등: <code>{nq_current_amp:.2f}%</code>
+▫️ 총 진폭: <code>{nq_amp:.2f}%</code> | <b>저점 대비 반등 위치: <code>{nq_rebound_ratio:.2f}%</code></b>
 ▫️ 레버리지 기대 진폭 (x5.0): <code>{lev_expected_amp:.2f}%</code>
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
 📊 <b>현재가 & 5MA(어제 진폭)</b>
@@ -860,3 +859,4 @@ async def process_back_to_main(callback_query: types.CallbackQuery, state: FSMCo
         await callback_query.message.edit_text(get_main_menu_text(), reply_markup=None, parse_mode="HTML")
     except Exception:
         pass
+
