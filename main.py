@@ -7,6 +7,7 @@
 # MODIFIED: 타임아웃 킬러 소각 - 발사된 모든 매수 주문(현재가 지정가/VWAP 덫)은 09:29까지 휩소 노출 체결 강제 (무한 대기)
 # NEW: 초과 Case 69 방어 - 3차 방어망 동적 임계치 하한선(0.8%) 클리핑 주입
 # MODIFIED: 초과 Case 68 방어 - profit_mode 데드코드 완전 적출에 따른 장부 언패킹 동기화
+# NEW: 초과 Case 70 방어 - 지연 체결 타임 패러독스 소각 (체결 확증 시점 NQ=F 기준점 동기화 락온)
 
 import sys
 import os
@@ -866,7 +867,8 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                                 await AssassinLedger.save_state(symbol, price=avg_price, target_sell_price=calculated_target, sell_order_id=new_sell_id, is_session_done=True, entry_session="MANUAL")
                                 is_session_done = True
                             else:
-                                await AssassinLedger.save_state(symbol, price=avg_price, target_sell_price=calculated_target, sell_order_id=new_sell_id)
+                                # NEW: 초과 Case 70 방어 - 체결 확인 시점의 실시간 NQ=F 지수/진폭으로 3차 방어망 기준점 동기화 (오버라이드)
+                                await AssassinLedger.save_state(symbol, price=avg_price, target_sell_price=calculated_target, sell_order_id=new_sell_id, nq_entry_price=nq_c_global, nq_entry_amp=nq_amp_global)
                             await notify_tg(f"🟢 <b>[aVWAP {symbol}] {trap_tag} 기계적 지정가 매도 덫 장전</b>\n▫️ 팩트 평단가: ${avg_price:.2f}\n▫️ 익절 덫: ${calculated_target:.2f}\n▫️ 수량: {trap_qty}주")
                         else:
                             await AssassinLedger.save_state(symbol, sell_order_id=new_sell_id)
@@ -919,7 +921,7 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID, 
-            text="✅ <b>[시스템 기동 완료]</b>\n▫️ 서버 재부팅 및 SOXS 단독 통제망 코어 결속\n▫️ 데드코드 적출 및 동적 덤핑 하한선(0.8%) 단방향 쉴드 락온 완료.", 
+            text="✅ <b>[시스템 기동 완료]</b>\n▫️ 서버 재부팅 및 SOXS 단독 통제망 코어 결속\n▫️ 지연 체결 타임 패러독스 소각(체결 확증 시점 매크로 기준점 동기화) 완료.", 
             parse_mode="HTML"
         )
     except Exception:
