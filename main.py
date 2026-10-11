@@ -5,6 +5,7 @@
 # MODIFIED: 타임아웃 킬러 소각 - 발사된 모든 매수 주문(현재가 지정가/VWAP 덫)은 09:29까지 휩소 노출 체결 강제 (무한 대기)
 # MODIFIED: 초과 Case 67 방어 - NQ=F 동적 3단계 장중 하드 스탑 100% 영구 소각 (무한 휩소 인내 락온)
 # MODIFIED: 초과 Case 68 방어 - NQ=F 당일 저점 대비 반등 위치(%) 기반 50% 임계값 동적 익절 스위칭 (1.0% / 0.5%) 락온
+# NEW: 초과 Case 50 방어 - 수동 추가 매수 개입(잔고 증가) 원자적 식별 및 덫 파기 재장전 하드 락온
 
 import sys
 import os
@@ -649,7 +650,7 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                             try:
                                 if nq_amp_global >= 2.0:
                                     await AssassinLedger.save_state(symbol, is_session_done=True)
-                                    await notify_tg(f"🛑 <b>[aVWAP {symbol}] 대세장 이탈 감지 (매수 차단)</b>\n▫️ 사유: NQ=F 실시간 전체 진폭 <code>{nq_amp_global:.2f}%</code>\n▫️ 조치: 추세 붕괴로 돌파 요격 취소 및 관망 퇴근")
+                                    await notify_tg(f"🛑 <b>[aVWAP {symbol}] 대세장 이탈 감지 (매수 차단)</b>\n▫️ 사유: NQ=F 실시간 전체 진폭 <code>{nq_amp_global:.2f}%</code>\n▫️ 조치: 추 추세 붕괴로 돌파 요격 취소 및 관망 퇴근")
                                     continue
                                 
                                 my_hold_check = await client.get_symbol_holdings_detail(symbol)
@@ -695,7 +696,6 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                                         target_qty = int(math.floor(actual_budget / target_price))
                                         
                                         if target_qty > 0:
-                                            # MODIFIED: 초과 Case 68 방어 - NQ=F 당일 저점 대비 반등 위치 산출 (50% 임계값 동적 스위칭)
                                             nq_rebound_ratio = 0.0
                                             if (nq_h_global - nq_l_global) > 0.0:
                                                 nq_rebound_ratio = ((nq_c_global - nq_l_global) / (nq_h_global - nq_l_global)) * 100.0
@@ -777,6 +777,18 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                 try:
                     od = await client.get_order_detail(sell_order_id)
                     status_trap = od.get("status", "")
+                    
+                    # NEW: 초과 Case 50 방어 - 수동 추가 매수 개입(잔고 증가) 원자적 식별 및 덫 파기 재장전 하드 락온
+                    if status_trap in ["PENDING", "PARTIAL_FILLED", "PENDING_CANCEL", "PENDING_REPLACE"]:
+                        trap_qty_server = float(od.get("quantity", 0.0))
+                        if holdings_qty > trap_qty_server:
+                            await notify_tg(f"🚨 <b>[aVWAP {symbol}] 수동 매수 개입(잔고 증가) 감지</b>\n▫️ 팩트 잔고({holdings_qty}주) > 기존 덫 물량({trap_qty_server}주)\n▫️ 조치: 기존 덫 원자적 파기 및 잔량 100% 재장전 파이프라인 가동")
+                            await client.cancel_order(sell_order_id)
+                            await AssassinLedger.save_state(symbol, sell_order_id="")
+                            sell_order_id = ""
+                            await asyncio.sleep(0.5)
+                            continue 
+                            
                     if status_trap in ["CANCELED", "REJECTED"]:
                         await notify_tg(f"🚨 <b>[aVWAP {symbol}] 유령 지정가 덫 증발 감지</b>\n▫️ 사유: 상태 변이({status_trap})\n▫️ 조치: 덫 파기 및 자동 재장전 가동")
                         await AssassinLedger.save_state(symbol, sell_order_id="")
@@ -931,3 +943,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
