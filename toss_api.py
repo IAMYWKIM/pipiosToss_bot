@@ -9,6 +9,7 @@
 # MODIFIED: 초과 Case 62 - 토스 인증 모듈(_do_authenticate) HTTP 상태 코드 검증망 주입을 통한 JSON 파싱 붕괴(HTML 응답) 원천 차단
 # NEW: 초과 Case 69 - API Null 페이로드 응답 시 단락 평가(or)를 통한 AttributeError 체이닝 붕괴 완벽 방어 락온 전면 주입
 # MODIFIED: 치명적 엣지 케이스 방어 - 비표준 에러 문자열 페이로드 응답 시 발생하는 AttributeError('str' object has no attribute 'get') 시스템 패닉 원천 봉쇄
+# NEW: 초과 Case 71 - 매도 가능 수량(sellableQuantity) 프로빙 API 통신망 신규 개통
 
 import asyncio
 import aiohttp
@@ -120,7 +121,6 @@ class TossApiClient:
                         if resp.status >= 400:
                             err_text = await resp.text()
                             try:
-                                # MODIFIED: 비표준 에러 응답 시 AttributeError 발생 차단 및 이중 캐치망 결속
                                 err_json = json.loads(err_text)
                                 err_obj = err_json.get("error", {})
                                 if isinstance(err_obj, dict):
@@ -179,7 +179,7 @@ class TossApiClient:
     async def fetch_account_seq(self):
         if not self.token: await self.authenticate()
         data = await self._request("GET", "/api/v1/accounts", "ACCOUNT", headers=self._get_headers())
-        data = data or {}  # 단락 평가 유지
+        data = data or {}
         accounts = data.get("result") or []
         for acc in accounts:
             if acc.get("accountType") == "BROKERAGE":
@@ -223,6 +223,15 @@ class TossApiClient:
         res_dict = data.get("result") or {}
         bp_raw = res_dict.get("cashBuyingPower")
         return float(bp_raw) if bp_raw is not None else 0.0
+
+    # NEW: 매도 가능 수량 단독 프로빙 (수동 주문 락온 감지망)
+    async def get_sellable_quantity(self, symbol: str) -> float:
+        if not self.account_seq: await self.fetch_account_seq()
+        data = await self._request("GET", f"/api/v1/sellable-quantity?symbol={symbol}", "ORDER_INFO", headers=self._get_headers(requires_account=True))
+        data = data or {}
+        res_dict = data.get("result") or {}
+        sq_raw = res_dict.get("sellableQuantity")
+        return float(sq_raw) if sq_raw is not None else 0.0
 
     async def is_market_open(self) -> tuple[bool, datetime, str, datetime]:
         now_ts = time.time()
