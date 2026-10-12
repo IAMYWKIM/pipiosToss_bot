@@ -1,10 +1,11 @@
 # =====================================================================
 # FILE: main.py
-# 목적: SOXS 단독 암살자 엔진 가동 (04:01 분기망 덫 영구 유지 + 제로오버나잇)
+# 목적: SOXS 단독 암살자 엔진 가동 (04:01 분기망 현재가 타격 + 제로오버나잇)
 # =====================================================================
 # MODIFIED: 초과 Case 67 방어 - NQ=F 동적 덤핑 방향성 락온 (abs 소각, 상승장 전용 단방향 쉴드 결속)
 # NEW: 04:00~04:01 틱 다수결 분기망 및 휩소 바이패스(Whipsaw Bypass) 절대 락온
-# MODIFIED: 타임아웃 킬러 소각 - 발사된 모든 매수 주문(현재가 지정가/VWAP 덫)은 09:29까지 휩소 노출 체결 강제 (무한 대기)
+# MODIFIED: 타임아웃 킬러 소각 - 발사된 모든 매수 주문(현재가 지정가)은 09:29까지 휩소 노출 체결 강제 (무한 대기)
+# NEW: 초과 가동 방어 - 04:01 VWAP 덫 오더북 거부 장애 방어를 위한 실시간 현재가(current_price) 지정가 타격 100% 락온
 # NEW: 초과 Case 69 방어 - 3차 방어망 동적 임계치 하한선(0.8%) 클리핑 주입
 # MODIFIED: 초과 Case 68 방어 - profit_mode 데드코드 완전 적출에 따른 장부 언패킹 동기화
 # NEW: 초과 Case 70 방어 - 지연 체결 타임 패러독스 소각 (체결 확증 시점 NQ=F 기준점 동기화 락온)
@@ -683,9 +684,10 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
 
                                     if not whipsaw_bypass_active:
                                         if pre_ticks_up > pre_ticks_down:
+                                            # MODIFIED: 04:01분 상회 틱 다수결 시 VWAP 덫 대신 실시간 현재가 지정가 타격으로 락온 (주문 거부/오더북 진입 실패 방어)
                                             trigger_fire = True
-                                            target_price = vwap_price
-                                            tag = "VWAP 지정가 덫 (상회 틱 다수결)"
+                                            target_price = current_price
+                                            tag = "현재가 지정가 타격 (상회 틱 다수결)"
                                         else:
                                             if current_price >= vwap_price:
                                                 whipsaw_bypass_active = True
@@ -867,7 +869,6 @@ async def assassin_loop(client: TossApiClient, bot: Bot, chat_id: int, symbol: s
                                 await AssassinLedger.save_state(symbol, price=avg_price, target_sell_price=calculated_target, sell_order_id=new_sell_id, is_session_done=True, entry_session="MANUAL")
                                 is_session_done = True
                             else:
-                                # NEW: 초과 Case 70 방어 - 체결 확인 시점의 실시간 NQ=F 지수/진폭으로 3차 방어망 기준점 동기화 (오버라이드)
                                 await AssassinLedger.save_state(symbol, price=avg_price, target_sell_price=calculated_target, sell_order_id=new_sell_id, nq_entry_price=nq_c_global, nq_entry_amp=nq_amp_global)
                             await notify_tg(f"🟢 <b>[aVWAP {symbol}] {trap_tag} 기계적 지정가 매도 덫 장전</b>\n▫️ 팩트 평단가: ${avg_price:.2f}\n▫️ 익절 덫: ${calculated_target:.2f}\n▫️ 수량: {trap_qty}주")
                         else:
