@@ -6,6 +6,7 @@
 # MODIFIED: 04:00~09:29 '절대쉴드(04:01 덫 대기 유지)' 텍스트 렌더링 주입
 # MODIFIED: 핵심 공식 1 헌법 준수 - 베타 4.2 상수 적용
 # MODIFIED: 초과 Case 68 방어 - NQ=F 반등 위치 연산(미래 참조) 완전 적출 및 UI 제거
+# MODIFIED: 관제탑 NQ=F 매크로 지표 UI 렌더링 재배치 및 저가 기준 현재 지수 반등 진폭(nq_rebound_amp) 연산 주입
 
 import os
 import html
@@ -150,6 +151,8 @@ async def build_avwap_radar() -> tuple[str, InlineKeyboardMarkup]:
     nq_c, nq_h, nq_l = await MacroDataCache.get_cached_nq_data()
     
     nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
+    # NEW: 저가 기준 현재 지수 반등 진폭 비율 산출
+    nq_rebound_amp = ((nq_c - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
     lev_expected_amp = nq_amp * 4.2
 
     price_s = await api_client.get_current_price("SOXS")
@@ -297,10 +300,12 @@ async def build_avwap_radar() -> tuple[str, InlineKeyboardMarkup]:
     
     scan_time = now_est.strftime("%m-%d %H:%M:%S")
 
+    # MODIFIED: NQ=F 지표 UI 레이아웃 재배치 및 반등 진폭 주입
     text = f"""📡 <b>[aVWAP 레이더]</b> {market_header}
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
 🌐 <b>나스닥 100 선물 (NQ=F)</b>
-▫️ 현재: <code>{nq_c:.2f}</code> | 고가: <code>{nq_h:.2f}</code> | 저가: <code>{nq_l:.2f}</code>
+▫️ 고가: <code>{nq_h:.2f}</code> | 저가: <code>{nq_l:.2f}</code>
+▫️ 현재: <code>{nq_c:.2f}</code> | 진폭: <code>{nq_rebound_amp:.2f}%</code>
 ▫️ 총 진폭: <code>{nq_amp:.2f}%</code>
 ▫️ 레버리지 기대 진폭 (x4.2): <code>{lev_expected_amp:.2f}%</code>
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
