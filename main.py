@@ -6,7 +6,7 @@
 # MODIFIED: 제3헌법 & Case 43 방어 - 구 04:01 프리장 틱 다수결/휩소 바이패스 데드코드 전면 소각
 # NEW: Case 09, Case 52, Case 54 방어 - SOXL/SOXS 양방향 병렬 루프 및 dual_strike_mutex 전역 타격 락 결속
 # NEW: Case 69 방어 - 3차 방어망 동적 임계치 하한선(NQ_DYNAMIC_FLOOR = 0.8) 상단 상수 하드 락온
-# MODIFIED: 플러그인 아키텍처 분리 - 전술 타격/방어/청산/덫 로직을 sniper_plugin.py로 모듈화 연결
+# MODIFIED: 플러그인 아키텍처 분리 및 미사용 임포트(fetch_full_session_candles) 소각
 
 import sys
 import os
@@ -25,9 +25,9 @@ from toss_api import TossApiClient
 from quant_engine import AssassinLedger, AVWAPEngine, MacroDataCache
 from tg_router import router, inject_dependencies
 from candle_recorder import record_candles_loop
+# MODIFIED: 제3헌법 준수 - 미사용 fetch_full_session_candles 임포트 소각
 from sniper_plugin import (
     SniperPluginContext,
-    fetch_full_session_candles,
     execute_moc_zero_overnight_plugin,
     execute_macro_defense_plugin,
     enforce_post_0930_cutoff_plugin,

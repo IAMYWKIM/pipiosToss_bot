@@ -8,19 +8,19 @@
 #   4) 팩트 평단가(averagePurchasePrice) 기준 +1.0% 지정가 익절 덫 장전 및 체결 시점 NQ 기준점 동기화
 #   5) 15:59~16:01 EST 제로-오버나이트 MOC 매수 1호가 1.5초 주기 고주파 강제 청산
 # =====================================================================
+# MODIFIED: 제3헌법 준수 - 미사용 데드코드 함수(fetch_full_session_candles) 및 불필요 임포트 영구 소각
 
 import math
 import time
 import asyncio
 import html
-import pandas as pd
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from aiogram import Bot
 
 from toss_api import TossApiClient
-from quant_engine import AssassinLedger, AVWAPEngine, MacroDataCache
+from quant_engine import AssassinLedger, MacroDataCache
 
 EST_TZ = ZoneInfo("America/New_York")
 
@@ -44,29 +44,6 @@ class SniperPluginContext:
             await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="HTML")
         except Exception as e:
             print(f"🚨 [텔레그램 전송 붕괴 방어] {e}", flush=True)
-
-
-async def fetch_full_session_candles(
-    client: TossApiClient, symbol: str, session_start_est: datetime
-) -> list:
-    all_candles = []
-    before = None
-    for _ in range(6):
-        try:
-            candles_page = await client.get_1m_candles_pagination(symbol, count=200, before=before)
-            candles = candles_page.get("candles", [])
-            all_candles.extend(candles)
-            if not candles:
-                break
-            oldest_time = pd.to_datetime(candles[-1]["timestamp"], utc=True).tz_convert(EST_TZ)
-            if oldest_time <= session_start_est:
-                break
-            before = candles_page.get("nextBefore")
-            if not before:
-                break
-        except Exception:
-            break
-    return all_candles
 
 
 # =====================================================================

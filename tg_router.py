@@ -7,6 +7,7 @@
 #           잔고 보유 시 '보유(+수익률%)', 09:31 이후 미보유/미체결 시 '장외대기' 팩트 표출 강제 (미래 참조 반등 위치 영구 소각)
 # MODIFIED: Case 37 & Case 68 방어 - 세션 토글/profit_mode 데드코드 소각 및 ☀️ 09:30 오프닝 스나이퍼 +1.0%/+0.5% 토글 결속
 # MODIFIED: Case 39, 47, 55, 56 방어 - SOXL/SOXS 양방향 5MA(count=6) 동적 시프트 및 예상 밴드 렌더링
+# MODIFIED: 관제탑 NQ=F 섹션 '저가기준 현재지수 진폭' 산출 및 렌더링 반영 (ZeroDivision 방어 결속)
 
 import os
 import html
@@ -184,7 +185,7 @@ async def build_avwap_radar() -> tuple[str, InlineKeyboardMarkup]:
     except Exception:
         pass
 
-    # NEW: Case 13 & Case 43 - NQ=F 실시간 지표 및 09:20~09:30 EST 10분봉 스나이핑 시그널 로드 (반등 위치 영구 소각)
+    # MODIFIED: Case 13, Case 23, Case 43 - NQ=F 실시간 지표 및 저가기준 현재지수 진폭 연산
     (
         nq_10m_trend,
         nq_10m_chg_pct,
@@ -195,7 +196,12 @@ async def build_avwap_radar() -> tuple[str, InlineKeyboardMarkup]:
     ) = await MacroDataCache.get_nq_10m_sniper_signal()
 
     nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
-    lev_expected_amp = nq_amp * 4.2
+    # NEW: 저가(nq_l) 기준 현재지수(nq_c) 진폭(%) 산출 (ZeroDivision 및 음수 오차 완벽 방어)
+    nq_curr_amp = (
+        max(0.0, ((nq_c - nq_l) / nq_l * 100.0))
+        if (nq_l > 0.0 and nq_c > 0.0)
+        else 0.0
+    )
 
     if nq_10m_trend == "DOWN":
         sniper_sig_str = f"🐻 하락(DOWN {nq_10m_chg_pct:+.2f}%) ➡️ 09:30 SOXS 타격"
@@ -396,12 +402,13 @@ async def build_avwap_radar() -> tuple[str, InlineKeyboardMarkup]:
 
     scan_time = now_est.strftime("%m-%d %H:%M:%S")
 
+    # MODIFIED: 관제탑 NQ=F 섹션 '저가기준 현재지수 진폭' 표출 락온
     text = f"""📡 <b>[09:30 스나이퍼 레이더]</b> {market_header}
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
 🌐 <b>나스닥 100 선물 (NQ=F)</b>
 ▫️ 고가: <code>{nq_h:.2f}</code> | 저가: <code>{nq_l:.2f}</code>
 ▫️ 현재: <code>{nq_c:.2f}</code> | 총 진폭: <code>{nq_amp:.2f}%</code>
-▫️ 레버리지 기대 진폭 (x4.2): <code>{lev_expected_amp:.2f}%</code>
+▫️ 저가기준 현재지수 진폭: <code>{nq_curr_amp:.2f}%</code>
 ▫️ 10분봉({nq_10m_bar_str}): <code>{sniper_sig_str}</code>
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
 📊 <b>현재가 & 5MA(어제 진폭)</b>

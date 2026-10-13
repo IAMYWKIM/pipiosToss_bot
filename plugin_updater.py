@@ -2,28 +2,33 @@
 # FILE: plugin_updater.py
 # 목적: 깃허브 코드 다운로드 검증 및 롤백 (프리플라이트 파이썬 컴파일)
 # =====================================================================
+# MODIFIED: 분리된 sniper_plugin.py 모듈을 프리플라이트 컴파일 검증 리스트에 동기화 결속
 
 import os
 import subprocess
 import sys
 import py_compile
 
+
 def run_command(command: str) -> tuple[int, str, str]:
-    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(
+        command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
     stdout, stderr = process.communicate()
     return process.returncode, stdout.strip(), stderr.strip()
+
 
 def main():
     code, current_hash, err = run_command("git rev-parse HEAD")
     if code != 0:
         print("🚨 해시 백업 실패. 업데이트를 중단합니다.", file=sys.stderr)
         sys.exit(1)
-    
+
     print(f"✅ 현재 정상 해시 백업 완료: {current_hash}")
 
     code, pull_out, pull_err = run_command("git pull origin main")
     print(pull_out)
-    
+
     if code != 0:
         print(f"🚨 Pull 네트워크 붕괴: {pull_err}", file=sys.stderr)
         run_command(f"git reset --hard {current_hash}")
@@ -32,12 +37,18 @@ def main():
     if "Already up to date." in pull_out:
         sys.exit(0)
 
+    # MODIFIED: sniper_plugin.py를 포함한 6대 코어 파일 전체 프리플라이트 컴파일 검증
     try:
-        py_compile.compile('main.py', doraise=True)
-        py_compile.compile('tg_router.py', doraise=True)
-        py_compile.compile('quant_engine.py', doraise=True)
-        py_compile.compile('toss_api.py', doraise=True)
-        py_compile.compile('candle_recorder.py', doraise=True)
+        for mod_file in (
+            "main.py",
+            "sniper_plugin.py",
+            "tg_router.py",
+            "quant_engine.py",
+            "toss_api.py",
+            "candle_recorder.py",
+        ):
+            if os.path.exists(mod_file):
+                py_compile.compile(mod_file, doraise=True)
         print("✅ 프리플라이트 파이썬 컴파일 검증 통과.")
         sys.exit(0)
     except py_compile.PyCompileError as e:
@@ -48,6 +59,7 @@ def main():
         else:
             print(f"🚨 롤백 실패. 시스템 권한 붕괴: {reset_err}", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
