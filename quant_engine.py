@@ -2,6 +2,7 @@
 # FILE: quant_engine.py
 # 목적: SOXS 단방향 독립 장부 및 NQ=F 실시간 진폭(매크로 방어선) 조회 캐싱 엔진
 # =====================================================================
+# MODIFIED: Case 68 방어 - 과거 장부에 오염된 익절률(예: 1.0%)이 잔존하더라도 원자적으로 소각하고 +0.64% 하드 락온 강제
 
 import os
 import json
@@ -79,7 +80,6 @@ class MacroDataCache:
                 high_val = float(df_session["High"].max())
                 low_val = float(df_session["Low"].min())
                 
-                # NQ 10분봉 방향성 로직 전면 폐기 (Case 43)
                 return curr_val, high_val, low_val, "WAIT", 0.0, "--:--"
 
             try:
@@ -150,7 +150,8 @@ class AssassinLedger:
                     with open(filepath, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         if not isinstance(data, dict): data = {}
-                        raw_rate = float(data.get("target_profit_rate", cls.DEFAULT_TARGET_PROFIT_RATE))
+                        # MODIFIED: 장부에 오염된 익절률이 존재하더라도 원자적으로 무시하고 0.64% 하드 락온 (Case 68)
+                        raw_rate = cls.DEFAULT_TARGET_PROFIT_RATE
                         return (
                             float(data.get("last_buy_price", 0.0)),
                             float(data.get("budget", 100.0)),
@@ -227,12 +228,11 @@ class AssassinLedger:
                             if isinstance(loaded, dict): data = loaded
                     except Exception: pass
 
-                if "target_profit_rate" not in data:
-                    data["target_profit_rate"] = cls.DEFAULT_TARGET_PROFIT_RATE
+                # MODIFIED: 장부 기록 시에도 파라미터를 무시하고 0.64% 영구 고정 (Case 68 하드 락온)
+                data["target_profit_rate"] = cls.DEFAULT_TARGET_PROFIT_RATE
 
                 if price is not None: data["last_buy_price"] = price
                 if budget is not None: data["budget"] = budget
-                if target_profit_rate is not None: data["target_profit_rate"] = target_profit_rate
                 if last_session_id is not None: data["last_session_id"] = last_session_id
                 if is_session_done is not None: data["is_session_done"] = is_session_done
                 if is_active is not None: data["is_active"] = is_active
