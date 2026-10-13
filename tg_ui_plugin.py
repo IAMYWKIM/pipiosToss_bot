@@ -2,6 +2,7 @@
 # FILE: tg_ui_plugin.py
 # 목적: 02:58 EST 단방향(SOXS) 전용 텔레그램 데이터 연산 및 UI 렌더링 전용 모듈
 # =====================================================================
+# MODIFIED: Case 40 방어 - 지시서 고가/저가 연산망을 불완전한 1분봉 Aggregation에서 일봉(1d) 팩트 매핑으로 전면 교체 완료
 
 import asyncio
 from datetime import datetime, timedelta
@@ -258,36 +259,29 @@ async def build_sync_board(api_client) -> str:
         profit_usd, profit_rate = hold.get("profit_usd", 0.0), hold.get("profit_rate", 0.0) * 100.0
         profit_krw = profit_usd * exchange_rate
         curr = await api_client.get_current_price(symbol)
+        
         prev_close = curr
+        high, low = curr, curr
 
         if now_est.hour >= 4: session_start_est = now_est.replace(hour=4, minute=0, second=0, microsecond=0)
         else: session_start_est = (now_est - timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
 
         try:
+            # 1분봉 Aggregation 소각 -> 1일봉(1d) 다이렉트 팩트 매핑 (Case 40 방어)
             data_1d = await api_client._request("GET", f"/api/v1/candles?symbol={symbol}&interval=1d&count=5", "MARKET_DATA_CHART", headers=api_client._get_headers())
             candles_1d = (data_1d or {}).get("result", {}).get("candles", [])
             target_date = session_start_est.date()
+            
             for c in candles_1d:
                 c_dt = pd.to_datetime(c["timestamp"], format="ISO8601", utc=True).tz_convert(EST_TZ).date()
-                if c_dt < target_date:
+                if c_dt == target_date:
+                    h_val = float(c.get("highPrice") or 0.0)
+                    l_val = float(c.get("lowPrice") or 0.0)
+                    if h_val > 0: high = h_val
+                    if l_val > 0: low = l_val
+                elif c_dt < target_date:
                     prev_close = float(c.get("closePrice") or 0.0)
                     break
-        except Exception: pass
-
-        high, low = curr, curr
-        try:
-            c_data = await api_client.get_1m_candles_pagination(symbol, count=200)
-            c_list = c_data.get("candles", [])
-            if c_list:
-                df = pd.DataFrame(c_list)
-                df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True).tz_convert(EST_TZ)
-                df.set_index("timestamp", inplace=True)
-                df = df[df.index >= session_start_est]
-                if not df.empty:
-                    h_max = float(pd.to_numeric(df["highPrice"], errors="coerce").max())
-                    l_min = float(pd.to_numeric(df["lowPrice"], errors="coerce").min())
-                    if h_max > 0: high = h_max
-                    if l_min > 0: low = l_min
         except Exception: pass
 
         high_rate = ((high - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
