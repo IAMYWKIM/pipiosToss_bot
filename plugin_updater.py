@@ -3,6 +3,7 @@
 # 목적: 깃허브 코드 다운로드 검증 및 롤백 (프리플라이트 파이썬 컴파일)
 # =====================================================================
 # MODIFIED: 분리된 tg_ui_plugin.py 모듈을 프리플라이트 컴파일 검증 리스트에 동기화 결속 (7대 코어 모듈)
+# MODIFIED: subprocess.communicate 30초 타임아웃 주입 및 프로세스 Kill 결속 (네트워크 교착 방어)
 
 import os
 import subprocess
@@ -14,8 +15,13 @@ def run_command(command: str) -> tuple[int, str, str]:
     process = subprocess.Popen(
         command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    stdout, stderr = process.communicate()
-    return process.returncode, stdout.strip(), stderr.strip()
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+        return process.returncode, stdout.strip(), stderr.strip()
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        return -1, stdout.strip(), "Subprocess Timeout Expired (네트워크 교착 상태 차단)"
 
 
 def main():
@@ -37,7 +43,6 @@ def main():
     if "Already up to date." in pull_out:
         sys.exit(0)
 
-    # MODIFIED: tg_ui_plugin.py를 포함한 7대 코어 파일 전체 프리플라이트 컴파일 검증
     try:
         for mod_file in (
             "main.py",
