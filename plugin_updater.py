@@ -2,7 +2,7 @@
 # FILE: plugin_updater.py
 # 목적: 깃허브 코드 다운로드 검증 및 롤백 (프리플라이트 파이썬 컴파일)
 # =====================================================================
-# MODIFIED: 분리된 sniper_plugin.py 모듈을 프리플라이트 컴파일 검증 리스트에 동기화 결속
+# MODIFIED: 분리된 tg_ui_plugin.py 모듈을 프리플라이트 컴파일 검증 리스트에 동기화 결속 (7대 코어 모듈)
 
 import os
 import subprocess
@@ -37,12 +37,13 @@ def main():
     if "Already up to date." in pull_out:
         sys.exit(0)
 
-    # MODIFIED: sniper_plugin.py를 포함한 6대 코어 파일 전체 프리플라이트 컴파일 검증
+    # MODIFIED: tg_ui_plugin.py를 포함한 7대 코어 파일 전체 프리플라이트 컴파일 검증
     try:
         for mod_file in (
             "main.py",
             "sniper_plugin.py",
             "tg_router.py",
+            "tg_ui_plugin.py",
             "quant_engine.py",
             "toss_api.py",
             "candle_recorder.py",

@@ -1,12 +1,13 @@
 # =====================================================================
 # FILE: main.py
-# 목적: 09:30 EST 정규장 개장 NQ=F 10분봉 추세 양방향(SOXL/SOXS) 스나이퍼 코어 오케스트레이터
+# 목적: 09:29 EST 프리장 선제 매수 & +1.0% 익절 덫 장전 (09:30 오프닝 휩소 노출) 양방향(SOXL/SOXS) 스나이퍼 코어 오케스트레이터
 # 구조: sniper_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 슬림 아키텍처
 # =====================================================================
 # MODIFIED: 제3헌법 & Case 43 방어 - 구 04:01 프리장 틱 다수결/휩소 바이패스 데드코드 전면 소각
 # NEW: Case 09, Case 52, Case 54 방어 - SOXL/SOXS 양방향 병렬 루프 및 dual_strike_mutex 전역 타격 락 결속
 # NEW: Case 69 방어 - 3차 방어망 동적 임계치 하한선(NQ_DYNAMIC_FLOOR = 0.8) 상단 상수 하드 락온
-# MODIFIED: 플러그인 아키텍처 분리 및 미사용 임포트(fetch_full_session_candles) 소각
+# MODIFIED: 09:29 EST 프리장 마감 1분 전 선제 지정가 매수 및 시드머니 전량 체결 즉시 +1.0% 매도 지정가 장전 파이프라인 결속
+# NEW: 09:29(preMarket) -> 09:30(regularMarket) 세션 전이 시 당일 타격/배타 락(is_session_done) 증발 원천 방어
 
 import sys
 import os
@@ -25,7 +26,6 @@ from toss_api import TossApiClient
 from quant_engine import AssassinLedger, AVWAPEngine, MacroDataCache
 from tg_router import router, inject_dependencies
 from candle_recorder import record_candles_loop
-# MODIFIED: 제3헌법 준수 - 미사용 fetch_full_session_candles 임포트 소각
 from sniper_plugin import (
     SniperPluginContext,
     execute_moc_zero_overnight_plugin,
@@ -56,9 +56,10 @@ if not all([TOSS_CLIENT_ID, TOSS_CLIENT_SECRET, TELEGRAM_BOT_TOKEN, _telegram_ch
 ADMIN_CHAT_ID = int(_telegram_chat_id_str)
 wakeup_event = asyncio.Event()
 
-# NEW: Case 09 & Case 69 - 양방향 감시 타겟 및 3차 방어망 동적 임계치 하한선(0.8%) 상수 락온
+# NEW: Case 09 & Case 69 - 양방향 감시 타겟, 3차 방어망 동적 임계치 하한선(0.8%), 09:29 선제 매수 초(Second) 상수 락온
 SYMBOLS = ("SOXL", "SOXS")
 NQ_DYNAMIC_FLOOR = 0.8
+SNIPER_PRE_BUY_SECOND = 0  # 09:29:00 EST 정각부터 즉시 선제 매수 발사 (09:29:30 발사 희망 시 30으로 설정)
 
 HOLIDAY_TRANSLATIONS = {
     "New Year's Day": "신정 (New Year's Day)",
@@ -123,12 +124,13 @@ def _run_git_update_sync() -> tuple[bool, str]:
         run_cmd(f"git reset --hard {current_hash}")
         return False, f"Hard Reset 붕괴 (원상 복구됨):\n{reset_err}"
 
-    # MODIFIED: 분리된 sniper_plugin.py를 포함한 전체 모듈 프리플라이트 컴파일 검증
+    # MODIFIED: 분리된 tg_ui_plugin.py를 포함한 7대 코어 모듈 프리플라이트 컴파일 검증 동기화
     try:
         for mod_file in (
             "main.py",
             "sniper_plugin.py",
             "tg_router.py",
+            "tg_ui_plugin.py",
             "quant_engine.py",
             "toss_api.py",
             "candle_recorder.py",
@@ -180,8 +182,9 @@ async def auto_update_loop(bot: Bot, chat_id: int):
 
 async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     """
-    MODIFIED: SOXL 및 SOXS 각각 독립 실행되는 09:30 오프닝 스나이퍼 메인 상태 루프.
-    세부 전술 액션은 sniper_plugin.py의 플러그인 함수로 위임하여 슬림화 및 단일 책임을 달성한다.
+    MODIFIED: SOXL 및 SOXS 각각 독립 실행되는 09:29 프리장 선제 스나이퍼 메인 상태 루프.
+    09:29 EST에 선제 매수 후 시드머니 기준 전량 체결 확인 즉시 +1.0% 익절 지정가 매도 주문을 장전하여
+    09:30:00 EST 정규장 오프닝 휩소(급등 스파이크)에 즉각 노출시킨다.
     """
     global last_holiday_notified_date
     runtime_state = {
@@ -196,8 +199,13 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     }
 
     while True:
+        # NEW: 09:29~09:30 스나이핑 및 전량 체결 확인 후 +1.0% 매도 덫 즉시 장전을 위한 동적 고속 폴링(0.4초)
+        now_est_pre = datetime.now(EST_TZ)
+        est_hm_pre = now_est_pre.hour * 100 + now_est_pre.minute
+        loop_timeout = 0.4 if est_hm_pre in (929, 930) else 1.5
+
         try:
-            await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=1.5)
+            await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=loop_timeout)
             ctx.wakeup_event.clear()
         except asyncio.TimeoutError:
             pass
@@ -371,9 +379,24 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             if not is_open or current_price <= 0.0:
                 continue
 
-            # 8. 세션 ID 변경 시 미보유/미체결 상태 클린업 (09:30 정각 신규 스나이핑 준비)
+            # 8. 세션 ID 변경 시 클린업 (NEW: 09:29 프리장 선제 타격/배타 락온 후 09:30 정규장 전이 시 당일 락 보존)
             if current_session_id != last_session_id:
-                if holdings_qty == 0:
+                is_same_day_reg_transition = (
+                    bool(last_session_id)
+                    and len(last_session_id) >= 8
+                    and last_session_id[:8] == current_session_id[:8]
+                    and hardcoded_session == "regularMarket"
+                    and (
+                        is_session_done
+                        or bool(buy_order_id)
+                        or bool(sell_order_id)
+                        or target_sell_price > 0.0
+                    )
+                )
+                if is_same_day_reg_transition:
+                    # 당일 09:29에 이미 선제 매수 또는 반대 종목 배타 락이 걸린 경우 초기화 없이 세션 ID만 승계
+                    await AssassinLedger.save_state(symbol, last_session_id=current_session_id)
+                elif holdings_qty == 0:
                     can_reset = True
                     if buy_order_id:
                         try:
@@ -425,12 +448,20 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 )
                 continue
 
-            # 11. 플러그인 ⑤: 09:30:00 EST 정규장 개장 NQ=F 10분봉 양방향 스나이퍼 타격 (Case 15, 43, 52, 53, 54, 65)
+            # 11. 플러그인 ⑤: 09:29 EST 프리장 마감 1분 전 선제 지정가 매수 + 09:30 백업 윈도우 (Case 15, 43, 52, 53, 54, 65)
+            is_pre_0929_strike = (
+                hardcoded_session == "preMarket"
+                and est_time_int == 929
+                and now_est.second >= SNIPER_PRE_BUY_SECOND
+            )
+            is_reg_0930_backup = (
+                hardcoded_session == "regularMarket"
+                and est_time_int == 930
+            )
             if (
                 is_active
                 and not is_session_done
-                and hardcoded_session == "regularMarket"
-                and est_time_int == 930
+                and (is_pre_0929_strike or is_reg_0930_backup)
                 and holdings_qty == 0
                 and not buy_order_id
             ):
@@ -444,7 +475,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     target_profit_rate=target_profit_rate,
                 )
 
-            # 12. 플러그인 ⑥: +1.0% 기계적 익절 덫 장전, 수동 매수 감지 및 유령 덫 복구 (Case 50, 58, 64, 70, 71)
+            # 12. 플러그인 ⑥: 시드머니 기준 전량 체결 확인 즉시 +1.0% 익절 지정가 매도 덫 장전 (09:30 오프닝 휩소 노출)
             await manage_mechanical_profit_trap_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -502,17 +533,17 @@ async def main():
         asyncio.create_task(assassin_loop(plugin_ctx, sym))
         asyncio.create_task(record_candles_loop(api_client, sym))
 
-    print("시스템 코어 및 09:30 NQ 10분봉 양방향(SOXL/SOXS) 스나이퍼 플러그인 결속 완료...", flush=True)
+    print("시스템 코어 및 09:29 프리장 선제 양방향(SOXL/SOXS) 스나이퍼 플러그인 결속 완료...", flush=True)
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=(
-                "✅ <b>[시스템 기동 완료 — 09:30 양방향 스나이퍼]</b>\n"
+                "✅ <b>[시스템 기동 완료 — 09:29 프리장 선제 양방향 스나이퍼]</b>\n"
                 "▫️ 타겟: <b>SOXL(롱) / SOXS(숏)</b> 배타적 1회 출동\n"
-                "▫️ 전략: 09:20~09:30 EST NQ=F 10분봉 추세 기반 09:30 정각 즉시 타격\n"
-                "▫️ 익절 및 방어: 기본 +1.0% 지정가 익절 & NQ=F 양방향 3단 방어망 결속 완료"
+                "▫️ 전략: 09:20~09:29 EST NQ=F 10분봉 추세 기반 09:29 프리장 선제 지정가 매수\n"
+                "▫️ 오프닝 노출: 시드머니 전량 체결 확인 즉시 +1.0% 익절 매도 지정가 장전 ➡️ 09:30 오프닝 급등 포착"
             ),
             parse_mode="HTML",
         )

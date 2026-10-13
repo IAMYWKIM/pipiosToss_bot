@@ -1,10 +1,10 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: SOXL/SOXS 양방향 듀얼 장부 격리, NQ=F 10분봉 추세 판별 및 세션별 aVWAP 연산 엔진 (I/O 통제 결속)
+# 목적: SOXL/SOXS 양방향 듀얼 장부 격리, NQ=F 10분봉(09:20~09:29) 추세 판별 및 세션별 aVWAP 연산 엔진 (I/O 통제 결속)
 # =====================================================================
 # MODIFIED: Case 09 & Case 52 방어 - SOXL/SOXS 양방향 듀얼 타겟 락온 및 배타적 단일 진입 교차 통제 메서드 주입
-# NEW: Case 43 방어 - 09:20~09:30 EST NQ=F 10분봉(closed='left', label='right') 벡터 추세(DOWN/UP) 판별 엔진 탑재
-# MODIFIED: Case 61 방어 - 평시 60초 TTL 유지 및 09:29:50~09:30:10 EST 오프닝 스나이핑 임계 구간 즉시 갱신 파이프라인 결속
+# NEW: Case 43 방어 - 09:20~09:29 EST NQ=F 10분봉(closed='left', label='right') 벡터 추세(DOWN/UP) 판별 엔진 탑재
+# MODIFIED: Case 61 방어 - 평시 60초 TTL 유지 및 09:28:50~09:30:10 EST 선제 오프닝 스나이핑 임계 구간 즉시 갱신 파이프라인 결속
 # MODIFIED: Case 62 방어 - NQ=F 5d 1m 스코프 및 45분 갭(>= 45분) 기반 논리 세션 시프트 계승
 # MODIFIED: Case 41 & Case 68 방어 - profit_mode 데드코드 영구 적출, 기본 익절률 +1.0% 하드 락온 및 entry_trend 기록 결속
 
@@ -24,9 +24,9 @@ EST_TZ = ZoneInfo("America/New_York")
 
 class MacroDataCache:
     """
-    NQ=F 인메모리 캐싱 및 09:20~09:30 EST 10분봉 추세(DOWN/UP) 벡터 판별 중앙 파이프라인.
-    평소 60초 TTL로 IP 밴 및 통신 병목을 방어하되, 09:29:50~09:30:10 EST 스나이핑 임계 구간에서는
-    09:20~09:30 EST 10분봉 확정 종가를 지연 없이 즉시 조회합니다 (Case 43, Case 61, Case 62).
+    NQ=F 인메모리 캐싱 및 09:20~09:29 EST 10분봉 추세(DOWN/UP) 벡터 판별 중앙 파이프라인.
+    평소 60초 TTL로 IP 밴 및 통신 병목을 방어하되, 09:28:50~09:30:10 EST 선제 스나이핑 임계 구간에서는
+    09:20~09:29 EST 10분봉 실시간/확정 종가를 지연 없이 즉시 조회합니다 (Case 43, Case 61, Case 62).
     """
     # (current, high, low, trend_10m, chg_10m_pct, bar_time_str, timestamp)
     _nq_cache_data = (0.0, 0.0, 0.0, "WAIT", 0.0, "--:--", 0.0)
@@ -35,8 +35,9 @@ class MacroDataCache:
     @classmethod
     def _is_sniper_critical_refresh_needed(cls, now_ts: float, last_ts: float) -> bool:
         """
-        NEW: Case 61 방어 - 09:29:50 ~ 09:30:10 EST 오프닝 스나이핑 임계 구간에서
-        09:30:00 EST 정각 돌파 직후 캐시가 09:30 이전 데이터이거나 2초 이상 경과 시 즉시 갱신을 강제한다.
+        MODIFIED: Case 61 방어 - 09:28:50 ~ 09:30:10 EST 선제 스나이핑 임계 구간에서
+        09:29:00 EST 또는 09:30:00 EST 정각 돌파 직후 캐시가 이전 분(minute) 데이터이거나
+        2.5초 이상 경과 시 즉시 갱신을 강제한다.
         """
         if last_ts <= 0.0:
             return True
@@ -44,12 +45,16 @@ class MacroDataCache:
         now_est = datetime.fromtimestamp(now_ts, tz=EST_TZ)
         last_est = datetime.fromtimestamp(last_ts, tz=EST_TZ)
 
-        today_0929_50 = now_est.replace(hour=9, minute=29, second=50, microsecond=0)
+        today_0928_50 = now_est.replace(hour=9, minute=28, second=50, microsecond=0)
+        today_0929_00 = now_est.replace(hour=9, minute=29, second=0, microsecond=0)
         today_0930_00 = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
         today_0930_10 = now_est.replace(hour=9, minute=30, second=10, microsecond=0)
 
-        if today_0929_50 <= now_est <= today_0930_10:
-            # 09:30:00 EST 정각을 넘겼는데 마지막 캐시가 09:30:00 이전이면 즉시 갱신
+        if today_0928_50 <= now_est <= today_0930_10:
+            # 09:29:00 EST 선제 매수 시각을 넘겼는데 마지막 캐시가 09:29:00 이전이면 즉시 갱신
+            if now_est >= today_0929_00 and last_est < today_0929_00:
+                return True
+            # 09:30:00 EST 정규장 개장 시각을 넘겼는데 마지막 캐시가 09:30:00 이전이면 즉시 갱신
             if now_est >= today_0930_00 and last_est < today_0930_00:
                 return True
             # 임계 구간 내에서는 2.5초 주기로 최신화 허용 (동시 호출은 Lock으로 병합)
@@ -61,9 +66,9 @@ class MacroDataCache:
     @staticmethod
     def _compute_10m_trend_vectorized(df_session: pd.DataFrame, now_est: datetime) -> tuple[str, float, str]:
         """
-        NEW: Case 43 방어 - 당일 04:00 ~ 09:29:59 EST 구간의 NQ=F 1분봉을
+        MODIFIED: Case 43 방어 - 당일 04:00 ~ 09:29:59 EST 구간의 NQ=F 1분봉을
         closed='left', label='right' 기준 10분봉으로 벡터 리샘플링하여
-        09:30 EST 라벨(09:20~09:30 EST)의 하락(DOWN) / 상승(UP) 추세를 판정한다.
+        09:30 EST 라벨(09:20~09:29 EST)의 하락(DOWN) / 상승(UP) 추세를 판정한다.
         """
         if df_session is None or df_session.empty:
             return "WAIT", 0.0, "--:--"
@@ -73,7 +78,7 @@ class MacroDataCache:
         if df_today.empty:
             df_today = df_session.copy()
 
-        # 09:30 EST 오프닝 스나이퍼를 위해 04:00 ~ 09:29:59 EST 프리장 분봉만 추출 (미래 참조 0%)
+        # 09:29 프리장 선제 스나이퍼 및 09:30 백업 타격을 위해 04:00 ~ 09:29:59 EST 프리장 분봉만 추출 (미래 참조 0%)
         df_pre = df_today.between_time("04:00", "09:29").copy()
         if df_pre.empty:
             return "WAIT", 0.0, "--:--"
@@ -110,7 +115,7 @@ class MacroDataCache:
             trend_series.mask(trend_series == "FLAT").ffill().fillna("FLAT")
         )
 
-        # 09:30 EST 정각 스나이핑 시 09:30 라벨(09:20~09:29:59) 봉을 최우선 타겟팅
+        # 09:29 선제 스나이핑 및 09:30 개장 시 09:30 라벨(09:20~09:29:59) 봉을 최우선 타겟팅
         target_0930_bars = df_10m.between_time("09:30", "09:30")
         if not target_0930_bars.empty:
             last_row = target_0930_bars.iloc[-1]
@@ -203,7 +208,7 @@ class MacroDataCache:
         cls, force_refresh: bool = False
     ) -> tuple[str, float, str, float, float, float]:
         """
-        NEW: 09:30 EST 오프닝 양방향 스나이퍼 및 관제탑 전용 시그널 반환.
+        09:29 프리장 선제 양방향 스나이퍼 및 관제탑 전용 시그널 반환.
         반환값: (nq_10m_trend['DOWN'|'UP'|'WAIT'], nq_10m_chg_pct, nq_10m_bar_str, nq_curr, nq_high, nq_low)
         """
         await cls._refresh_cache_if_needed(force_refresh=force_refresh)
@@ -317,7 +322,7 @@ class AssassinLedger:
 
     @classmethod
     async def get_entry_trend(cls, symbol: str) -> str:
-        """NEW: Case 41 방어 - 진입 방향(entry_trend = 'UP' | 'DOWN') 팩트 조회"""
+        """Case 41 방어: 진입 방향(entry_trend = 'UP' | 'DOWN') 팩트 조회"""
         filepath = cls._get_file_path(symbol)
         async with GlobalThrottle.get_file_lock(filepath):
             def _read():
@@ -418,7 +423,7 @@ class AssassinLedger:
     @classmethod
     async def lock_opposite_symbol(cls, active_symbol: str, current_session_id: str = None):
         """
-        NEW: Case 09, Case 50, Case 52 방어 - SOXL 또는 SOXS 중 한 종목 진입/보유 감지 즉시
+        Case 09, Case 50, Case 52 방어: SOXL 또는 SOXS 중 한 종목 진입/보유 감지 즉시
         반대 종목의 당일 매수 권한(is_session_done = True)을 원자적으로 영구 소각한다.
         """
         sym = cls._validate_symbol(active_symbol)
@@ -431,7 +436,7 @@ class AssassinLedger:
     @classmethod
     async def reset_all_ledgers(cls):
         """
-        NEW: Case 02 방어 - /reset 명령 시 SOXL 및 SOXS 양방향 장부를 모두 원자적으로 0점 소각한다.
+        Case 02 방어: /reset 명령 시 SOXL 및 SOXS 양방향 장부를 모두 원자적으로 0점 소각한다.
         """
         for sym in cls.ALLOWED_SYMBOLS:
             await cls.save_state(

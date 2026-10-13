@@ -1,0 +1,699 @@
+# =====================================================================
+# FILE: tg_ui_plugin.py
+# 목적: tg_router.py와 플러그인 방식으로 결속되는 텔레그램 관제탑(/avwap), 통합 지시서(/sync),
+#       전술 제어반(/settlement) 데이터 연산 및 UI 렌더링 전용 모듈
+# =====================================================================
+# NEW: 단일 책임 원칙(제3헌법) 및 스마트폰 복사 최적화를 위해 tg_router.py에서 UI 빌더 로직을 독립 분리
+# MODIFIED: Case 13 & Case 57 방어 - 19:00~03:59 '🌙 시스템 대기', 04:00~09:28 '🔍 프리장 NQ 10분봉 정찰(09:29 선제타격 대기)',
+#           09:29 매수 체결 대기 시 '⏳ 지정가 매수 전량체결 대기', 잔고 보유 시 '보유(+수익률%)', 09:31 이후 미보유 시 '장외대기' 표출
+# MODIFIED: Case 39, 47, 55, 56 방어 - SOXL/SOXS 양방향 5MA(count=6) 동적 시프트 및 예상 밴드 렌더링
+# MODIFIED: 회귀 실측 고정 베타(4.2 -> NQ 0.1%당 0.42%) 텔레그램 UI 전용 환산 표기 및 저가기준 현재지수 진폭 산출 (Case 23 방어)
+
+import asyncio
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import pandas as pd
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from quant_engine import AssassinLedger, MacroDataCache
+
+EST_TZ = ZoneInfo("America/New_York")
+
+# NEW: 텔레그램 UI 환산 표시 전용 고정 베타 상수 (NQ 0.1% 변동 당 SOXL/SOXS 0.42% 기대 변동)
+# 주의: 매크로 3단 방어망(2.0%, 0.8%) 임계치 연산에는 절대 곱하지 않음 (UI 표시 전용)
+NQ_UI_BETA = 4.2
+
+
+def get_main_menu_text() -> str:
+    now_est = datetime.now(EST_TZ)
+    is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
+    dst_status_text = "🌞서머타임 ON (EDT)" if is_dst else "❄️서머타임 OFF (EST)"
+
+    return (
+        f"🕒 <b>[ 09:29 선제 양방향 스나이퍼 스케줄 ({dst_status_text}) ]</b>\n"
+        "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
+        "🔹 19:00~03:59: 🌙 0세션 시스템 대기 (폴링 휴식)\n"
+        "🔹 04:00~09:28: 🔍 1세션 프리장 NQ 10분봉 정찰\n"
+        "      (09:20~09:29 추세 수집 · 선제 타격 준비)\n"
+        "🔹 09:29:00: ⚡ 프리장 마감 1분 전 선제 지정가 매수\n"
+        "      (NQ 10분봉 하락=<b>SOXS</b> / 상승=<b>SOXL</b> 1회 타격)\n"
+        "      (시드머니 전량 체결 확인 즉시 +1.0% 매도 지정가 장전)\n"
+        "🔹 09:30:00: 🔥 2세션 정규장 오프닝 휩소(급등) 익절 노출\n"
+        "🔹 09:31~15:58: 🎯 +1.0% 익절 감시 & NQ 3단 방어\n"
+        "      (장중 뒤늦은 추격 매수 100% 영구 차단)\n"
+        "🔹 15:59~16:01: 🛑 제로-오버나이트 MOC 덤핑\n"
+        "🔹 17:00: 🧹 정산 스캔 및 가비지 컬렉션(GC)\n\n"
+        "🛠 <b>[ 핵심 명령어 ]</b>\n"
+        "▶️ /avwap : 🔫 양방향 스나이퍼 레이더 관제탑\n"
+        "▶️ /sync : 📜 SOXL/SOXS 통합 지시서 동기화\n"
+        "▶️ /settlement : ⚙️ 통합 전술 제어반 (시드/익절률)\n\n"
+        "⚠️ /reset : 🧹 양방향 장부(SOXL/SOXS) 0점 소각\n"
+        "⚠️ /update : 🚀 시스템 자가 업데이트\n\n"
+        "🌙 <b>오버나이트를 원할 경우 [통합 전술 제어반]에서 가동을 OFF 해주세요.</b>"
+    )
+
+
+def parse_session_data(all_candles: list, session_start_est: datetime) -> dict:
+    """
+    🛠️ 벡터화 강제: 1세션(04:00~09:29 EST) 및 2세션(09:30~16:00 EST) 캔들 데이터를
+    파이썬 for 루프 없이 벡터 연산으로 분리하여 고가/저가/진폭/독립 VWAP을 산출한다 (Case 23 방어).
+    """
+    res = {
+        "pre_h": 0.0,
+        "pre_l": 0.0,
+        "pre_amp": 0.0,
+        "pre_vwap": 0.0,
+        "pre_body": 0.0,
+        "reg_h": 0.0,
+        "reg_l": 0.0,
+        "reg_amp": 0.0,
+        "reg_vwap": 0.0,
+        "reg_body": 0.0,
+    }
+    if not all_candles:
+        return res
+
+    df = pd.DataFrame(all_candles)
+    if df.empty:
+        return res
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"], format="ISO8601", utc=True
+    ).dt.tz_convert(EST_TZ)
+    df.set_index("timestamp", inplace=True)
+    df.sort_index(ascending=True, inplace=True)
+
+    for col in ["openPrice", "highPrice", "lowPrice", "closePrice", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    df = df[df.index >= session_start_est]
+    if df.empty:
+        return res
+
+    pre_df = df.between_time("04:00", "09:29")
+    reg_df = df.between_time("09:30", "16:00")
+
+    def calc_metrics(sub_df: pd.DataFrame):
+        if sub_df.empty:
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+        h = float(sub_df["highPrice"].max())
+        l = float(sub_df["lowPrice"].min())
+        amp = ((h - l) / l * 100.0) if l > 0.0 else 0.0
+
+        o = float(sub_df["openPrice"].iloc[0])
+        c = float(sub_df["closePrice"].iloc[-1])
+        body = ((c - o) / o * 100.0) if o > 0.0 else 0.0
+
+        tp = (sub_df["highPrice"] + sub_df["lowPrice"] + sub_df["closePrice"]) / 3.0
+        pv = tp * sub_df["volume"]
+        vol = float(sub_df["volume"].sum())
+        vwap = float(pv.sum() / vol) if vol > 0.0 else 0.0
+        return h, l, float(amp), vwap, float(body)
+
+    pre_h, pre_l, pre_amp, pre_vwap, pre_body = calc_metrics(pre_df)
+    reg_h, reg_l, reg_amp, reg_vwap, reg_body = calc_metrics(reg_df)
+
+    res.update(
+        {
+            "pre_h": pre_h,
+            "pre_l": pre_l,
+            "pre_amp": pre_amp,
+            "pre_vwap": pre_vwap,
+            "pre_body": pre_body,
+            "reg_h": reg_h,
+            "reg_l": reg_l,
+            "reg_amp": reg_amp,
+            "reg_vwap": reg_vwap,
+            "reg_body": reg_body,
+        }
+    )
+    return res
+
+
+async def _fetch_5ma_amp(api_client, symbol: str) -> tuple[float, float, float]:
+    """Case 39 & Case 55 방어: count=6 일봉 호출 후 당일 미완성 일봉을 배제하여 5MA 및 어제 진폭 산출"""
+    avg_amp = 0.0
+    yesterday_amp = 0.0
+    yesterday_return = 0.0
+    try:
+        endpoint = f"/api/v1/candles?symbol={symbol}&interval=1d&count=6"
+        data = await api_client._request(
+            "GET", endpoint, "MARKET_DATA_CHART", headers=api_client._get_headers()
+        )
+        candles = (data or {}).get("result", {}).get("candles", [])
+        if not candles:
+            return 0.0, 0.0, 0.0
+
+        c0_dt = (
+            pd.to_datetime(candles[0]["timestamp"], format="ISO8601", utc=True)
+            .tz_convert(EST_TZ)
+            .date()
+        )
+        now_est_check = datetime.now(EST_TZ)
+        today_dt = now_est_check.date()
+
+        if c0_dt > today_dt:
+            valid_candles = candles[1:6]
+        elif c0_dt == today_dt:
+            if 16 <= now_est_check.hour < 19:
+                valid_candles = candles[0:5]
+            else:
+                valid_candles = candles[1:6]
+        else:
+            valid_candles = candles[0:5]
+
+        amps = []
+        for i, c in enumerate(valid_candles):
+            h = float(c.get("highPrice") or 0.0)
+            l = float(c.get("lowPrice") or 0.0)
+            if l > 0.0:
+                amp = (h - l) / l * 100.0
+                amps.append(amp)
+                if i == 0:
+                    yesterday_amp = amp
+
+        if len(valid_candles) >= 2:
+            yest_cls = float(valid_candles[0].get("closePrice") or 0.0)
+            prev_cls = float(valid_candles[1].get("closePrice") or 0.0)
+            if prev_cls > 0.0:
+                yesterday_return = ((yest_cls - prev_cls) / prev_cls) * 100.0
+
+        if amps:
+            avg_amp = sum(amps) / len(amps)
+        return avg_amp, yesterday_amp, yesterday_return
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+
+async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> dict:
+    all_candles = []
+    before = None
+    if now_est.hour >= 4:
+        session_start_est = now_est.replace(hour=4, minute=0, second=0, microsecond=0)
+    else:
+        session_start_est = (now_est - timedelta(days=1)).replace(
+            hour=4, minute=0, second=0, microsecond=0
+        )
+
+    for _ in range(8):
+        try:
+            data = await api_client.get_1m_candles_pagination(
+                symbol, count=200, before=before
+            )
+            candles = data.get("candles", [])
+            all_candles.extend(candles)
+            if not candles:
+                break
+            oldest_time = pd.to_datetime(candles[-1]["timestamp"], utc=True).tz_convert(
+                EST_TZ
+            )
+            if oldest_time <= session_start_est:
+                break
+            before = data.get("nextBefore")
+            if not before:
+                break
+        except Exception:
+            break
+    return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
+
+
+def build_compact_status(
+    symbol: str,
+    state_tuple: tuple,
+    buy_order_id: str,
+    current_session: str,
+    est_time_int: int,
+    qty: float,
+) -> str:
+    """
+    MODIFIED: Case 13, Case 38, Case 57 방어 - 모바일 단일 라인 팩트 상태 렌더링.
+    - 잔고 보유 시: '보유(+사용자설정수익률%)'
+    - 19:00~03:59 EST: '🌙 시스템 대기'
+    - 04:00~09:28 EST: '🔍 프리장 NQ 10분봉 정찰(09:29 선제타격 대기)'
+    - 09:29~09:30 미체결 매수 대기 시: '⏳ 지정가 매수 전량체결 대기'
+    - 09:31 이후 미보유 및 미체결 주문 부재 시: '장외대기'
+    """
+    budget = state_tuple[1]
+    target_profit_rate = state_tuple[2]
+    is_done = state_tuple[4]
+    is_active = state_tuple[5]
+    state_flag = "ON" if is_active else "OFF"
+    emoji = "🐂" if symbol == "SOXL" else "🐻"
+
+    if not is_active:
+        state_text = "가동OFF(수동대기)"
+    elif qty > 0:
+        state_text = f"보유(+{target_profit_rate}%)"
+    elif current_session == "dayMarket":
+        state_text = "🌙 시스템 대기"
+    elif buy_order_id:
+        state_text = "⏳ 지정가 매수 전량체결 대기"
+    elif current_session == "preMarket":
+        if est_time_int == 929 and not is_done:
+            state_text = "⚡ 09:29 선제 스나이핑 타격 중"
+        elif est_time_int == 929 and is_done:
+            state_text = "🔒 09:29 반대종목 타격완료(대기)"
+        else:
+            state_text = "🔍 프리장 NQ 10분봉 정찰(09:29 타격 대기)"
+    elif current_session == "regularMarket" and est_time_int == 930 and not is_done:
+        state_text = "⚡ 09:30 스나이핑 타격 중"
+    else:
+        state_text = "장외대기"
+
+    return f"{emoji} <b>{symbol}</b> <code>[{state_flag}]</code> {state_text} | <code>${budget:.0f}</code>"
+
+
+async def build_avwap_radar(api_client) -> tuple[str, InlineKeyboardMarkup]:
+    now_est = datetime.now(EST_TZ)
+    t = now_est.hour * 100 + now_est.minute
+
+    if 400 <= t <= 929:
+        session_name_ui = "preMarket"
+        market_header = (
+            "( <b>⚡ 09:29 선제 스나이핑</b> )"
+            if t == 929
+            else "( <b>🌅 PRE_MARKET 정찰</b> )"
+        )
+    elif 930 <= t <= 1559:
+        session_name_ui = "regularMarket"
+        market_header = "( <b>🔥 REG_MARKET 가동</b> )"
+    elif 1600 <= t <= 1659:
+        session_name_ui = "afterMarket"
+        market_header = "( <b>🛑 AFT_MARKET 마감</b> )"
+    else:
+        session_name_ui = "dayMarket"
+        market_header = "( <b>🌙 시스템 대기</b> )"
+
+    try:
+        is_open, _, sess_name, _ = await asyncio.wait_for(
+            api_client.is_market_open(), timeout=3.0
+        )
+        if not is_open:
+            session_name_ui = "dayMarket"
+            if sess_name and "HOLIDAY" in sess_name:
+                market_header = "( <b>🌙 주말/휴장일</b> )"
+            else:
+                market_header = "( <b>🌙 시스템 대기</b> )"
+    except Exception:
+        pass
+
+    # NQ=F 실시간 지표 및 저가기준 현재지수 진폭 연산 (Case 23 ZeroDivision 방어)
+    (
+        nq_10m_trend,
+        nq_10m_chg_pct,
+        nq_10m_bar_str,
+        nq_c,
+        nq_h,
+        nq_l,
+    ) = await MacroDataCache.get_nq_10m_sniper_signal()
+
+    nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
+    nq_curr_amp = (
+        max(0.0, ((nq_c - nq_l) / nq_l * 100.0))
+        if (nq_l > 0.0 and nq_c > 0.0)
+        else 0.0
+    )
+    # UI 전용 베타(4.2) 환산 기대 진폭 표기
+    etf_expected_amp_ui = nq_amp * NQ_UI_BETA
+
+    if nq_10m_trend == "DOWN":
+        sniper_sig_str = f"🐻 하락(DOWN {nq_10m_chg_pct:+.2f}%) ➡️ 09:29 SOXS 선제타격"
+    elif nq_10m_trend == "UP":
+        sniper_sig_str = f"🐂 상승(UP {nq_10m_chg_pct:+.2f}%) ➡️ 09:29 SOXL 선제타격"
+    else:
+        sniper_sig_str = "⏳ 10분봉 데이터 수집 대기"
+
+    price_l, price_s = await asyncio.gather(
+        api_client.get_current_price("SOXL"),
+        api_client.get_current_price("SOXS"),
+    )
+    hold_l, hold_s = await asyncio.gather(
+        api_client.get_symbol_holdings_detail("SOXL"),
+        api_client.get_symbol_holdings_detail("SOXS"),
+    )
+
+    (amp_l, yest_amp_l, yest_return_l), (amp_s, yest_amp_s, yest_return_s) = (
+        await asyncio.gather(
+            _fetch_5ma_amp(api_client, "SOXL"),
+            _fetch_5ma_amp(api_client, "SOXS"),
+        )
+    )
+
+    # Case 56: 어제 진폭 격차 기반 상승/하락/횡보장 판별
+    diff_return = abs(yest_return_l - yest_return_s)
+    if diff_return <= 0.3:
+        trend_msg = "▫️ ⚔️ <b>횡보/휩소장 (방향성 상실)</b> : 전일 등락률 격차 미미"
+    elif yest_return_l > yest_return_s:
+        trend_msg = "▫️ 🐂 <b>상승장 (SOXL 우위)</b> : 전일 롱(SOXL) 등락률 우위"
+    else:
+        trend_msg = "▫️ 🐻 <b>하락장 (SOXS 우위)</b> : 전일 숏(SOXS) 등락률 우위"
+
+    empty_sess = {
+        "pre_h": 0.0,
+        "pre_l": 0.0,
+        "pre_amp": 0.0,
+        "pre_vwap": 0.0,
+        "pre_body": 0.0,
+        "reg_h": 0.0,
+        "reg_l": 0.0,
+        "reg_amp": 0.0,
+        "reg_vwap": 0.0,
+        "reg_body": 0.0,
+    }
+    # 0세션(19:00~03:59 EST) 캔들 조회 및 VWAP 연산 100% 영구 차단
+    if session_name_ui == "dayMarket":
+        sess_l, sess_s = dict(empty_sess), dict(empty_sess)
+    else:
+        sess_l, sess_s = await asyncio.gather(
+            _fetch_session_stats(api_client, "SOXL", now_est),
+            _fetch_session_stats(api_client, "SOXS", now_est),
+        )
+
+    # Case 47: 5MA 기반 동적 예상 저가/고가 밴드 산출
+    pre_exp_l_l = sess_l["pre_h"] * (1.0 - amp_l / 100.0) if sess_l["pre_h"] > 0 else 0.0
+    pre_exp_h_l = sess_l["pre_l"] * (1.0 + amp_l / 100.0) if sess_l["pre_l"] > 0 else 0.0
+    reg_exp_l_l = sess_l["reg_h"] * (1.0 - amp_l / 100.0) if sess_l["reg_h"] > 0 else 0.0
+    reg_exp_h_l = sess_l["reg_l"] * (1.0 + amp_l / 100.0) if sess_l["reg_l"] > 0 else 0.0
+
+    pre_exp_l_s = sess_s["pre_h"] * (1.0 - amp_s / 100.0) if sess_s["pre_h"] > 0 else 0.0
+    pre_exp_h_s = sess_s["pre_l"] * (1.0 + amp_s / 100.0) if sess_s["pre_l"] > 0 else 0.0
+    reg_exp_l_s = sess_s["reg_h"] * (1.0 - amp_s / 100.0) if sess_s["reg_h"] > 0 else 0.0
+    reg_exp_h_s = sess_s["reg_l"] * (1.0 + amp_s / 100.0) if sess_s["reg_l"] > 0 else 0.0
+
+    state_l, state_s = await asyncio.gather(
+        AssassinLedger.get_state("SOXL"), AssassinLedger.get_state("SOXS")
+    )
+    buy_id_l, buy_id_s = await asyncio.gather(
+        AssassinLedger.get_buy_order_id("SOXL"), AssassinLedger.get_buy_order_id("SOXS")
+    )
+
+    status_l = build_compact_status(
+        "SOXL", state_l, buy_id_l, session_name_ui, t, hold_l.get("qty", 0.0)
+    )
+    status_s = build_compact_status(
+        "SOXS", state_s, buy_id_s, session_name_ui, t, hold_s.get("qty", 0.0)
+    )
+
+    scan_time = now_est.strftime("%m-%d %H:%M:%S")
+
+    text = f"""📡 <b>[09:29 선제 스나이퍼 레이더]</b> {market_header}
+➖➖➖➖➖➖➖➖➖➖➖➖➖➖
+🌐 <b>나스닥 100 선물 (NQ=F)</b>
+▫️ 고가: <code>{nq_h:.2f}</code> | 저가: <code>{nq_l:.2f}</code>
+▫️ 현재: <code>{nq_c:.2f}</code> | 총 진폭: <code>{nq_amp:.2f}%</code> (레버환산 <code>{etf_expected_amp_ui:.1f}%</code>)
+▫️ 저가기준 현재지수 진폭: <code>{nq_curr_amp:.2f}%</code>
+▫️ 10분봉({nq_10m_bar_str}): <code>{sniper_sig_str}</code>
+➖➖➖➖➖➖➖➖➖➖➖➖➖➖
+📊 <b>현재가 & 5MA(어제 진폭)</b>
+🐂 <b>SOXL</b> <code>${price_l:.2f}</code> | <code>{amp_l:.1f}%({yest_amp_l:.1f}%)</code>
+🐻 <b>SOXS</b> <code>${price_s:.2f}</code> | <code>{amp_s:.1f}%({yest_amp_s:.1f}%)</code>
+{trend_msg}
+
+🌅 <b>프리장</b> (04:00~09:29 정찰 & 09:29 선제매수)
+🐂 <b>SOXL</b> <code>[VWAP] ${sess_l['pre_vwap']:.2f}</code>
+  ⤷ 팩트: <code>${sess_l['pre_l']:.2f}~${sess_l['pre_h']:.2f} ({sess_l['pre_amp']:.1f}%)</code> | 예상: <code>${pre_exp_l_l:.2f}~${pre_exp_h_l:.2f}</code>
+🐻 <b>SOXS</b> <code>[VWAP] ${sess_s['pre_vwap']:.2f}</code>
+  ⤷ 팩트: <code>${sess_s['pre_l']:.2f}~${sess_s['pre_h']:.2f} ({sess_s['pre_amp']:.1f}%)</code> | 예상: <code>${pre_exp_l_s:.2f}~${pre_exp_h_s:.2f}</code>
+
+🔥 <b>정규장</b> (09:30 오프닝 노출 ~ 16:00 청산)
+🐂 <b>SOXL</b> <code>[VWAP] ${sess_l['reg_vwap']:.2f}</code>
+  ⤷ 팩트: <code>${sess_l['reg_l']:.2f}~${sess_l['reg_h']:.2f} ({sess_l['reg_amp']:.1f}%)</code> | 예상: <code>${reg_exp_l_l:.2f}~${reg_exp_h_l:.2f}</code>
+🐻 <b>SOXS</b> <code>[VWAP] ${sess_s['reg_vwap']:.2f}</code>
+  ⤷ 팩트: <code>${sess_s['reg_l']:.2f}~${sess_s['reg_h']:.2f} ({sess_s['reg_amp']:.1f}%)</code> | 예상: <code>${reg_exp_l_s:.2f}~${reg_exp_h_s:.2f}</code>
+➖➖➖➖➖➖➖➖➖➖➖➖➖➖
+{status_l}
+{status_s}
+
+⏱️ 갱신: <code>{scan_time} EST</code>"""
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 레이더 갱신", callback_data="open_avwap")],
+            [InlineKeyboardButton(text="⚙️ 전술 제어반", callback_data="open_settlement")],
+            [InlineKeyboardButton(text="🔙 메인 메뉴", callback_data="back_to_main")],
+        ]
+    )
+    return text, keyboard
+
+
+async def build_sync_board(api_client) -> str:
+    now_est = datetime.now(EST_TZ)
+    is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
+    dst_str = "🌞 서머타임" if is_dst else "❄️ 서머타임 OFF"
+
+    t = now_est.hour * 100 + now_est.minute
+    if 400 <= t <= 929:
+        market_state = "⚡ 09:29 선제 타격" if t == 929 else "🌅 프리장 정찰"
+    elif 930 <= t <= 1559:
+        market_state = "🔥 정규장 가동"
+    elif 1600 <= t <= 1659:
+        market_state = "⛔ 장마감"
+    else:
+        market_state = "🌙 시스템 대기"
+
+    try:
+        is_open, _, sess_name, _ = await asyncio.wait_for(
+            api_client.is_market_open(), timeout=3.0
+        )
+        if not is_open:
+            if sess_name and "HOLIDAY" in sess_name:
+                market_state = "🌙 주말/휴장일"
+            else:
+                market_state = "🌙 장외 대기"
+    except Exception:
+        pass
+
+    bp = await api_client.get_usd_buying_power()
+
+    exchange_rate = 1400.0
+    try:
+        ex_data = await api_client._request(
+            "GET",
+            "/api/v1/exchange-rate?baseCurrency=USD&quoteCurrency=KRW",
+            "MARKET_INFO",
+            headers=api_client._get_headers(),
+        )
+        exchange_rate = float((ex_data or {}).get("result", {}).get("rate", 1400.0))
+    except Exception:
+        pass
+
+    async def get_symbol_sync_data(symbol: str):
+        state = await AssassinLedger.get_state(symbol)
+        budget = state[1]
+        target_profit_rate = state[2]
+        entry_session = state[8]
+        entry_trend = await AssassinLedger.get_entry_trend(symbol)
+
+        hold = await api_client.get_symbol_holdings_detail(symbol)
+        qty = hold.get("qty", 0.0)
+        avg_price = hold.get("avg_price", 0.0)
+        profit_usd = hold.get("profit_usd", 0.0)
+        profit_rate = hold.get("profit_rate", 0.0) * 100.0
+        profit_krw = profit_usd * exchange_rate
+
+        curr = await api_client.get_current_price(symbol)
+        prev_close = curr
+
+        if now_est.hour >= 4:
+            session_start_est = now_est.replace(hour=4, minute=0, second=0, microsecond=0)
+        else:
+            session_start_est = (now_est - timedelta(days=1)).replace(
+                hour=4, minute=0, second=0, microsecond=0
+            )
+
+        try:
+            data_1d = await api_client._request(
+                "GET",
+                f"/api/v1/candles?symbol={symbol}&interval=1d&count=5",
+                "MARKET_DATA_CHART",
+                headers=api_client._get_headers(),
+            )
+            candles_1d = (data_1d or {}).get("result", {}).get("candles", [])
+            target_date = session_start_est.date()
+            for c in candles_1d:
+                c_dt = (
+                    pd.to_datetime(c["timestamp"], format="ISO8601", utc=True)
+                    .tz_convert(EST_TZ)
+                    .date()
+                )
+                if c_dt < target_date:
+                    prev_close = float(c.get("closePrice") or 0.0)
+                    break
+        except Exception:
+            pass
+
+        if market_state in ["🌙 시스템 대기", "🌙 주말/휴장일", "🌙 장외 대기"]:
+            high, low, high_rate, low_rate = 0.0, 0.0, 0.0, 0.0
+        else:
+            all_candles = []
+            before = None
+            for _ in range(8):
+                try:
+                    c_data = await api_client.get_1m_candles_pagination(
+                        symbol, count=200, before=before
+                    )
+                    c_list = c_data.get("candles", [])
+                    all_candles.extend(c_list)
+                    if not c_list:
+                        break
+                    oldest_time = pd.to_datetime(c_list[-1]["timestamp"], utc=True).tz_convert(
+                        EST_TZ
+                    )
+                    if oldest_time <= session_start_est:
+                        break
+                    before = c_data.get("nextBefore")
+                    if not before:
+                        break
+                except Exception:
+                    break
+
+            high, low = 0.0, 0.0
+            if all_candles:
+                df = pd.DataFrame(all_candles)
+                if not df.empty:
+                    df["timestamp"] = pd.to_datetime(
+                        df["timestamp"], format="ISO8601", utc=True
+                    ).tz_convert(EST_TZ)
+                    df.set_index("timestamp", inplace=True)
+                    df = df[df.index >= session_start_est]
+                    if not df.empty:
+                        df["highPrice"] = pd.to_numeric(
+                            df["highPrice"], errors="coerce"
+                        ).fillna(0.0)
+                        df["lowPrice"] = pd.to_numeric(
+                            df["lowPrice"], errors="coerce"
+                        ).fillna(0.0)
+                        h_max = float(df["highPrice"].max())
+                        l_min = float(df["lowPrice"].min())
+                        if h_max > 0:
+                            high = h_max
+                        if l_min > 0:
+                            low = l_min
+
+            if high == 0.0:
+                high = curr
+            if low == 0.0:
+                low = curr
+
+            high_rate = ((high - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+            low_rate = ((low - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+
+        return {
+            "symbol": symbol,
+            "budget": budget,
+            "target_profit_rate": target_profit_rate,
+            "entry_session": entry_session,
+            "entry_trend": entry_trend,
+            "curr": curr,
+            "avg_price": avg_price,
+            "qty": qty,
+            "high": high,
+            "high_rate": high_rate,
+            "low": low,
+            "low_rate": low_rate,
+            "profit_rate": profit_rate,
+            "profit_usd": profit_usd,
+            "profit_krw": profit_krw,
+        }
+
+    soxl_data, soxs_data = await asyncio.gather(
+        get_symbol_sync_data("SOXL"), get_symbol_sync_data("SOXS")
+    )
+
+    def format_symbol(d: dict) -> str:
+        profit_sign = "+" if d["profit_usd"] >= 0 else "-"
+        icon = "🐂" if d["symbol"] == "SOXL" else "🐻"
+        if d["qty"] > 0:
+            sess_lbl = d["entry_session"] or "PRE_0929"
+            tr_lbl = f"·{d['entry_trend']}" if d["entry_trend"] else ""
+            flag_str = f"⚡ [{sess_lbl}{tr_lbl}: +{d['target_profit_rate']}%]"
+        else:
+            flag_str = f"⏳ 대기 (목표 +{d['target_profit_rate']}%)"
+
+        return (
+            f"{icon} <b>[{d['symbol']}] 09:29 선제 스나이퍼 지시서</b>\n"
+            f"💵 시드: ${d['budget']:,.0f} | 🎯 {flag_str}\n"
+            f"💰 현재 ${d['curr']:.2f} / 평단 ${d['avg_price']:.2f} ({int(d['qty'])}주)\n"
+            f"📈 금일 고가: ${d['high']:.2f} ({d['high_rate']:+.2f}%)\n"
+            f"📉 금일 저가: ${d['low']:.2f} ({d['low_rate']:+.2f}%)\n"
+            f"🔺 수익: {d['profit_rate']:+.2f}% ({profit_sign}${abs(d['profit_usd']):,.2f} | {profit_sign}₩{int(abs(d['profit_krw'])):,})"
+        )
+
+    text = (
+        f"📜 <b>[ 양방향 통합 지시서 ({market_state}) ]</b>\n"
+        f"📅 {dst_str} ({now_est.strftime('%H:%M')} EST)\n"
+        f"💵 주문가능금액: ${bp:,.2f}\n"
+        "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"{format_symbol(soxl_data)}\n\n"
+        "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"{format_symbol(soxs_data)}\n\n"
+        "▶️ /avwap : 🔫 양방향 스나이퍼 레이더 관제탑"
+    )
+    return text
+
+
+async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
+    state_l, state_s = await asyncio.gather(
+        AssassinLedger.get_state("SOXL"), AssassinLedger.get_state("SOXS")
+    )
+    budget_l, rate_l, act_l = state_l[1], state_l[2], state_l[5]
+    budget_s, rate_s, act_s = state_s[1], state_s[2], state_s[5]
+
+    act_l_str = "🟢 ON" if act_l else "🔴 OFF"
+    act_s_str = "🟢 ON" if act_s else "🔴 OFF"
+
+    next_rate_l = 0.5 if rate_l == 1.0 else 1.0
+    next_rate_s = 0.5 if rate_s == 1.0 else 1.0
+
+    # Case 37 & Case 68: 09:29 프리장 선제 매수 & 09:30 오프닝 노출 스나이퍼 모드 고정 및 +1.0%/+0.5% 토글 제어반
+    text = (
+        "⚙️ <b>[통합 전술 코어 제어반 (양방향 락온)]</b>\n"
+        "▫️ <b>전술 모드:</b> <code>⚡ 09:29 프리장 선제 매수 & 09:30 오프닝 익절 노출</code>\n"
+        "▫️ <b>타격 원칙:</b> <code>일일 1회 배타적 출동 (하락=SOXS / 상승=SOXL)</code>\n"
+        "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
+        "🐂 <b>SOXL (LONG · 10분봉 상승 시 09:29 선제 타격)</b>\n"
+        f"▫️ 상태: <code>{act_l_str}</code> | 예산: <code>${budget_l:,.2f}</code> | 익절: <code>+{rate_l}%</code>\n\n"
+        "🐻 <b>SOXS (SHORT · 10분봉 하락 시 09:29 선제 타격)</b>\n"
+        f"▫️ 상태: <code>{act_s_str}</code> | 예산: <code>${budget_s:,.2f}</code> | 익절: <code>+{rate_s}%</code>"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔴 SOXL 정지" if act_l else "🟢 SOXL 가동",
+                    callback_data="toggle_set_act_SOXL",
+                ),
+                InlineKeyboardButton(
+                    text="🔴 SOXS 정지" if act_s else "🟢 SOXS 가동",
+                    callback_data="toggle_set_act_SOXS",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💵 SOXL 시드 설정", callback_data="set_budget_SOXL"
+                ),
+                InlineKeyboardButton(
+                    text="💵 SOXS 시드 설정", callback_data="set_budget_SOXS"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🎯 SOXL 익절({rate_l}%➡️{next_rate_l}%)",
+                    callback_data="toggle_profit_rate_SOXL",
+                ),
+                InlineKeyboardButton(
+                    text=f"🎯 SOXS 익절({rate_s}%➡️{next_rate_s}%)",
+                    callback_data="toggle_profit_rate_SOXS",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔫 스나이퍼 레이더", callback_data="open_avwap"
+                ),
+                InlineKeyboardButton(text="🔙 메인 메뉴", callback_data="back_to_main"),
+            ],
+        ]
+    )
+    return text, keyboard
