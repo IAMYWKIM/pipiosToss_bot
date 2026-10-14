@@ -16,7 +16,6 @@ from toss_api import GlobalThrottle
 
 EST_TZ = ZoneInfo("America/New_York")
 
-# NEW: 벡터 연산 강제 RSI 1분봉 산출 (VWAP 동시 추출)
 def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: int = 14) -> tuple[float, float]:
     """
     Pandas 기반 백그라운드 벡터 연산.
@@ -42,13 +41,11 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
     if session_df.empty:
         return 0.0, 0.0
 
-    # 1. 당일 VWAP 산출
     tp = (session_df["highPrice"] + session_df["lowPrice"] + session_df["closePrice"]) / 3.0
     pv = tp * session_df["volume"]
     cum_vol = session_df["volume"].sum()
     vwap_val = float(pv.sum() / cum_vol) if cum_vol > 0.0 else 0.0
 
-    # 2. RSI(14) 산출 (Wilder's Smoothing)
     delta = session_df["closePrice"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)

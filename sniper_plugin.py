@@ -1,6 +1,6 @@
 # =====================================================================
 # FILE: sniper_plugin.py
-# 목적: 02:58 EST 숏 단방향 스나이퍼 및 RSI 20-10-30 패닉 셀 레이더 상태 머신
+# 목적: 02:58 EST 숏 단방향 스나이퍼 및 24시간 RSI 20-10-30 패닉 셀 레이더 상태 머신
 # =====================================================================
 
 import math
@@ -39,10 +39,6 @@ class SniperPluginContext:
 async def execute_rsi_monitoring_plugin(
     ctx: SniperPluginContext, symbol: str, rsi_val: float, vwap_val: float, current_price: float
 ):
-    """
-    NEW: RSI + VWAP 20-10-30 폭포수 상태 머신 텔레그램 스팸 락온 통제 모듈.
-    스나이핑 로직과 100% 분리되어 읽기 전용으로만 동작 (Case 43 준수)
-    """
     if ctx.shared_rsi_state is None:
         return
         
@@ -566,8 +562,6 @@ async def manage_mechanical_profit_trap_plugin(
                         "sell_order_id": new_sell_id, "is_session_done": True,
                     }
                     
-                    # MODIFIED: 초과 Case 70 지연 체결 패러독스 소각. 
-                    # 익절 덫 장전 시 실시간 NQ=F 지수로 3차 방어망 기준점을 오버라이드.
                     if not buy_order_id:
                         kwargs.update({
                             "entry_session": "MANUAL", "entry_trend": "SHORT",

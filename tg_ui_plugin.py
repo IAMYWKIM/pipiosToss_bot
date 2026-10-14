@@ -120,8 +120,9 @@ async def _fetch_5ma_amp(api_client, symbol: str) -> tuple[float, float, float]:
 async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> dict:
     all_candles = []
     before = None
-    if now_est.hour >= 4: session_start_est = now_est.replace(hour=4, minute=0, second=0, microsecond=0)
-    else: session_start_est = (now_est - timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
+    # MODIFIED: 초과 Case 72 방어 - 19:00 EST 기점 롤오버 동기화 (전역 통합)
+    if now_est.hour >= 19: session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
+    else: session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
 
     for _ in range(8):
         try:
@@ -199,7 +200,6 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
     status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, hold_s.get("qty", 0.0))
 
-    # NEW: RSI 관제탑 UI 렌더링 주입
     rsi_ui_str = ""
     if shared_rsi_state and "SOXS" in shared_rsi_state:
         rsi_data = shared_rsi_state["SOXS"]
@@ -277,8 +277,9 @@ async def build_sync_board(api_client) -> str:
         prev_close = curr
         high, low = curr, curr
 
-        if now_est.hour >= 4: session_start_est = now_est.replace(hour=4, minute=0, second=0, microsecond=0)
-        else: session_start_est = (now_est - timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
+        # MODIFIED: 초과 Case 72 방어 - 일봉 매핑 기준점도 19:00 EST 통일 결속
+        if now_est.hour >= 19: session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
+        else: session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
 
         try:
             data_1d = await api_client._request("GET", f"/api/v1/candles?symbol={symbol}&interval=1d&count=5", "MARKET_DATA_CHART", headers=api_client._get_headers())
