@@ -2,7 +2,8 @@
 # FILE: tg_ui_plugin.py
 # 목적: 03:58 EST 단방향(SOXS) 전용 텔레그램 데이터 연산 및 UI 렌더링 전용 모듈
 # =====================================================================
-# MODIFIED: 레이더 관제탑에 SOXS(🐻) 및 SOXL(🐂) 듀얼 RSI 상태 동적 렌더링 락온
+# MODIFIED: 04:07 EST 타임쉴드 및 지정가 추격 타격망(Force Entry) UI 가이드 동기화
+# MODIFIED: 관제탑 스나이퍼 상태 표출 시 타임쉴드(03:58 ~ 04:07) 구간 동적 렌더링 결속
 
 import asyncio
 from datetime import datetime, timedelta
@@ -27,6 +28,7 @@ def get_main_menu_text() -> str:
         "🔹 03:58:00: ⚡ 데이장 마감 직전 숏(SOXS) 선제 지정가 타격\n"
         "      (NQ=F 진폭 2.0% 미만 시 즉각 진입)\n"
         "      (현재가 기준 -1.0% 역산 가격에 매수 덫 대기)\n"
+        "      (04:07까지 미체결 시 타임쉴드 해제 및 현재가 추격 강제)\n"
         "      (전량 체결 확인 즉시 +0.64% 매도 덫 하드 락온)\n"
         "🔹 03:59~15:58: 🎯 +0.64% 익절 감시 & NQ 매크로 방어\n"
         "      (장중 NQ 상승(손실방향) 임계치 이탈 시 덤핑)\n"
@@ -143,12 +145,18 @@ def build_compact_status(symbol: str, state_tuple: tuple, buy_order_id: str, cur
     target_profit_rate = state_tuple[2]
     is_done = state_tuple[4]
     is_active = state_tuple[5]
+    entry_session = state_tuple[8]
     state_flag = "ON" if is_active else "OFF"
 
     if not is_active: state_text = "가동OFF(수동대기)"
     elif qty > 0: state_text = f"보유(+{target_profit_rate}%)"
     elif current_session == "dayMarket": state_text = "🌙 시스템 대기(03:58 타격 대기)"
-    elif buy_order_id: state_text = "⏳ 지정가 매수 전량체결 대기"
+    elif buy_order_id:
+        # MODIFIED: 03:58 ~ 04:07 타임쉴드 구간의 스나이퍼 상태 동적 렌더링
+        if entry_session == "DAY_0358" and est_time_int < 407:
+            state_text = "🛡️ 03:58 덫 미체결 (04:07 추격 대기)"
+        else:
+            state_text = "⏳ 지정가 매수 전량체결 대기"
     elif est_time_int == 358 and not is_done: state_text = "⚡ 03:58 휩소 매수 덫 장전 중"
     elif is_done: state_text = "🔒 금일 타격완료(대기)"
     else: state_text = "장외대기"
@@ -201,7 +209,6 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
     status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, hold_s.get("qty", 0.0))
 
-    # MODIFIED: 듀얼 심볼(SOXS, SOXL) RSI 동적 렌더링 결속
     rsi_ui_lines = []
     if shared_rsi_state:
         for r_sym in ("SOXS", "SOXL"):

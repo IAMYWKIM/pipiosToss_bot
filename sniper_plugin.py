@@ -2,7 +2,8 @@
 # FILE: sniper_plugin.py
 # 목적: 03:58 EST 숏 단방향 스나이퍼 및 24시간 RSI 20-10-30 패닉 셀 레이더 상태 머신
 # =====================================================================
-# MODIFIED: RSI 레이더 타전 시 롱(SOXL)/숏(SOXS) 동적 아이콘(🐂/🐻) 주입
+# MODIFIED: 04:07 타임쉴드 해제 시 현재가 추격 매수(Force Entry) 궤도 폭격 플러그인 이식
+# MODIFIED: DAY_0407 추격 세션에 대응하는 함정(Trap) 태그 네이밍 동기화
 
 import math
 import time
@@ -51,7 +52,6 @@ async def execute_rsi_monitoring_plugin(
     state["vwap"] = vwap_val
     current_level = state["level"]
 
-    # NEW: 심볼에 따른 곰/황소 아이콘 동적 매핑
     icon = "🐻" if symbol == "SOXS" else "🐂"
 
     if rsi_val >= 30.0:
@@ -458,6 +458,99 @@ async def execute_0358_sniper_strike_plugin(
         finally:
             ctx.in_memory_ordering_lock[symbol] = False
 
+# MODIFIED: 04:07 EST 타임쉴드 만료 기반 지정가 추격 타격(Force Entry) 플러그인
+async def execute_0407_force_entry_plugin(
+    ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
+    current_price: float, budget: float, buy_order_id: str
+):
+    if ctx.in_memory_ordering_lock[symbol]: return
+    
+    state = await AssassinLedger.get_state(symbol)
+    entry_session = state[8]
+    if entry_session != "DAY_0358": return
+    
+    async with ctx.dual_strike_mutex:
+        ctx.in_memory_ordering_lock[symbol] = True
+        try:
+            _, _, _, nq_c_global, nq_h_global, nq_l_global = await MacroDataCache.get_nq_sniper_signal(force_refresh=True)
+            nq_amp_global = (((nq_h_global - nq_l_global) / nq_l_global * 100.0) if nq_l_global > 0.0 else 0.0)
+            
+            if nq_amp_global >= 2.0:
+                try:
+                    await ctx.client.cancel_order(buy_order_id)
+                except Exception:
+                    pass
+                await AssassinLedger.save_state(symbol, buy_order_id="", is_session_done=True, entry_session="CANCELED_MACRO")
+                await ctx.notify_tg(
+                    f"🛑 <b>[04:07 타임쉴드 종료] 대세장 이탈 감지 (진입 전면 취소)</b>\n"
+                    f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 이상)\n"
+                    "▫️ 조치: 03:58 미체결 덫 원자적 파기 및 당일 매수 권한 영구 포기"
+                )
+                return
+                
+            try:
+                await ctx.client.cancel_order(buy_order_id)
+            except Exception as e:
+                pass
+            
+            await asyncio.sleep(1.0)
+            
+            my_hold_check = await ctx.client.get_symbol_holdings_detail(symbol)
+            if int(math.floor(my_hold_check.get("qty", 0.0))) > 0:
+                return
+                
+            latest_price = await ctx.client.get_current_price(symbol)
+            if latest_price <= 0.0: latest_price = current_price
+            
+            try:
+                current_bp = await ctx.client.get_usd_buying_power()
+                actual_budget = min(budget, current_bp * 0.995)
+            except Exception:
+                actual_budget = budget
+                
+            target_qty = int(math.floor(actual_budget / latest_price))
+            if target_qty <= 0: return
+            
+            idem = ctx.idempotency_keys[symbol].get("FORCE_BUY")
+            if not idem:
+                idem = {
+                    "key": f"FBUY_{symbol}_{now_est.strftime('%H%M%S')}"[:36],
+                    "qty": target_qty,
+                    "price": latest_price,
+                }
+                ctx.idempotency_keys[symbol]["FORCE_BUY"] = idem
+            else:
+                target_qty = idem["qty"]
+                latest_price = idem["price"]
+                
+            res = await ctx.client.create_order(
+                symbol=symbol, side="BUY", order_type="LIMIT",
+                quantity=target_qty, price=f"{latest_price:.2f}", client_order_id=idem["key"],
+            )
+            
+            if res and isinstance(res, dict) and res.get("result", {}).get("orderId"):
+                new_buy_id = str(res["result"]["orderId"])
+                await AssassinLedger.save_state(
+                    symbol, buy_order_id=new_buy_id, entry_session="DAY_0407", entry_trend="SHORT",
+                    entry_time=time.time(), nq_entry_price=nq_c_global, nq_entry_amp=nq_amp_global,
+                    is_session_done=True, last_session_id=current_session_id,
+                )
+                ctx.wakeup_event.set()
+                await ctx.notify_tg(
+                    f"⚡ <b>[04:07 타임쉴드 종료] 휩소 덫 미체결 ➡️ 현재가 추격 타격 돌입</b>\n"
+                    f"▫️ 시장 현재가: <code>${latest_price:.2f}</code>\n"
+                    f"▫️ 추격 매수(LIMIT): <code>${latest_price:.2f}</code> (시드기준 <code>{target_qty}주</code>)\n"
+                    f"▫️ 사유: 9분 타임쉴드 만료. 역방향 휩소 조건 해소 및 정규 추세 추종 전환 확정"
+                )
+            ctx.idempotency_keys[symbol]["FORCE_BUY"] = None
+        except Exception as e:
+            err_str = str(e)
+            print(f"🚨 [04:07 추격 타격 방어 {symbol}] {err_str}", flush=True)
+            if any(code in err_str for code in ["400", "422", "404", "409", "401", "403", "429"]):
+                ctx.idempotency_keys[symbol]["FORCE_BUY"] = None
+        finally:
+            ctx.in_memory_ordering_lock[symbol] = False
+
 async def manage_mechanical_profit_trap_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
     is_active: bool, just_turned_off: bool, holdings_qty: int, holdings_detail: dict,
@@ -521,7 +614,11 @@ async def manage_mechanical_profit_trap_plugin(
 
             if avg_price > 0.0:
                 calculated_target = math.ceil(avg_price * (1.0 + target_profit_rate / 100.0) * 100) / 100.0
-                trap_tag = f"03:58 스나이퍼(+{target_profit_rate}%)" if (entry_session == "DAY_0358" and buy_order_id) else f"수동개입(+{target_profit_rate}%)"
+                # MODIFIED: DAY_0407 추격 세션에 대응하는 함정(Trap) 태그 동기화
+                if entry_session in ["DAY_0358", "DAY_0407"] and buy_order_id:
+                    trap_tag = f"추격 스나이퍼(+{target_profit_rate}%)" if entry_session == "DAY_0407" else f"03:58 스나이퍼(+{target_profit_rate}%)"
+                else:
+                    trap_tag = f"수동개입(+{target_profit_rate}%)"
 
         trap_qty = holdings_qty
         if calculated_target > 0.0 and trap_qty > 0 and not skip_trap:

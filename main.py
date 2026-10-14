@@ -3,7 +3,7 @@
 # 목적: 03:58 EST 데이장 마감 직전 숏(SOXS) 단일 방향 스나이퍼 코어 오케스트레이터
 # 구조: sniper_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 슬림 아키텍처
 # =====================================================================
-# MODIFIED: 매매 코어(SOXS)와 RSI 레이더(SOXS, SOXL) 파이프라인 전면 분리 격리
+# MODIFIED: 04:07 EST 타임쉴드 만료 기반 현재가 추격 타격망(FORCE_BUY) 루프 인젝션
 
 import sys
 import os
@@ -31,6 +31,7 @@ from sniper_plugin import (
     execute_0358_sniper_strike_plugin,
     manage_mechanical_profit_trap_plugin,
     execute_rsi_monitoring_plugin,
+    execute_0407_force_entry_plugin, # MODIFIED: 04:07 추격 타격 플러그인 결속
 )
 
 logging.getLogger("aiogram").setLevel(logging.CRITICAL)
@@ -53,7 +54,6 @@ if not all([TOSS_CLIENT_ID, TOSS_CLIENT_SECRET, TELEGRAM_BOT_TOKEN, _telegram_ch
 ADMIN_CHAT_ID = int(_telegram_chat_id_str)
 wakeup_event = asyncio.Event()
 
-# NEW: 매매 전담 타겟과 레이더 관제 타겟의 아키텍처 분리 락온
 TRADE_SYMBOL = "SOXS"
 RSI_SYMBOLS = ("SOXS", "SOXL")
 NQ_DYNAMIC_FLOOR = 0.8
@@ -77,11 +77,10 @@ in_memory_ordering_lock = {TRADE_SYMBOL: False}
 dual_strike_mutex = asyncio.Lock()
 shared_holdings = {TRADE_SYMBOL: 0}
 
-# MODIFIED: 듀얼 RSI 관제를 위한 공유 상태 딕셔너리 확장
 shared_rsi_state = {sym: {"value": 0.0, "level": 0, "vwap": 0.0} for sym in RSI_SYMBOLS}
 
 idempotency_keys = {
-    TRADE_SYMBOL: {"BUY": None, "TRAP": None, "MOC": None, "M_DUMP": None},
+    TRADE_SYMBOL: {"BUY": None, "TRAP": None, "MOC": None, "M_DUMP": None, "FORCE_BUY": None},
 }
 
 holiday_notify_lock = asyncio.Lock()
@@ -218,7 +217,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     while True:
         now_est_pre = datetime.now(EST_TZ)
         est_hm_pre = now_est_pre.hour * 100 + now_est_pre.minute
-        loop_timeout = 0.4 if est_hm_pre == 358 else 1.5
+        loop_timeout = 0.4 if est_hm_pre in [358, 407] else 1.5
 
         try:
             await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=loop_timeout)
@@ -278,9 +277,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             if 17 <= now_est.hour < 19 and runtime_state["last_gc_date"] != today_str:
                 runtime_state["last_gc_date"] = today_str
                 ctx.in_memory_ordering_lock[symbol] = False
-                ctx.idempotency_keys[symbol] = {"BUY": None, "TRAP": None, "MOC": None, "M_DUMP": None}
+                ctx.idempotency_keys[symbol] = {"BUY": None, "TRAP": None, "MOC": None, "M_DUMP": None, "FORCE_BUY": None}
                 
-                # MODIFIED: GC 시점에 모든 레이더 심볼 초기화
                 for r_sym in ctx.shared_rsi_state:
                     ctx.shared_rsi_state[r_sym]["level"] = 0
                 
@@ -475,6 +473,24 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     target_profit_rate=target_profit_rate,
                 )
 
+            # MODIFIED: 04:07 타임쉴드 만료 추격 매수 격발망 (15초간 1회 격발 시도)
+            is_0407_force = (est_time_int == 407 and 0 <= now_est.second <= 15)
+            if (
+                is_active
+                and is_0407_force
+                and holdings_qty == 0
+                and buy_order_id
+            ):
+                await execute_0407_force_entry_plugin(
+                    ctx=ctx,
+                    symbol=symbol,
+                    now_est=now_est,
+                    current_session_id=current_session_id,
+                    current_price=current_price,
+                    budget=budget,
+                    buy_order_id=buy_order_id,
+                )
+
             await manage_mechanical_profit_trap_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -527,10 +543,8 @@ async def main():
     asyncio.create_task(api_client.token_renewal_loop())
     asyncio.create_task(auto_update_loop(bot, ADMIN_CHAT_ID))
 
-    # MODIFIED: 매매 코어는 오직 TRADE_SYMBOL(SOXS) 단 1회 스폰하여 절대 헌법 Case 09 완벽 보호
     asyncio.create_task(assassin_loop(plugin_ctx, TRADE_SYMBOL))
     
-    # MODIFIED: 데이터 누적 및 RSI 레이더망은 RSI_SYMBOLS(듀얼)로 다중 스폰하여 관제탑 기능 제공
     for sym in RSI_SYMBOLS:
         asyncio.create_task(record_candles_loop(api_client, sym))
         asyncio.create_task(rsi_radar_loop(plugin_ctx, sym))
@@ -546,6 +560,7 @@ async def main():
                 "▫️ 타겟: <b>SOXS(숏)</b> 배타적 1회 출동 (매매 코어 100% 락온)\n"
                 "▫️ 관제: <b>SOXS(숏) & SOXL(롱)</b> 듀얼 RSI 레이더망 백그라운드 가동\n"
                 "▫️ 전략: NQ=F 진폭 2.0% 미만 시 03:58 EST 현재가 기준 <b>-1.0% 역산가</b> 지정가 매수 덫 장전\n"
+                "▫️ 추격: <b>04:07 타임쉴드 만료 시 미체결 덫 파기 및 현재가 추격 강제</b>\n"
                 "▫️ 방어: 3단 매크로 폭격 덤핑 & 24시간 패닉 셀 레이더망(19:00 EST 롤오버) 상시 가동\n"
                 "▫️ 익절: 덫 체결 즉시 팩트 평단가 기준 +0.64% 매도 하드 락온"
             ),
