@@ -1,8 +1,7 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: SOXS 단방향 독립 장부 및 NQ=F 실시간 진폭(매크로 방어선) 조회 캐싱 엔진
+# 목적: SOXS 단방향 독립 장부 및 NQ=F 실시간 진폭 조회 캐싱, RSI 레이더 엔진
 # =====================================================================
-# MODIFIED: Case 68 방어 - 과거 장부에 오염된 익절률(예: 1.0%)이 잔존하더라도 원자적으로 소각하고 +0.64% 하드 락온 강제
 
 import os
 import json
@@ -17,19 +16,61 @@ from toss_api import GlobalThrottle
 
 EST_TZ = ZoneInfo("America/New_York")
 
+# NEW: 벡터 연산 강제 RSI 1분봉 산출 (VWAP 동시 추출)
+def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: int = 14) -> tuple[float, float]:
+    """
+    Pandas 기반 백그라운드 벡터 연산.
+    VWAP와 RSI를 1개의 데이터프레임에서 동시 산출하여 CPU 블로킹 및 API 중복 호출 원천 차단.
+    """
+    if not candles_json:
+        return 0.0, 0.0
+        
+    df = pd.DataFrame(candles_json)
+    if df.empty:
+        return 0.0, 0.0
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True).dt.tz_convert(EST_TZ)
+    df.set_index("timestamp", inplace=True)
+    df.sort_index(ascending=True, inplace=True)
+
+    for col in ["highPrice", "lowPrice", "closePrice", "volume"]:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    session_df = df[df.index >= session_start_est].copy()
+    if session_df.empty:
+        return 0.0, 0.0
+
+    # 1. 당일 VWAP 산출
+    tp = (session_df["highPrice"] + session_df["lowPrice"] + session_df["closePrice"]) / 3.0
+    pv = tp * session_df["volume"]
+    cum_vol = session_df["volume"].sum()
+    vwap_val = float(pv.sum() / cum_vol) if cum_vol > 0.0 else 0.0
+
+    # 2. RSI(14) 산출 (Wilder's Smoothing)
+    delta = session_df["closePrice"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
+    rsi_series = 100.0 - (100.0 / (1.0 + rs))
+    rsi_series = rsi_series.fillna(0.0)
+    
+    rsi_val = float(rsi_series.iloc[-1])
+    
+    return rsi_val, vwap_val
+
 class MacroDataCache:
-    """
-    NQ=F 인메모리 캐싱 및 실시간 지수/진폭 산출 파이프라인.
-    02:57:50~02:58:10 EST 스나이핑 임계 구간 즉시 갱신 결속 (Case 61)
-    """
-    # (current, high, low, trend_dummy, chg_dummy, bar_str_dummy, timestamp)
     _nq_cache_data = (0.0, 0.0, 0.0, "WAIT", 0.0, "--:--", 0.0)
     _nq_cache_lock = asyncio.Lock()
 
     @classmethod
     def _is_sniper_critical_refresh_needed(cls, now_ts: float, last_ts: float) -> bool:
-        if last_ts <= 0.0:
-            return True
+        if last_ts <= 0.0: return True
 
         now_est = datetime.fromtimestamp(now_ts, tz=EST_TZ)
         last_est = datetime.fromtimestamp(last_ts, tz=EST_TZ)
@@ -59,8 +100,7 @@ class MacroDataCache:
             def _fetch():
                 tkr = yf.Ticker("NQ=F")
                 df = tkr.history(period="5d", interval="1m")
-                if df is None or df.empty:
-                    return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
+                if df is None or df.empty: return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
                 df.sort_index(ascending=True, inplace=True)
@@ -73,8 +113,7 @@ class MacroDataCache:
                 else:
                     df_session = df.copy()
 
-                if df_session.empty:
-                    return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
+                if df_session.empty: return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
 
                 curr_val = float(df_session["Close"].iloc[-1])
                 high_val = float(df_session["High"].max())
@@ -116,10 +155,6 @@ class MacroDataCache:
         )
 
 class AssassinLedger:
-    """
-    SOXS 단방향 로컬 장부 통제소. (Case 09, 12, 68)
-    기본 익절률은 +0.64% 로 하드 락온됩니다.
-    """
     ALLOWED_SYMBOLS = ("SOXS",)
     DEFAULT_TARGET_PROFIT_RATE = 0.64
 
@@ -150,7 +185,6 @@ class AssassinLedger:
                     with open(filepath, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         if not isinstance(data, dict): data = {}
-                        # MODIFIED: 장부에 오염된 익절률이 존재하더라도 원자적으로 무시하고 0.64% 하드 락온 (Case 68)
                         raw_rate = cls.DEFAULT_TARGET_PROFIT_RATE
                         return (
                             float(data.get("last_buy_price", 0.0)),
@@ -228,7 +262,6 @@ class AssassinLedger:
                             if isinstance(loaded, dict): data = loaded
                     except Exception: pass
 
-                # MODIFIED: 장부 기록 시에도 파라미터를 무시하고 0.64% 영구 고정 (Case 68 하드 락온)
                 data["target_profit_rate"] = cls.DEFAULT_TARGET_PROFIT_RATE
 
                 if price is not None: data["last_buy_price"] = price
@@ -260,7 +293,6 @@ class AssassinLedger:
 
     @classmethod
     async def reset_all_ledgers(cls):
-        """Case 02 방어: SOXS 장부 원자적 0점 소각"""
         for sym in cls.ALLOWED_SYMBOLS:
             await cls.save_state(
                 sym, price=0.0, target_sell_price=0.0, buy_order_id="", sell_order_id="",

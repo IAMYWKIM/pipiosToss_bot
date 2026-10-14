@@ -1,6 +1,6 @@
 # =====================================================================
 # FILE: sniper_plugin.py
-# 목적: 02:58 EST 숏(SOXS) 단방향 스나이퍼 매수 & +0.64% 익절 노출 및 매크로 덤핑 모듈
+# 목적: 02:58 EST 숏 단방향 스나이퍼 및 RSI 20-10-30 패닉 셀 레이더 상태 머신
 # =====================================================================
 
 import math
@@ -28,12 +28,57 @@ class SniperPluginContext:
     shared_holdings: dict
     idempotency_keys: dict
     nq_dynamic_floor: float = 0.8
+    shared_rsi_state: dict = None
 
     async def notify_tg(self, text: str):
         try:
             await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="HTML")
         except Exception as e:
             print(f"🚨 [텔레그램 전송 붕괴 방어] {e}", flush=True)
+
+async def execute_rsi_monitoring_plugin(
+    ctx: SniperPluginContext, symbol: str, rsi_val: float, vwap_val: float, current_price: float
+):
+    """
+    NEW: RSI + VWAP 20-10-30 폭포수 상태 머신 텔레그램 스팸 락온 통제 모듈.
+    스나이핑 로직과 100% 분리되어 읽기 전용으로만 동작 (Case 43 준수)
+    """
+    if ctx.shared_rsi_state is None:
+        return
+        
+    state = ctx.shared_rsi_state.get(symbol)
+    if not state:
+        return
+        
+    state["value"] = rsi_val
+    state["vwap"] = vwap_val
+    current_level = state["level"]
+
+    if rsi_val >= 30.0:
+        if current_level != 0:
+            print(f"♻️ [RSI 레이더 {symbol}] {rsi_val:.1f} 회복. 경보 상태 머신 릴리스 (Level 0).", flush=True)
+            state["level"] = 0
+        return
+        
+    is_under_vwap = current_price < vwap_val
+    
+    if is_under_vwap:
+        if rsi_val <= 10.0 and current_level == 1:
+            state["level"] = 2
+            await ctx.notify_tg(
+                f"🚨 <b>[패닉 셀 심각 {symbol}] 2차 폭포수 과매도 포착</b>\n"
+                f"▫️ 실시간 RSI(1m): <code>{rsi_val:.1f}</code> (10 붕괴)\n"
+                f"▫️ VWAP 하방 이탈: <code>${current_price:.2f} &lt; ${vwap_val:.2f}</code>\n"
+                "▫️ 극단적 휩소 우려 (스팸 타전 락온)"
+            )
+        elif rsi_val <= 20.0 and current_level == 0:
+            state["level"] = 1
+            await ctx.notify_tg(
+                f"⚠️ <b>[패닉 셀 경고 {symbol}] 1차 투매 구간 진입 포착</b>\n"
+                f"▫️ 실시간 RSI(1m): <code>{rsi_val:.1f}</code> (20 붕괴)\n"
+                f"▫️ VWAP 하방 이탈: <code>${current_price:.2f} &lt; ${vwap_val:.2f}</code>\n"
+                "▫️ (스팸 타전 락온. RSI 10 붕괴 또는 30 회복 전까지 타전 금지)"
+            )
 
 async def execute_moc_zero_overnight_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, is_active: bool,
@@ -145,7 +190,6 @@ async def execute_macro_defense_plugin(
 
     is_macro_breach = nq_amp_global >= 2.0
 
-    # Case 14, 67: SOXS(숏) 단방향 상승 손실분 락온 (abs 소각, 하락 검증 소각)
     is_dynamic_breach = (
         nq_entry_price > 0.0
         and dynamic_threshold > 0.0
@@ -251,7 +295,6 @@ async def execute_macro_defense_plugin(
     return False
 
 async def enforce_post_0258_cutoff_plugin(symbol: str, est_time_int: int, is_session_done: bool) -> bool:
-    """Case 53 방어: 02:59 EST 이후 신규 추격 매수 전면 차단"""
     if 259 <= est_time_int < 1600 and not is_session_done:
         await AssassinLedger.save_state(symbol, is_session_done=True)
         print(f"🔒 [02:59 골든타임 마감 {symbol}] 당일 추가 신규 매수 영구 차단.", flush=True)
@@ -338,7 +381,6 @@ async def execute_0258_sniper_strike_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
     current_price: float, budget: float, target_profit_rate: float,
 ):
-    """Case 13, 15, 43 방어: 02:58 EST 정각 SOXS 현재가 선제 지정가 1회 타격 (방향성 검증 소각)"""
     if ctx.in_memory_ordering_lock[symbol]: return
 
     async with ctx.dual_strike_mutex:
@@ -491,7 +533,6 @@ async def manage_mechanical_profit_trap_plugin(
             try:
                 sellable_q = await ctx.client.get_sellable_quantity(symbol)
                 sellable_q_int = int(math.floor(sellable_q))
-                # MODIFIED: 잔고 수량 부족 시 영구 스킵 방어망 (다음 틱에서 재시도)
                 if sellable_q_int < trap_qty: 
                     return
 
@@ -519,13 +560,24 @@ async def manage_mechanical_profit_trap_plugin(
                 if not is_rearm:
                     nq_c_now, nq_h_now, nq_l_now = await MacroDataCache.get_cached_nq_data()
                     nq_amp_now = (((nq_h_now - nq_l_now) / nq_l_now * 100.0) if nq_l_now > 0.0 else 0.0)
+                    
                     kwargs = {
                         "price": avg_price, "target_sell_price": calculated_target,
                         "sell_order_id": new_sell_id, "is_session_done": True,
-                        "nq_entry_price": nq_c_now, "nq_entry_amp": nq_amp_now,
                     }
+                    
+                    # MODIFIED: 초과 Case 70 지연 체결 패러독스 소각. 
+                    # 익절 덫 장전 시 실시간 NQ=F 지수로 3차 방어망 기준점을 오버라이드.
                     if not buy_order_id:
-                        kwargs.update({"entry_session": "MANUAL", "entry_trend": "SHORT"})
+                        kwargs.update({
+                            "entry_session": "MANUAL", "entry_trend": "SHORT",
+                            "nq_entry_price": nq_c_now, "nq_entry_amp": nq_amp_now
+                        })
+                    else:
+                        kwargs.update({
+                            "nq_entry_price": nq_c_now, "nq_entry_amp": nq_amp_now
+                        })
+                        
                     await AssassinLedger.save_state(symbol, **kwargs)
 
                     await ctx.notify_tg(

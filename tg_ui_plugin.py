@@ -2,7 +2,6 @@
 # FILE: tg_ui_plugin.py
 # 목적: 02:58 EST 단방향(SOXS) 전용 텔레그램 데이터 연산 및 UI 렌더링 전용 모듈
 # =====================================================================
-# MODIFIED: Case 40 방어 - 지시서 고가/저가 연산망을 불완전한 1분봉 Aggregation에서 일봉(1d) 팩트 매핑으로 전면 교체 완료
 
 import asyncio
 from datetime import datetime, timedelta
@@ -154,7 +153,7 @@ def build_compact_status(symbol: str, state_tuple: tuple, buy_order_id: str, cur
 
     return f"🐻 <b>{symbol}</b> <code>[{state_flag}]</code> {state_text} | <code>${budget:.0f}</code>"
 
-async def build_avwap_radar(api_client) -> tuple[str, InlineKeyboardMarkup]:
+async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
 
@@ -200,6 +199,21 @@ async def build_avwap_radar(api_client) -> tuple[str, InlineKeyboardMarkup]:
     buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
     status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, hold_s.get("qty", 0.0))
 
+    # NEW: RSI 관제탑 UI 렌더링 주입
+    rsi_ui_str = ""
+    if shared_rsi_state and "SOXS" in shared_rsi_state:
+        rsi_data = shared_rsi_state["SOXS"]
+        r_val = rsi_data["value"]
+        v_val = rsi_data["vwap"]
+        lv = rsi_data["level"]
+        
+        warn_str = "🟢 안정"
+        if lv == 1: warn_str = "⚠️ 1차 투매(과매도)"
+        elif lv == 2: warn_str = "🚨 2차 패닉(심각)"
+            
+        if r_val > 0.0:
+            rsi_ui_str = f"▫️ RSI(1m): <code>{r_val:.1f}</code> | VWAP: <code>${v_val:.2f}</code> ➡️ {warn_str}\n"
+
     scan_time = now_est.strftime("%m-%d %H:%M:%S")
 
     text = f"""📡 <b>[02:58 숏 전용 스나이퍼 레이더]</b> {market_header}
@@ -211,7 +225,7 @@ async def build_avwap_radar(api_client) -> tuple[str, InlineKeyboardMarkup]:
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
 📊 <b>현재가 & 5MA(어제 진폭)</b>
 🐻 <b>SOXS</b> <code>${price_s:.2f}</code> | <code>{amp_s:.1f}%({yest_amp_s:.1f}%)</code>
-
+{rsi_ui_str}
 🌅 <b>프리장</b> (04:00~09:29)
 🐻 <b>SOXS</b> <code>[VWAP] ${sess_s['pre_vwap']:.2f}</code>
   ⤷ 팩트: <code>${sess_s['pre_l']:.2f}~${sess_s['pre_h']:.2f} ({sess_s['pre_amp']:.1f}%)</code> | 예상: <code>${pre_exp_l_s:.2f}~${pre_exp_h_s:.2f}</code>
@@ -267,7 +281,6 @@ async def build_sync_board(api_client) -> str:
         else: session_start_est = (now_est - timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
 
         try:
-            # 1분봉 Aggregation 소각 -> 1일봉(1d) 다이렉트 팩트 매핑 (Case 40 방어)
             data_1d = await api_client._request("GET", f"/api/v1/candles?symbol={symbol}&interval=1d&count=5", "MARKET_DATA_CHART", headers=api_client._get_headers())
             candles_1d = (data_1d or {}).get("result", {}).get("candles", [])
             target_date = session_start_est.date()

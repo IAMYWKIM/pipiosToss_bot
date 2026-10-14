@@ -1,6 +1,6 @@
 # =====================================================================
 # FILE: tg_router.py
-# 목적: 02:58 EST 숏(SOXS) 단일 스나이퍼 텔레그램 명령 라우팅 컨트롤러
+# 목적: 02:58 EST 숏 단일 스나이퍼 텔레그램 명령 라우팅 컨트롤러
 # =====================================================================
 
 import os
@@ -24,12 +24,14 @@ router = Router()
 api_client = None
 ADMIN_CHAT_ID = None
 wakeup_event = None
+shared_rsi_state = None
 
-def inject_dependencies(client, admin_id, event):
-    global api_client, ADMIN_CHAT_ID, wakeup_event
+def inject_dependencies(client, admin_id, event, rsi_state):
+    global api_client, ADMIN_CHAT_ID, wakeup_event, shared_rsi_state
     api_client = client
     ADMIN_CHAT_ID = admin_id
     wakeup_event = event
+    shared_rsi_state = rsi_state
 
 class BudgetState(StatesGroup):
     waiting_for_budget = State()
@@ -49,7 +51,7 @@ async def cmd_avwap(message: types.Message, state: FSMContext):
     await state.clear()
     try:
         msg = await message.answer("📡 <b>스나이퍼 레이더 스캔 중...</b>", parse_mode="HTML")
-        text, keyboard = await build_avwap_radar(api_client)
+        text, keyboard = await build_avwap_radar(api_client, shared_rsi_state)
         await msg.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
         await message.answer(f"🚨 <b>관제탑 렌더링 실패:</b> {html.escape(str(e))}", parse_mode="HTML")
@@ -60,7 +62,7 @@ async def process_open_avwap(callback_query: types.CallbackQuery, state: FSMCont
     if not user or getattr(user, "id", None) != ADMIN_CHAT_ID: return
     await state.clear()
     try:
-        text, keyboard = await build_avwap_radar(api_client)
+        text, keyboard = await build_avwap_radar(api_client, shared_rsi_state)
         await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
         pass
