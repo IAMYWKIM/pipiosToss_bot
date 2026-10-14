@@ -1,7 +1,8 @@
 # =====================================================================
 # FILE: sniper_plugin.py
-# 목적: 02:58 EST 숏 단방향 스나이퍼 및 24시간 RSI 20-10-30 패닉 셀 레이더 상태 머신
+# 목적: 03:58 EST 숏 단방향 스나이퍼 및 24시간 RSI 20-10-30 패닉 셀 레이더 상태 머신
 # =====================================================================
+# MODIFIED: 스나이핑 골든타임을 데이장 마감 2분 전(03:58 EST)으로 영구 하드 락온
 
 import math
 import time
@@ -290,10 +291,11 @@ async def execute_macro_defense_plugin(
         return True
     return False
 
-async def enforce_post_0258_cutoff_plugin(symbol: str, est_time_int: int, is_session_done: bool) -> bool:
-    if 259 <= est_time_int < 1600 and not is_session_done:
+# MODIFIED: 03:59 컷오프
+async def enforce_post_0358_cutoff_plugin(symbol: str, est_time_int: int, is_session_done: bool) -> bool:
+    if 359 <= est_time_int < 1600 and not is_session_done:
         await AssassinLedger.save_state(symbol, is_session_done=True)
-        print(f"🔒 [02:59 골든타임 마감 {symbol}] 당일 추가 신규 매수 영구 차단.", flush=True)
+        print(f"🔒 [03:59 골든타임 마감 {symbol}] 당일 추가 신규 매수 영구 차단.", flush=True)
         return True
     return is_session_done
 
@@ -373,7 +375,8 @@ async def reconcile_zero_holdings_exit_plugin(
     finally:
         ctx.in_memory_ordering_lock[symbol] = False
 
-async def execute_0258_sniper_strike_plugin(
+# MODIFIED: 03:58 스나이퍼
+async def execute_0358_sniper_strike_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
     current_price: float, budget: float, target_profit_rate: float,
 ):
@@ -393,7 +396,7 @@ async def execute_0258_sniper_strike_plugin(
             if nq_amp_global >= 2.0:
                 await AssassinLedger.save_state(symbol, is_session_done=True, last_session_id=current_session_id)
                 await ctx.notify_tg(
-                    f"🛑 <b>[02:58 스나이퍼] 대세장 이탈 감지 (진입 차단)</b>\n"
+                    f"🛑 <b>[03:58 스나이퍼] 대세장 이탈 감지 (진입 차단)</b>\n"
                     f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 이상)\n"
                     "▫️ 조치: 당일 매수 권한 영구 소각 및 관망 퇴근"
                 )
@@ -436,21 +439,22 @@ async def execute_0258_sniper_strike_plugin(
 
             if res and isinstance(res, dict) and res.get("result", {}).get("orderId"):
                 new_buy_id = str(res["result"]["orderId"])
+                # MODIFIED: 진입 세션 플래그 반영 (0358)
                 await AssassinLedger.save_state(
-                    symbol, buy_order_id=new_buy_id, entry_session="DAY_0258", entry_trend="SHORT",
+                    symbol, buy_order_id=new_buy_id, entry_session="DAY_0358", entry_trend="SHORT",
                     entry_time=time.time(), nq_entry_price=nq_c_global, nq_entry_amp=nq_amp_global,
                     is_session_done=True, last_session_id=current_session_id,
                 )
                 ctx.wakeup_event.set()
                 await ctx.notify_tg(
-                    f"🎯 <b>[02:58 데이장 마감 스나이퍼] {symbol} 단방향 매수 발사 완료</b>\n"
+                    f"🎯 <b>[03:58 데이장 마감 스나이퍼] {symbol} 단방향 매수 발사 완료</b>\n"
                     f"▫️ 타격 지정가(현재가): <code>${target_price:.2f}</code> (시드기준 <code>{target_qty}주</code>)\n"
                     f"▫️ 후속 프로토콜: <code>전량 체결 확인 즉시 +{target_profit_rate}% 매도 덫 장전</code>"
                 )
             ctx.idempotency_keys[symbol]["BUY"] = None
         except Exception as e:
             err_str = str(e)
-            print(f"🚨 [02:58 스나이퍼 타격 방어 {symbol}] {err_str}", flush=True)
+            print(f"🚨 [03:58 스나이퍼 타격 방어 {symbol}] {err_str}", flush=True)
             if any(code in err_str for code in ["400", "422", "404", "409", "401", "403", "429"]):
                 ctx.idempotency_keys[symbol]["BUY"] = None
                 if "400" in err_str or "422" in err_str:
@@ -521,7 +525,7 @@ async def manage_mechanical_profit_trap_plugin(
 
             if avg_price > 0.0:
                 calculated_target = math.ceil(avg_price * (1.0 + target_profit_rate / 100.0) * 100) / 100.0
-                trap_tag = f"02:58 스나이퍼(+{target_profit_rate}%)" if (entry_session == "DAY_0258" and buy_order_id) else f"수동개입(+{target_profit_rate}%)"
+                trap_tag = f"03:58 스나이퍼(+{target_profit_rate}%)" if (entry_session == "DAY_0358" and buy_order_id) else f"수동개입(+{target_profit_rate}%)"
 
         trap_qty = holdings_qty
         if calculated_target > 0.0 and trap_qty > 0 and not skip_trap:

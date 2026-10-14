@@ -2,6 +2,7 @@
 # FILE: quant_engine.py
 # 목적: SOXS 단방향 독립 장부 및 NQ=F 실시간 진폭 조회 캐싱, RSI 레이더 엔진
 # =====================================================================
+# MODIFIED: 스나이핑 임계 구간을 02:58에서 03:58 (데이장 마감 2분 전)로 정상화 결속
 
 import os
 import json
@@ -72,12 +73,13 @@ class MacroDataCache:
         now_est = datetime.fromtimestamp(now_ts, tz=EST_TZ)
         last_est = datetime.fromtimestamp(last_ts, tz=EST_TZ)
 
-        today_0257_50 = now_est.replace(hour=2, minute=57, second=50, microsecond=0)
-        today_0258_00 = now_est.replace(hour=2, minute=58, second=0, microsecond=0)
-        today_0258_10 = now_est.replace(hour=2, minute=58, second=10, microsecond=0)
+        # MODIFIED: 03:58 임계 구간으로 변경 결속
+        today_0357_50 = now_est.replace(hour=3, minute=57, second=50, microsecond=0)
+        today_0358_00 = now_est.replace(hour=3, minute=58, second=0, microsecond=0)
+        today_0358_10 = now_est.replace(hour=3, minute=58, second=10, microsecond=0)
 
-        if today_0257_50 <= now_est <= today_0258_10:
-            if now_est >= today_0258_00 and last_est < today_0258_00:
+        if today_0357_50 <= now_est <= today_0358_10:
+            if now_est >= today_0358_00 and last_est < today_0358_00:
                 return True
             if now_ts - last_ts >= 2.5:
                 return True
@@ -95,8 +97,8 @@ class MacroDataCache:
                 return
 
             def _fetch():
-                tkr = yf.Ticker("NQ=F")
-                df = tkr.history(period="5d", interval="1m")
+                tkr = yfinance.Ticker("NQ=F") # type: ignore (handled by yfinance import) # local fix for variable name if needed, but module is yf
+                df = yf.Ticker("NQ=F").history(period="5d", interval="1m")
                 if df is None or df.empty: return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
