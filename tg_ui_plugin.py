@@ -2,7 +2,7 @@
 # FILE: tg_ui_plugin.py
 # 목적: 03:58 EST 단방향(SOXS) 전용 텔레그램 데이터 연산 및 UI 렌더링 전용 모듈
 # =====================================================================
-# MODIFIED: 렌더링 시계열을 03:58 EST로 전면 수정하여 UI 일관성 100% 결속
+# MODIFIED: 레이더 관제탑에 SOXS(🐻) 및 SOXL(🐂) 듀얼 RSI 상태 동적 렌더링 락온
 
 import asyncio
 from datetime import datetime, timedelta
@@ -26,6 +26,7 @@ def get_main_menu_text() -> str:
         "🔹 19:00~03:57: 🌙 0세션 시스템 대기 (매수 차단)\n"
         "🔹 03:58:00: ⚡ 데이장 마감 직전 숏(SOXS) 선제 지정가 타격\n"
         "      (NQ=F 진폭 2.0% 미만 시 즉각 진입)\n"
+        "      (현재가 기준 -1.0% 역산 가격에 매수 덫 대기)\n"
         "      (전량 체결 확인 즉시 +0.64% 매도 덫 하드 락온)\n"
         "🔹 03:59~15:58: 🎯 +0.64% 익절 감시 & NQ 매크로 방어\n"
         "      (장중 NQ 상승(손실방향) 임계치 이탈 시 덤핑)\n"
@@ -148,7 +149,7 @@ def build_compact_status(symbol: str, state_tuple: tuple, buy_order_id: str, cur
     elif qty > 0: state_text = f"보유(+{target_profit_rate}%)"
     elif current_session == "dayMarket": state_text = "🌙 시스템 대기(03:58 타격 대기)"
     elif buy_order_id: state_text = "⏳ 지정가 매수 전량체결 대기"
-    elif est_time_int == 358 and not is_done: state_text = "⚡ 03:58 단방향 스나이핑 타격 중"
+    elif est_time_int == 358 and not is_done: state_text = "⚡ 03:58 휩소 매수 덫 장전 중"
     elif is_done: state_text = "🔒 금일 타격완료(대기)"
     else: state_text = "장외대기"
 
@@ -169,7 +170,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         market_header = "( <b>🛑 AFT_MARKET</b> )"
     else:
         session_name_ui = "dayMarket"
-        market_header = "( <b>⚡ 03:58 데이장 마감 타격 대기</b> )" if t == 358 else "( <b>🌙 시스템 대기</b> )"
+        market_header = "( <b>⚡ 03:58 휩소 대기</b> )" if t == 358 else "( <b>🌙 시스템 대기</b> )"
 
     try:
         is_open, _, sess_name, _ = await asyncio.wait_for(api_client.is_market_open(), timeout=3.0)
@@ -200,19 +201,24 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
     status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, hold_s.get("qty", 0.0))
 
-    rsi_ui_str = ""
-    if shared_rsi_state and "SOXS" in shared_rsi_state:
-        rsi_data = shared_rsi_state["SOXS"]
-        r_val = rsi_data["value"]
-        v_val = rsi_data["vwap"]
-        lv = rsi_data["level"]
-        
-        warn_str = "🟢 안정"
-        if lv == 1: warn_str = "⚠️ 1차 투매(과매도)"
-        elif lv == 2: warn_str = "🚨 2차 패닉(심각)"
-            
-        if r_val > 0.0:
-            rsi_ui_str = f"▫️ RSI(1m): <code>{r_val:.1f}</code> | VWAP: <code>${v_val:.2f}</code> ➡️ {warn_str}\n"
+    # MODIFIED: 듀얼 심볼(SOXS, SOXL) RSI 동적 렌더링 결속
+    rsi_ui_lines = []
+    if shared_rsi_state:
+        for r_sym in ("SOXS", "SOXL"):
+            if r_sym in shared_rsi_state:
+                rsi_data = shared_rsi_state[r_sym]
+                r_val = rsi_data["value"]
+                lv = rsi_data["level"]
+                
+                warn_str = "🟢 안정"
+                if lv == 1: warn_str = "⚠️ 1차 투매(과매도)"
+                elif lv == 2: warn_str = "🚨 2차 패닉(심각)"
+                    
+                if r_val > 0.0:
+                    icon = "🐻" if r_sym == "SOXS" else "🐂"
+                    rsi_ui_lines.append(f"▫️ {icon} {r_sym} RSI(1m): <code>{r_val:.1f}</code> ➡️ {warn_str}")
+    
+    rsi_ui_str = "\n".join(rsi_ui_lines) + "\n" if rsi_ui_lines else ""
 
     scan_time = now_est.strftime("%m-%d %H:%M:%S")
 
@@ -256,7 +262,7 @@ async def build_sync_board(api_client) -> str:
     if 400 <= t <= 929: market_state = "🌅 프리장 가동"
     elif 930 <= t <= 1559: market_state = "🔥 정규장 가동"
     elif 1600 <= t <= 1659: market_state = "⛔ 장마감"
-    else: market_state = "⚡ 03:58 선제 타격" if t == 358 else "🌙 시스템 대기"
+    else: market_state = "⚡ 03:58 휩소 선제 타격" if t == 358 else "🌙 시스템 대기"
 
     bp = await api_client.get_usd_buying_power()
     exchange_rate = 1400.0
@@ -340,10 +346,10 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
 
     text = (
         "⚙️ <b>[단방향 전술 코어 제어반 (SOXS 락온)]</b>\n"
-        "▫️ <b>전술 모드:</b> <code>⚡ 03:58 데이장 마감 스나이핑 & +0.64% 익절 노출</code>\n"
+        "▫️ <b>전술 모드:</b> <code>⚡ 03:58 데이장 마감 휩소 매수(-1.0%) & +0.64% 익절 노출</code>\n"
         "▫️ <b>타격 원칙:</b> <code>일일 1회 단독 출동 (진폭 2.0% 미만 시)</code>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
-        "🐻 <b>SOXS (SHORT · 03:58 EST 무조건 선제 타격)</b>\n"
+        "🐻 <b>SOXS (SHORT · 03:58 EST 무조건 휩소 타격)</b>\n"
         f"▫️ 상태: <code>{act_s_str}</code> | 예산: <code>${budget_s:,.2f}</code> | 익절: <code>+{rate_s}% (고정)</code>"
     )
 

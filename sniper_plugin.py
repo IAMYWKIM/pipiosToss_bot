@@ -2,7 +2,7 @@
 # FILE: sniper_plugin.py
 # 목적: 03:58 EST 숏 단방향 스나이퍼 및 24시간 RSI 20-10-30 패닉 셀 레이더 상태 머신
 # =====================================================================
-# MODIFIED: 스나이핑 골든타임을 데이장 마감 2분 전(03:58 EST)으로 영구 하드 락온
+# MODIFIED: RSI 레이더 타전 시 롱(SOXL)/숏(SOXS) 동적 아이콘(🐂/🐻) 주입
 
 import math
 import time
@@ -51,31 +51,29 @@ async def execute_rsi_monitoring_plugin(
     state["vwap"] = vwap_val
     current_level = state["level"]
 
+    # NEW: 심볼에 따른 곰/황소 아이콘 동적 매핑
+    icon = "🐻" if symbol == "SOXS" else "🐂"
+
     if rsi_val >= 30.0:
         if current_level != 0:
-            print(f"♻️ [RSI 레이더 {symbol}] {rsi_val:.1f} 회복. 경보 상태 머신 릴리스 (Level 0).", flush=True)
+            print(f"♻️ [{icon} RSI 레이더 {symbol}] {rsi_val:.1f} 회복. 경보 상태 머신 릴리스 (Level 0).", flush=True)
             state["level"] = 0
         return
         
-    is_under_vwap = current_price < vwap_val
-    
-    if is_under_vwap:
-        if rsi_val <= 10.0 and current_level == 1:
-            state["level"] = 2
-            await ctx.notify_tg(
-                f"🚨 <b>[패닉 셀 심각 {symbol}] 2차 폭포수 과매도 포착</b>\n"
-                f"▫️ 실시간 RSI(1m): <code>{rsi_val:.1f}</code> (10 붕괴)\n"
-                f"▫️ VWAP 하방 이탈: <code>${current_price:.2f} &lt; ${vwap_val:.2f}</code>\n"
-                "▫️ 극단적 휩소 우려 (스팸 타전 락온)"
-            )
-        elif rsi_val <= 20.0 and current_level == 0:
-            state["level"] = 1
-            await ctx.notify_tg(
-                f"⚠️ <b>[패닉 셀 경고 {symbol}] 1차 투매 구간 진입 포착</b>\n"
-                f"▫️ 실시간 RSI(1m): <code>{rsi_val:.1f}</code> (20 붕괴)\n"
-                f"▫️ VWAP 하방 이탈: <code>${current_price:.2f} &lt; ${vwap_val:.2f}</code>\n"
-                "▫️ (스팸 타전 락온. RSI 10 붕괴 또는 30 회복 전까지 타전 금지)"
-            )
+    if rsi_val <= 10.0 and current_level == 1:
+        state["level"] = 2
+        await ctx.notify_tg(
+            f"🚨 <b>[{icon} 패닉 셀 심각 {symbol}] 2차 폭포수 과매도 포착</b>\n"
+            f"▫️ 실시간 RSI(1m): <code>{rsi_val:.1f}</code> (10 붕괴)\n"
+            "▫️ 극단적 휩소 우려 (스팸 타전 락온)"
+        )
+    elif rsi_val <= 20.0 and current_level == 0:
+        state["level"] = 1
+        await ctx.notify_tg(
+            f"⚠️ <b>[{icon} 패닉 셀 경고 {symbol}] 1차 투매 구간 진입 포착</b>\n"
+            f"▫️ 실시간 RSI(1m): <code>{rsi_val:.1f}</code> (20 붕괴)\n"
+            "▫️ (스팸 타전 락온. RSI 10 붕괴 또는 30 회복 전까지 타전 금지)"
+        )
 
 async def execute_moc_zero_overnight_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, is_active: bool,
@@ -291,7 +289,6 @@ async def execute_macro_defense_plugin(
         return True
     return False
 
-# MODIFIED: 03:59 컷오프
 async def enforce_post_0358_cutoff_plugin(symbol: str, est_time_int: int, is_session_done: bool) -> bool:
     if 359 <= est_time_int < 1600 and not is_session_done:
         await AssassinLedger.save_state(symbol, is_session_done=True)
@@ -375,7 +372,6 @@ async def reconcile_zero_holdings_exit_plugin(
     finally:
         ctx.in_memory_ordering_lock[symbol] = False
 
-# MODIFIED: 03:58 스나이퍼
 async def execute_0358_sniper_strike_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
     current_price: float, budget: float, target_profit_rate: float,
@@ -413,7 +409,7 @@ async def execute_0358_sniper_strike_plugin(
             except Exception:
                 actual_budget = budget
 
-            target_price = current_price
+            target_price = math.floor((current_price / 1.01) * 100) / 100.0
             target_qty = int(math.floor(actual_budget / target_price))
 
             if target_qty <= 0:
@@ -439,7 +435,6 @@ async def execute_0358_sniper_strike_plugin(
 
             if res and isinstance(res, dict) and res.get("result", {}).get("orderId"):
                 new_buy_id = str(res["result"]["orderId"])
-                # MODIFIED: 진입 세션 플래그 반영 (0358)
                 await AssassinLedger.save_state(
                     symbol, buy_order_id=new_buy_id, entry_session="DAY_0358", entry_trend="SHORT",
                     entry_time=time.time(), nq_entry_price=nq_c_global, nq_entry_amp=nq_amp_global,
@@ -447,9 +442,10 @@ async def execute_0358_sniper_strike_plugin(
                 )
                 ctx.wakeup_event.set()
                 await ctx.notify_tg(
-                    f"🎯 <b>[03:58 데이장 마감 스나이퍼] {symbol} 단방향 매수 발사 완료</b>\n"
-                    f"▫️ 타격 지정가(현재가): <code>${target_price:.2f}</code> (시드기준 <code>{target_qty}주</code>)\n"
-                    f"▫️ 후속 프로토콜: <code>전량 체결 확인 즉시 +{target_profit_rate}% 매도 덫 장전</code>"
+                    f"🎯 <b>[03:58 데이장 마감 스나이퍼] {symbol} 휩소 요격망(매수 덫) 전개 완료</b>\n"
+                    f"▫️ 시장 현재가: <code>${current_price:.2f}</code>\n"
+                    f"▫️ 요격 지정가(-1.0% 역산): <code>${target_price:.2f}</code> (시드기준 <code>{target_qty}주</code>)\n"
+                    f"▫️ 후속 프로토콜: <code>체결 팩트 확인 즉시 +{target_profit_rate}% 매도 덫 장전</code>"
                 )
             ctx.idempotency_keys[symbol]["BUY"] = None
         except Exception as e:

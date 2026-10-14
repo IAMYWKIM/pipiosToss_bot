@@ -2,7 +2,7 @@
 # FILE: quant_engine.py
 # 목적: SOXS 단방향 독립 장부 및 NQ=F 실시간 진폭 조회 캐싱, RSI 레이더 엔진
 # =====================================================================
-# MODIFIED: 스나이핑 임계 구간을 02:58에서 03:58 (데이장 마감 2분 전)로 정상화 결속
+# MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온
 
 import os
 import json
@@ -38,16 +38,8 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-    session_df = df[df.index >= session_start_est].copy()
-    if session_df.empty:
-        return 0.0, 0.0
-
-    tp = (session_df["highPrice"] + session_df["lowPrice"] + session_df["closePrice"]) / 3.0
-    pv = tp * session_df["volume"]
-    cum_vol = session_df["volume"].sum()
-    vwap_val = float(pv.sum() / cum_vol) if cum_vol > 0.0 else 0.0
-
-    delta = session_df["closePrice"].diff()
+    # MODIFIED: 전체 데이터(df)를 대상으로 RSI를 선행 연산하여 과거 데이터 단절 방어
+    delta = df["closePrice"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
     
@@ -58,7 +50,16 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
     rsi_series = 100.0 - (100.0 / (1.0 + rs))
     rsi_series = rsi_series.fillna(0.0)
     
-    rsi_val = float(rsi_series.iloc[-1])
+    rsi_val = float(rsi_series.iloc[-1]) if not rsi_series.empty else 0.0
+
+    # VWAP 산출 시에만 논리적 거래일 기준(session_df)으로 분리
+    session_df = df[df.index >= session_start_est].copy()
+    vwap_val = 0.0
+    if not session_df.empty:
+        tp = (session_df["highPrice"] + session_df["lowPrice"] + session_df["closePrice"]) / 3.0
+        pv = tp * session_df["volume"]
+        cum_vol = session_df["volume"].sum()
+        vwap_val = float(pv.sum() / cum_vol) if cum_vol > 0.0 else 0.0
     
     return rsi_val, vwap_val
 
@@ -73,7 +74,6 @@ class MacroDataCache:
         now_est = datetime.fromtimestamp(now_ts, tz=EST_TZ)
         last_est = datetime.fromtimestamp(last_ts, tz=EST_TZ)
 
-        # MODIFIED: 03:58 임계 구간으로 변경 결속
         today_0357_50 = now_est.replace(hour=3, minute=57, second=50, microsecond=0)
         today_0358_00 = now_est.replace(hour=3, minute=58, second=0, microsecond=0)
         today_0358_10 = now_est.replace(hour=3, minute=58, second=10, microsecond=0)
@@ -97,8 +97,8 @@ class MacroDataCache:
                 return
 
             def _fetch():
-                tkr = yfinance.Ticker("NQ=F") # type: ignore (handled by yfinance import) # local fix for variable name if needed, but module is yf
-                df = yf.Ticker("NQ=F").history(period="5d", interval="1m")
+                tkr = yf.Ticker("NQ=F")
+                df = tkr.history(period="5d", interval="1m")
                 if df is None or df.empty: return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
