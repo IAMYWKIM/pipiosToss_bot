@@ -1,8 +1,9 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: 프리장 SOXS 단방향 실거래 스나이퍼 독립 장부, NQ=F 진폭 캐싱 및 Wilder's RSI(14) 벡터 엔진
+# 목적: 프리장 SOXS 단방향 실거래 스나이퍼 독립 장부, NQ=F 진폭 캐싱 및 Wilder's RSI(14) 벡터/틱 합성 엔진
 # =====================================================================
 # MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
+# NEW: 20초 폴링 사각지대(원인 D) 소각을 위한 Wilder's EWM 기저 상태(ewm_state_out) 추출 및 1.5초 O(1) 실시간 틱 RSI 점화식(compute_realtime_tick_rsi) 신설
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 임계 윈도우 데드코드 및 AVWAPEngine 영구 소각
 # MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
 # MODIFIED: SOXS 단일 타겟 하드 락온 및 +0.64% 목표 익절률 고정, 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30, 68)
@@ -10,6 +11,7 @@
 import os
 import json
 import time
+import math
 import asyncio
 import numpy as np
 import pandas as pd
@@ -21,20 +23,28 @@ from toss_api import GlobalThrottle
 EST_TZ = ZoneInfo("America/New_York")
 
 
-def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: int = 14) -> tuple[float, float]:
+def calculate_rsi_1m(
+    candles_json: list,
+    session_start_est: datetime,
+    period: int = 14,
+    current_price: float = 0.0,
+    ewm_state_out: dict = None,
+) -> tuple[float, float]:
     """
     Pandas 기반 백그라운드 벡터 연산.
     VWAP와 RSI를 1개의 데이터프레임에서 동시 산출하여 CPU 블로킹 및 API 중복 호출 원천 차단.
+    NEW: current_price 실시간 종가 보정 및 직전 확정 분봉(iloc[-2])의 Wilder's EWM 기저 상태를 ewm_state_out에 기록.
     """
     if not candles_json:
         return 0.0, 0.0
 
     df = pd.DataFrame(candles_json)
-    if df.empty:
+    if df.empty or "timestamp" not in df.columns:
         return 0.0, 0.0
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True).dt.tz_convert(EST_TZ)
     df.set_index("timestamp", inplace=True)
+    df = df[~df.index.duplicated(keep="last")]
     df.sort_index(ascending=True, inplace=True)
 
     for col in ["highPrice", "lowPrice", "closePrice", "volume"]:
@@ -42,19 +52,52 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
+    df = df[df["closePrice"] > 0.0].copy()
+    if df.empty:
+        return 0.0, 0.0
+
+    # NEW: 실시간 현재가(current_price)가 주입된 경우 최신 진행 분봉(iloc[-1])의 종가·고가·저가 즉시 동기화
+    if current_price is not None and current_price > 0.0:
+        last_idx = df.index[-1]
+        df.at[last_idx, "closePrice"] = float(current_price)
+        if float(df.at[last_idx, "highPrice"]) < float(current_price):
+            df.at[last_idx, "highPrice"] = float(current_price)
+        cur_low = float(df.at[last_idx, "lowPrice"])
+        if cur_low <= 0.0 or cur_low > float(current_price):
+            df.at[last_idx, "lowPrice"] = float(current_price)
+
     # MODIFIED: 전체 데이터(df)를 대상으로 RSI를 선행 연산하여 과거 데이터 단절 방어 및 ZeroDivision(inf) 안전 처리 (Case 23, 72)
     delta = df["closePrice"].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+    gain = delta.where(delta > 0.0, 0.0)
+    loss = -delta.where(delta < 0.0, 0.0)
 
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
+
+    # NEW: 1.5초 메인 루프에서 O(1) 실시간 틱 RSI를 합성할 수 있도록 직전 확정 분봉(iloc[-2])의 EWM 기저 상태 추출
+    if isinstance(ewm_state_out, dict):
+        if len(df) >= 2:
+            ewm_state_out["prev_close"] = float(df["closePrice"].iloc[-2])
+            ewm_state_out["prev_avg_gain"] = float(avg_gain.iloc[-2])
+            ewm_state_out["prev_avg_loss"] = float(avg_loss.iloc[-2])
+            ewm_state_out["ready"] = True
+        elif len(df) == 1:
+            ewm_state_out["prev_close"] = float(df["closePrice"].iloc[-1])
+            ewm_state_out["prev_avg_gain"] = float(avg_gain.iloc[-1])
+            ewm_state_out["prev_avg_loss"] = float(avg_loss.iloc[-1])
+            ewm_state_out["ready"] = True
 
     rs = avg_gain / avg_loss
     rsi_series = 100.0 - (100.0 / (1.0 + rs))
-    rsi_series = rsi_series.replace([np.inf, -np.inf], 100.0).fillna(0.0)
+    rsi_series = np.where(
+        (avg_loss <= 0.0) & (avg_gain <= 0.0),
+        50.0,
+        np.where(avg_loss <= 0.0, 100.0, rsi_series),
+    )
+    rsi_series = pd.Series(rsi_series, index=df.index).replace([np.inf, -np.inf], 100.0).fillna(50.0)
 
-    rsi_val = float(rsi_series.iloc[-1]) if not rsi_series.empty else 0.0
+    raw_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 0.0
+    rsi_val = max(0.01, min(100.0, raw_rsi)) if not rsi_series.empty else 0.0
 
     # VWAP 산출 시에만 논리적 거래일 기준(session_df)으로 분리
     session_df = df[df.index >= session_start_est].copy()
@@ -66,6 +109,48 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
         vwap_val = float(pv.sum() / cum_vol) if cum_vol > 0.0 else 0.0
 
     return rsi_val, vwap_val
+
+
+def compute_realtime_tick_rsi(
+    live_price: float, ewm_state: dict, fallback_rsi: float = 0.0, period: int = 14
+) -> float:
+    """
+    NEW: 1.5초 메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 RSI 합성 엔진.
+    직전 확정 분봉(t-1)의 Wilder's EWM 기저 상태에 실시간 현재가(live_price)를 대입하여
+    추가 API 호출 0회로 순간적인 급락 타점(RSI <= 30.0)을 1.5초 이내에 즉시 포착합니다.
+    """
+    if live_price is None or live_price <= 0.0 or not isinstance(ewm_state, dict):
+        return float(fallback_rsi or 0.0)
+
+    if not ewm_state.get("ready", False):
+        return float(fallback_rsi or 0.0)
+
+    prev_close = float(ewm_state.get("prev_close", 0.0))
+    prev_avg_gain = float(ewm_state.get("prev_avg_gain", 0.0))
+    prev_avg_loss = float(ewm_state.get("prev_avg_loss", 0.0))
+
+    if prev_close <= 0.0 or not math.isfinite(prev_avg_gain) or not math.isfinite(prev_avg_loss):
+        return float(fallback_rsi or 0.0)
+
+    alpha = 1.0 / float(period)
+    delta = float(live_price) - prev_close
+    cur_gain = delta if delta > 0.0 else 0.0
+    cur_loss = -delta if delta < 0.0 else 0.0
+
+    live_avg_gain = (1.0 - alpha) * prev_avg_gain + alpha * cur_gain
+    live_avg_loss = (1.0 - alpha) * prev_avg_loss + alpha * cur_loss
+
+    if live_avg_loss <= 0.0:
+        if live_avg_gain <= 0.0:
+            return 50.0
+        return 100.0
+
+    rs = live_avg_gain / live_avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    if not math.isfinite(rsi):
+        return float(fallback_rsi or 50.0)
+
+    return max(0.01, min(100.0, float(rsi)))
 
 
 class MacroDataCache:

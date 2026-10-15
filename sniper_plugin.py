@@ -4,6 +4,7 @@
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 암살자 타격 함수 영구 소각
 # NEW: 프리장 골든타임(04:00~09:29 EST) SOXS 1분봉 RSI<=30.0 포착 즉시 wakeup_event 격발 및 지정가(LIMIT) 실거래 요격 (Case 15, 25, 52, 53, 59)
+# NEW: 프리장 타격 시 시드/USD 예수금 부족(target_qty <= 0) 및 주문 API 거절 예외 발생 시 무음 스킵 방지 텔레그램 타전망 결속 (Case 17, 18, 65)
 # NEW: 09:30 EST 정규장 개장 정각 신규 매수 원천 봉쇄 및 프리장 미체결 매수 주문(buy_order_id) 즉각 선취소 (Case 48, 53)
 # MODIFIED: 프리장(04:00~09:29 EST) 내 +0.64% 익절 완료 시 is_session_done=False 복원으로 무한 재출동 루프 결속 (Case 52)
 # MODIFIED: 매크로 1·2·3차 방어선 작동 시 entry_session="CANCELED_MACRO" 및 당일 재진입 영구 차단 락온 (Case 66, 67)
@@ -23,6 +24,13 @@ from quant_engine import AssassinLedger, MacroDataCache
 
 EST_TZ = ZoneInfo("America/New_York")
 PRE_SNIPER_RSI_THRESHOLD = 30.0
+
+# NEW: 무음 불발(Silent Drop) 방어 및 스팸 억제용 인메모리 경보 캐시 (Case 18)
+_STRIKE_ALERT_CACHE = {
+    "last_warn_session": "",
+    "last_err_msg": "",
+    "last_macro1_date": "",
+}
 
 
 @dataclass
@@ -233,11 +241,23 @@ async def execute_macro_defense_plugin(
             await AssassinLedger.save_state(symbol, **save_kwargs)
             print(f"🛑 [매크로 1차 진입 차단 {symbol}] NQ=F 진폭 {nq_amp_global:.2f}% 도달. 출동 취소.", flush=True)
 
+            est_hm = now_est.hour * 100 + now_est.minute
+            today_str = now_est.strftime("%Y-%m-%d")
+
             if canceled_any_buy:
+                _STRIKE_ALERT_CACHE["last_macro1_date"] = today_str
                 await ctx.notify_tg(
                     f"🛑 <b>[스나이퍼 {symbol}] 대세장 과열 감지 (미체결 매수 긴급 파기)</b>\n"
                     f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 이상)\n"
                     "▫️ 조치: 프리장 미체결 매수 주문 원자적 파기 및 당일 매수 권한 영구 소각"
+                )
+            elif (400 <= est_hm <= 929) and _STRIKE_ALERT_CACHE.get("last_macro1_date") != today_str:
+                # NEW: 미체결 주문이 없더라도 프리장 중 매크로 1차 방어선이 최초 작동해 잠길 때 무음 잠금 방지 알림 타전
+                _STRIKE_ALERT_CACHE["last_macro1_date"] = today_str
+                await ctx.notify_tg(
+                    f"🛑 <b>[프리장 스나이퍼 {symbol}] 매크로 1차 방어선 작동 (출동 마감)</b>\n"
+                    f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 이상 과열)\n"
+                    "▫️ 조치: 금일 프리장 신규 매수 진입 전면 차단 및 관망 전환"
                 )
         finally:
             ctx.in_memory_ordering_lock[symbol] = False
@@ -498,7 +518,7 @@ async def reconcile_zero_holdings_exit_plugin(
         ctx.in_memory_ordering_lock[symbol] = False
 
 
-# NEW: 목표 1 & Case 15, 25, 52, 53, 59, 65, 71 — 프리장(04:00~09:29 EST) SOXS RSI<=30.0 실거래 지정가 매수 요격 플러그인
+# NEW: 목표 1 & Case 15, 17, 18, 25, 52, 53, 59, 65, 71 — 프리장(04:00~09:29 EST) SOXS RSI<=30.0 실거래 지정가 매수 요격 플러그인
 async def execute_premarket_rsi_sniper_strike_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
     current_price: float, budget: float, target_profit_rate: float, rsi_val: float,
@@ -532,6 +552,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                 await AssassinLedger.save_state(
                     symbol, is_session_done=True, last_session_id=current_session_id, entry_session="CANCELED_MACRO"
                 )
+                _STRIKE_ALERT_CACHE["last_macro1_date"] = now_est.strftime("%Y-%m-%d")
                 await ctx.notify_tg(
                     f"🛑 <b>[프리장 스나이퍼] 대세장 과열 감지 (진입 차단)</b>\n"
                     f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 이상)\n"
@@ -555,6 +576,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                 return
 
             # Case 65: USD Buying Power 프로빙 및 0.5% 안전 버퍼(0.995) 차감
+            current_bp = -1.0
             try:
                 current_bp = await ctx.client.get_usd_buying_power()
                 actual_budget = min(budget, current_bp * 0.995)
@@ -562,9 +584,22 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                 actual_budget = budget
 
             target_price = math.floor(latest_price * 100.0) / 100.0
+            if target_price <= 0.0:
+                return
+
             target_qty = int(math.floor(actual_budget / target_price))
 
+            # MODIFIED: Case 18 & Case 65 — target_qty <= 0 발생 시 무음 스킵 방지 및 세션당 1회 텔레그램 경고 타전
             if target_qty <= 0:
+                if _STRIKE_ALERT_CACHE.get("last_warn_session") != current_session_id:
+                    _STRIKE_ALERT_CACHE["last_warn_session"] = current_session_id
+                    bp_str = f"${current_bp:,.2f}" if current_bp >= 0.0 else "조회실패"
+                    await ctx.notify_tg(
+                        f"⚠️ <b>[프리장 스나이퍼 요격 보류] 주문 수량 0주 산출</b>\n"
+                        f"▫️ 포착 RSI: <code>{rsi_val:.1f}</code> | 현재가: <code>${target_price:.2f}</code>\n"
+                        f"▫️ 설정 시드: <code>${budget:,.2f}</code> | USD 가능금액: <code>{bp_str}</code>\n"
+                        f"▫️ 사유: 유효 투입금(<code>${actual_budget:,.2f}</code>)이 1주 가격(<code>${target_price:.2f}</code>) 미만입니다."
+                    )
                 return
 
             # 제5헌법 & Case 34: 토스증권 멱등성 키(clientOrderId) 생성 및 주입
@@ -592,6 +627,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                     entry_time=time.time(), nq_entry_price=nq_c_global, nq_entry_amp=nq_amp_global,
                     is_session_done=True, last_session_id=current_session_id,
                 )
+                _STRIKE_ALERT_CACHE["last_err_msg"] = ""
                 ctx.wakeup_event.set()
                 await ctx.notify_tg(
                     f"🔫 <b>[프리장 스나이퍼] {symbol} RSI≤30 과매도 포착 ➡️ 실거래 지정가 요격 발사</b>\n"
@@ -606,6 +642,14 @@ async def execute_premarket_rsi_sniper_strike_plugin(
             print(f"🚨 [프리장 스나이퍼 타격 방어 {symbol}] {err_str}", flush=True)
             if any(code in err_str for code in ["400", "422", "404", "409", "401", "403", "429"]):
                 ctx.idempotency_keys[symbol]["BUY"] = None
+            # NEW: Case 17 & Case 18 — 주문 API 예외 발생 시 무음 소멸 방지 및 텔레그램 에러 즉시 타전
+            if _STRIKE_ALERT_CACHE.get("last_err_msg") != err_str:
+                _STRIKE_ALERT_CACHE["last_err_msg"] = err_str
+                await ctx.notify_tg(
+                    f"🚨 <b>[프리장 스나이퍼 주문 에러 {symbol}]</b>\n"
+                    f"▫️ 포착 RSI: <code>{rsi_val:.1f}</code>\n"
+                    f"▫️ 사유: <code>{html.escape(err_str)}</code>"
+                )
         finally:
             ctx.in_memory_ordering_lock[symbol] = False
 
