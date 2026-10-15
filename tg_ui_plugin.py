@@ -8,7 +8,7 @@
 # NEW: 관제탑(/avwap) 내 NQ=F 3단 매크로 방어선(체결 기준 지수 및 동적 역행 임계치) 실시간 상태 렌더링 주입 (Case 13, 66, 67)
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
 # MODIFIED: 전술 제어반(/settlement) 내 마스터 전원(ON/OFF)과 세션별 실시간 출동상태(09:30 정규장 진입봉쇄 등) 분리 렌더링 결속 (Case 13, 37, 53, 57)
-# NEW: 복리 모드(익절 +0.50% 순수익 가산 / 손절 수수료 0.14% 포함 실손실 차감) vs 단리 모드 토글 버튼 및 소수점 둘째 자리 복리 시드($10,050.00) 실시간 표출 결속
+# NEW: 전술 제어반(/settlement) 내 목표 익절률(+0.64%[순+0.50%] vs +1.00%[순+0.86%]) 선택 버튼 및 복리/단리 모드 토글, 소수점 둘째 자리 시드 실시간 표출 결속
 
 import asyncio
 from datetime import datetime, timedelta
@@ -23,30 +23,37 @@ NQ_UI_BETA = 4.2
 NQ_DYNAMIC_FLOOR_UI = 0.8
 
 
-def get_main_menu_text() -> str:
+async def get_main_menu_text() -> str:
     now_est = datetime.now(EST_TZ)
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
     dst_status_text = "🌞서머타임 ON (EDT)" if is_dst else "❄️서머타임 OFF (EST)"
 
+    state_s = await AssassinLedger.get_state("SOXS")
+    is_comp_s = await AssassinLedger.get_is_compound("SOXS")
+    active_rate = AssassinLedger.normalize_target_rate(state_s[2])
+    net_rate = AssassinLedger.get_net_compound_rate(active_rate)
+    comp_mode_str = f"복리 ON (익절 시 +{net_rate:.2f}% 증액)" if is_comp_s else "단리 ON (시드 고정)"
+
     return (
         f"🕒 <b>[ 프리장 SOXS 단방향 RSI≤30 스나이퍼 스케줄 ({dst_status_text}) ]</b>\n"
+        f"▫️ 현재 설정: <b>목표 익절 +{active_rate:.2f}% (순수익 +{net_rate:.2f}%) · {comp_mode_str}</b>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
         "🔹 19:00~03:59: 🌙 0세션 데이마켓 대기 (신규 매수 차단 · 듀얼 RSI 관제)\n"
         "🔹 04:00~09:29: 🔫 <b>프리장 스나이퍼 골든타임 (무한 출동)</b>\n"
         "      (NQ=F 당일 진폭 2.0% 미만 & SOXS 1분봉 RSI ≤ 30.0 감시)\n"
         "      (포착 즉시 실시간 현재가 기준 LIMIT 지정가 매수 발사)\n"
-        "      (전량 체결 확인 즉시 팩트 평단가 +0.64% 매도 덫 하드 락온)\n"
-        "      (복리 모드 시: 익절마다 순수익 +0.50% 가산 · 손절 시 수수료포함 차감)\n"
-        "      (프리장 내 +0.64% 익절 완료 시 09:29까지 무한 재출동)\n"
+        f"      (전량 체결 확인 즉시 팩트 평단가 +{active_rate:.2f}% 매도 덫 하드 락온)\n"
+        f"      (복리 모드 시: 익절마다 순수익 +{net_rate:.2f}% 가산 · 손절 시 수수료포함 차감)\n"
+        f"      (프리장 내 +{active_rate:.2f}% 익절 완료 시 09:29까지 무한 재출동)\n"
         "🔹 09:30~15:58: 🔥 <b>정규장 본장 (09:30 신규 매수 마감)</b>\n"
         "      (09:30 정각 프리장 미체결 매수 주문 즉각 선취소)\n"
-        "      (보유 물량 +0.64% 익절 홀딩 & NQ=F 2·3차 매크로 손절 감시)\n"
+        f"      (보유 물량 +{active_rate:.2f}% 익절 홀딩 & NQ=F 2·3차 매크로 손절 감시)\n"
         "🔹 15:59~16:01: 🛑 제로-오버나이트 MOC 매수 1호가 스윕 강제 청산\n"
         "🔹 17:00: 🧹 정산 스캔 및 가비지 컬렉션(GC)\n\n"
         "🛠 <b>[ 핵심 명령어 ]</b>\n"
         "▶️ /avwap : 🔫 프리장 스나이퍼 레이더 관제탑\n"
         "▶️ /sync : 📜 SOXS 스나이퍼 지시서 동기화\n"
-        "▶️ /settlement : ⚙️ 전술 제어반 (복리/단리 · 시드 · 가동 ON/OFF)\n\n"
+        "▶️ /settlement : ⚙️ 전술 제어반 (+0.64%/+1.00% · 복리/단리 · 시드)\n\n"
         "⚠️ /reset : 🧹 SOXS 장부 0점 소각\n"
         "⚠️ /update : 🚀 시스템 자가 업데이트\n\n"
         "🌙 <b>수동 오버나이트를 원할 경우 [전술 제어반]에서 가동을 OFF 해주세요.</b>"
@@ -174,7 +181,7 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 57 프리장 스나이퍼 헌법 기반 세션별 상태 및 복리/단리 시드($10,050.00) 표출
+# Case 13 & 초과 Case 57 프리장 스나이퍼 헌법 기반 세션별 상태 및 선택된 목표 익절률(+0.64% / +1.00%), 복리/단리 시드 표출
 def build_compact_status(
     symbol: str,
     state_tuple: tuple,
@@ -185,7 +192,7 @@ def build_compact_status(
     is_compound: bool = True,
 ) -> str:
     budget = state_tuple[1]
-    target_profit_rate = state_tuple[2]
+    active_rate = AssassinLedger.normalize_target_rate(state_tuple[2])
     is_done = state_tuple[4]
     is_active = state_tuple[5]
     target_sell_price = state_tuple[6]
@@ -197,18 +204,18 @@ def build_compact_status(
         state_text = "가동OFF(수동대기)"
     elif qty > 0:
         if target_sell_price > 0.0:
-            state_text = f"보유(목표 ${target_sell_price:.2f} · +{target_profit_rate}%)"
+            state_text = f"보유(목표 ${target_sell_price:.2f} · +{active_rate:.2f}%)"
         else:
-            state_text = f"보유(+{target_profit_rate}% 덫 장전중)"
+            state_text = f"보유(+{active_rate:.2f}% 덫 장전중)"
     elif buy_order_id:
-        state_text = "⏳ 프리장 지정가 매수 체결대기"
+        state_text = f"⏳ 프리장 매수 체결대기(목표+{active_rate:.2f}%)"
     elif entry_session == "CANCELED_MACRO":
         state_text = "🛑 매크로방어 발동(금일 마감)"
     elif current_session == "dayMarket":
-        state_text = "🌙 데이장 대기(04:00 출동대기)"
+        state_text = f"🌙 데이장 대기(04:00 · 목표+{active_rate:.2f}%)"
     elif 400 <= est_time_int <= 929:
         if not is_done:
-            state_text = "🔫 프리장 RSI≤30 무한 감시중"
+            state_text = f"🔫 프리장 RSI≤30 감시중(목표+{active_rate:.2f}%)"
         else:
             state_text = "🔒 금일 프리장 타격마감"
     elif 930 <= est_time_int < 1600:
@@ -383,7 +390,10 @@ async def build_sync_board(api_client) -> str:
     async def get_symbol_sync_data(symbol: str):
         state = await AssassinLedger.get_state(symbol)
         is_comp = await AssassinLedger.get_is_compound(symbol)
-        budget, target_profit_rate, entry_session = state[1], state[2], state[8]
+        budget = state[1]
+        active_rate = AssassinLedger.normalize_target_rate(state[2])
+        net_rate = AssassinLedger.get_net_compound_rate(active_rate)
+        entry_session = state[8]
         hold = await api_client.get_symbol_holdings_detail(symbol)
         qty, avg_price = hold.get("qty", 0.0), hold.get("avg_price", 0.0)
         profit_usd, profit_rate = hold.get("profit_usd", 0.0), hold.get("profit_rate", 0.0) * 100.0
@@ -428,8 +438,8 @@ async def build_sync_board(api_client) -> str:
 
         return {
             "symbol": symbol, "budget": budget, "is_compound": is_comp,
-            "target_profit_rate": target_profit_rate, "entry_session": entry_session,
-            "curr": curr, "avg_price": avg_price, "qty": qty,
+            "target_profit_rate": active_rate, "net_profit_rate": net_rate,
+            "entry_session": entry_session, "curr": curr, "avg_price": avg_price, "qty": qty,
             "high": high, "high_rate": high_rate, "low": low, "low_rate": low_rate,
             "profit_rate": profit_rate, "profit_usd": profit_usd, "profit_krw": profit_krw,
         }
@@ -440,9 +450,9 @@ async def build_sync_board(api_client) -> str:
         profit_sign = "+" if d["profit_usd"] >= 0 else "-"
         comp_label = "📈 복리시드" if d["is_compound"] else "💵 단리시드"
         if d["qty"] > 0:
-            flag_str = f"⚡ [{d['entry_session'] or 'HOLD'}: +{d['target_profit_rate']}%]"
+            flag_str = f"⚡ [{d['entry_session'] or 'HOLD'}: +{d['target_profit_rate']:.2f}% (순+{d['net_profit_rate']:.2f}%)]"
         else:
-            flag_str = f"⏳ 대기 (목표 +{d['target_profit_rate']}% · 순수익 +0.50%)"
+            flag_str = f"⏳ 대기 (목표 +{d['target_profit_rate']:.2f}% · 순수익 +{d['net_profit_rate']:.2f}%)"
         return (
             f"🐻 <b>[SOXS] 프리장 RSI≤30 스나이퍼 지시서</b>\n"
             f"{comp_label}: <code>${d['budget']:,.2f}</code> | 🎯 {flag_str}\n"
@@ -464,7 +474,7 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: Case 13, 37, 53, 57 — 전술 제어반(/settlement) 내 마스터 전원, 출동상태, 복리/단리 모드 상태 및 토글 버튼 렌더링
+# MODIFIED: 전술 제어반(/settlement) 내 목표 익절률(+0.64% vs +1.00%) 선택 버튼 및 복리/단리 모드 토글 렌더링
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
@@ -475,7 +485,8 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
 
     last_buy_p = float(state_s[0] or 0.0)
     budget_s = float(state_s[1] or 100.0)
-    rate_s = float(state_s[2] or 0.64)
+    rate_s = AssassinLedger.normalize_target_rate(state_s[2])
+    net_rate_s = AssassinLedger.get_net_compound_rate(rate_s)
     is_done = bool(state_s[4])
     act_s = bool(state_s[5])
     target_sell_p = float(state_s[6] or 0.0)
@@ -484,9 +495,14 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
 
     act_s_str = "🟢 ON (시스템 활성)" if act_s else "🔴 OFF (수동 통제)"
     comp_s_str = (
-        "📈 복리 모드 (익절 +0.50% 가산 · 손절 수수료포함 차감)"
+        f"📈 복리 모드 (익절 +{net_rate_s:.2f}% 가산 · 손절 수수료포함 차감)"
         if is_comp_s
         else "💵 단리 모드 (설정 시드 고정 출동)"
+    )
+    rate_mode_desc = (
+        "🎯 고승률 회전형 (+0.64% 익절 · 5개년 승률 90.6%)"
+        if abs(rate_s - 0.64) < 1e-4
+        else "🚀 고수익 복리형 (+1.00% 익절 · 5개년 복리 +720.54%)"
     )
     has_position_in_ledger = (target_sell_p > 0.0 or bool(sell_id_s) or last_buy_p > 0.0)
 
@@ -499,9 +515,9 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
             strike_status_str = "⏳ 프리장 지정가 매수 체결 대기중"
         elif has_position_in_ledger:
             if target_sell_p > 0.0:
-                strike_status_str = f"🎯 보유중 (목표 ${target_sell_p:.2f} 익절 시 무한 재출동)"
+                strike_status_str = f"🎯 보유중 (목표 ${target_sell_p:.2f} [+{rate_s:.2f}%] 익절 시 무한 재출동)"
             else:
-                strike_status_str = f"🎯 보유중 (+{rate_s}% 익절 덫 장전중)"
+                strike_status_str = f"🎯 보유중 (+{rate_s:.2f}% 익절 덫 장전중)"
         elif not is_done:
             strike_status_str = "🔫 프리장 RSI≤30 무한 출동 감시중 (신규진입 가능)"
         else:
@@ -509,9 +525,9 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     elif 930 <= t <= 1558:
         if has_position_in_ledger:
             if target_sell_p > 0.0:
-                strike_status_str = f"🔒 09:30 신규진입 마감 (보유분 ${target_sell_p:.2f} 익절·방어 감시)"
+                strike_status_str = f"🔒 09:30 신규진입 마감 (보유분 ${target_sell_p:.2f} [+{rate_s:.2f}%] 감시)"
             else:
-                strike_status_str = "🔒 09:30 신규진입 마감 (보유분 익절·방어 감시)"
+                strike_status_str = f"🔒 09:30 신규진입 마감 (보유분 +{rate_s:.2f}% 감시)"
         else:
             strike_status_str = "🔒 09:30 정규장 신규진입 봉쇄 (관망 · 매수불가)"
     elif 1559 <= t <= 1601:
@@ -521,17 +537,21 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     else:
         strike_status_str = "⛔ 장외/애프터장 대기 (신규진입 차단)"
 
+    btn_064_label = "✅ 🎯 +0.64% (순+0.50%)" if abs(rate_s - 0.64) < 1e-4 else "🎯 +0.64% (순+0.50%)"
+    btn_100_label = "✅ 🚀 +1.00% (순+0.86%)" if abs(rate_s - 1.00) < 1e-4 else "🚀 +1.00% (순+0.86%)"
+
     text = (
         "⚙️ <b>[단방향 전술 코어 제어반 (프리장 SOXS 스나이퍼)]</b>\n"
-        "▫️ <b>전술 모드:</b> <code>🔫 프리장(04:00~09:29 EST) RSI≤30 지정가 요격 & +0.64% 익절</code>\n"
+        f"▫️ <b>전술 모드:</b> <code>🔫 프리장(04:00~09:29 EST) RSI≤30 요격 & +{rate_s:.2f}% 익절</code>\n"
         "▫️ <b>타격 원칙:</b> <code>프리장 익절 시 무한 재출동 / 09:30 정규장 진입 봉쇄</code>\n"
         "▫️ <b>방어 체계:</b> <code>NQ=F 3단 매크로 손절 덤핑 & 15:59 제로-오버나이트 MOC</code>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
         "🐻 <b>SOXS (SHORT · 단방향 스나이퍼)</b>\n"
         f"▫️ 마스터 전원: <code>{act_s_str}</code>\n"
         f"▫️ 현재 출동상태: <code>{strike_status_str}</code>\n"
+        f"▫️ 목표 익절타점: <code>{rate_mode_desc}</code>\n"
         f"▫️ 시드 운용방식: <code>{comp_s_str}</code>\n"
-        f"▫️ 현재 출동시드: <code>${budget_s:,.2f}</code> | 목표 익절: <code>+{rate_s}% (순수익 +0.50%)</code>"
+        f"▫️ 현재 출동시드: <code>${budget_s:,.2f}</code> | 목표 익절: <code>+{rate_s:.2f}% (순수익 +{net_rate_s:.2f}%)</code>"
     )
 
     keyboard = InlineKeyboardMarkup(
@@ -543,8 +563,12 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
                 )
             ],
             [
+                InlineKeyboardButton(text=btn_064_label, callback_data="set_rate_SOXS_0.64"),
+                InlineKeyboardButton(text=btn_100_label, callback_data="set_rate_SOXS_1.00"),
+            ],
+            [
                 InlineKeyboardButton(
-                    text="💵 단리(시드고정) 전환" if is_comp_s else "📈 복리(+0.50%증액) 전환",
+                    text="💵 단리(시드고정) 전환" if is_comp_s else f"📈 복리(+{net_rate_s:.2f}%증액) 전환",
                     callback_data="toggle_compound_SOXS",
                 ),
                 InlineKeyboardButton(text="💵 SOXS 시드 설정", callback_data="set_budget_SOXS"),

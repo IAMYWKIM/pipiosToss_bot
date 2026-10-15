@@ -6,8 +6,8 @@
 # NEW: 20초 폴링 사각지대(원인 D) 소각을 위한 Wilder's EWM 기저 상태(ewm_state_out) 추출 및 1.5초 O(1) 실시간 틱 RSI 점화식(compute_realtime_tick_rsi) 신설
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 임계 윈도우 데드코드 및 AVWAPEngine 영구 소각
 # MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
-# MODIFIED: SOXS 단일 타겟 하드 락온 및 +0.64% 목표 익절률 고정, 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30, 68)
-# NEW: 복리 모드(is_compound) 상태 관리 및 익절 시 순수익 +0.50% 가산 / 손절 시 왕복 수수료(0.14%) 포함 실손실금 차감 복리 엔진 탑재
+# MODIFIED: SOXS 단일 타겟 하드 락온 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
+# NEW: 전술 제어반 목표 익절률(+0.64% vs +1.00%) 선택 영구 보존 및 복리 모드(익절 시 +0.50% / +0.86% 순수익 가산, 손절 시 왕복 수수료 0.14% 포함 실손실 차감) 엔진 탑재
 
 import os
 import json
@@ -236,8 +236,9 @@ class MacroDataCache:
 class AssassinLedger:
     ALLOWED_SYMBOLS = ("SOXS",)
     DEFAULT_TARGET_PROFIT_RATE = 0.64
-    # NEW: 복리 모드 전용 핵심 상수 (목표 익절 +0.64% - 협의 왕복수수료 0.14% = 순수익 +0.50% 복리 증액)
-    NET_TP_COMPOUND_RATE = 0.50
+    # NEW: 전술 제어반 선택 허용 목표 익절률 (+0.64% 고승률 회전형 vs +1.00% 고수익 복리형)
+    ALLOWED_TARGET_RATES = (0.64, 1.00)
+    ROUND_TRIP_COMM_PCT = 0.14
     ONE_WAY_COMM_RATE = 0.0007
     MIN_BUDGET_FLOOR = 10.0
 
@@ -252,6 +253,23 @@ class AssassinLedger:
     def _get_file_path(cls, symbol: str) -> str:
         sym = cls._validate_symbol(symbol)
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"AssassinLedger_{sym}.json")
+
+    # NEW: 목표 익절률 정규화 검증 (0.64% 또는 1.00% 외 비정상 값 유입 원천 차단)
+    @classmethod
+    def normalize_target_rate(cls, rate_val) -> float:
+        try:
+            r = float(rate_val)
+            if math.isfinite(r) and abs(r - 1.00) < 1e-4:
+                return 1.00
+        except Exception:
+            pass
+        return 0.64
+
+    # NEW: 선택된 목표 익절률에서 왕복 협의 수수료(0.14%)를 공제한 순수익 복리 증액률 반환 (0.64% -> 0.50%, 1.00% -> 0.86%)
+    @classmethod
+    def get_net_compound_rate(cls, target_profit_rate: float) -> float:
+        norm_r = cls.normalize_target_rate(target_profit_rate)
+        return round(norm_r - cls.ROUND_TRIP_COMM_PCT, 2)
 
     @classmethod
     async def get_state(
@@ -269,7 +287,10 @@ class AssassinLedger:
                         data = json.load(f)
                         if not isinstance(data, dict):
                             data = {}
-                        raw_rate = cls.DEFAULT_TARGET_PROFIT_RATE
+                        # MODIFIED: 장부에 저장된 사용자 선택 목표 익절률(0.64 또는 1.00)을 정규화하여 로드
+                        raw_rate = cls.normalize_target_rate(
+                            data.get("target_profit_rate", cls.DEFAULT_TARGET_PROFIT_RATE)
+                        )
                         return (
                             float(data.get("last_buy_price", 0.0)),
                             float(data.get("budget", 100.0)),
@@ -320,7 +341,7 @@ class AssassinLedger:
                     return ""
             return await asyncio.to_thread(_read)
 
-    # NEW: 복리 모드(is_compound) 활성화 상태 조회 (기본값 True)
+    # 복리 모드(is_compound) 활성화 상태 조회 (기본값 True)
     @classmethod
     async def get_is_compound(cls, symbol: str) -> bool:
         filepath = cls._get_file_path(symbol)
@@ -338,7 +359,7 @@ class AssassinLedger:
                     return True
             return await asyncio.to_thread(_read)
 
-    # NEW: 복리 모드 정산 시 차기 출동 시드(new_budget), 순증감액(net_delta_usd), 왕복 수수료(comm_usd) 원자적 산출
+    # MODIFIED: 선택된 목표 익절률(0.64% -> 순수익 +0.50%, 1.00% -> 순수익 +0.86%) 연동 복리 시드 산출
     @classmethod
     def calc_compound_next_budget(
         cls,
@@ -347,14 +368,15 @@ class AssassinLedger:
         entry_price: float = 0.0,
         exit_price: float = 0.0,
         filled_qty: float = 0.0,
+        target_profit_rate: float = 0.64,
     ) -> tuple[float, float, float]:
         base_budget = float(current_budget) if (current_budget and math.isfinite(current_budget)) else 100.0
         if base_budget < cls.MIN_BUDGET_FLOOR:
             base_budget = cls.MIN_BUDGET_FLOOR
 
         if is_take_profit:
-            # 익절 시: 설정 시드 기준 순수익률 +0.50% (세전 +0.64% - 왕복 수수료 0.14%) 복리 가산
-            net_delta_usd = round(base_budget * (cls.NET_TP_COMPOUND_RATE / 100.0), 2)
+            net_comp_rate = cls.get_net_compound_rate(target_profit_rate)
+            net_delta_usd = round(base_budget * (net_comp_rate / 100.0), 2)
             comm_usd = round(base_budget * (cls.ONE_WAY_COMM_RATE * 2.0), 2)
             new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
             return new_budget, net_delta_usd, comm_usd
@@ -420,7 +442,14 @@ class AssassinLedger:
                     except Exception:
                         pass
 
-                data["target_profit_rate"] = cls.DEFAULT_TARGET_PROFIT_RATE
+                # MODIFIED: target_profit_rate가 명시적으로 전달되면 정규화 저장하고, 없으면 기존 선택값 보존
+                if target_profit_rate is not None:
+                    data["target_profit_rate"] = cls.normalize_target_rate(target_profit_rate)
+                else:
+                    data["target_profit_rate"] = cls.normalize_target_rate(
+                        data.get("target_profit_rate", cls.DEFAULT_TARGET_PROFIT_RATE)
+                    )
+
                 if "is_compound" not in data:
                     data["is_compound"] = True
 

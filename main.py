@@ -11,6 +11,7 @@
 # NEW: 20초 폴링 사각지대(원인 D) 원천 소각 — 프리장 SOXS 5초 캔들 스캔 가속 및 1.5초 메인 루프 실시간 틱 RSI(compute_realtime_tick_rsi) 즉시 합성 결속
 # MODIFIED: 17:00 EST GC 가동 시 is_session_done=False 초기화 및 19:00 EST 논리적 거래일 롤오버 적용으로 전일 마감 락 이월 원천 차단 (Case 01, 22, 36)
 # NEW: 프리장(04:00~09:29 EST) 미보유·무주문·비매크로차단 상태에서 구버전 잔재 잠금(is_session_done=True) 감지 시 즉시 해제하는 자가 치유(Self-Healing) 가드 주입 (Case 52)
+# NEW: 시스템 기동 시 장부 내 선택된 목표 익절률(+0.64% vs +1.00%) 및 복리/단리 시드 모드를 동적으로 읽어 부팅 타전에 반영
 
 import sys
 import os
@@ -211,7 +212,6 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
 
                     current_price = await ctx.client.get_current_price(symbol)
 
-                    # MODIFIED: 불필요한 level 키 제거
                     sym_state = ctx.shared_rsi_state.setdefault(
                         symbol, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
                     )
@@ -306,7 +306,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             just_turned_off = (runtime_state["prev_is_active"] is True and is_active is False)
             runtime_state["prev_is_active"] = is_active
 
-            # MODIFIED: Case 22 — 17:00 EST 가비지 컬렉션(GC) 실행 시 미보유 상태면 is_session_done=False 및 EWM 캐시 초기화 (level 제거)
+            # Case 22 — 17:00 EST 가비지 컬렉션(GC) 실행 시 미보유 상태면 is_session_done=False 및 EWM 캐시 초기화
             if 17 <= now_est.hour < 19 and runtime_state["last_gc_date"] != today_str:
                 runtime_state["last_gc_date"] = today_str
                 ctx.in_memory_ordering_lock[symbol] = False
@@ -390,7 +390,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             if now_est.hour != runtime_state["last_heartbeat_hour"]:
                 print(
                     f"💓 [맥박 {symbol}] {now_est.strftime('%Y-%m-%d %H:%M:%S')} EST | "
-                    f"세션: {hardcoded_session} | 활성: {is_active} | 잔고: {holdings_qty}주",
+                    f"세션: {hardcoded_session} | 활성: {is_active} | 잔고: {holdings_qty}주 | 목표: +{target_profit_rate:.2f}%",
                     flush=True,
                 )
                 runtime_state["last_heartbeat_hour"] = now_est.hour
@@ -519,7 +519,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 )
                 continue
 
-            # MODIFIED: 불필요한 level 키 제거 및 1.5초 메인 루프 실시간 틱 RSI(compute_realtime_tick_rsi) 즉시 합성
+            # 1.5초 메인 루프 실시간 틱 RSI(compute_realtime_tick_rsi) 즉시 합성
             is_premarket_window = (400 <= est_time_int <= 929)
             sym_rsi_dict = ctx.shared_rsi_state.setdefault(
                 symbol, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
@@ -556,7 +556,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     rsi_val=live_rsi_val,
                 )
 
-            # 목표 2 & 초과 Case 50, 58, 64, 68: 매수 전량 체결 확인 즉시 +0.64% 지정가 매도 덫(TRAP) 하드 락온
+            # 목표 2 & 초과 Case 50, 58, 64: 매수 전량 체결 확인 즉시 선택된 목표 익절가(+0.64% / +1.00%) 지정가 매도 덫(TRAP) 하드 락온
             await manage_mechanical_profit_trap_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -619,6 +619,17 @@ async def main():
     print("시스템 코어: 프리장(04:00~09:29 EST) SOXS 단방향 RSI<=30 1.5초 틱 스나이퍼 결속 완료...", flush=True)
 
     try:
+        boot_state = await AssassinLedger.get_state(TRADE_SYMBOL)
+        boot_comp = await AssassinLedger.get_is_compound(TRADE_SYMBOL)
+        boot_budget = float(boot_state[1] or 100.0)
+        boot_rate = AssassinLedger.normalize_target_rate(boot_state[2])
+        boot_net_rate = AssassinLedger.get_net_compound_rate(boot_rate)
+        comp_desc = (
+            f"📈 복리 모드 (익절 시 +{boot_net_rate:.2f}% 증액 · 손절 시 수수료포함 차감)"
+            if boot_comp
+            else "💵 단리 모드 (시드 고정)"
+        )
+
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
@@ -627,9 +638,10 @@ async def main():
                 "▫️ 타겟: <b>SOXS(숏)</b> 배타적 실물 자산 투입 (SOXL 매매 영구 차단)\n"
                 "▫️ 관제: <b>5초 고해상도 캔들 동기화 + 1.5초 실시간 틱 RSI 합성</b> 상시 가동\n"
                 "▫️ 타격: <b>프리장(04:00~09:29 EST)</b> NQ=F 진폭 2.0% 미만 & <b>SOXS 실시간 RSI≤30.0</b> 포착 시 현재가 지정가(LIMIT) 즉시 매수\n"
-                "▫️ 회전: 프리장 내 <b>+0.64% 익절</b> 완료 시 잔고 0주 복귀 후 09:29 EST까지 <b>무한 재출동</b>\n"
+                f"▫️ 익절: 현재 설정 <b>+{boot_rate:.2f}% (순수익 +{boot_net_rate:.2f}%)</b> · 제어반(/settlement)에서 <b>+0.64% / +1.00%</b> 즉시 전환 가능\n"
+                f"▫️ 시드: <b>${boot_budget:,.2f}</b> · {comp_desc}\n"
                 "▫️ 마감: <b>09:30 EST</b> 정규장 개장 정각 신규 매수 마감 및 미체결 매수 주문 즉각 파기\n"
-                "▫️ 방어: <b>NQ=F 3단 매크로 손절 덤핑</b> & <b>15:59 EST 제로-오버나이트 MOC</b> 상시 가동"
+                "▫️ 방어: <b>NQ=F 3단 매크로 손절 덤핑</b> & <b>15:59 EST 제로-오버나이트 MOC(선취소+정정 스윕)</b> 상시 가동"
             ),
             parse_mode="HTML",
         )

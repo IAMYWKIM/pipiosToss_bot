@@ -6,7 +6,7 @@
 # MODIFIED: 예산 입력 시 음수/0/NaN/Inf 유입으로 인한 장부 오염 방어 로직 유지 (Case 37)
 # MODIFIED: /reset 명령을 통한 SOXS 스나이퍼 원장 원자적 0점 소각 및 wakeup_event 즉각 동기화 (Case 02)
 # MODIFIED: 모든 인라인 콜백 제자리 갱신(edit_text) 및 except Exception as e 문법 무결성 사수 (Case 17, 26)
-# NEW: 전술 제어반(/settlement) 내 복리 모드(익절 +0.50% 가산 / 손절 수수료포함 차감) vs 단리 모드 원클릭 토글 라우터(toggle_compound_SOXS) 결속
+# NEW: 전술 제어반(/settlement) 내 목표 익절률(+0.64% vs +1.00%) 원클릭 선택 라우터(set_rate_SOXS_) 및 복리/단리 토글 라우터(toggle_compound_SOXS) 결속
 
 import os
 import math
@@ -52,7 +52,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
         return
     await state.clear()
     try:
-        await message.answer(get_main_menu_text(), parse_mode="HTML")
+        text = await get_main_menu_text()
+        await message.answer(text, parse_mode="HTML")
     except Exception as e:
         pass
 
@@ -181,12 +182,44 @@ async def process_toggle_set_act(callback_query: types.CallbackQuery, state: FSM
             pass
 
 
-# NEW: 전술 제어반(/settlement) 복리 모드(is_compound) vs 단리 모드 원클릭 토글 핸들러
+# NEW: 전술 제어반(/settlement) 목표 익절률(+0.64% vs +1.00%) 원클릭 선택 핸들러
+@router.callback_query(F.data.startswith("set_rate_SOXS_"))
+async def process_set_target_rate(callback_query: types.CallbackQuery, state: FSMContext):
+    user = getattr(callback_query, "from_user", None)
+    if not user or getattr(user, "id", None) != ADMIN_CHAT_ID:
+        return
+    raw_str = callback_query.data.replace("set_rate_SOXS_", "").strip()
+    new_rate = AssassinLedger.normalize_target_rate(raw_str)
+    net_rate = AssassinLedger.get_net_compound_rate(new_rate)
+
+    await AssassinLedger.save_state("SOXS", target_profit_rate=new_rate)
+    if wakeup_event:
+        wakeup_event.set()
+
+    text, keyboard = await build_settlement_board()
+    try:
+        await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception as e:
+        pass
+    finally:
+        try:
+            await callback_query.answer(
+                f"🎯 목표 익절률 +{new_rate:.2f}% (순수익 +{net_rate:.2f}%) 락온 완료"
+            )
+        except Exception as e:
+            pass
+
+
+# 전술 제어반(/settlement) 복리 모드(is_compound) vs 단리 모드 원클릭 토글 핸들러
 @router.callback_query(F.data.startswith("toggle_compound_SOXS"))
 async def process_toggle_compound(callback_query: types.CallbackQuery, state: FSMContext):
     user = getattr(callback_query, "from_user", None)
     if not user or getattr(user, "id", None) != ADMIN_CHAT_ID:
         return
+    state_data = await AssassinLedger.get_state("SOXS")
+    active_rate = AssassinLedger.normalize_target_rate(state_data[2])
+    net_rate = AssassinLedger.get_net_compound_rate(active_rate)
+
     cur_comp = await AssassinLedger.get_is_compound("SOXS")
     new_comp = not cur_comp
     await AssassinLedger.save_state("SOXS", is_compound=new_comp)
@@ -199,7 +232,11 @@ async def process_toggle_compound(callback_query: types.CallbackQuery, state: FS
         pass
     finally:
         try:
-            mode_label = "📈 복리 모드 ON (+0.50% 증액)" if new_comp else "💵 단리(시드 고정) 모드 ON"
+            mode_label = (
+                f"📈 복리 모드 ON (익절 시 +{net_rate:.2f}% 증액)"
+                if new_comp
+                else "💵 단리(시드 고정) 모드 ON"
+            )
             await callback_query.answer(mode_label)
         except Exception as e:
             pass
@@ -211,11 +248,15 @@ async def process_set_budget(callback_query: types.CallbackQuery, state: FSMCont
     if not user or getattr(user, "id", None) != ADMIN_CHAT_ID:
         return
     await state.set_state(BudgetState.waiting_for_budget)
+    state_data = await AssassinLedger.get_state("SOXS")
+    active_rate = AssassinLedger.normalize_target_rate(state_data[2])
+    net_rate = AssassinLedger.get_net_compound_rate(active_rate)
     is_comp = await AssassinLedger.get_is_compound("SOXS")
+
     mode_desc = (
-        "📈 현재 <b>[복리 모드]</b>가 활성화되어 있습니다. 입력하신 시드를 시작점으로 익절 시마다 순수익 <b>+0.50%</b>가 가산되고 손절 시 수수료 포함 실손실금이 차감됩니다."
+        f"📈 현재 <b>[복리 모드 · 목표 +{active_rate:.2f}%]</b>가 활성화되어 있습니다. 입력하신 시드를 시작점으로 익절 시마다 순수익 <b>+{net_rate:.2f}%</b>(수수료 0.14% 차감)가 가산되고 손절 시 수수료 포함 실손실금이 차감됩니다."
         if is_comp
-        else "💵 현재 <b>[단리(고정) 모드]</b>가 활성화되어 있습니다. 매 출동 시 입력하신 고정 달러 예산만 투입됩니다."
+        else f"💵 현재 <b>[단리(고정) 모드 · 목표 +{active_rate:.2f}%]</b>가 활성화되어 있습니다. 매 출동 시 입력하신 고정 달러 예산만 투입됩니다."
     )
     text = (
         "⌨️ <b>SOXS 스나이퍼 투입 시드 설정 (USD)</b>\n\n"
@@ -272,7 +313,7 @@ async def cmd_reset(message: types.Message, state: FSMContext):
         "⚠️ <b>[SOXS 스나이퍼 장부 초기화]</b>\n\n"
         "경고: SOXS 로컬 장부(평단가, 목표가, 주문 ID, 당일 진입 잠금)를 "
         "100% 영구 소각하고 0점으로 원자적 초기화를 수행합니다.\n"
-        "(설정된 시드 금액 및 복리/단리 모드는 그대로 보존됩니다.)\n진행하시겠습니까?"
+        "(설정된 시드 금액, 목표 익절률 및 복리/단리 모드는 그대로 보존됩니다.)\n진행하시겠습니까?"
     )
     try:
         await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
@@ -416,8 +457,9 @@ async def process_back_to_main(callback_query: types.CallbackQuery, state: FSMCo
     await state.clear()
     try:
         await callback_query.answer()
+        text = await get_main_menu_text()
         await callback_query.message.edit_text(
-            get_main_menu_text(), reply_markup=None, parse_mode="HTML"
+            text, reply_markup=None, parse_mode="HTML"
         )
     except Exception as e:
         pass
