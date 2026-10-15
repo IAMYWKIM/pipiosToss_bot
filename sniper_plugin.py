@@ -4,6 +4,8 @@
 # =====================================================================
 # MODIFIED: 04:07 타임쉴드 해제 시 현재가 추격 매수(Force Entry) 궤도 폭격 플러그인 이식
 # MODIFIED: DAY_0407 추격 세션에 대응하는 함정(Trap) 태그 네이밍 동기화
+# MODIFIED: 타임쉴드(03:58~04:07) 미체결 대기 중 NQ=F 2.0% 돌파 시 기장전 매수 덫 즉각 파기 결속 (Case 66)
+# MODIFIED: 04:07 추격 매수 시 선취소 완료 검증 및 실패 시 장부 buy_order_id 고착 방어 (Case 48)
 
 import math
 import time
@@ -172,7 +174,7 @@ async def execute_moc_zero_overnight_plugin(
 async def execute_macro_defense_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, is_active: bool,
     is_session_done: bool, holdings_qty: int, current_price: float, avg_price_dump: float,
-    sell_order_id: str, nq_entry_price: float, nq_entry_amp: float,
+    sell_order_id: str, nq_entry_price: float, nq_entry_amp: float, buy_order_id: str = "",
 ) -> bool:
     if not is_active or ctx.in_memory_ordering_lock[symbol]:
         return False
@@ -192,18 +194,39 @@ async def execute_macro_defense_plugin(
         and nq_diff_pct >= dynamic_threshold
     )
 
-    if is_macro_breach and not is_session_done:
+    # MODIFIED: 03:58 매수 덫 장전 후(is_session_done=True) 타임쉴드 대기 중에도 미체결 매수 주문(buy_order_id)이 존재하면 즉각 취소
+    if is_macro_breach and (not is_session_done or bool(buy_order_id)):
         ctx.in_memory_ordering_lock[symbol] = True
         try:
+            canceled_any_buy = False
+            if buy_order_id:
+                try:
+                    await ctx.client.cancel_order(buy_order_id)
+                    canceled_any_buy = True
+                except Exception:
+                    pass
+
             open_orders_macro = await ctx.client.get_orders(status="OPEN", symbol=symbol)
             for order in open_orders_macro:
                 if order.get("side") == "BUY":
                     try:
                         await ctx.client.cancel_order(order["orderId"])
-                    except Exception as e:
+                        canceled_any_buy = True
+                    except Exception:
                         pass
-            await AssassinLedger.save_state(symbol, buy_order_id="", is_session_done=True)
+
+            save_kwargs = {"buy_order_id": "", "is_session_done": True}
+            if canceled_any_buy:
+                save_kwargs["entry_session"] = "CANCELED_MACRO"
+            await AssassinLedger.save_state(symbol, **save_kwargs)
             print(f"🛑 [매크로 진입 차단 {symbol}] NQ=F 진폭 {nq_amp_global:.2f}% 도달. 출동 취소.", flush=True)
+
+            if canceled_any_buy:
+                await ctx.notify_tg(
+                    f"🛑 <b>[스나이퍼 {symbol}] 대세장 이탈 감지 (미체결 매수 덫 긴급 파기)</b>\n"
+                    f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 이상)\n"
+                    "▫️ 조치: 기장전된 미체결 매수 덫 원자적 파기 및 당일 매수 권한 영구 소각"
+                )
         finally:
             ctx.in_memory_ordering_lock[symbol] = False
 
@@ -490,7 +513,7 @@ async def execute_0407_force_entry_plugin(
                 
             try:
                 await ctx.client.cancel_order(buy_order_id)
-            except Exception as e:
+            except Exception:
                 pass
             
             await asyncio.sleep(1.0)
@@ -498,6 +521,18 @@ async def execute_0407_force_entry_plugin(
             my_hold_check = await ctx.client.get_symbol_holdings_detail(symbol)
             if int(math.floor(my_hold_check.get("qty", 0.0))) > 0:
                 return
+
+            # NEW: 선취소 후 미체결 매수 주문 잔존 여부 이중 프로빙 (중복 매수 원천 봉쇄)
+            open_orders_check = await ctx.client.get_orders(status="OPEN", symbol=symbol)
+            for o in open_orders_check:
+                if o.get("side") == "BUY":
+                    try:
+                        await ctx.client.cancel_order(o["orderId"])
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        return
+
+            await AssassinLedger.save_state(symbol, buy_order_id="")
                 
             latest_price = await ctx.client.get_current_price(symbol)
             if latest_price <= 0.0: latest_price = current_price

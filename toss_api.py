@@ -6,11 +6,11 @@
 # MODIFIED: 캘린더 블로킹 연산 방어를 위한 asyncio.to_thread 스레드 격리 헌법 준수
 # MODIFIED: 외부 모듈 예외 시 제2 방어선(토스증권 API) 무중단 Fallback 경로 강제 (Case 21 방어)
 # MODIFIED: 19:00 EST 기점 논리적 거래일(Logical Trading Day) 롤오버 파이프라인 결속 (야간 데이마켓 휴장일 오인 차단)
-# MODIFIED: 초과 Case 62 - 토스 인증 모듈(_do_authenticate) HTTP 상태 코드 검증망 주입을 통한 JSON 파싱 붕괴(HTML 응답) 원천 차단
-# MODIFIED: 초과 Case 69 - API Null 페이로드 응답 시 단락 평가(or)를 통한 AttributeError 체이닝 붕괴 완벽 방어 락온 전면 주입
-# MODIFIED: 치명적 엣지 케이스 방어 - 비표준 에러 문자열 페이로드 응답 시 발생하는 AttributeError('str' object has no attribute 'get') 시스템 패닉 원천 봉쇄
-# MODIFIED: 초과 Case 71 - 매도 가능 수량(sellableQuantity) 프로빙 API 통신망 신규 개통
-# NEW: 초과 Case 73 - 데이장 조기 개장(18:00 EDT 등) 시 익일 마감 롤오버 누락 방어망 주입 (start.hour >= 12 하향 락온)
+# MODIFIED: 토스 인증 모듈(_do_authenticate) HTTP 상태 코드 검증망 주입을 통한 JSON 파싱 붕괴(HTML 응답) 원천 차단
+# MODIFIED: API Null 및 비표준 문자열 페이로드 응답 시 isinstance 검증을 통한 AttributeError 체이닝 붕괴 완벽 방어 (Case 03, 04)
+# MODIFIED: 매도 가능 수량(sellableQuantity) 프로빙 API 통신망 개통
+# MODIFIED: 데이장 조기 개장(18:00 EDT 등) 시 익일 마감 롤오버 누락 방어망 주입 (start.hour >= 12 하향 락온)
+# MODIFIED: 제3헌법 및 Case 14 의거 미사용 조건주문(conditional-orders) 데드코드 메서드 3종 영구 소각
 
 import asyncio
 import aiohttp
@@ -123,11 +123,14 @@ class TossApiClient:
                             err_text = await resp.text()
                             try:
                                 err_json = json.loads(err_text)
-                                err_obj = err_json.get("error", {})
-                                if isinstance(err_obj, dict):
-                                    err_msg = err_obj.get("message", err_text)
+                                if isinstance(err_json, dict):
+                                    err_obj = err_json.get("error", {})
+                                    if isinstance(err_obj, dict):
+                                        err_msg = err_obj.get("message", err_text)
+                                    else:
+                                        err_msg = err_json.get("error_description", str(err_obj))
                                 else:
-                                    err_msg = err_json.get("error_description", str(err_obj))
+                                    err_msg = err_text
                                 safe_err = html.escape(str(err_msg))
                             except Exception:
                                 safe_err = html.escape(err_text)
@@ -167,7 +170,8 @@ class TossApiClient:
                     err_text = await resp.text()
                     raise Exception(f"Auth HTTP {resp.status}: {html.escape(err_text[:200])}")
                 data = await resp.json()
-                self.token = data.get("access_token")
+                if isinstance(data, dict):
+                    self.token = data.get("access_token")
 
     async def token_renewal_loop(self):
         while True:
@@ -180,10 +184,11 @@ class TossApiClient:
     async def fetch_account_seq(self):
         if not self.token: await self.authenticate()
         data = await self._request("GET", "/api/v1/accounts", "ACCOUNT", headers=self._get_headers())
-        data = data or {}
-        accounts = data.get("result") or []
+        if not isinstance(data, dict): data = {}
+        accounts = data.get("result")
+        if not isinstance(accounts, list): accounts = []
         for acc in accounts:
-            if acc.get("accountType") == "BROKERAGE":
+            if isinstance(acc, dict) and acc.get("accountType") == "BROKERAGE":
                 self.account_seq = acc.get("accountSeq")
                 break
 
@@ -193,43 +198,49 @@ class TossApiClient:
         if before:
             endpoint += f"&before={before.replace('+', '%2B')}"
         data = await self._request("GET", endpoint, "MARKET_DATA_CHART", headers=self._get_headers())
-        data = data or {}
-        return data.get("result") or {}
+        if not isinstance(data, dict): return {}
+        res = data.get("result")
+        return res if isinstance(res, dict) else {}
 
     async def get_symbol_holdings_detail(self, symbol: str) -> dict:
         if not self.account_seq: await self.fetch_account_seq()
         data = await self._request("GET", f"/api/v1/holdings?symbol={symbol}", "ASSET", headers=self._get_headers(requires_account=True))
-        data = data or {}
-        res_dict = data.get("result") or {}
-        items = res_dict.get("items") or []
+        if not isinstance(data, dict): data = {}
+        res_dict = data.get("result")
+        if not isinstance(res_dict, dict): res_dict = {}
+        items = res_dict.get("items")
         
-        if not items:
+        if not isinstance(items, list) or not items or not isinstance(items[0], dict):
             return {"qty": 0.0, "avg_price": 0.0, "profit_rate": 0.0, "profit_usd": 0.0}
             
         item = items[0]
         qty_raw = item.get("quantity")
         avg_price_raw = item.get("averagePurchasePrice")
+        pl_dict = item.get("profitLoss")
+        if not isinstance(pl_dict, dict): pl_dict = {}
         
         return {
             "qty": float(qty_raw) if qty_raw is not None else 0.0,
             "avg_price": float(avg_price_raw) if avg_price_raw is not None else 0.0,
-            "profit_rate": float(item.get("profitLoss", {}).get("rate") or 0.0),
-            "profit_usd": float(item.get("profitLoss", {}).get("amount") or 0.0)
+            "profit_rate": float(pl_dict.get("rate") or 0.0),
+            "profit_usd": float(pl_dict.get("amount") or 0.0)
         }
 
     async def get_usd_buying_power(self) -> float:
         if not self.account_seq: await self.fetch_account_seq()
         data = await self._request("GET", "/api/v1/buying-power?currency=USD", "ORDER_INFO", headers=self._get_headers(requires_account=True))
-        data = data or {}
-        res_dict = data.get("result") or {}
+        if not isinstance(data, dict): data = {}
+        res_dict = data.get("result")
+        if not isinstance(res_dict, dict): res_dict = {}
         bp_raw = res_dict.get("cashBuyingPower")
         return float(bp_raw) if bp_raw is not None else 0.0
 
     async def get_sellable_quantity(self, symbol: str) -> float:
         if not self.account_seq: await self.fetch_account_seq()
         data = await self._request("GET", f"/api/v1/sellable-quantity?symbol={symbol}", "ORDER_INFO", headers=self._get_headers(requires_account=True))
-        data = data or {}
-        res_dict = data.get("result") or {}
+        if not isinstance(data, dict): data = {}
+        res_dict = data.get("result")
+        if not isinstance(res_dict, dict): res_dict = {}
         sq_raw = res_dict.get("sellableQuantity")
         return float(sq_raw) if sq_raw is not None else 0.0
 
@@ -256,8 +267,9 @@ class TossApiClient:
             if not self.token: await self.authenticate()
             endpoint = f"/api/v1/market-calendar/US?date={est_today_str}"
             data = await self._request("GET", endpoint, "MARKET_INFO", headers=self._get_headers())
-            data = data or {}
-            result_data = data.get("result") or {}
+            if not isinstance(data, dict): data = {}
+            result_data = data.get("result")
+            if not isinstance(result_data, dict): result_data = {}
             
             for day_key in ["today", "nextBusinessDay", "previousBusinessDay"]:
                 day_obj = result_data.get(day_key)
@@ -345,24 +357,27 @@ class TossApiClient:
     async def get_current_price(self, symbol: str) -> float:
         if not self.token: await self.authenticate()
         data = await self._request("GET", f"/api/v1/prices?symbols={symbol}", "MARKET_DATA", headers=self._get_headers())
-        data = data or {}
-        result = data.get("result") or []
-        if not result: return 0.0
+        if not isinstance(data, dict): return 0.0
+        result = data.get("result")
+        if not isinstance(result, list) or not result or not isinstance(result[0], dict): return 0.0
         price_raw = result[0].get("lastPrice")
         return float(price_raw) if price_raw is not None else 0.0
 
     async def get_orderbook(self, symbol: str) -> dict:
         if not self.token: await self.authenticate()
         data = await self._request("GET", f"/api/v1/orderbook?symbol={symbol}", "MARKET_DATA", headers=self._get_headers())
-        data = data or {}
-        return data.get("result") or {}
+        if not isinstance(data, dict): return {}
+        res = data.get("result")
+        return res if isinstance(res, dict) else {}
 
     async def get_orders(self, status: str, symbol: str) -> list:
         if not self.account_seq: await self.fetch_account_seq()
         data = await self._request("GET", f"/api/v1/orders?status={status}&symbol={symbol}", "ORDER_HISTORY", headers=self._get_headers(requires_account=True))
-        data = data or {}
-        res_dict = data.get("result") or {}
-        return res_dict.get("orders") or []
+        if not isinstance(data, dict): return []
+        res_dict = data.get("result")
+        if not isinstance(res_dict, dict): return []
+        orders = res_dict.get("orders")
+        return orders if isinstance(orders, list) else []
 
     async def cancel_order(self, order_id: str):
         if not self.account_seq: await self.fetch_account_seq()
@@ -371,8 +386,9 @@ class TossApiClient:
     async def get_order_detail(self, order_id: str) -> dict:
         if not self.account_seq: await self.fetch_account_seq()
         data = await self._request("GET", f"/api/v1/orders/{order_id}", "ORDER_HISTORY", headers=self._get_headers(requires_account=True))
-        data = data or {}
-        return data.get("result") or {}
+        if not isinstance(data, dict): return {}
+        res = data.get("result")
+        return res if isinstance(res, dict) else {}
 
     async def create_order(self, symbol: str, side: str, order_type: str, quantity: float, price: str, client_order_id: str) -> dict:
         if not self.account_seq: await self.fetch_account_seq()
@@ -386,32 +402,4 @@ class TossApiClient:
             "timeInForce": "DAY"
         }
         data = await self._request("POST", "/api/v1/orders", "ORDER", headers=self._get_headers(requires_account=True), json_data=payload)
-        return data or {}
-
-    async def create_conditional_order(self, symbol: str, quantity: int, price: str, client_order_id: str, expire_date: str) -> dict:
-        if not self.account_seq: await self.fetch_account_seq()
-        payload = {
-            "clientOrderId": client_order_id,
-            "symbol": symbol,
-            "type": "SINGLE",
-            "quantity": str(quantity),
-            "orderType": "LIMIT",
-            "expireDate": expire_date,
-            "first": {
-                "orderSide": "SELL",
-                "triggerPrice": price,
-                "orderPrice": price
-            }
-        }
-        data = await self._request("POST", "/api/v1/conditional-orders", "CONDITIONAL_ORDER", headers=self._get_headers(requires_account=True), json_data=payload)
-        return data or {}
-
-    async def cancel_conditional_order(self, cond_order_id: str):
-        if not self.account_seq: await self.fetch_account_seq()
-        await self._request("DELETE", f"/api/v1/conditional-orders/{cond_order_id}", "CONDITIONAL_ORDER", headers=self._get_headers(requires_account=True))
-
-    async def get_conditional_order_detail(self, cond_order_id: str) -> dict:
-        if not self.account_seq: await self.fetch_account_seq()
-        data = await self._request("GET", f"/api/v1/conditional-orders/{cond_order_id}", "CONDITIONAL_ORDER_HISTORY", headers=self._get_headers(requires_account=True))
-        data = data or {}
-        return data.get("result") or {}
+        return data if isinstance(data, dict) else {}

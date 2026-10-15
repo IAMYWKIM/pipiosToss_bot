@@ -2,7 +2,9 @@
 # FILE: quant_engine.py
 # 목적: SOXS 단방향 독립 장부 및 NQ=F 실시간 진폭 조회 캐싱, RSI 레이더 엔진
 # =====================================================================
-# MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온
+# MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
+# MODIFIED: 제3헌법 의거 미사용 AVWAPEngine 데드코드 클래스 영구 소각
+# MODIFIED: 04:07 EST 타임쉴드 만료 임계 구간(04:06:50~04:07:10) NQ=F 캐시 즉시 갱신 조건 추가 (Case 48, 61)
 
 import os
 import json
@@ -38,7 +40,7 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-    # MODIFIED: 전체 데이터(df)를 대상으로 RSI를 선행 연산하여 과거 데이터 단절 방어
+    # MODIFIED: 전체 데이터(df)를 대상으로 RSI를 선행 연산하여 과거 데이터 단절 방어 및 ZeroDivision(inf) 안전 처리
     delta = df["closePrice"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -48,7 +50,7 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
     
     rs = avg_gain / avg_loss
     rsi_series = 100.0 - (100.0 / (1.0 + rs))
-    rsi_series = rsi_series.fillna(0.0)
+    rsi_series = rsi_series.replace([np.inf, -np.inf], 100.0).fillna(0.0)
     
     rsi_val = float(rsi_series.iloc[-1]) if not rsi_series.empty else 0.0
 
@@ -80,6 +82,17 @@ class MacroDataCache:
 
         if today_0357_50 <= now_est <= today_0358_10:
             if now_est >= today_0358_00 and last_est < today_0358_00:
+                return True
+            if now_ts - last_ts >= 2.5:
+                return True
+
+        # NEW: 04:07 EST 타임쉴드 만료 추격 타격 임계 윈도우 즉시 갱신 결속
+        today_0406_50 = now_est.replace(hour=4, minute=6, second=50, microsecond=0)
+        today_0407_00 = now_est.replace(hour=4, minute=7, second=0, microsecond=0)
+        today_0407_10 = now_est.replace(hour=4, minute=7, second=10, microsecond=0)
+
+        if today_0406_50 <= now_est <= today_0407_10:
+            if now_est >= today_0407_00 and last_est < today_0407_00:
                 return True
             if now_ts - last_ts >= 2.5:
                 return True
@@ -298,31 +311,3 @@ class AssassinLedger:
                 is_session_done=False, entry_session="", entry_time=0.0,
                 nq_entry_price=0.0, nq_entry_amp=0.0, entry_trend="",
             )
-
-class AVWAPEngine:
-    @staticmethod
-    def calculate_vwap(candles_json: list, session_start_est: datetime) -> float:
-        if not candles_json: return 0.0
-        df = pd.DataFrame(candles_json)
-        if df.empty: return 0.0
-
-        df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
-        df["timestamp"] = df["timestamp"].dt.tz_convert(EST_TZ)
-        df.set_index("timestamp", inplace=True)
-        df.sort_index(ascending=True, inplace=True)
-
-        for col in ["highPrice", "lowPrice", "closePrice", "volume"]:
-            if col not in df.columns: df[col] = 0.0
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-        session_df = df[df.index >= session_start_est]
-        if session_df.empty: return 0.0
-
-        typical_price = (session_df["highPrice"] + session_df["lowPrice"] + session_df["closePrice"]) / 3.0
-        pv = typical_price * session_df["volume"]
-
-        cumulative_pv = pv.sum()
-        cumulative_vol = session_df["volume"].sum()
-
-        if cumulative_vol <= 0: return 0.0
-        return float(cumulative_pv / cumulative_vol)

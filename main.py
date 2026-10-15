@@ -4,6 +4,9 @@
 # 구조: sniper_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 슬림 아키텍처
 # =====================================================================
 # MODIFIED: 04:07 EST 타임쉴드 만료 기반 현재가 추격 타격망(FORCE_BUY) 루프 인젝션
+# MODIFIED: 제3헌법 의거 미사용 AVWAPEngine 임포트 데드코드 소각
+# MODIFIED: execute_macro_defense_plugin 호출 시 buy_order_id 인자 전달 결속 (타임쉴드 중 매크로 돌파 방어)
+# MODIFIED: 03:58 EST 타격 윈도우 보호를 위해 무인 업데이트 락다운 시간대를 03:00~17:00 EST로 확장 (Case 07)
 
 import sys
 import os
@@ -19,7 +22,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from dotenv import load_dotenv
 
 from toss_api import TossApiClient
-from quant_engine import AssassinLedger, AVWAPEngine, MacroDataCache, calculate_rsi_1m
+from quant_engine import AssassinLedger, MacroDataCache, calculate_rsi_1m
 from tg_router import router, inject_dependencies
 from candle_recorder import record_candles_loop
 from sniper_plugin import (
@@ -99,7 +102,8 @@ def _run_git_update_sync() -> tuple[bool, str]:
             return proc.returncode, out.strip(), err.strip()
         except subprocess.TimeoutExpired:
             proc.kill()
-            return -1, "", "Subprocess Timeout Expired (네트워크 교착 상태 방어)"
+            out, err = proc.communicate()
+            return -1, out.strip(), "Subprocess Timeout Expired (네트워크 교착 상태 방어)"
 
     code, current_hash, err = run_cmd("git rev-parse HEAD")
     if code != 0:
@@ -142,7 +146,8 @@ async def auto_update_loop(bot: Bot, chat_id: int):
     while True:
         try:
             now_est = datetime.now(EST_TZ)
-            if 4 <= now_est.hour < 17:
+            # MODIFIED: 03:58 EST 스나이핑 타격 직전 재기동 방지를 위해 03:00~17:00 EST 구간 전체 락다운
+            if 3 <= now_est.hour < 17:
                 await asyncio.sleep(3600.0)
                 continue
 
@@ -372,6 +377,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             current_price = await ctx.client.get_current_price(symbol)
             avg_price_dump = float(holdings_detail.get("avg_price", 0.0)) or last_buy_price
 
+            # MODIFIED: buy_order_id 인자 주입으로 타임쉴드 중 매크로 2.0% 돌파 시 미체결 매수 덫 즉각 파기 연동
             macro_dumped = await execute_macro_defense_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -384,6 +390,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 sell_order_id=sell_order_id,
                 nq_entry_price=nq_entry_price,
                 nq_entry_amp=nq_entry_amp,
+                buy_order_id=buy_order_id,
             )
             if macro_dumped:
                 continue

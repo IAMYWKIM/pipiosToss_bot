@@ -1,9 +1,12 @@
 # =====================================================================
 # FILE: tg_router.py
-# 목적: 02:58 EST 숏 단일 스나이퍼 텔레그램 명령 라우팅 컨트롤러
+# 목적: 03:58 EST 숏 단일 스나이퍼 텔레그램 명령 라우팅 컨트롤러
 # =====================================================================
+# MODIFIED: 초과 Case 71 의거 구버전 02:58 시계열 잔재를 03:58 EST로 100% 영구 동기화
+# MODIFIED: 예산 입력 시 음수/0/NaN/Inf 유입으로 인한 장부 오염 방어 로직 주입
 
 import os
+import math
 import html
 import asyncio
 from aiogram import Router, types, F
@@ -102,7 +105,8 @@ async def process_open_sync(callback_query: types.CallbackQuery, state: FSMConte
             ]
         )
         await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    except Exception: pass
+    except Exception as e:
+        pass
     finally:
         try: await callback_query.answer("동기화 완료")
         except Exception: pass
@@ -124,7 +128,8 @@ async def process_open_settlement(callback_query: types.CallbackQuery, state: FS
     try:
         text, keyboard = await build_settlement_board()
         await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    except Exception: pass
+    except Exception as e:
+        pass
 
 @router.callback_query(F.data.startswith("toggle_set_act_SOXS"))
 async def process_toggle_set_act(callback_query: types.CallbackQuery, state: FSMContext):
@@ -135,19 +140,22 @@ async def process_toggle_set_act(callback_query: types.CallbackQuery, state: FSM
     if wakeup_event: wakeup_event.set()
     text, keyboard = await build_settlement_board()
     try: await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    except Exception: pass
+    except Exception as e:
+        pass
 
 @router.callback_query(F.data.startswith("set_budget_SOXS"))
 async def process_set_budget(callback_query: types.CallbackQuery, state: FSMContext):
     user = getattr(callback_query, "from_user", None)
     if not user or getattr(user, "id", None) != ADMIN_CHAT_ID: return
     await state.set_state(BudgetState.waiting_for_budget)
+    # MODIFIED: 초과 Case 71 의거 03:58 EST 시계열 텍스트 동기화
     text = (
-        f"⌨️ <b>SOXS 고정 투입 예산 입력 (USD)</b>\n\n"
-        "▫️ 02:58 데이장 마감 스나이핑 출동 시 투입할 달러 예산을 숫자로 전송하십시오."
+        "⌨️ <b>SOXS 고정 투입 예산 입력 (USD)</b>\n\n"
+        "▫️ 03:58 EST 데이장 마감 스나이핑 출동 시 투입할 달러 예산을 숫자로 전송하십시오."
     )
     try: await callback_query.message.edit_text(text, parse_mode="HTML")
-    except Exception: pass
+    except Exception as e:
+        pass
 
 @router.message(BudgetState.waiting_for_budget)
 async def process_budget_input(message: types.Message, state: FSMContext):
@@ -155,13 +163,16 @@ async def process_budget_input(message: types.Message, state: FSMContext):
     if not user or getattr(user, "id", None) != ADMIN_CHAT_ID: return
     try:
         budget = float(message.text.strip())
+        # MODIFIED: 0 이하 또는 비정상 부동소수점(NaN/Inf) 입력 원천 차단
+        if budget <= 0.0 or not math.isfinite(budget):
+            raise ValueError("Budget must be a positive finite number.")
         await AssassinLedger.save_state("SOXS", budget=budget)
         if wakeup_event: wakeup_event.set()
         await state.clear()
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 제어반으로", callback_data="open_settlement")]])
         await message.answer(f"✅ <b>SOXS 예산 ${budget:,.2f} 락온 완료.</b>", reply_markup=keyboard, parse_mode="HTML")
     except Exception:
-        await message.answer("🚨 유효한 숫자를 입력하세요.", parse_mode="HTML")
+        await message.answer("🚨 0보다 큰 유효한 숫자를 입력하세요.", parse_mode="HTML")
 
 @router.message(Command("reset"))
 async def cmd_reset(message: types.Message, state: FSMContext):
@@ -274,4 +285,5 @@ async def process_back_to_main(callback_query: types.CallbackQuery, state: FSMCo
     try:
         await callback_query.answer()
         await callback_query.message.edit_text(get_main_menu_text(), reply_markup=None, parse_mode="HTML")
-    except Exception: pass
+    except Exception as e:
+        pass
