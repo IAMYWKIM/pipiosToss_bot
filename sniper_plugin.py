@@ -11,6 +11,7 @@
 # MODIFIED: 매크로 1·2·3차 방어선 작동 시 entry_session="CANCELED_MACRO" 및 당일 재진입 영구 차단 락온 (Case 66, 67)
 # MODIFIED: 스나이퍼 OFF 상태 중 수동 청산 식별 시 타전 억제(Silent Reset) 분기 결속 (Case 46)
 # NEW: MOC 및 매크로 덤핑 시 미체결 매도 선취소 후 수량 해방(sellableQuantity > 0) 2.0초 폴링 대기 및 거래소 취소 병목 시 기존 매도 주문 가격 즉시 정정(modify_order) 우회 타격망 결속 (Case 16, 24, 69)
+# NEW: 복리 모드(is_compound) 가동 시 익절(+0.50% 순수익 가산) 및 손절/MOC(왕복 수수료 0.14% 포함 실손실 차감) 시드 자동 갱신 결속
 
 import math
 import time
@@ -171,18 +172,16 @@ async def execute_moc_zero_overnight_plugin(
                 dump_qty = int(math.floor(holdings_detail_moc["qty"]))
 
                 if dump_qty <= 0:
-                    # 보유 수량이 0주이면 잔여 미체결 주문만 정리 후 마감
-                    if sell_order_id:
-                        try:
-                            await ctx.client.cancel_order(sell_order_id)
-                        except Exception:
-                            pass
-                    await AssassinLedger.save_state(
-                        symbol, buy_order_id="", sell_order_id="", target_sell_price=0.0, is_session_done=True
-                    )
+                    # MODIFIED: 잔고 0주 확인 시 장부에 미정산 포지션(last_buy_price > 0)이 남아 있다면
+                    # False를 반환하여 메인 루프의 reconcile_zero_holdings_exit_plugin이 즉시 복리 정산 및 타전을 수행하도록 연동
+                    st_chk = await AssassinLedger.get_state(symbol)
+                    has_unsettled_ledger = (st_chk[0] > 0.0 or st_chk[6] > 0.0 or bool(st_chk[7]))
+                    if has_unsettled_ledger:
+                        return False
+                    await AssassinLedger.save_state(symbol, buy_order_id="", is_session_done=True)
                     return True
 
-                # MODIFIED: 1단계 — 미체결 주문 선취소 및 매도 가능 수량 해방(sellableQuantity > 0) 폴링 대기
+                # 1단계 — 미체결 주문 선취소 및 매도 가능 수량 해방(sellableQuantity > 0) 폴링 대기
                 sellable_q_int, surviving_sell_ids = await _cancel_open_orders_and_wait_sellable(
                     ctx=ctx, symbol=symbol, sell_order_id=sell_order_id, cancel_all_sides=True
                 )
@@ -197,7 +196,6 @@ async def execute_moc_zero_overnight_plugin(
                     return True
 
                 if sellable_q_int > 0:
-                    # 정상적으로 기존 매도 주문이 취소되어 매도 가능 수량이 확보된 경우 -> 매수 1호가 신규 LIMIT 주문 발사
                     exec_qty = min(dump_qty, sellable_q_int)
                     idem_key = f"MOC_{symbol}_{now_est.strftime('%H%M%S')}_{int(time.time() * 10) % 100}"[:36]
                     ctx.idempotency_keys[symbol]["MOC"] = {
@@ -226,8 +224,7 @@ async def execute_moc_zero_overnight_plugin(
                         ctx.idempotency_keys[symbol]["MOC"] = None
 
                 elif surviving_sell_ids:
-                    # NEW: 2단계 우회 타격 — 장마감 1분 전 거래소 취소 병목/제한으로 인해 취소 후에도 수량이 잠겨 있는 경우,
-                    # 살아있는 기존 매도 주문의 가격을 즉시 매수 1호가(bid_1_price)로 정정(modify_order)하여 강제 체결!
+                    # 2단계 우회 타격 — 장마감 1분 전 거래소 취소 병목 시 살아있는 기존 매도 주문 가격을 매수 1호가로 즉시 정정(modify_order)
                     target_mod_id = surviving_sell_ids[0]
                     await asyncio.wait_for(
                         ctx.client.modify_order(
@@ -342,7 +339,6 @@ async def execute_macro_defense_plugin(
             dump_qty = int(math.floor(holdings_detail_mdump["qty"]))
 
             if dump_qty > 0:
-                # MODIFIED: 미체결 매도 주문 선취소 및 매도 가능 수량 해방(sellableQuantity > 0) 폴링 대기
                 sellable_q_int, surviving_sell_ids = await _cancel_open_orders_and_wait_sellable(
                     ctx=ctx, symbol=symbol, sell_order_id=sell_order_id, cancel_all_sides=False
                 )
@@ -371,7 +367,6 @@ async def execute_macro_defense_plugin(
                         )
                         dumped_ok = True
                     elif surviving_sell_ids:
-                        # NEW: 취소 지연 시 기존 지정가 매도 주문을 매수 1호가로 즉시 하향 정정(modify_order)
                         await asyncio.wait_for(
                             ctx.client.modify_order(
                                 order_id=surviving_sell_ids[0],
@@ -481,30 +476,10 @@ async def reconcile_zero_holdings_exit_plugin(
     ctx.in_memory_ordering_lock[symbol] = True
     try:
         current_state = await AssassinLedger.get_state(symbol)
-        prev_entry_session = current_state[8]
-
-        exit_price, filled_qty = 0.0, 0.0
-        try:
-            orders = await ctx.client.get_orders(status="CLOSED", symbol=symbol)
-            for o in orders:
-                if o.get("side") == "SELL" and o.get("status") in ["FILLED", "PARTIAL_FILLED"]:
-                    exec_info = o.get("execution", {})
-                    avg_p = float(exec_info.get("averageFilledPrice") or 0.0)
-                    f_qty = float(exec_info.get("filledQuantity") or 0.0)
-                    if avg_p > 0.0 and f_qty > 0.0:
-                        exit_price, filled_qty = avg_p, f_qty
-                        break
-        except Exception:
-            pass
-
-        entry_price = last_buy_price
-        if entry_price > 0.0 and exit_price > 0.0 and filled_qty > 0.0:
-            pnl_amt = (exit_price * filled_qty) - (entry_price * filled_qty)
-            pnl_rate = (exit_price / entry_price - 1.0) * 100.0
-            sign = "+" if pnl_amt > 0 else ""
-            pnl_str = f"\n▫️ 타점: 매수 ${entry_price:.2f} ➡️ 매도 ${exit_price:.2f}\n▫️ 손익: {sign}{pnl_rate:.2f}% ({sign}${pnl_amt:.2f})"
-        else:
-            pnl_str = "\n▫️ 타점: 체결 데이터 추출 지연 (장부 참조 요망)"
+        current_budget = float(current_state[1] or 100.0)
+        prev_target_sell_price = float(current_state[6] or 0.0)
+        prev_entry_session = str(current_state[8] or "")
+        is_compound = await AssassinLedger.get_is_compound(symbol)
 
         now_est_check = datetime.now(EST_TZ)
         est_hm_now = now_est_check.hour * 100 + now_est_check.minute
@@ -513,23 +488,99 @@ async def reconcile_zero_holdings_exit_plugin(
             now_est_check.hour == 16 and 0 <= now_est_check.minute <= 5
         )
         is_take_profit_exit, is_trap_survived = False, False
+        exit_price, filled_qty = 0.0, 0.0
 
+        # 1) sell_order_id 상세 원장 우선 프로빙 (익절 체결 여부 및 체결 단가/수량 1차 확인)
         if sell_order_id:
             try:
                 od = await ctx.client.get_order_detail(sell_order_id)
                 st = od.get("status", "")
+                exec_info_trap = od.get("execution") or {}
+                trap_avg_p = float(exec_info_trap.get("averageFilledPrice") or 0.0)
+                trap_f_qty = float(exec_info_trap.get("filledQuantity") or 0.0)
+                if trap_avg_p > 0.0 and trap_f_qty > 0.0:
+                    exit_price, filled_qty = trap_avg_p, trap_f_qty
+
                 if st == "FILLED":
                     is_take_profit_exit = True
                 elif st in ["PENDING", "PARTIAL_FILLED", "PENDING_CANCEL", "PENDING_REPLACE"]:
                     is_trap_survived = True
-                await ctx.client.cancel_order(sell_order_id)
-                await asyncio.sleep(0.5)
+                    await ctx.client.cancel_order(sell_order_id)
+                    await asyncio.sleep(0.4)
             except Exception:
                 pass
 
+        # 2) CLOSED 주문 목록에서 최신 SELL 체결 단가 및 수량 추출 (인덱싱 지연 시 0.4초 대기 후 1회 재시도)
         was_holding = last_buy_price > 0.0
+        for attempt_closed in range(2):
+            if exit_price > 0.0 and filled_qty > 0.0:
+                break
+            if attempt_closed == 1 and was_holding:
+                await asyncio.sleep(0.4)
+            try:
+                orders = await ctx.client.get_orders(status="CLOSED", symbol=symbol)
+                for o in orders:
+                    if o.get("side") == "SELL" and o.get("status") in ["FILLED", "PARTIAL_FILLED"]:
+                        exec_info = o.get("execution") or {}
+                        avg_p = float(exec_info.get("averageFilledPrice") or 0.0)
+                        f_qty = float(exec_info.get("filledQuantity") or 0.0)
+                        if avg_p > 0.0 and f_qty > 0.0:
+                            exit_price, filled_qty = avg_p, f_qty
+                            if (
+                                not is_take_profit_exit
+                                and prev_target_sell_price > 0.0
+                                and avg_p >= (prev_target_sell_price - 0.01)
+                            ):
+                                is_take_profit_exit = True
+                            break
+            except Exception:
+                pass
+
+        entry_price = last_buy_price
+        if entry_price > 0.0 and exit_price > 0.0 and filled_qty > 0.0:
+            pnl_amt = (exit_price * filled_qty) - (entry_price * filled_qty)
+            pnl_rate = (exit_price / entry_price - 1.0) * 100.0
+            sign = "+" if pnl_amt > 0 else ""
+            pnl_str = f"\n▫️ 타점: 매수 ${entry_price:.2f} ➡️ 매도 ${exit_price:.2f}\n▫️ 세전 손익: {sign}{pnl_rate:.2f}% ({sign}${pnl_amt:.2f})"
+        else:
+            pnl_str = "\n▫️ 타점: 체결 데이터 추출 지연 (장부 참조 요망)"
+
         is_manual_exit = (was_holding and not is_take_profit_exit and not is_moc_time and not is_trap_survived)
         is_buy_cancel_exit = (not was_holding and not is_take_profit_exit and not is_moc_time and not is_trap_survived)
+
+        # NEW: 복리 모드(is_compound) 가동 시 실제 포지션 청산(was_holding)에 대해 차기 시드(new_budget) 원자적 갱신
+        updated_budget = None
+        compound_str = ""
+        if was_holding and not is_buy_cancel_exit:
+            if is_compound:
+                calc_exit_p = exit_price
+                if calc_exit_p <= 0.0 and not is_take_profit_exit:
+                    try:
+                        calc_exit_p = await ctx.client.get_current_price(symbol)
+                    except Exception:
+                        calc_exit_p = 0.0
+
+                new_b, net_delta, comm_val = AssassinLedger.calc_compound_next_budget(
+                    current_budget=current_budget,
+                    is_take_profit=is_take_profit_exit,
+                    entry_price=entry_price,
+                    exit_price=calc_exit_p,
+                    filled_qty=filled_qty,
+                )
+                updated_budget = new_b
+                d_sign = "+" if net_delta >= 0.0 else ""
+                if is_take_profit_exit:
+                    compound_str = (
+                        f"\n▫️ 📈 <b>복리 시드 증액(+0.50%)</b>: <code>${current_budget:,.2f}</code> ➡️ "
+                        f"<code>${new_b:,.2f}</code> (<code>{d_sign}${net_delta:,.2f}</code> · 수수료 0.14% 제함)"
+                    )
+                else:
+                    compound_str = (
+                        f"\n▫️ 📉 <b>복리 시드 차감(수수료포함)</b>: <code>${current_budget:,.2f}</code> ➡️ "
+                        f"<code>${new_b:,.2f}</code> (<code>{d_sign}${net_delta:,.2f}</code> · 수수료 ${comm_val:,.2f} 포함)"
+                    )
+            else:
+                compound_str = f"\n▫️ 💵 <b>단리 시드 고정</b>: <code>${current_budget:,.2f}</code>"
 
         # 초과 Case 52 — 프리장(04:00~09:29 EST) 내 익절 완료(또는 매크로 아닌 단순 매수취소) 시 is_session_done=False로 무한 재출동 활성화
         if (
@@ -544,7 +595,7 @@ async def reconcile_zero_holdings_exit_plugin(
             next_entry_session = "CANCELED_MACRO" if prev_entry_session == "CANCELED_MACRO" else ""
 
         await AssassinLedger.save_state(
-            symbol, price=0.0, target_sell_price=0.0, buy_order_id="", sell_order_id="",
+            symbol, price=0.0, budget=updated_budget, target_sell_price=0.0, buy_order_id="", sell_order_id="",
             is_session_done=next_is_session_done, entry_session=next_entry_session, entry_time=0.0,
             nq_entry_price=0.0, nq_entry_amp=0.0, entry_trend="",
         )
@@ -557,24 +608,27 @@ async def reconcile_zero_holdings_exit_plugin(
         if is_buy_cancel_exit:
             print(f"🧹 [매수 취소/실패 {symbol}] 허위 익절 타전 억제 및 장부 초기화 완료.", flush=True)
         elif is_moc_time:
-            await ctx.notify_tg(f"🛑 <b>[스나이퍼 {symbol}] MOC 강제 덤핑 청산 완료</b>\n▫️ 잔고 0주 (제로-오버나이트 락온){pnl_str}")
+            await ctx.notify_tg(
+                f"🛑 <b>[스나이퍼 {symbol}] MOC 강제 덤핑 청산 완료</b>\n"
+                f"▫️ 잔고 0주 (제로-오버나이트 락온){pnl_str}{compound_str}"
+            )
         elif is_take_profit_exit:
             if not next_is_session_done:
                 await ctx.notify_tg(
                     f"🎉 <b>[스나이퍼 {symbol}] 프리장 +0.64% 익절 성공 ➡️ 무한 재출동 대기 복귀</b>\n"
-                    f"▫️ 잔고 0주 (지정가 익절 매도 체결 확인){pnl_str}\n"
+                    f"▫️ 잔고 0주 (지정가 익절 매도 체결 확인){pnl_str}{compound_str}\n"
                     "▫️ 후속 조치: 09:29 EST까지 차기 SOXS RSI≤30 타점 연속 감시 재개"
                 )
             else:
                 await ctx.notify_tg(
                     f"🎉 <b>[스나이퍼 {symbol}] 정규장 +0.64% 익절 타격 성공 (당일 퇴근 완료)</b>\n"
-                    f"▫️ 잔고 0주 (지정가 익절 매도 체결 확인){pnl_str}\n"
+                    f"▫️ 잔고 0주 (지정가 익절 매도 체결 확인){pnl_str}{compound_str}\n"
                     "▫️ 당일 신규 진입 권한 영구 소각"
                 )
         elif is_manual_exit:
             await ctx.notify_tg(
                 f"🛑 <b>[스나이퍼 {symbol}] 수동 매도/매크로 청산 감지 (퇴근 락온 완료)</b>\n"
-                f"▫️ 잔고 0주 (청산 완료 식별){pnl_str}\n"
+                f"▫️ 잔고 0주 (청산 완료 식별){pnl_str}{compound_str}\n"
                 "▫️ 당일 신규 진입 권한 영구 소각 완료"
             )
     finally:
@@ -665,6 +719,9 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                     )
                 return
 
+            is_compound = await AssassinLedger.get_is_compound(symbol)
+            mode_tag = "복리" if is_compound else "단리"
+
             # 제5헌법 & Case 34: 토스증권 멱등성 키(clientOrderId) 생성 및 주입
             idem = ctx.idempotency_keys[symbol]["BUY"]
             if not idem:
@@ -695,9 +752,9 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                 await ctx.notify_tg(
                     f"🔫 <b>[프리장 스나이퍼] {symbol} RSI≤30 과매도 포착 ➡️ 실거래 지정가 요격 발사</b>\n"
                     f"▫️ 실시간 1분봉 RSI: <code>{rsi_val:.1f}</code> (기준 ≤ 30.0)\n"
-                    f"▫️ 요격 지정가(LIMIT): <code>${target_price:.2f}</code> (시드기준 <code>{target_qty}주</code>)\n"
+                    f"▫️ 요격 지정가(LIMIT): <code>${target_price:.2f}</code> ({mode_tag}시드 <code>${budget:,.2f}</code> ➔ <code>{target_qty}주</code>)\n"
                     f"▫️ NQ=F 기준점: <code>{nq_c_global:.2f}</code> (당일 진폭 <code>{nq_amp_global:.2f}%</code>)\n"
-                    f"▫️ 후속 프로토콜: <code>전량 체결 즉시 +{target_profit_rate}% 익절 덫 장전 (프리장 익절 시 무한 재출동)</code>"
+                    f"▫️ 후속 프로토콜: <code>전량 체결 즉시 +{target_profit_rate}% 익절 덫 장전 (익절 시 +0.50% 복리 증액)</code>"
                 )
             ctx.idempotency_keys[symbol]["BUY"] = None
         except Exception as e:

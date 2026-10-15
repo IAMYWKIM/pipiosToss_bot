@@ -8,6 +8,7 @@
 # NEW: 관제탑(/avwap) 내 NQ=F 3단 매크로 방어선(체결 기준 지수 및 동적 역행 임계치) 실시간 상태 렌더링 주입 (Case 13, 66, 67)
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
 # MODIFIED: 전술 제어반(/settlement) 내 마스터 전원(ON/OFF)과 세션별 실시간 출동상태(09:30 정규장 진입봉쇄 등) 분리 렌더링 결속 (Case 13, 37, 53, 57)
+# NEW: 복리 모드(익절 +0.50% 순수익 가산 / 손절 수수료 0.14% 포함 실손실 차감) vs 단리 모드 토글 버튼 및 소수점 둘째 자리 복리 시드($10,050.00) 실시간 표출 결속
 
 import asyncio
 from datetime import datetime, timedelta
@@ -35,6 +36,7 @@ def get_main_menu_text() -> str:
         "      (NQ=F 당일 진폭 2.0% 미만 & SOXS 1분봉 RSI ≤ 30.0 감시)\n"
         "      (포착 즉시 실시간 현재가 기준 LIMIT 지정가 매수 발사)\n"
         "      (전량 체결 확인 즉시 팩트 평단가 +0.64% 매도 덫 하드 락온)\n"
+        "      (복리 모드 시: 익절마다 순수익 +0.50% 가산 · 손절 시 수수료포함 차감)\n"
         "      (프리장 내 +0.64% 익절 완료 시 09:29까지 무한 재출동)\n"
         "🔹 09:30~15:58: 🔥 <b>정규장 본장 (09:30 신규 매수 마감)</b>\n"
         "      (09:30 정각 프리장 미체결 매수 주문 즉각 선취소)\n"
@@ -44,7 +46,7 @@ def get_main_menu_text() -> str:
         "🛠 <b>[ 핵심 명령어 ]</b>\n"
         "▶️ /avwap : 🔫 프리장 스나이퍼 레이더 관제탑\n"
         "▶️ /sync : 📜 SOXS 스나이퍼 지시서 동기화\n"
-        "▶️ /settlement : ⚙️ 전술 제어반 (시드/가동 ON·OFF)\n\n"
+        "▶️ /settlement : ⚙️ 전술 제어반 (복리/단리 · 시드 · 가동 ON/OFF)\n\n"
         "⚠️ /reset : 🧹 SOXS 장부 0점 소각\n"
         "⚠️ /update : 🚀 시스템 자가 업데이트\n\n"
         "🌙 <b>수동 오버나이트를 원할 경우 [전술 제어반]에서 가동을 OFF 해주세요.</b>"
@@ -95,7 +97,7 @@ def parse_session_data(all_candles: list, session_start_est: datetime) -> dict:
     reg_h, reg_l, reg_amp, reg_vwap, reg_body = calc_metrics(reg_df)
     res.update({
         "pre_h": pre_h, "pre_l": pre_l, "pre_amp": pre_amp, "pre_vwap": pre_vwap, "pre_body": pre_body,
-        "reg_h": reg_h, "reg_l": reg_l, "reg_amp": reg_vwap if False else reg_amp, "reg_vwap": reg_vwap, "reg_body": reg_body,
+        "reg_h": reg_h, "reg_l": reg_l, "reg_amp": reg_amp, "reg_vwap": reg_vwap, "reg_body": reg_body,
     })
     return res
 
@@ -172,9 +174,15 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# Case 13 & 초과 Case 57 프리장 스나이퍼 헌법 기반 세션별 상태 표출
+# MODIFIED: Case 13 & 초과 Case 57 프리장 스나이퍼 헌법 기반 세션별 상태 및 복리/단리 시드($10,050.00) 표출
 def build_compact_status(
-    symbol: str, state_tuple: tuple, buy_order_id: str, current_session: str, est_time_int: int, qty: float
+    symbol: str,
+    state_tuple: tuple,
+    buy_order_id: str,
+    current_session: str,
+    est_time_int: int,
+    qty: float,
+    is_compound: bool = True,
 ) -> str:
     budget = state_tuple[1]
     target_profit_rate = state_tuple[2]
@@ -183,6 +191,7 @@ def build_compact_status(
     target_sell_price = state_tuple[6]
     entry_session = state_tuple[8]
     state_flag = "ON" if is_active else "OFF"
+    comp_tag = "복리" if is_compound else "단리"
 
     if not is_active:
         state_text = "가동OFF(수동대기)"
@@ -207,7 +216,7 @@ def build_compact_status(
     else:
         state_text = "장외대기"
 
-    return f"🐻 <b>{symbol}</b> <code>[{state_flag}]</code> {state_text} | <code>${budget:.0f}</code>"
+    return f"🐻 <b>{symbol}</b> <code>[{state_flag}·{comp_tag}]</code> {state_text} | <code>${budget:,.2f}</code>"
 
 
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
@@ -267,7 +276,8 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     state_s = await AssassinLedger.get_state("SOXS")
     buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
-    status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, qty_s)
+    is_comp_s = await AssassinLedger.get_is_compound("SOXS")
+    status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, qty_s, is_comp_s)
 
     # Case 17 텔레그램 HTML 파서 충돌 방지를 위해 원시 부등호('<') 제거 및 '2.0%미만' 한글 치환
     nq_entry_p = float(state_s[10] or 0.0)
@@ -283,7 +293,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     else:
         macro_3rd_line = ""
 
-    # MODIFIED: RSI<=20/10 경보 상태 머신(level) 폐기에 따라 순수 RSI 수치 기준으로만 관제 상태 렌더링 (Case 17, 44)
+    # 순수 RSI 수치 기준으로만 관제 상태 렌더링 (Case 17, 44)
     rsi_ui_lines = []
     if shared_rsi_state:
         for r_sym in ("SOXS", "SOXL"):
@@ -372,6 +382,7 @@ async def build_sync_board(api_client) -> str:
 
     async def get_symbol_sync_data(symbol: str):
         state = await AssassinLedger.get_state(symbol)
+        is_comp = await AssassinLedger.get_is_compound(symbol)
         budget, target_profit_rate, entry_session = state[1], state[2], state[8]
         hold = await api_client.get_symbol_holdings_detail(symbol)
         qty, avg_price = hold.get("qty", 0.0), hold.get("avg_price", 0.0)
@@ -416,8 +427,9 @@ async def build_sync_board(api_client) -> str:
         low_rate = ((low - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
 
         return {
-            "symbol": symbol, "budget": budget, "target_profit_rate": target_profit_rate,
-            "entry_session": entry_session, "curr": curr, "avg_price": avg_price, "qty": qty,
+            "symbol": symbol, "budget": budget, "is_compound": is_comp,
+            "target_profit_rate": target_profit_rate, "entry_session": entry_session,
+            "curr": curr, "avg_price": avg_price, "qty": qty,
             "high": high, "high_rate": high_rate, "low": low, "low_rate": low_rate,
             "profit_rate": profit_rate, "profit_usd": profit_usd, "profit_krw": profit_krw,
         }
@@ -426,13 +438,14 @@ async def build_sync_board(api_client) -> str:
 
     def format_symbol(d: dict) -> str:
         profit_sign = "+" if d["profit_usd"] >= 0 else "-"
+        comp_label = "📈 복리시드" if d["is_compound"] else "💵 단리시드"
         if d["qty"] > 0:
             flag_str = f"⚡ [{d['entry_session'] or 'HOLD'}: +{d['target_profit_rate']}%]"
         else:
-            flag_str = f"⏳ 대기 (목표 +{d['target_profit_rate']}%)"
+            flag_str = f"⏳ 대기 (목표 +{d['target_profit_rate']}% · 순수익 +0.50%)"
         return (
             f"🐻 <b>[SOXS] 프리장 RSI≤30 스나이퍼 지시서</b>\n"
-            f"💵 시드: ${d['budget']:,.0f} | 🎯 {flag_str}\n"
+            f"{comp_label}: <code>${d['budget']:,.2f}</code> | 🎯 {flag_str}\n"
             f"💰 현재 ${d['curr']:.2f} / 평단 ${d['avg_price']:.2f} ({int(d['qty'])}주)\n"
             f"📈 금일 고가: ${d['high']:.2f} ({d['high_rate']:+.2f}%)\n"
             f"📉 금일 저가: ${d['low']:.2f} ({d['low_rate']:+.2f}%)\n"
@@ -451,13 +464,14 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# Case 13, 37, 53, 57 — 전술 제어반(/settlement) 내 마스터 전원(ON/OFF)과 세션별 실시간 출동상태 분리 렌더링
+# MODIFIED: Case 13, 37, 53, 57 — 전술 제어반(/settlement) 내 마스터 전원, 출동상태, 복리/단리 모드 상태 및 토글 버튼 렌더링
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
 
     state_s = await AssassinLedger.get_state("SOXS")
     buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
+    is_comp_s = await AssassinLedger.get_is_compound("SOXS")
 
     last_buy_p = float(state_s[0] or 0.0)
     budget_s = float(state_s[1] or 100.0)
@@ -469,6 +483,11 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     entry_sess = str(state_s[8] or "")
 
     act_s_str = "🟢 ON (시스템 활성)" if act_s else "🔴 OFF (수동 통제)"
+    comp_s_str = (
+        "📈 복리 모드 (익절 +0.50% 가산 · 손절 수수료포함 차감)"
+        if is_comp_s
+        else "💵 단리 모드 (설정 시드 고정 출동)"
+    )
     has_position_in_ledger = (target_sell_p > 0.0 or bool(sell_id_s) or last_buy_p > 0.0)
 
     if not act_s:
@@ -511,7 +530,8 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
         "🐻 <b>SOXS (SHORT · 단방향 스나이퍼)</b>\n"
         f"▫️ 마스터 전원: <code>{act_s_str}</code>\n"
         f"▫️ 현재 출동상태: <code>{strike_status_str}</code>\n"
-        f"▫️ 설정 시드: <code>${budget_s:,.2f}</code> | 목표 익절: <code>+{rate_s}% (고정)</code>"
+        f"▫️ 시드 운용방식: <code>{comp_s_str}</code>\n"
+        f"▫️ 현재 출동시드: <code>${budget_s:,.2f}</code> | 목표 익절: <code>+{rate_s}% (순수익 +0.50%)</code>"
     )
 
     keyboard = InlineKeyboardMarkup(
@@ -522,7 +542,13 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
                     callback_data="toggle_set_act_SOXS",
                 )
             ],
-            [InlineKeyboardButton(text="💵 SOXS 시드 설정", callback_data="set_budget_SOXS")],
+            [
+                InlineKeyboardButton(
+                    text="💵 단리(시드고정) 전환" if is_comp_s else "📈 복리(+0.50%증액) 전환",
+                    callback_data="toggle_compound_SOXS",
+                ),
+                InlineKeyboardButton(text="💵 SOXS 시드 설정", callback_data="set_budget_SOXS"),
+            ],
             [
                 InlineKeyboardButton(text="🔫 스나이퍼 레이더", callback_data="open_avwap"),
                 InlineKeyboardButton(text="🔙 메인 메뉴", callback_data="back_to_main"),

@@ -7,6 +7,7 @@
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 임계 윈도우 데드코드 및 AVWAPEngine 영구 소각
 # MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
 # MODIFIED: SOXS 단일 타겟 하드 락온 및 +0.64% 목표 익절률 고정, 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30, 68)
+# NEW: 복리 모드(is_compound) 상태 관리 및 익절 시 순수익 +0.50% 가산 / 손절 시 왕복 수수료(0.14%) 포함 실손실금 차감 복리 엔진 탑재
 
 import os
 import json
@@ -56,7 +57,7 @@ def calculate_rsi_1m(
     if df.empty:
         return 0.0, 0.0
 
-    # NEW: 실시간 현재가(current_price)가 주입된 경우 최신 진행 분봉(iloc[-1])의 종가·고가·저가 즉시 동기화
+    # 실시간 현재가(current_price)가 주입된 경우 최신 진행 분봉(iloc[-1])의 종가·고가·저가 즉시 동기화
     if current_price is not None and current_price > 0.0:
         last_idx = df.index[-1]
         df.at[last_idx, "closePrice"] = float(current_price)
@@ -66,7 +67,7 @@ def calculate_rsi_1m(
         if cur_low <= 0.0 or cur_low > float(current_price):
             df.at[last_idx, "lowPrice"] = float(current_price)
 
-    # MODIFIED: 전체 데이터(df)를 대상으로 RSI를 선행 연산하여 과거 데이터 단절 방어 및 ZeroDivision(inf) 안전 처리 (Case 23, 72)
+    # 전체 데이터(df)를 대상으로 RSI를 선행 연산하여 과거 데이터 단절 방어 및 ZeroDivision(inf) 안전 처리 (Case 23, 72)
     delta = df["closePrice"].diff()
     gain = delta.where(delta > 0.0, 0.0)
     loss = -delta.where(delta < 0.0, 0.0)
@@ -74,7 +75,7 @@ def calculate_rsi_1m(
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
 
-    # NEW: 1.5초 메인 루프에서 O(1) 실시간 틱 RSI를 합성할 수 있도록 직전 확정 분봉(iloc[-2])의 EWM 기저 상태 추출
+    # 1.5초 메인 루프에서 O(1) 실시간 틱 RSI를 합성할 수 있도록 직전 확정 분봉(iloc[-2])의 EWM 기저 상태 추출
     if isinstance(ewm_state_out, dict):
         if len(df) >= 2:
             ewm_state_out["prev_close"] = float(df["closePrice"].iloc[-2])
@@ -115,7 +116,7 @@ def compute_realtime_tick_rsi(
     live_price: float, ewm_state: dict, fallback_rsi: float = 0.0, period: int = 14
 ) -> float:
     """
-    NEW: 1.5초 메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 RSI 합성 엔진.
+    1.5초 메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 RSI 합성 엔진.
     직전 확정 분봉(t-1)의 Wilder's EWM 기저 상태에 실시간 현재가(live_price)를 대입하여
     추가 API 호출 0회로 순간적인 급락 타점(RSI <= 30.0)을 1.5초 이내에 즉시 포착합니다.
     """
@@ -235,6 +236,10 @@ class MacroDataCache:
 class AssassinLedger:
     ALLOWED_SYMBOLS = ("SOXS",)
     DEFAULT_TARGET_PROFIT_RATE = 0.64
+    # NEW: 복리 모드 전용 핵심 상수 (목표 익절 +0.64% - 협의 왕복수수료 0.14% = 순수익 +0.50% 복리 증액)
+    NET_TP_COMPOUND_RATE = 0.50
+    ONE_WAY_COMM_RATE = 0.0007
+    MIN_BUDGET_FLOOR = 10.0
 
     @classmethod
     def _validate_symbol(cls, symbol: str) -> str:
@@ -315,6 +320,73 @@ class AssassinLedger:
                     return ""
             return await asyncio.to_thread(_read)
 
+    # NEW: 복리 모드(is_compound) 활성화 상태 조회 (기본값 True)
+    @classmethod
+    async def get_is_compound(cls, symbol: str) -> bool:
+        filepath = cls._get_file_path(symbol)
+        async with GlobalThrottle.get_file_lock(filepath):
+            def _read():
+                if not os.path.exists(filepath):
+                    return True
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if not isinstance(data, dict):
+                            return True
+                        return bool(data.get("is_compound", True))
+                except Exception:
+                    return True
+            return await asyncio.to_thread(_read)
+
+    # NEW: 복리 모드 정산 시 차기 출동 시드(new_budget), 순증감액(net_delta_usd), 왕복 수수료(comm_usd) 원자적 산출
+    @classmethod
+    def calc_compound_next_budget(
+        cls,
+        current_budget: float,
+        is_take_profit: bool,
+        entry_price: float = 0.0,
+        exit_price: float = 0.0,
+        filled_qty: float = 0.0,
+    ) -> tuple[float, float, float]:
+        base_budget = float(current_budget) if (current_budget and math.isfinite(current_budget)) else 100.0
+        if base_budget < cls.MIN_BUDGET_FLOOR:
+            base_budget = cls.MIN_BUDGET_FLOOR
+
+        if is_take_profit:
+            # 익절 시: 설정 시드 기준 순수익률 +0.50% (세전 +0.64% - 왕복 수수료 0.14%) 복리 가산
+            net_delta_usd = round(base_budget * (cls.NET_TP_COMPOUND_RATE / 100.0), 2)
+            comm_usd = round(base_budget * (cls.ONE_WAY_COMM_RATE * 2.0), 2)
+            new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
+            return new_budget, net_delta_usd, comm_usd
+
+        # 손절 / MOC / 수동 청산 시: 실제 손실금에 왕복 수수료(0.14%)를 포함하여 시드에서 차감
+        if entry_price > 0.0 and exit_price > 0.0 and filled_qty > 0.0:
+            invested_usd = float(entry_price) * float(filled_qty)
+            returned_usd = float(exit_price) * float(filled_qty)
+            gross_pnl_usd = returned_usd - invested_usd
+            comm_usd = (invested_usd + returned_usd) * cls.ONE_WAY_COMM_RATE
+            net_delta_usd = round(gross_pnl_usd - comm_usd, 2)
+            new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
+            return new_budget, net_delta_usd, round(comm_usd, 2)
+
+        # 체결 단가만 확보되고 체결 수량이 누락된 경우 시드 기준 추정 수량으로 역산
+        if entry_price > 0.0 and exit_price > 0.0:
+            est_qty = math.floor(base_budget / float(entry_price))
+            if est_qty > 0:
+                invested_usd = float(entry_price) * est_qty
+                returned_usd = float(exit_price) * est_qty
+                gross_pnl_usd = returned_usd - invested_usd
+                comm_usd = (invested_usd + returned_usd) * cls.ONE_WAY_COMM_RATE
+                net_delta_usd = round(gross_pnl_usd - comm_usd, 2)
+                new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
+                return new_budget, net_delta_usd, round(comm_usd, 2)
+
+        # 체결 데이터가 완전히 지연된 경우 최소 왕복 수수료(0.14%) 차감 폴백
+        comm_usd = round(base_budget * (cls.ONE_WAY_COMM_RATE * 2.0), 2)
+        net_delta_usd = -comm_usd
+        new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
+        return new_budget, net_delta_usd, comm_usd
+
     @classmethod
     async def save_state(
         cls,
@@ -333,6 +405,7 @@ class AssassinLedger:
         nq_entry_price: float = None,
         nq_entry_amp: float = None,
         entry_trend: str = None,
+        is_compound: bool = None,
     ):
         filepath = cls._get_file_path(symbol)
         async with GlobalThrottle.get_file_lock(filepath):
@@ -348,11 +421,13 @@ class AssassinLedger:
                         pass
 
                 data["target_profit_rate"] = cls.DEFAULT_TARGET_PROFIT_RATE
+                if "is_compound" not in data:
+                    data["is_compound"] = True
 
                 if price is not None:
                     data["last_buy_price"] = price
                 if budget is not None:
-                    data["budget"] = budget
+                    data["budget"] = round(float(budget), 2)
                 if last_session_id is not None:
                     data["last_session_id"] = last_session_id
                 if is_session_done is not None:
@@ -375,6 +450,8 @@ class AssassinLedger:
                     data["nq_entry_amp"] = nq_entry_amp
                 if entry_trend is not None:
                     data["entry_trend"] = entry_trend
+                if is_compound is not None:
+                    data["is_compound"] = bool(is_compound)
 
                 for obsolete_key in [
                     "pre_first_flag", "force_downgrade", "force_downgrade_0_6", "is_stage_3",
