@@ -12,13 +12,14 @@
 # MODIFIED: 스나이퍼 OFF 상태 중 수동 청산 식별 시 타전 억제(Silent Reset) 분기 결속 (Case 46)
 # NEW: MOC 및 매크로 덤핑 시 미체결 매도 선취소 후 수량 해방(sellableQuantity > 0) 2.0초 폴링 대기 및 거래소 취소 병목 시 기존 매도 주문 가격 즉시 정정(modify_order) 우회 타격망 결속 (Case 16, 24, 69)
 # NEW: 전술 제어반 목표 익절률(+0.64% vs +1.00%) 동적 연동, 보유 중 익절률 변경 시 매도 덫 자동 재장전 및 복리 모드(+0.50% / +0.86% 순수익 가산, 손절 시 수수료 0.14% 포함 실손실 차감) 결속
+# NEW: 데이장(19:00~03:59 EST) SOXS RSI<=30.0 포착 시 실거래 매수 없이 관측용 텔레그램 알림만 타전하는 히스테리시스(재장전 RSI>=35.0) 알림 플러그인 탑재 (Case 01, 36, 53)
 
 import math
 import time
 import asyncio
 import html
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from aiogram import Bot
 
@@ -27,12 +28,18 @@ from quant_engine import AssassinLedger, MacroDataCache
 
 EST_TZ = ZoneInfo("America/New_York")
 PRE_SNIPER_RSI_THRESHOLD = 30.0
+# NEW: 데이장(19:00~03:59 EST) SOXS RSI<=30 알림 재장전 히스테리시스 임계치 및 쿨다운 상수
+DAY_RSI_REARM_THRESHOLD = 35.0
+DAY_RSI_ALERT_COOLDOWN_SEC = 180.0
 
-# 무음 불발(Silent Drop) 방어 및 스팸 억제용 인메모리 경보 캐시 (Case 18)
+# 무음 불발(Silent Drop) 방어 및 데이장 히스테리시스 스팸 억제용 인메모리 경보 캐시 (Case 18)
 _STRIKE_ALERT_CACHE = {
     "last_warn_session": "",
     "last_err_msg": "",
     "last_macro1_date": "",
+    "day_logical_date": "",
+    "day_rsi30_armed": True,
+    "last_day_rsi30_ts": 0.0,
 }
 
 
@@ -63,7 +70,7 @@ async def _cancel_open_orders_and_wait_sellable(
     cancel_all_sides: bool = False,
 ) -> tuple[int, list[str]]:
     """
-    NEW: MOC 및 매크로 긴급 덤핑 전 기존 미체결 주문(익절 TRAP 등)을 중복 없이 선취소하고,
+    MOC 및 매크로 긴급 덤핑 전 기존 미체결 주문(익절 TRAP 등)을 중복 없이 선취소하고,
     미국 거래소에서 수량 잠금이 해제되어 sellableQuantity > 0이 될 때까지 최대 2.0초(0.25초 * 8회) 폴링 대기합니다.
     만약 장마감 주문 폭주로 취소가 지연/거부되어 여전히 잠겨 있는 SELL 주문이 있다면 해당 주문 ID 리스트를 반환하여
     즉시 가격 정정(modify_order) 우회 타격이 가능하도록 지원합니다.
@@ -131,6 +138,86 @@ async def _cancel_open_orders_and_wait_sellable(
     return sellable_q_int, surviving_sell_ids
 
 
+# NEW: 데이장(19:00 ~ 03:59 EST) SOXS RSI <= 30.0 관측 전용 텔레그램 알림 플러그인 (실거래 매수 0% 원천 차단)
+async def execute_daymarket_rsi_alert_plugin(
+    ctx: SniperPluginContext,
+    symbol: str,
+    now_est: datetime,
+    current_price: float,
+    rsi_val: float,
+    vwap_val: float = 0.0,
+):
+    if symbol != "SOXS" or rsi_val <= 0.0:
+        return
+
+    est_hm = now_est.hour * 100 + now_est.minute
+    is_day_market = (est_hm >= 1900 or est_hm <= 359)
+    if not is_day_market:
+        return
+
+    # Case 01 & 초과 Case 36: 19:00 EST 기준 논리적 거래일 산출 및 날짜 변경 시 알림 락 자동 초기화
+    logical_dt = (now_est + timedelta(days=1)) if now_est.hour >= 19 else now_est
+    logical_date_str = logical_dt.strftime("%Y-%m-%d")
+
+    if _STRIKE_ALERT_CACHE.get("day_logical_date") != logical_date_str:
+        _STRIKE_ALERT_CACHE["day_logical_date"] = logical_date_str
+        _STRIKE_ALERT_CACHE["day_rsi30_armed"] = True
+        _STRIKE_ALERT_CACHE["last_day_rsi30_ts"] = 0.0
+
+    # 히스테리시스 재장전: RSI가 35.0 이상으로 회복되면 차기 하락 파동 감시를 위해 Armed = True 복원
+    if rsi_val >= DAY_RSI_REARM_THRESHOLD:
+        if not _STRIKE_ALERT_CACHE.get("day_rsi30_armed", True):
+            _STRIKE_ALERT_CACHE["day_rsi30_armed"] = True
+        return
+
+    # 발사 조건: 0.0 < RSI <= 30.0 및 Armed == True 및 최소 180초 쿨다운 경과
+    if 0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD:
+        now_ts = time.time()
+        last_ts = float(_STRIKE_ALERT_CACHE.get("last_day_rsi30_ts", 0.0))
+        if not _STRIKE_ALERT_CACHE.get("day_rsi30_armed", True):
+            return
+        if (now_ts - last_ts) < DAY_RSI_ALERT_COOLDOWN_SEC:
+            return
+
+        state_s = await AssassinLedger.get_state(symbol)
+        is_active = bool(state_s[5])
+        if not is_active:
+            return
+
+        if current_price <= 0.0:
+            try:
+                current_price = await ctx.client.get_current_price(symbol)
+            except Exception:
+                current_price = 0.0
+        if current_price <= 0.0:
+            return
+
+        _STRIKE_ALERT_CACHE["day_rsi30_armed"] = False
+        _STRIKE_ALERT_CACHE["last_day_rsi30_ts"] = now_ts
+
+        if vwap_val <= 0.0 and ctx.shared_rsi_state and symbol in ctx.shared_rsi_state:
+            vwap_val = float(ctx.shared_rsi_state[symbol].get("vwap", 0.0))
+
+        nq_c_global, nq_h_global, nq_l_global = await MacroDataCache.get_cached_nq_data()
+        nq_amp_global = (
+            ((nq_h_global - nq_l_global) / nq_l_global * 100.0) if nq_l_global > 0.0 else 0.0
+        )
+
+        sim_tp_064 = math.ceil(current_price * 1.0064 * 100.0) / 100.0
+        sim_tp_100 = math.ceil(current_price * 1.0100 * 100.0) / 100.0
+        vwap_str = f"${vwap_val:.2f}" if vwap_val > 0.0 else "집계중"
+
+        await ctx.notify_tg(
+            f"🔔 <b>[데이장 관측 레이더] {symbol} RSI≤30 과매도 포착 (알림전용 · 매수차단)</b>\n"
+            f"▫️ 포착 시각: <code>{now_est.strftime('%H:%M:%S')} EST</code> (0세션 데이마켓)\n"
+            f"▫️ 실시간 1분봉 RSI: <code>{rsi_val:.1f}</code> (기준 ≤ 30.0 · 재장전 ≥ 35.0)\n"
+            f"▫️ 현재가: <code>${current_price:.2f}</code> | 데이장 VWAP: <code>{vwap_str}</code>\n"
+            f"▫️ NQ=F 당일 진폭: <code>{nq_amp_global:.2f}%</code> (현재지수 <code>{nq_c_global:.2f}</code>)\n"
+            f"▫️ 가상 익절 타점: <code>+0.64% (${sim_tp_064:.2f})</code> | <code>+1.00% (${sim_tp_100:.2f})</code>\n"
+            "▫️ 조치: <code>초과 Case 53 의거 데이장 실거래 매수는 차단되며 관측 알림만 전송됩니다.</code>"
+        )
+
+
 async def execute_rsi_monitoring_plugin(
     ctx: SniperPluginContext, symbol: str, rsi_val: float, vwap_val: float, current_price: float
 ):
@@ -141,15 +228,26 @@ async def execute_rsi_monitoring_plugin(
     if not state:
         return
 
-    # 듀얼 관제탑(/avwap) 표출용 실시간 RSI 및 VWAP 상태만 갱신하고, RSI<=20/10 텔레그램 푸시 알림은 영구 폐기
+    # 듀얼 관제탑(/avwap) 표출용 실시간 RSI 및 VWAP 상태 갱신
     state["value"] = rsi_val
     state["vwap"] = vwap_val
 
-    # Case 25 & Case 59: 프리장(04:00~09:29 EST) 내 SOXS RSI <= 30.0 포착 즉시 메인 루프 기상 트리거 격발
     now_est = datetime.now(EST_TZ)
     est_hm = now_est.hour * 100 + now_est.minute
+
+    # Case 25 & Case 59: 프리장(04:00~09:29 EST) 내 SOXS RSI <= 30.0 포착 즉시 메인 루프 기상 트리거 격발
     if symbol == "SOXS" and (400 <= est_hm <= 929) and (0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD):
         ctx.wakeup_event.set()
+    # NEW: 데이장(19:00~03:59 EST) 내 SOXS RSI <= 30.0 포착 시 관측 전용 텔레그램 알림 플러그인 실행
+    elif symbol == "SOXS" and (est_hm >= 1900 or est_hm <= 359):
+        await execute_daymarket_rsi_alert_plugin(
+            ctx=ctx,
+            symbol=symbol,
+            now_est=now_est,
+            current_price=current_price,
+            rsi_val=rsi_val,
+            vwap_val=vwap_val,
+        )
 
 
 async def execute_moc_zero_overnight_plugin(
@@ -550,7 +648,7 @@ async def reconcile_zero_holdings_exit_plugin(
         is_manual_exit = (was_holding and not is_take_profit_exit and not is_moc_time and not is_trap_survived)
         is_buy_cancel_exit = (not was_holding and not is_take_profit_exit and not is_moc_time and not is_trap_survived)
 
-        # MODIFIED: 선택된 목표 익절률(+0.64% -> 순수익 +0.50%, +1.00% -> 순수익 +0.86%) 연동 복리 시드 자동 갱신
+        # 선택된 목표 익절률(+0.64% -> 순수익 +0.50%, +1.00% -> 순수익 +0.86%) 연동 복리 시드 자동 갱신
         updated_budget = None
         compound_str = ""
         if was_holding and not is_buy_cancel_exit:
@@ -806,8 +904,8 @@ async def manage_mechanical_profit_trap_plugin(
     active_rate = AssassinLedger.normalize_target_rate(target_profit_rate)
     avg_price = float(holdings_detail.get("avg_price", 0.0)) or last_buy_price
 
-    # NEW: 포지션 보유 및 매도 덫 대기 중 사용자가 제어반(/settlement)에서 목표 익절률(+0.64% <-> +1.00%)을 변경한 경우
-    # 기존 매도 덫을 선취소하고 차기 루프(즉시 기상)에서 새로운 목표 익절가로 자동 재장전!
+    # 포지션 보유 및 매도 덫 대기 중 사용자가 제어반(/settlement)에서 목표 익절률(+0.64% <-> +1.00%)을 변경한 경우
+    # 기존 매도 덫을 선취소하고 차기 루프(즉시 기상)에서 새로운 목표 익절가로 자동 재장전
     if (
         holdings_qty > 0
         and sell_order_id

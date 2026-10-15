@@ -9,6 +9,7 @@
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
 # MODIFIED: 전술 제어반(/settlement) 내 마스터 전원(ON/OFF)과 세션별 실시간 출동상태(09:30 정규장 진입봉쇄 등) 분리 렌더링 결속 (Case 13, 37, 53, 57)
 # NEW: 전술 제어반(/settlement) 내 목표 익절률(+0.64%[순+0.50%] vs +1.00%[순+0.86%]) 선택 버튼 및 복리/단리 모드 토글, 소수점 둘째 자리 시드 실시간 표출 결속
+# NEW: 데이장(19:00~03:59 EST) SOXS RSI<=30.0 관측 알림 전용 모드(매수차단 · 재장전 RSI>=35.0) 상태 표출 동기화 (Case 53, 57)
 
 import asyncio
 from datetime import datetime, timedelta
@@ -38,8 +39,11 @@ async def get_main_menu_text() -> str:
         f"🕒 <b>[ 프리장 SOXS 단방향 RSI≤30 스나이퍼 스케줄 ({dst_status_text}) ]</b>\n"
         f"▫️ 현재 설정: <b>목표 익절 +{active_rate:.2f}% (순수익 +{net_rate:.2f}%) · {comp_mode_str}</b>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
-        "🔹 19:00~03:59: 🌙 0세션 데이마켓 대기 (신규 매수 차단 · 듀얼 RSI 관제)\n"
-        "🔹 04:00~09:29: 🔫 <b>프리장 스나이퍼 골든타임 (무한 출동)</b>\n"
+        "🔹 19:00~03:59: 🌙 <b>0세션 데이마켓 (관측 알림 전용 · 매수차단)</b>\n"
+        "      (실거래 매수 100% 차단 · 1분봉 캔들 수집 및 듀얼 RSI 관제)\n"
+        "      (🔔 SOXS 1분봉 RSI ≤ 30.0 도달 시 관측용 텔레그램 알림 발송)\n"
+        "      (히스테리시스 적용: RSI ≥ 35.0 회복 시 차기 알림 자동 재장전)\n"
+        "🔹 04:00~09:29: 🔫 <b>프리장 스나이퍼 골든타임 (실거래 무한 출동)</b>\n"
         "      (NQ=F 당일 진폭 2.0% 미만 & SOXS 1분봉 RSI ≤ 30.0 감시)\n"
         "      (포착 즉시 실시간 현재가 기준 LIMIT 지정가 매수 발사)\n"
         f"      (전량 체결 확인 즉시 팩트 평단가 +{active_rate:.2f}% 매도 덫 하드 락온)\n"
@@ -181,7 +185,7 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# Case 13 & 초과 Case 57 프리장 스나이퍼 헌법 기반 세션별 상태 및 선택된 목표 익절률(+0.64% / +1.00%), 복리/단리 시드 표출
+# MODIFIED: Case 13 & 초과 Case 57 프리장 스나이퍼 헌법 기반 세션별 상태(데이장 RSI≤30 알림감시 포함) 표출
 def build_compact_status(
     symbol: str,
     state_tuple: tuple,
@@ -212,7 +216,7 @@ def build_compact_status(
     elif entry_session == "CANCELED_MACRO":
         state_text = "🛑 매크로방어 발동(금일 마감)"
     elif current_session == "dayMarket":
-        state_text = f"🌙 데이장 대기(04:00 · 목표+{active_rate:.2f}%)"
+        state_text = f"🔔 데이장 RSI≤30 알림감시(매수차단·목표+{active_rate:.2f}%)"
     elif 400 <= est_time_int <= 929:
         if not is_done:
             state_text = f"🔫 프리장 RSI≤30 감시중(목표+{active_rate:.2f}%)"
@@ -229,8 +233,10 @@ def build_compact_status(
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
+    is_day_time = (t >= 1900 or t <= 359)
+    is_pre_time = (400 <= t <= 929)
 
-    if 400 <= t <= 929:
+    if is_pre_time:
         session_name_ui = "preMarket"
         market_header = "( <b>🌅 PRE_MARKET · 스나이퍼 골든타임</b> )"
         pre_window_label = "(04:00~09:29 · 무한 출동 가동중)"
@@ -244,7 +250,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         pre_window_label = "(04:00~09:29 · 출동 마감)"
     else:
         session_name_ui = "dayMarket"
-        market_header = "( <b>🌙 데이마켓 · 04:00 대기</b> )"
+        market_header = "( <b>🌙 데이마켓 · 🔔SOXS RSI≤30 알림전용</b> )"
         pre_window_label = "(04:00~09:29 · 개장 대기)"
 
     try:
@@ -300,7 +306,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     else:
         macro_3rd_line = ""
 
-    # 순수 RSI 수치 기준으로만 관제 상태 렌더링 (Case 17, 44)
+    # MODIFIED: 세션별(프리장 타격권 / 데이장 알림권 / 정규장 진입마감) RSI 관제 상태 렌더링 (Case 17, 44, 53)
     rsi_ui_lines = []
     if shared_rsi_state:
         for r_sym in ("SOXS", "SOXL"):
@@ -310,7 +316,12 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
                 if r_sym == "SOXS":
                     if 0.0 < r_val <= 30.0:
-                        warn_str = "🔫 스나이퍼 타격권(≤30)"
+                        if is_pre_time:
+                            warn_str = "🔫 스나이퍼 타격권(≤30)"
+                        elif is_day_time:
+                            warn_str = "🔔 데이장 알림권(≤30 · 매수차단)"
+                        else:
+                            warn_str = "📉 과매도(≤30 · 진입마감)"
                     else:
                         warn_str = "🟢 안정(30초과)"
                 else:
@@ -372,7 +383,7 @@ async def build_sync_board(api_client) -> str:
     elif 1600 <= t <= 1659:
         market_state = "⛔ 장마감"
     else:
-        market_state = "🌙 데이마켓 대기"
+        market_state = "🌙 데이마켓 (🔔RSI≤30 알림가동)"
 
     bp = await api_client.get_usd_buying_power()
     exchange_rate = 1400.0
@@ -474,7 +485,7 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: 전술 제어반(/settlement) 내 목표 익절률(+0.64% vs +1.00%) 선택 버튼 및 복리/단리 모드 토글 렌더링
+# MODIFIED: 전술 제어반(/settlement) 내 목표 익절률(+0.64% vs +1.00%) 선택 버튼, 복리/단리 토글 및 데이장 알림 가동 상태 렌더링
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
@@ -507,7 +518,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     has_position_in_ledger = (target_sell_p > 0.0 or bool(sell_id_s) or last_buy_p > 0.0)
 
     if not act_s:
-        strike_status_str = "⏸️ 가동OFF (자동 매수·방어·MOC 전면 중지)"
+        strike_status_str = "⏸️ 가동OFF (자동 매수·방어·MOC·알림 전면 중지)"
     elif entry_sess == "CANCELED_MACRO":
         strike_status_str = "🛑 매크로 방어 발동 (금일 신규진입 영구 소각)"
     elif 400 <= t <= 929:
@@ -533,7 +544,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     elif 1559 <= t <= 1601:
         strike_status_str = "🛑 15:59~16:01 제로-오버나이트 MOC 강제 청산 윈도우"
     elif t >= 1900 or t < 400:
-        strike_status_str = "🌙 데이마켓 대기 (04:00 프리장 개장 전 매수차단)"
+        strike_status_str = "🌙 데이마켓 대기 (매수차단 · 🔔 SOXS RSI≤30 관측알림 가동)"
     else:
         strike_status_str = "⛔ 장외/애프터장 대기 (신규진입 차단)"
 
@@ -543,7 +554,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     text = (
         "⚙️ <b>[단방향 전술 코어 제어반 (프리장 SOXS 스나이퍼)]</b>\n"
         f"▫️ <b>전술 모드:</b> <code>🔫 프리장(04:00~09:29 EST) RSI≤30 요격 & +{rate_s:.2f}% 익절</code>\n"
-        "▫️ <b>타격 원칙:</b> <code>프리장 익절 시 무한 재출동 / 09:30 정규장 진입 봉쇄</code>\n"
+        "▫️ <b>데이장 모드:</b> <code>🔔 데이장(19:00~03:59 EST) SOXS RSI≤30 관측 알림 전용 (매수차단)</code>\n"
         "▫️ <b>방어 체계:</b> <code>NQ=F 3단 매크로 손절 덤핑 & 15:59 제로-오버나이트 MOC</code>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
         "🐻 <b>SOXS (SHORT · 단방향 스나이퍼)</b>\n"

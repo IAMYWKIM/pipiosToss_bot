@@ -12,6 +12,7 @@
 # MODIFIED: 17:00 EST GC 가동 시 is_session_done=False 초기화 및 19:00 EST 논리적 거래일 롤오버 적용으로 전일 마감 락 이월 원천 차단 (Case 01, 22, 36)
 # NEW: 프리장(04:00~09:29 EST) 미보유·무주문·비매크로차단 상태에서 구버전 잔재 잠금(is_session_done=True) 감지 시 즉시 해제하는 자가 치유(Self-Healing) 가드 주입 (Case 52)
 # NEW: 시스템 기동 시 장부 내 선택된 목표 익절률(+0.64% vs +1.00%) 및 복리/단리 시드 모드를 동적으로 읽어 부팅 타전에 반영
+# NEW: 데이장(19:00~03:59 EST) SOXS 15초 캔들 스캔 가속 및 1.5초 실시간 틱 RSI<=30.0 관측 알림 플러그인(execute_daymarket_rsi_alert_plugin) 메인 루프 결속 (Case 53)
 
 import sys
 import os
@@ -38,6 +39,7 @@ from candle_recorder import record_candles_loop
 from sniper_plugin import (
     SniperPluginContext,
     PRE_SNIPER_RSI_THRESHOLD,
+    execute_daymarket_rsi_alert_plugin,
     execute_moc_zero_overnight_plugin,
     execute_macro_defense_plugin,
     enforce_0930_regular_cutoff_plugin,
@@ -90,7 +92,7 @@ in_memory_ordering_lock = {TRADE_SYMBOL: False}
 dual_strike_mutex = asyncio.Lock()
 shared_holdings = {TRADE_SYMBOL: 0}
 
-# MODIFIED: RSI<=20/10 경보 상태 머신 폐기에 따라 불필요한 level 키 소각 및 ewm_state 슬롯 유지
+# RSI<=20/10 경보 상태 머신 폐기에 따라 불필요한 level 키 소각 및 ewm_state 슬롯 유지
 shared_rsi_state = {
     sym: {"value": 0.0, "vwap": 0.0, "ewm_state": {}} for sym in RSI_SYMBOLS
 }
@@ -228,10 +230,15 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
         except Exception as e:
             print(f"🚨 [RSI 레이더망 {symbol}] 붕괴 방어: {e}", flush=True)
 
-        # 프리장 골든타임(04:00~09:29 EST) 중 SOXS 캔들 스캔 주기를 5초로 가속하여 EWM 기저 상태 초고속 동기화
+        # MODIFIED: 프리장(04:00~09:29 EST) 중 SOXS 5초 스캔, 데이장(19:00~03:59 EST) 중 SOXS 15초 스캔으로 EWM 기저 상태 동기화
         now_est_chk = datetime.now(EST_TZ)
         est_hm_chk = now_est_chk.hour * 100 + now_est_chk.minute
-        sleep_sec = 5.0 if (symbol == "SOXS" and 400 <= est_hm_chk <= 929) else 60.0
+        if symbol == "SOXS" and (400 <= est_hm_chk <= 929):
+            sleep_sec = 5.0
+        elif symbol == "SOXS" and (est_hm_chk >= 1900 or est_hm_chk <= 359):
+            sleep_sec = 15.0
+        else:
+            sleep_sec = 60.0
         await asyncio.sleep(sleep_sec)
 
 
@@ -521,6 +528,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
 
             # 1.5초 메인 루프 실시간 틱 RSI(compute_realtime_tick_rsi) 즉시 합성
             is_premarket_window = (400 <= est_time_int <= 929)
+            is_daymarket_window = (est_time_int >= 1900 or est_time_int <= 359)
             sym_rsi_dict = ctx.shared_rsi_state.setdefault(
                 symbol, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
             )
@@ -535,6 +543,17 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 sym_rsi_dict["value"] = live_rsi_val
             else:
                 live_rsi_val = fallback_rsi
+
+            # NEW: 데이장(19:00~03:59 EST) 중 SOXS RSI <= 30.0 포착 시 실거래 매수 없이 관측용 텔레그램 알림만 타전 (Case 53)
+            if is_active and is_daymarket_window and live_rsi_val > 0.0:
+                await execute_daymarket_rsi_alert_plugin(
+                    ctx=ctx,
+                    symbol=symbol,
+                    now_est=now_est,
+                    current_price=current_price,
+                    rsi_val=live_rsi_val,
+                    vwap_val=float(sym_rsi_dict.get("vwap", 0.0)),
+                )
 
             # 목표 1 & Case 15, 25, 52, 53, 59 — 프리장(04:00~09:29 EST) SOXS RSI<=30.0 실거래 지정가 매수 발사
             if (
@@ -636,7 +655,7 @@ async def main():
             text=(
                 "✅ <b>[시스템 기동 완료 — 프리장 SOXS 단방향 RSI≤30 실거래 스나이퍼]</b>\n"
                 "▫️ 타겟: <b>SOXS(숏)</b> 배타적 실물 자산 투입 (SOXL 매매 영구 차단)\n"
-                "▫️ 관제: <b>5초 고해상도 캔들 동기화 + 1.5초 실시간 틱 RSI 합성</b> 상시 가동\n"
+                "▫️ 데이장: <b>19:00~03:59 EST</b> 신규 매수 차단 · <b>SOXS RSI≤30.0 관측 알림 전용 가동</b>\n"
                 "▫️ 타격: <b>프리장(04:00~09:29 EST)</b> NQ=F 진폭 2.0% 미만 & <b>SOXS 실시간 RSI≤30.0</b> 포착 시 현재가 지정가(LIMIT) 즉시 매수\n"
                 f"▫️ 익절: 현재 설정 <b>+{boot_rate:.2f}% (순수익 +{boot_net_rate:.2f}%)</b> · 제어반(/settlement)에서 <b>+0.64% / +1.00%</b> 즉시 전환 가능\n"
                 f"▫️ 시드: <b>${boot_budget:,.2f}</b> · {comp_desc}\n"
