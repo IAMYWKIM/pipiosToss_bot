@@ -7,7 +7,8 @@
 # MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30~17:00 EST로 전면 확장 (Case 07)
 # NEW: 09:30 EST 정규장 컷오프 및 프리장 미체결 매수 즉시 파기 플러그인(enforce_0930_regular_cutoff_plugin) 메인 루프 결속 (Case 48, 53)
 # NEW: 프리장(04:00~09:29 EST) SOXS RSI<=30.0 즉시 요격 플러그인(execute_premarket_rsi_sniper_strike_plugin) 원자적 편입 (Case 25, 52, 59, 70)
-# MODIFIED: reconcile_zero_holdings_exit_plugin 호출 시 is_active 전달로 OFF 상태 수동 청산 Silent Reset 결속 (Case 46)
+# MODIFIED: 17:00 EST GC 가동 시 is_session_done=False 초기화 및 19:00 EST 논리적 거래일 롤오버 적용으로 전일 마감 락 이월 원천 차단 (Case 01, 22, 36)
+# NEW: 프리장(04:00~09:29 EST) 미보유·무주문·비매크로차단 상태에서 구버전 잔재 잠금(is_session_done=True) 감지 시 즉시 해제하는 자가 치유(Self-Healing) 가드 주입 (Case 52)
 
 import sys
 import os
@@ -287,7 +288,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             just_turned_off = (runtime_state["prev_is_active"] is True and is_active is False)
             runtime_state["prev_is_active"] = is_active
 
-            # Case 22: 17:00 EST 가비지 컬렉션(GC) 및 일일 상태 초기화
+            # MODIFIED: Case 22 — 17:00 EST 가비지 컬렉션(GC) 실행 시 미보유 상태면 is_session_done=False 포함 장부 완전 초기화
             if 17 <= now_est.hour < 19 and runtime_state["last_gc_date"] != today_str:
                 runtime_state["last_gc_date"] = today_str
                 ctx.in_memory_ordering_lock[symbol] = False
@@ -301,6 +302,9 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 if holdings_qty == 0:
                     await AssassinLedger.save_state(
                         symbol,
+                        price=0.0,
+                        target_sell_price=0.0,
+                        is_session_done=False,
                         buy_order_id="",
                         sell_order_id="",
                         entry_session="",
@@ -339,6 +343,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 await asyncio.sleep(60.0)
                 continue
 
+            # MODIFIED: Case 01 & 초과 Case 36 — 19:00 EST 데이마켓 진입 시 논리적 거래일(익일 날짜) 기준으로 세션 ID 산출
             if 400 <= est_time_int < 930:
                 hardcoded_session = "preMarket"
                 base_h, base_m, base_date = 4, 0, now_est
@@ -351,7 +356,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             else:
                 hardcoded_session = "dayMarket"
                 base_h, base_m = 19, 0
-                base_date = now_est if now_est.hour >= 19 else now_est - timedelta(days=1)
+                base_date = (now_est + timedelta(days=1)) if now_est.hour >= 19 else now_est
 
             session_baseline_est = base_date.replace(hour=base_h, minute=base_m, second=0, microsecond=0)
             current_session_id = f"{session_baseline_est.strftime('%Y%m%d_%H%M')}_{hardcoded_session}"
@@ -414,7 +419,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     and len(last_session_id) >= 8
                     and last_session_id[:8] == current_session_id[:8]
                     and (
-                        is_session_done
+                        entry_session == "CANCELED_MACRO"
                         or bool(buy_order_id)
                         or bool(sell_order_id)
                         or target_sell_price > 0.0
@@ -450,11 +455,31 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                         target_sell_price = 0.0
                         buy_order_id = ""
                         sell_order_id = ""
+                        entry_session = ""
                 else:
                     await AssassinLedger.save_state(symbol, last_session_id=current_session_id)
                 last_session_id = current_session_id
 
-            # NEW: 목표 1 & 초과 Case 48, 53 — 09:30 EST 정규장 개장 정각 신규 매수 마감 및 미체결 매수 즉시 파기
+            # NEW: 초과 Case 52 — 프리장(04:00~09:29 EST) 무한 출동 자가 치유(Self-Healing) 가드
+            # 미보유(0주) & 미체결 주문 없음 & 매크로 차단(CANCELED_MACRO) 아님에도 구버전 잔재 등으로 잠겨 있으면 즉시 해제
+            if (
+                400 <= est_time_int <= 929
+                and is_session_done
+                and holdings_qty == 0
+                and not buy_order_id
+                and not sell_order_id
+                and target_sell_price <= 0.0
+                and last_buy_price <= 0.0
+                and entry_session != "CANCELED_MACRO"
+            ):
+                await AssassinLedger.save_state(symbol, is_session_done=False)
+                is_session_done = False
+                print(
+                    f"♻️ [프리장 자가 치유 {symbol}] 비정상 마감 락(is_session_done) 자동 해제 완료 ➡️ 프리장 RSI≤30 무한 감시 복귀",
+                    flush=True,
+                )
+
+            # 목표 1 & 초과 Case 48, 53 — 09:30 EST 정규장 개장 정각 신규 매수 마감 및 미체결 매수 즉시 파기
             is_session_done, buy_order_id = await enforce_0930_regular_cutoff_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -477,7 +502,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 )
                 continue
 
-            # NEW: 목표 1 & Case 15, 25, 52, 53, 59 — 프리장(04:00~09:29 EST) SOXS RSI<=30.0 실거래 지정가 매수 발사
+            # 목표 1 & Case 15, 25, 52, 53, 59 — 프리장(04:00~09:29 EST) SOXS RSI<=30.0 실거래 지정가 매수 발사
             is_premarket_window = (400 <= est_time_int <= 929)
             live_rsi_val = float(ctx.shared_rsi_state.get(symbol, {}).get("value", 0.0))
             if (
