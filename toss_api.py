@@ -7,9 +7,10 @@
 # MODIFIED: 외부 모듈 예외 시 제2 방어선(토스증권 API) 무중단 Fallback 경로 강제 (Case 21 방어)
 # MODIFIED: 19:00 EST 기점 논리적 거래일(Logical Trading Day) 롤오버 파이프라인 결속 (야간 데이마켓 휴장일 오인 차단)
 # MODIFIED: 초과 Case 62 - 토스 인증 모듈(_do_authenticate) HTTP 상태 코드 검증망 주입을 통한 JSON 파싱 붕괴(HTML 응답) 원천 차단
-# NEW: 초과 Case 69 - API Null 페이로드 응답 시 단락 평가(or)를 통한 AttributeError 체이닝 붕괴 완벽 방어 락온 전면 주입
+# MODIFIED: 초과 Case 69 - API Null 페이로드 응답 시 단락 평가(or)를 통한 AttributeError 체이닝 붕괴 완벽 방어 락온 전면 주입
 # MODIFIED: 치명적 엣지 케이스 방어 - 비표준 에러 문자열 페이로드 응답 시 발생하는 AttributeError('str' object has no attribute 'get') 시스템 패닉 원천 봉쇄
-# NEW: 초과 Case 71 - 매도 가능 수량(sellableQuantity) 프로빙 API 통신망 신규 개통
+# MODIFIED: 초과 Case 71 - 매도 가능 수량(sellableQuantity) 프로빙 API 통신망 신규 개통
+# NEW: 초과 Case 73 - 데이장 조기 개장(18:00 EDT 등) 시 익일 마감 롤오버 누락 방어망 주입 (start.hour >= 12 하향 락온)
 
 import asyncio
 import aiohttp
@@ -224,7 +225,6 @@ class TossApiClient:
         bp_raw = res_dict.get("cashBuyingPower")
         return float(bp_raw) if bp_raw is not None else 0.0
 
-    # NEW: 매도 가능 수량 단독 프로빙 (수동 주문 락온 감지망)
     async def get_sellable_quantity(self, symbol: str) -> float:
         if not self.account_seq: await self.fetch_account_seq()
         data = await self._request("GET", f"/api/v1/sellable-quantity?symbol={symbol}", "ORDER_INFO", headers=self._get_headers(requires_account=True))
@@ -285,7 +285,8 @@ class TossApiClient:
                             end = datetime.fromisoformat(end_str).astimezone(ZoneInfo('America/New_York'))
                             
                             if session_name == "dayMarket":
-                                if start.hour >= 19:
+                                # MODIFIED: 시작 시간이 12:00 이후(오후/저녁)일 경우 서머타임/개장시간 유동성과 무관하게 무조건 익일 03:59:59 락온
+                                if start.hour >= 12:
                                     end = (start + timedelta(days=1)).replace(hour=3, minute=59, second=59, microsecond=0)
                                 else:
                                     end = start.replace(hour=3, minute=59, second=59, microsecond=0)
