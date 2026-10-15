@@ -11,6 +11,8 @@
 # MODIFIED: 매도 가능 수량(sellableQuantity) 프로빙 API 통신망 개통
 # MODIFIED: 데이장 조기 개장(18:00 EDT 등) 시 익일 마감 롤오버 누락 방어망 주입 (start.hour >= 12 하향 락온)
 # MODIFIED: 제3헌법 및 Case 14 의거 미사용 조건주문(conditional-orders) 데드코드 메서드 3종 영구 소각
+# NEW: 스나이퍼 SOXS 단일 타겟 하드 락온 — 비허용 종목(SOXL 등) 주문 API 호출 물리적 원천 차단 쉴드 주입 (Case 09, 54)
+# NEW: 미국 주식 주문 정정(Modify) 시 quantity 파라미터 원천 적출 방어 메서드 구축 (Case 69)
 
 import asyncio
 import aiohttp
@@ -22,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 _NYSE_CALENDAR = None
 
+
 def get_nyse_holiday_name(logical_dt_est: datetime) -> str:
     """
     pandas_market_calendars 라이브러리를 활용한 미국 주식시장 정규 휴장일 명칭 원자적 추출
@@ -30,16 +33,16 @@ def get_nyse_holiday_name(logical_dt_est: datetime) -> str:
     global _NYSE_CALENDAR
     if _NYSE_CALENDAR is None:
         import pandas_market_calendars as mcal
-        _NYSE_CALENDAR = mcal.get_calendar('NYSE')
-        
+        _NYSE_CALENDAR = mcal.get_calendar("NYSE")
+
     import pandas as pd
     dt_str = logical_dt_est.strftime("%Y-%m-%d")
-    
+
     if logical_dt_est.weekday() >= 5:
         return "주말 (Weekend)"
-        
+
     schedule = _NYSE_CALENDAR.schedule(start_date=dt_str, end_date=dt_str)
-    
+
     if schedule.empty:
         try:
             dt_ts = pd.Timestamp(dt_str)
@@ -50,8 +53,9 @@ def get_nyse_holiday_name(logical_dt_est: datetime) -> str:
         except Exception:
             pass
         return "미국 주식시장 정규 휴장 (Market Calendar 식별)"
-        
+
     return ""
+
 
 class GlobalThrottle:
     _api_lock = asyncio.Lock()
@@ -63,7 +67,7 @@ class GlobalThrottle:
         async with cls._api_lock:
             now = time.time()
             elapsed = now - cls._last_api_time
-            if elapsed < 0.15:  
+            if elapsed < 0.15:
                 await asyncio.sleep(0.15 - elapsed)
             cls._last_api_time = time.time()
 
@@ -73,7 +77,11 @@ class GlobalThrottle:
             cls._file_locks[filepath] = asyncio.Lock()
         return cls._file_locks[filepath]
 
+
 class TossApiClient:
+    # NEW: 실거래 스나이퍼 허용 단일 종목 하드 락온 (Case 09, 54)
+    REAL_ALLOWED_SYMBOLS = ("SOXS",)
+
     def __init__(self, client_id: str, client_secret: str):
         self.client_id = client_id
         self.client_secret = client_secret
@@ -84,31 +92,41 @@ class TossApiClient:
         self._calendar_cache_time = 0.0
         self._auth_lock = asyncio.Lock()
 
-    async def _request(self, method: str, endpoint: str, rate_limit_group: str, headers: dict = None, json_data: dict = None, timeout: float = 10.0):
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        rate_limit_group: str,
+        headers: dict = None,
+        json_data: dict = None,
+        timeout: float = 10.0,
+    ):
         url = f"{self.base_url}{endpoint}"
         req_headers = dict(headers) if headers else {}
-        
+
         for attempt in range(3):
             await GlobalThrottle.wait_api_sync()
-            
+
             if self.token:
                 req_headers["Authorization"] = f"Bearer {self.token}"
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.request(method, url, headers=req_headers, json=json_data, timeout=timeout) as resp:
-                        
+                    async with session.request(
+                        method, url, headers=req_headers, json=json_data, timeout=timeout
+                    ) as resp:
+
                         if resp.status == 401:
                             if attempt == 2:
                                 raise Exception("API HTTP 401: Unauthorized (Max retries exceeded)")
-                            
+
                             async with self._auth_lock:
                                 failed_auth = req_headers.get("Authorization")
                                 current_system_auth = f"Bearer {self.token}" if self.token else None
                                 if failed_auth == current_system_auth or not failed_auth:
                                     await self._do_authenticate()
                             continue
-                            
+
                         if resp.status == 429:
                             if attempt == 2:
                                 raise Exception("API HTTP 429: Rate Limit Exceeded (Max retries)")
@@ -118,7 +136,7 @@ class TossApiClient:
 
                         if resp.status == 204:
                             return {}
-                            
+
                         if resp.status >= 400:
                             err_text = await resp.text()
                             try:
@@ -135,13 +153,15 @@ class TossApiClient:
                             except Exception:
                                 safe_err = html.escape(err_text)
                             raise Exception(f"API HTTP {resp.status}: {safe_err}")
-                        
+
                         return await resp.json()
             except asyncio.TimeoutError:
-                if attempt == 2: raise Exception("API Timeout")
+                if attempt == 2:
+                    raise Exception("API Timeout")
                 await asyncio.sleep(2 ** attempt)
             except Exception as e:
-                if attempt == 2: raise e
+                if attempt == 2:
+                    raise e
                 await asyncio.sleep(2 ** attempt)
 
     def _get_headers(self, requires_account: bool = False) -> dict:
@@ -161,7 +181,7 @@ class TossApiClient:
         payload = {
             "grant_type": "client_credentials",
             "client_id": self.client_id,
-            "client_secret": self.client_secret
+            "client_secret": self.client_secret,
         }
         await GlobalThrottle.wait_api_sync()
         async with aiohttp.ClientSession() as session:
@@ -182,65 +202,95 @@ class TossApiClient:
                 await asyncio.sleep(60)
 
     async def fetch_account_seq(self):
-        if not self.token: await self.authenticate()
+        if not self.token:
+            await self.authenticate()
         data = await self._request("GET", "/api/v1/accounts", "ACCOUNT", headers=self._get_headers())
-        if not isinstance(data, dict): data = {}
+        if not isinstance(data, dict):
+            data = {}
         accounts = data.get("result")
-        if not isinstance(accounts, list): accounts = []
+        if not isinstance(accounts, list):
+            accounts = []
         for acc in accounts:
             if isinstance(acc, dict) and acc.get("accountType") == "BROKERAGE":
                 self.account_seq = acc.get("accountSeq")
                 break
 
     async def get_1m_candles_pagination(self, symbol: str, count: int = 200, before: str = None) -> dict:
-        if not self.token: await self.authenticate()
+        if not self.token:
+            await self.authenticate()
         endpoint = f"/api/v1/candles?symbol={symbol}&interval=1m&count={count}"
         if before:
             endpoint += f"&before={before.replace('+', '%2B')}"
         data = await self._request("GET", endpoint, "MARKET_DATA_CHART", headers=self._get_headers())
-        if not isinstance(data, dict): return {}
+        if not isinstance(data, dict):
+            return {}
         res = data.get("result")
         return res if isinstance(res, dict) else {}
 
     async def get_symbol_holdings_detail(self, symbol: str) -> dict:
-        if not self.account_seq: await self.fetch_account_seq()
-        data = await self._request("GET", f"/api/v1/holdings?symbol={symbol}", "ASSET", headers=self._get_headers(requires_account=True))
-        if not isinstance(data, dict): data = {}
+        if not self.account_seq:
+            await self.fetch_account_seq()
+        data = await self._request(
+            "GET",
+            f"/api/v1/holdings?symbol={symbol}",
+            "ASSET",
+            headers=self._get_headers(requires_account=True),
+        )
+        if not isinstance(data, dict):
+            data = {}
         res_dict = data.get("result")
-        if not isinstance(res_dict, dict): res_dict = {}
+        if not isinstance(res_dict, dict):
+            res_dict = {}
         items = res_dict.get("items")
-        
+
         if not isinstance(items, list) or not items or not isinstance(items[0], dict):
             return {"qty": 0.0, "avg_price": 0.0, "profit_rate": 0.0, "profit_usd": 0.0}
-            
+
         item = items[0]
         qty_raw = item.get("quantity")
         avg_price_raw = item.get("averagePurchasePrice")
         pl_dict = item.get("profitLoss")
-        if not isinstance(pl_dict, dict): pl_dict = {}
-        
+        if not isinstance(pl_dict, dict):
+            pl_dict = {}
+
         return {
             "qty": float(qty_raw) if qty_raw is not None else 0.0,
             "avg_price": float(avg_price_raw) if avg_price_raw is not None else 0.0,
             "profit_rate": float(pl_dict.get("rate") or 0.0),
-            "profit_usd": float(pl_dict.get("amount") or 0.0)
+            "profit_usd": float(pl_dict.get("amount") or 0.0),
         }
 
     async def get_usd_buying_power(self) -> float:
-        if not self.account_seq: await self.fetch_account_seq()
-        data = await self._request("GET", "/api/v1/buying-power?currency=USD", "ORDER_INFO", headers=self._get_headers(requires_account=True))
-        if not isinstance(data, dict): data = {}
+        if not self.account_seq:
+            await self.fetch_account_seq()
+        data = await self._request(
+            "GET",
+            "/api/v1/buying-power?currency=USD",
+            "ORDER_INFO",
+            headers=self._get_headers(requires_account=True),
+        )
+        if not isinstance(data, dict):
+            data = {}
         res_dict = data.get("result")
-        if not isinstance(res_dict, dict): res_dict = {}
+        if not isinstance(res_dict, dict):
+            res_dict = {}
         bp_raw = res_dict.get("cashBuyingPower")
         return float(bp_raw) if bp_raw is not None else 0.0
 
     async def get_sellable_quantity(self, symbol: str) -> float:
-        if not self.account_seq: await self.fetch_account_seq()
-        data = await self._request("GET", f"/api/v1/sellable-quantity?symbol={symbol}", "ORDER_INFO", headers=self._get_headers(requires_account=True))
-        if not isinstance(data, dict): data = {}
+        if not self.account_seq:
+            await self.fetch_account_seq()
+        data = await self._request(
+            "GET",
+            f"/api/v1/sellable-quantity?symbol={symbol}",
+            "ORDER_INFO",
+            headers=self._get_headers(requires_account=True),
+        )
+        if not isinstance(data, dict):
+            data = {}
         res_dict = data.get("result")
-        if not isinstance(res_dict, dict): res_dict = {}
+        if not isinstance(res_dict, dict):
+            res_dict = {}
         sq_raw = res_dict.get("sellableQuantity")
         return float(sq_raw) if sq_raw is not None else 0.0
 
@@ -249,9 +299,9 @@ class TossApiClient:
         if now_ts - self._calendar_cache_time < 30.0 and self._calendar_cache:
             return self._calendar_cache
 
-        now_est = datetime.now(ZoneInfo('America/New_York'))
+        now_est = datetime.now(ZoneInfo("America/New_York"))
         logical_est = now_est if now_est.hour < 19 else now_est + timedelta(days=1)
-        
+
         try:
             holiday_name = await asyncio.to_thread(get_nyse_holiday_name, logical_est)
             if holiday_name:
@@ -262,15 +312,18 @@ class TossApiClient:
             print(f"🚨 [NYSE 캘린더 방어망 붕괴] 외부 모듈 예외 자체 흡수 및 제2 방어선 전환: {e}", flush=True)
 
         est_today_str = logical_est.strftime("%Y-%m-%d")
-        
+
         try:
-            if not self.token: await self.authenticate()
+            if not self.token:
+                await self.authenticate()
             endpoint = f"/api/v1/market-calendar/US?date={est_today_str}"
             data = await self._request("GET", endpoint, "MARKET_INFO", headers=self._get_headers())
-            if not isinstance(data, dict): data = {}
+            if not isinstance(data, dict):
+                data = {}
             result_data = data.get("result")
-            if not isinstance(result_data, dict): result_data = {}
-            
+            if not isinstance(result_data, dict):
+                result_data = {}
+
             for day_key in ["today", "nextBusinessDay", "previousBusinessDay"]:
                 day_obj = result_data.get(day_key)
                 if not day_obj or not isinstance(day_obj, dict):
@@ -286,23 +339,23 @@ class TossApiClient:
                         self._calendar_cache = (False, None, "HOLIDAY|미국 주식시장 휴장 (API 응답 기준)", None)
                         self._calendar_cache_time = now_ts
                         return self._calendar_cache
-                    
+
                 for session_name in ["dayMarket", "preMarket", "regularMarket", "afterMarket"]:
                     session = day_obj.get(session_name)
                     if session and isinstance(session, dict):
                         start_str = session.get("startTime")
                         end_str = session.get("endTime")
                         if start_str and end_str:
-                            start = datetime.fromisoformat(start_str).astimezone(ZoneInfo('America/New_York'))
-                            end = datetime.fromisoformat(end_str).astimezone(ZoneInfo('America/New_York'))
-                            
+                            start = datetime.fromisoformat(start_str).astimezone(ZoneInfo("America/New_York"))
+                            end = datetime.fromisoformat(end_str).astimezone(ZoneInfo("America/New_York"))
+
                             if session_name == "dayMarket":
                                 # MODIFIED: 시작 시간이 12:00 이후(오후/저녁)일 경우 서머타임/개장시간 유동성과 무관하게 무조건 익일 03:59:59 락온
                                 if start.hour >= 12:
                                     end = (start + timedelta(days=1)).replace(hour=3, minute=59, second=59, microsecond=0)
                                 else:
                                     end = start.replace(hour=3, minute=59, second=59, microsecond=0)
-                                    
+
                             if start <= now_est <= end:
                                 self._calendar_cache = (True, end, session_name, start)
                                 self._calendar_cache_time = now_ts
@@ -313,7 +366,7 @@ class TossApiClient:
 
         est_time_int = now_est.hour * 100 + now_est.minute
         logical_weekday = logical_est.weekday()
-        
+
         is_fallback_open = False
         session_name = "CLOSED"
         fallback_start = now_est
@@ -355,51 +408,124 @@ class TossApiClient:
         return self._calendar_cache
 
     async def get_current_price(self, symbol: str) -> float:
-        if not self.token: await self.authenticate()
-        data = await self._request("GET", f"/api/v1/prices?symbols={symbol}", "MARKET_DATA", headers=self._get_headers())
-        if not isinstance(data, dict): return 0.0
+        if not self.token:
+            await self.authenticate()
+        data = await self._request(
+            "GET", f"/api/v1/prices?symbols={symbol}", "MARKET_DATA", headers=self._get_headers()
+        )
+        if not isinstance(data, dict):
+            return 0.0
         result = data.get("result")
-        if not isinstance(result, list) or not result or not isinstance(result[0], dict): return 0.0
+        if not isinstance(result, list) or not result or not isinstance(result[0], dict):
+            return 0.0
         price_raw = result[0].get("lastPrice")
         return float(price_raw) if price_raw is not None else 0.0
 
     async def get_orderbook(self, symbol: str) -> dict:
-        if not self.token: await self.authenticate()
-        data = await self._request("GET", f"/api/v1/orderbook?symbol={symbol}", "MARKET_DATA", headers=self._get_headers())
-        if not isinstance(data, dict): return {}
+        if not self.token:
+            await self.authenticate()
+        data = await self._request(
+            "GET", f"/api/v1/orderbook?symbol={symbol}", "MARKET_DATA", headers=self._get_headers()
+        )
+        if not isinstance(data, dict):
+            return {}
         res = data.get("result")
         return res if isinstance(res, dict) else {}
 
     async def get_orders(self, status: str, symbol: str) -> list:
-        if not self.account_seq: await self.fetch_account_seq()
-        data = await self._request("GET", f"/api/v1/orders?status={status}&symbol={symbol}", "ORDER_HISTORY", headers=self._get_headers(requires_account=True))
-        if not isinstance(data, dict): return []
+        if not self.account_seq:
+            await self.fetch_account_seq()
+        data = await self._request(
+            "GET",
+            f"/api/v1/orders?status={status}&symbol={symbol}",
+            "ORDER_HISTORY",
+            headers=self._get_headers(requires_account=True),
+        )
+        if not isinstance(data, dict):
+            return []
         res_dict = data.get("result")
-        if not isinstance(res_dict, dict): return []
+        if not isinstance(res_dict, dict):
+            return []
         orders = res_dict.get("orders")
         return orders if isinstance(orders, list) else []
 
     async def cancel_order(self, order_id: str):
-        if not self.account_seq: await self.fetch_account_seq()
-        await self._request("POST", f"/api/v1/orders/{order_id}/cancel", "ORDER", headers=self._get_headers(requires_account=True))
+        if not self.account_seq:
+            await self.fetch_account_seq()
+        await self._request(
+            "POST",
+            f"/api/v1/orders/{order_id}/cancel",
+            "ORDER",
+            headers=self._get_headers(requires_account=True),
+        )
 
     async def get_order_detail(self, order_id: str) -> dict:
-        if not self.account_seq: await self.fetch_account_seq()
-        data = await self._request("GET", f"/api/v1/orders/{order_id}", "ORDER_HISTORY", headers=self._get_headers(requires_account=True))
-        if not isinstance(data, dict): return {}
+        if not self.account_seq:
+            await self.fetch_account_seq()
+        data = await self._request(
+            "GET",
+            f"/api/v1/orders/{order_id}",
+            "ORDER_HISTORY",
+            headers=self._get_headers(requires_account=True),
+        )
+        if not isinstance(data, dict):
+            return {}
         res = data.get("result")
         return res if isinstance(res, dict) else {}
 
-    async def create_order(self, symbol: str, side: str, order_type: str, quantity: float, price: str, client_order_id: str) -> dict:
-        if not self.account_seq: await self.fetch_account_seq()
+    async def create_order(
+        self, symbol: str, side: str, order_type: str, quantity: float, price: str, client_order_id: str
+    ) -> dict:
+        # NEW: Case 09 & Case 54 비허용 종목(SOXL 등) 주문 API 호출 물리적 원천 차단 쉴드
+        sym_clean = str(symbol).strip().upper()
+        if sym_clean not in self.REAL_ALLOWED_SYMBOLS:
+            raise RuntimeError(
+                f"🚨 [Case 09/54 위반] SOXS 외 비허용 종목 주문 요청 원천 차단: symbol={sym_clean}"
+            )
+
+        if not self.account_seq:
+            await self.fetch_account_seq()
         payload = {
-            "clientOrderId": client_order_id,
-            "symbol": symbol,
+            "clientOrderId": str(client_order_id)[:36],
+            "symbol": sym_clean,
             "side": side,
             "orderType": order_type,
             "quantity": str(quantity),
             "price": price,
-            "timeInForce": "DAY"
+            "timeInForce": "DAY",
         }
-        data = await self._request("POST", "/api/v1/orders", "ORDER", headers=self._get_headers(requires_account=True), json_data=payload)
+        data = await self._request(
+            "POST",
+            "/api/v1/orders",
+            "ORDER",
+            headers=self._get_headers(requires_account=True),
+            json_data=payload,
+        )
+        return data if isinstance(data, dict) else {}
+
+    # NEW: Case 69 미국 주식 주문 정정(Modify) 시 quantity 파라미터 원천 적출 방어
+    async def modify_order(
+        self,
+        order_id: str,
+        price: str,
+        order_type: str = "LIMIT",
+        market_country: str = "US",
+        quantity: int = None,
+    ) -> dict:
+        if not self.account_seq:
+            await self.fetch_account_seq()
+        payload = {
+            "orderType": order_type,
+        }
+        if order_type == "LIMIT":
+            payload["price"] = str(price)
+        if str(market_country).upper() == "KR" and quantity is not None:
+            payload["quantity"] = str(int(quantity))
+        data = await self._request(
+            "POST",
+            f"/api/v1/orders/{order_id}/modify",
+            "ORDER",
+            headers=self._get_headers(requires_account=True),
+            json_data=payload,
+        )
         return data if isinstance(data, dict) else {}

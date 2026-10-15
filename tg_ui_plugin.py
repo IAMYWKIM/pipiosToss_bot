@@ -1,9 +1,11 @@
 # =====================================================================
 # FILE: tg_ui_plugin.py
-# 목적: 03:58 EST 단방향(SOXS) 전용 텔레그램 데이터 연산 및 UI 렌더링 전용 모듈
+# 목적: 프리장(04:00~09:29 EST) SOXS 단방향 RSI<=30 무한 출동 스나이퍼 텔레그램 UI 렌더링 모듈
 # =====================================================================
-# MODIFIED: 04:07 EST 타임쉴드 및 지정가 추격 타격망(Force Entry) UI 가이드 동기화
-# MODIFIED: 관제탑 스나이퍼 상태 표출 시 타임쉴드(03:58 ~ 04:07) 구간 동적 렌더링 결속
+# MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 암살자 스케줄 및 타임쉴드 UI 잔재 영구 소각
+# MODIFIED: 프리장(04:00~09:29 EST) SOXS RSI<=30 무한 출동 및 09:30 정규장 컷오프 상태 표출 결속 (Case 13, 52, 53, 57)
+# NEW: 관제탑(/avwap) 내 NQ=F 3단 매크로 방어선(체결 기준 지수 및 동적 역행 임계치) 실시간 상태 렌더링 주입 (Case 13, 66, 67)
+# MODIFIED: SOXS(🐻) 및 SOXL(🐂) 듀얼 RSI 관제탑 유지 및 SOXS RSI<=30 타격권 상태 표시 결속 (Case 44)
 
 import asyncio
 from datetime import datetime, timedelta
@@ -15,6 +17,8 @@ from quant_engine import AssassinLedger, MacroDataCache
 
 EST_TZ = ZoneInfo("America/New_York")
 NQ_UI_BETA = 4.2
+NQ_DYNAMIC_FLOOR_UI = 0.8
+
 
 def get_main_menu_text() -> str:
     now_est = datetime.now(EST_TZ)
@@ -22,50 +26,57 @@ def get_main_menu_text() -> str:
     dst_status_text = "🌞서머타임 ON (EDT)" if is_dst else "❄️서머타임 OFF (EST)"
 
     return (
-        f"🕒 <b>[ 03:58 숏(SOXS) 전용 스나이퍼 스케줄 ({dst_status_text}) ]</b>\n"
+        f"🕒 <b>[ 프리장 SOXS 단방향 RSI≤30 스나이퍼 스케줄 ({dst_status_text}) ]</b>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
-        "🔹 19:00~03:57: 🌙 0세션 시스템 대기 (매수 차단)\n"
-        "🔹 03:58:00: ⚡ 데이장 마감 직전 숏(SOXS) 선제 지정가 타격\n"
-        "      (NQ=F 진폭 2.0% 미만 시 즉각 진입)\n"
-        "      (현재가 기준 -1.0% 역산 가격에 매수 덫 대기)\n"
-        "      (04:07까지 미체결 시 타임쉴드 해제 및 현재가 추격 강제)\n"
-        "      (전량 체결 확인 즉시 +0.64% 매도 덫 하드 락온)\n"
-        "🔹 03:59~15:58: 🎯 +0.64% 익절 감시 & NQ 매크로 방어\n"
-        "      (장중 NQ 상승(손실방향) 임계치 이탈 시 덤핑)\n"
-        "🔹 15:59~16:01: 🛑 제로-오버나이트 MOC 강제 덤핑\n"
+        "🔹 19:00~03:59: 🌙 0세션 데이마켓 대기 (신규 매수 차단 · 듀얼 RSI 관제)\n"
+        "🔹 04:00~09:29: 🔫 <b>프리장 스나이퍼 골든타임 (무한 출동)</b>\n"
+        "      (NQ=F 당일 진폭 2.0% 미만 & SOXS 1분봉 RSI ≤ 30.0 감시)\n"
+        "      (포착 즉시 실시간 현재가 기준 LIMIT 지정가 매수 발사)\n"
+        "      (전량 체결 확인 즉시 팩트 평단가 +0.64% 매도 덫 하드 락온)\n"
+        "      (프리장 내 +0.64% 익절 완료 시 09:29까지 무한 재출동)\n"
+        "🔹 09:30~15:58: 🔥 <b>정규장 본장 (09:30 신규 매수 마감)</b>\n"
+        "      (09:30 정각 프리장 미체결 매수 주문 즉각 선취소)\n"
+        "      (보유 물량 +0.64% 익절 홀딩 & NQ=F 2·3차 매크로 손절 감시)\n"
+        "🔹 15:59~16:01: 🛑 제로-오버나이트 MOC 매수 1호가 스윕 강제 청산\n"
         "🔹 17:00: 🧹 정산 스캔 및 가비지 컬렉션(GC)\n\n"
         "🛠 <b>[ 핵심 명령어 ]</b>\n"
-        "▶️ /avwap : 🔫 스나이퍼 레이더 관제탑\n"
-        "▶️ /sync : 📜 SOXS 전용 지시서 동기화\n"
-        "▶️ /settlement : ⚙️ 단일 전술 제어반 (시드/가동)\n\n"
+        "▶️ /avwap : 🔫 프리장 스나이퍼 레이더 관제탑\n"
+        "▶️ /sync : 📜 SOXS 스나이퍼 지시서 동기화\n"
+        "▶️ /settlement : ⚙️ 전술 제어반 (시드/가동 ON·OFF)\n\n"
         "⚠️ /reset : 🧹 SOXS 장부 0점 소각\n"
         "⚠️ /update : 🚀 시스템 자가 업데이트\n\n"
         "🌙 <b>수동 오버나이트를 원할 경우 [전술 제어반]에서 가동을 OFF 해주세요.</b>"
     )
+
 
 def parse_session_data(all_candles: list, session_start_est: datetime) -> dict:
     res = {
         "pre_h": 0.0, "pre_l": 0.0, "pre_amp": 0.0, "pre_vwap": 0.0, "pre_body": 0.0,
         "reg_h": 0.0, "reg_l": 0.0, "reg_amp": 0.0, "reg_vwap": 0.0, "reg_body": 0.0,
     }
-    if not all_candles: return res
+    if not all_candles:
+        return res
     df = pd.DataFrame(all_candles)
-    if df.empty: return res
+    if df.empty:
+        return res
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True).dt.tz_convert(EST_TZ)
     df.set_index("timestamp", inplace=True)
     df.sort_index(ascending=True, inplace=True)
 
     for col in ["openPrice", "highPrice", "lowPrice", "closePrice", "volume"]:
-        if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
     df = df[df.index >= session_start_est]
-    if df.empty: return res
+    if df.empty:
+        return res
 
     pre_df = df.between_time("04:00", "09:29")
     reg_df = df.between_time("09:30", "16:00")
 
     def calc_metrics(sub_df: pd.DataFrame):
-        if sub_df.empty: return 0.0, 0.0, 0.0, 0.0, 0.0
+        if sub_df.empty:
+            return 0.0, 0.0, 0.0, 0.0, 0.0
         h = float(sub_df["highPrice"].max())
         l = float(sub_df["lowPrice"].min())
         amp = ((h - l) / l * 100.0) if l > 0.0 else 0.0
@@ -80,9 +91,12 @@ def parse_session_data(all_candles: list, session_start_est: datetime) -> dict:
 
     pre_h, pre_l, pre_amp, pre_vwap, pre_body = calc_metrics(pre_df)
     reg_h, reg_l, reg_amp, reg_vwap, reg_body = calc_metrics(reg_df)
-    res.update({"pre_h": pre_h, "pre_l": pre_l, "pre_amp": pre_amp, "pre_vwap": pre_vwap, "pre_body": pre_body,
-                "reg_h": reg_h, "reg_l": reg_l, "reg_amp": reg_amp, "reg_vwap": reg_vwap, "reg_body": reg_body})
+    res.update({
+        "pre_h": pre_h, "pre_l": pre_l, "pre_amp": pre_amp, "pre_vwap": pre_vwap, "pre_body": pre_body,
+        "reg_h": reg_h, "reg_l": reg_l, "reg_amp": reg_amp, "reg_vwap": reg_vwap, "reg_body": reg_body,
+    })
     return res
+
 
 async def _fetch_5ma_amp(api_client, symbol: str) -> tuple[float, float, float]:
     avg_amp, yesterday_amp, yesterday_return = 0.0, 0.0, 0.0
@@ -90,17 +104,22 @@ async def _fetch_5ma_amp(api_client, symbol: str) -> tuple[float, float, float]:
         endpoint = f"/api/v1/candles?symbol={symbol}&interval=1d&count=6"
         data = await api_client._request("GET", endpoint, "MARKET_DATA_CHART", headers=api_client._get_headers())
         candles = (data or {}).get("result", {}).get("candles", [])
-        if not candles: return 0.0, 0.0, 0.0
+        if not candles:
+            return 0.0, 0.0, 0.0
 
         c0_dt = pd.to_datetime(candles[0]["timestamp"], format="ISO8601", utc=True).tz_convert(EST_TZ).date()
         now_est_check = datetime.now(EST_TZ)
         today_dt = now_est_check.date()
 
-        if c0_dt > today_dt: valid_candles = candles[1:6]
+        if c0_dt > today_dt:
+            valid_candles = candles[1:6]
         elif c0_dt == today_dt:
-            if 16 <= now_est_check.hour < 19: valid_candles = candles[0:5]
-            else: valid_candles = candles[1:6]
-        else: valid_candles = candles[0:5]
+            if 16 <= now_est_check.hour < 19:
+                valid_candles = candles[0:5]
+            else:
+                valid_candles = candles[1:6]
+        else:
+            valid_candles = candles[0:5]
 
         amps = []
         for i, c in enumerate(valid_candles):
@@ -109,59 +128,85 @@ async def _fetch_5ma_amp(api_client, symbol: str) -> tuple[float, float, float]:
             if l > 0.0:
                 amp = (h - l) / l * 100.0
                 amps.append(amp)
-                if i == 0: yesterday_amp = amp
+                if i == 0:
+                    yesterday_amp = amp
 
         if len(valid_candles) >= 2:
             yest_cls = float(valid_candles[0].get("closePrice") or 0.0)
             prev_cls = float(valid_candles[1].get("closePrice") or 0.0)
-            if prev_cls > 0.0: yesterday_return = ((yest_cls - prev_cls) / prev_cls) * 100.0
+            if prev_cls > 0.0:
+                yesterday_return = ((yest_cls - prev_cls) / prev_cls) * 100.0
 
-        if amps: avg_amp = sum(amps) / len(amps)
+        if amps:
+            avg_amp = sum(amps) / len(amps)
         return avg_amp, yesterday_amp, yesterday_return
     except Exception:
         return 0.0, 0.0, 0.0
 
+
 async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> dict:
     all_candles = []
     before = None
-    if now_est.hour >= 19: session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
-    else: session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
+    if now_est.hour >= 19:
+        session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
+    else:
+        session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
 
     for _ in range(8):
         try:
             data = await api_client.get_1m_candles_pagination(symbol, count=200, before=before)
             candles = data.get("candles", [])
             all_candles.extend(candles)
-            if not candles: break
+            if not candles:
+                break
             oldest_time = pd.to_datetime(candles[-1]["timestamp"], utc=True).tz_convert(EST_TZ)
-            if oldest_time <= session_start_est: break
+            if oldest_time <= session_start_est:
+                break
             before = data.get("nextBefore")
-            if not before: break
-        except Exception: break
+            if not before:
+                break
+        except Exception:
+            break
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
-def build_compact_status(symbol: str, state_tuple: tuple, buy_order_id: str, current_session: str, est_time_int: int, qty: float) -> str:
+
+# MODIFIED: Case 13 & 초과 Case 57 프리장 스나이퍼 헌법 기반 세션별 상태 표출
+def build_compact_status(
+    symbol: str, state_tuple: tuple, buy_order_id: str, current_session: str, est_time_int: int, qty: float
+) -> str:
     budget = state_tuple[1]
     target_profit_rate = state_tuple[2]
     is_done = state_tuple[4]
     is_active = state_tuple[5]
+    target_sell_price = state_tuple[6]
     entry_session = state_tuple[8]
     state_flag = "ON" if is_active else "OFF"
 
-    if not is_active: state_text = "가동OFF(수동대기)"
-    elif qty > 0: state_text = f"보유(+{target_profit_rate}%)"
-    elif current_session == "dayMarket": state_text = "🌙 시스템 대기(03:58 타격 대기)"
-    elif buy_order_id:
-        # MODIFIED: 03:58 ~ 04:07 타임쉴드 구간의 스나이퍼 상태 동적 렌더링
-        if entry_session == "DAY_0358" and est_time_int < 407:
-            state_text = "🛡️ 03:58 덫 미체결 (04:07 추격 대기)"
+    if not is_active:
+        state_text = "가동OFF(수동대기)"
+    elif qty > 0:
+        if target_sell_price > 0.0:
+            state_text = f"보유(목표 ${target_sell_price:.2f} · +{target_profit_rate}%)"
         else:
-            state_text = "⏳ 지정가 매수 전량체결 대기"
-    elif est_time_int == 358 and not is_done: state_text = "⚡ 03:58 휩소 매수 덫 장전 중"
-    elif is_done: state_text = "🔒 금일 타격완료(대기)"
-    else: state_text = "장외대기"
+            state_text = f"보유(+{target_profit_rate}% 덫 장전중)"
+    elif buy_order_id:
+        state_text = "⏳ 프리장 지정가 매수 체결대기"
+    elif entry_session == "CANCELED_MACRO":
+        state_text = "🛑 매크로방어 발동(금일 마감)"
+    elif current_session == "dayMarket":
+        state_text = "🌙 데이장 대기(04:00 출동대기)"
+    elif 400 <= est_time_int <= 929:
+        if not is_done:
+            state_text = "🔫 프리장 RSI≤30 무한 감시중"
+        else:
+            state_text = "🔒 금일 프리장 타격마감"
+    elif 930 <= est_time_int < 1600:
+        state_text = "🔒 09:30 정규장 진입마감(관망)"
+    else:
+        state_text = "장외대기"
 
     return f"🐻 <b>{symbol}</b> <code>[{state_flag}]</code> {state_text} | <code>${budget:.0f}</code>"
+
 
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
@@ -169,23 +214,26 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     if 400 <= t <= 929:
         session_name_ui = "preMarket"
-        market_header = "( <b>🌅 PRE_MARKET</b> )"
+        market_header = "( <b>🌅 PRE_MARKET · 스나이퍼 골든타임</b> )"
     elif 930 <= t <= 1559:
         session_name_ui = "regularMarket"
-        market_header = "( <b>🔥 REG_MARKET</b> )"
+        market_header = "( <b>🔥 REG_MARKET · 신규진입 마감</b> )"
     elif 1600 <= t <= 1659:
         session_name_ui = "afterMarket"
         market_header = "( <b>🛑 AFT_MARKET</b> )"
     else:
         session_name_ui = "dayMarket"
-        market_header = "( <b>⚡ 03:58 휩소 대기</b> )" if t == 358 else "( <b>🌙 시스템 대기</b> )"
+        market_header = "( <b>🌙 데이마켓 · 04:00 대기</b> )"
 
     try:
         is_open, _, sess_name, _ = await asyncio.wait_for(api_client.is_market_open(), timeout=3.0)
         if not is_open:
             session_name_ui = "dayMarket"
-            market_header = "( <b>🌙 주말/휴장일</b> )" if sess_name and "HOLIDAY" in sess_name else "( <b>🌙 시스템 대기</b> )"
-    except Exception: pass
+            market_header = (
+                "( <b>🌙 주말/휴장일</b> )" if sess_name and "HOLIDAY" in sess_name else "( <b>🌙 시스템 대기</b> )"
+            )
+    except Exception:
+        pass
 
     _, _, _, nq_c, nq_h, nq_l = await MacroDataCache.get_nq_sniper_signal()
     nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
@@ -194,11 +242,17 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     price_s = await api_client.get_current_price("SOXS")
     hold_s = await api_client.get_symbol_holdings_detail("SOXS")
-    amp_s, yest_amp_s, yest_return_s = await _fetch_5ma_amp(api_client, "SOXS")
+    qty_s = float(hold_s.get("qty", 0.0))
+    amp_s, yest_amp_s, _ = await _fetch_5ma_amp(api_client, "SOXS")
 
-    empty_sess = {"pre_h": 0.0, "pre_l": 0.0, "pre_amp": 0.0, "pre_vwap": 0.0, "pre_body": 0.0, "reg_h": 0.0, "reg_l": 0.0, "reg_amp": 0.0, "reg_vwap": 0.0, "reg_body": 0.0}
-    if session_name_ui == "dayMarket": sess_s = dict(empty_sess)
-    else: sess_s = await _fetch_session_stats(api_client, "SOXS", now_est)
+    empty_sess = {
+        "pre_h": 0.0, "pre_l": 0.0, "pre_amp": 0.0, "pre_vwap": 0.0, "pre_body": 0.0,
+        "reg_h": 0.0, "reg_l": 0.0, "reg_amp": 0.0, "reg_vwap": 0.0, "reg_body": 0.0,
+    }
+    if session_name_ui == "dayMarket":
+        sess_s = dict(empty_sess)
+    else:
+        sess_s = await _fetch_session_stats(api_client, "SOXS", now_est)
 
     pre_exp_l_s = sess_s["pre_h"] * (1.0 - amp_s / 100.0) if sess_s["pre_h"] > 0 else 0.0
     pre_exp_h_s = sess_s["pre_l"] * (1.0 + amp_s / 100.0) if sess_s["pre_l"] > 0 else 0.0
@@ -207,43 +261,70 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     state_s = await AssassinLedger.get_state("SOXS")
     buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
-    status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, hold_s.get("qty", 0.0))
+    status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, qty_s)
+
+    # NEW: Case 13 & Case 66, 67 NQ=F 3단 매크로 방어선 실시간 현황 표출
+    nq_entry_p = float(state_s[10] or 0.0)
+    nq_entry_a = float(state_s[11] or 0.0)
+    macro_1st_str = "🛑 과열차단(≥2.0%)" if nq_amp >= 2.0 else "🟢 진입허용(<2.0%)"
+    if qty_s > 0.0 and nq_entry_p > 0.0:
+        dyn_thresh = max(nq_entry_a * 0.5, NQ_DYNAMIC_FLOOR_UI)
+        nq_diff = ((nq_c - nq_entry_p) / nq_entry_p * 100.0) if nq_c > 0.0 else 0.0
+        macro_3rd_line = (
+            f"\n▫️ 3차 역행방어: 기준 <code>{nq_entry_p:.2f}</code> 대비 "
+            f"<code>{nq_diff:+.2f}%</code> (한도 <code>+{dyn_thresh:.2f}%</code>)"
+        )
+    else:
+        macro_3rd_line = ""
 
     rsi_ui_lines = []
     if shared_rsi_state:
         for r_sym in ("SOXS", "SOXL"):
             if r_sym in shared_rsi_state:
                 rsi_data = shared_rsi_state[r_sym]
-                r_val = rsi_data["value"]
-                lv = rsi_data["level"]
-                
-                warn_str = "🟢 안정"
-                if lv == 1: warn_str = "⚠️ 1차 투매(과매도)"
-                elif lv == 2: warn_str = "🚨 2차 패닉(심각)"
-                    
+                r_val = float(rsi_data.get("value", 0.0))
+                lv = int(rsi_data.get("level", 0))
+
+                if r_sym == "SOXS":
+                    if lv == 2:
+                        warn_str = "🚨 2차 패닉(≤10 · 스나이퍼 타격권)"
+                    elif lv == 1:
+                        warn_str = "⚠️ 1차 투매(≤20 · 스나이퍼 타격권)"
+                    elif 0.0 < r_val <= 30.0:
+                        warn_str = "🔫 스나이퍼 타격권(≤30)"
+                    else:
+                        warn_str = "🟢 안정(>30)"
+                else:
+                    if lv == 2:
+                        warn_str = "🚨 2차 패닉(심각)"
+                    elif lv == 1:
+                        warn_str = "⚠️ 1차 투매(과매도)"
+                    else:
+                        warn_str = "🟢 안정"
+
                 if r_val > 0.0:
                     icon = "🐻" if r_sym == "SOXS" else "🐂"
                     rsi_ui_lines.append(f"▫️ {icon} {r_sym} RSI(1m): <code>{r_val:.1f}</code> ➡️ {warn_str}")
-    
+
     rsi_ui_str = "\n".join(rsi_ui_lines) + "\n" if rsi_ui_lines else ""
 
     scan_time = now_est.strftime("%m-%d %H:%M:%S")
 
-    text = f"""📡 <b>[03:58 숏 전용 스나이퍼 레이더]</b> {market_header}
+    text = f"""📡 <b>[프리장 SOXS 단방향 RSI≤30 스나이퍼 레이더]</b> {market_header}
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
-🌐 <b>나스닥 100 선물 (NQ=F)</b>
+🌐 <b>나스닥 100 선물 (NQ=F · 3단 매크로 방어)</b>
 ▫️ 고가: <code>{nq_h:.2f}</code> | 저가: <code>{nq_l:.2f}</code>
 ▫️ 현재: <code>{nq_c:.2f}</code> | 총 진폭: <code>{nq_amp:.2f}%</code> (레버 <code>{etf_expected_amp_ui:.1f}%</code>)
-▫️ 저가기준 현재지수 진폭: <code>{nq_curr_amp:.2f}%</code>
+▫️ 저가기준 진폭: <code>{nq_curr_amp:.2f}%</code> | 1·2차 방어: <code>{macro_1st_str}</code>{macro_3rd_line}
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
-📊 <b>현재가 & 5MA(어제 진폭)</b>
+📊 <b>현재가 & 5MA(어제 진폭) & 듀얼 RSI(1m)</b>
 🐻 <b>SOXS</b> <code>${price_s:.2f}</code> | <code>{amp_s:.1f}%({yest_amp_s:.1f}%)</code>
 {rsi_ui_str}
-🌅 <b>프리장</b> (04:00~09:29)
+🌅 <b>프리장</b> (04:00~09:29 · 무한 출동 윈도우)
 🐻 <b>SOXS</b> <code>[VWAP] ${sess_s['pre_vwap']:.2f}</code>
   ⤷ 팩트: <code>${sess_s['pre_l']:.2f}~${sess_s['pre_h']:.2f} ({sess_s['pre_amp']:.1f}%)</code> | 예상: <code>${pre_exp_l_s:.2f}~${pre_exp_h_s:.2f}</code>
 
-🔥 <b>정규장</b> (09:30~16:00)
+🔥 <b>정규장</b> (09:30~16:00 · 신규진입 봉쇄)
 🐻 <b>SOXS</b> <code>[VWAP] ${sess_s['reg_vwap']:.2f}</code>
   ⤷ 팩트: <code>${sess_s['reg_l']:.2f}~${sess_s['reg_h']:.2f} ({sess_s['reg_amp']:.1f}%)</code> | 예상: <code>${reg_exp_l_s:.2f}~${reg_exp_h_s:.2f}</code>
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
@@ -260,23 +341,34 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     )
     return text, keyboard
 
+
 async def build_sync_board(api_client) -> str:
     now_est = datetime.now(EST_TZ)
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
     dst_str = "🌞 서머타임" if is_dst else "❄️ 서머타임 OFF"
     t = now_est.hour * 100 + now_est.minute
-    
-    if 400 <= t <= 929: market_state = "🌅 프리장 가동"
-    elif 930 <= t <= 1559: market_state = "🔥 정규장 가동"
-    elif 1600 <= t <= 1659: market_state = "⛔ 장마감"
-    else: market_state = "⚡ 03:58 휩소 선제 타격" if t == 358 else "🌙 시스템 대기"
+
+    if 400 <= t <= 929:
+        market_state = "🔫 프리장 스나이퍼 가동"
+    elif 930 <= t <= 1559:
+        market_state = "🔥 정규장 (신규매수 마감)"
+    elif 1600 <= t <= 1659:
+        market_state = "⛔ 장마감"
+    else:
+        market_state = "🌙 데이마켓 대기"
 
     bp = await api_client.get_usd_buying_power()
     exchange_rate = 1400.0
     try:
-        ex_data = await api_client._request("GET", "/api/v1/exchange-rate?baseCurrency=USD&quoteCurrency=KRW", "MARKET_INFO", headers=api_client._get_headers())
+        ex_data = await api_client._request(
+            "GET",
+            "/api/v1/exchange-rate?baseCurrency=USD&quoteCurrency=KRW",
+            "MARKET_INFO",
+            headers=api_client._get_headers(),
+        )
         exchange_rate = float((ex_data or {}).get("result", {}).get("rate", 1400.0))
-    except Exception: pass
+    except Exception:
+        pass
 
     async def get_symbol_sync_data(symbol: str):
         state = await AssassinLedger.get_state(symbol)
@@ -286,29 +378,39 @@ async def build_sync_board(api_client) -> str:
         profit_usd, profit_rate = hold.get("profit_usd", 0.0), hold.get("profit_rate", 0.0) * 100.0
         profit_krw = profit_usd * exchange_rate
         curr = await api_client.get_current_price(symbol)
-        
+
         prev_close = curr
         high, low = curr, curr
 
-        if now_est.hour >= 19: session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
-        else: session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
+        if now_est.hour >= 19:
+            session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
+        else:
+            session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
 
         try:
-            data_1d = await api_client._request("GET", f"/api/v1/candles?symbol={symbol}&interval=1d&count=5", "MARKET_DATA_CHART", headers=api_client._get_headers())
+            data_1d = await api_client._request(
+                "GET",
+                f"/api/v1/candles?symbol={symbol}&interval=1d&count=5",
+                "MARKET_DATA_CHART",
+                headers=api_client._get_headers(),
+            )
             candles_1d = (data_1d or {}).get("result", {}).get("candles", [])
             target_date = session_start_est.date()
-            
+
             for c in candles_1d:
                 c_dt = pd.to_datetime(c["timestamp"], format="ISO8601", utc=True).tz_convert(EST_TZ).date()
                 if c_dt == target_date:
                     h_val = float(c.get("highPrice") or 0.0)
                     l_val = float(c.get("lowPrice") or 0.0)
-                    if h_val > 0: high = h_val
-                    if l_val > 0: low = l_val
+                    if h_val > 0:
+                        high = h_val
+                    if l_val > 0:
+                        low = l_val
                 elif c_dt < target_date:
                     prev_close = float(c.get("closePrice") or 0.0)
                     break
-        except Exception: pass
+        except Exception:
+            pass
 
         high_rate = ((high - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
         low_rate = ((low - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
@@ -324,10 +426,12 @@ async def build_sync_board(api_client) -> str:
 
     def format_symbol(d: dict) -> str:
         profit_sign = "+" if d["profit_usd"] >= 0 else "-"
-        if d["qty"] > 0: flag_str = f"⚡ [{d['entry_session']}: +{d['target_profit_rate']}%]"
-        else: flag_str = f"⏳ 대기 (목표 +{d['target_profit_rate']}%)"
+        if d["qty"] > 0:
+            flag_str = f"⚡ [{d['entry_session'] or 'HOLD'}: +{d['target_profit_rate']}%]"
+        else:
+            flag_str = f"⏳ 대기 (목표 +{d['target_profit_rate']}%)"
         return (
-            f"🐻 <b>[SOXS] 단일 스나이퍼 지시서</b>\n"
+            f"🐻 <b>[SOXS] 프리장 RSI≤30 스나이퍼 지시서</b>\n"
             f"💵 시드: ${d['budget']:,.0f} | 🎯 {flag_str}\n"
             f"💰 현재 ${d['curr']:.2f} / 평단 ${d['avg_price']:.2f} ({int(d['qty'])}주)\n"
             f"📈 금일 고가: ${d['high']:.2f} ({d['high_rate']:+.2f}%)\n"
@@ -346,25 +450,35 @@ async def build_sync_board(api_client) -> str:
     )
     return text
 
+
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     state_s = await AssassinLedger.get_state("SOXS")
     budget_s, rate_s, act_s = state_s[1], state_s[2], state_s[5]
     act_s_str = "🟢 ON" if act_s else "🔴 OFF"
 
     text = (
-        "⚙️ <b>[단방향 전술 코어 제어반 (SOXS 락온)]</b>\n"
-        "▫️ <b>전술 모드:</b> <code>⚡ 03:58 데이장 마감 휩소 매수(-1.0%) & +0.64% 익절 노출</code>\n"
-        "▫️ <b>타격 원칙:</b> <code>일일 1회 단독 출동 (진폭 2.0% 미만 시)</code>\n"
+        "⚙️ <b>[단방향 전술 코어 제어반 (프리장 SOXS 스나이퍼)]</b>\n"
+        "▫️ <b>전술 모드:</b> <code>🔫 프리장(04:00~09:29 EST) RSI≤30 지정가 요격 & +0.64% 익절</code>\n"
+        "▫️ <b>타격 원칙:</b> <code>프리장 익절 시 무한 재출동 / 09:30 정규장 진입 봉쇄</code>\n"
+        "▫️ <b>방어 체계:</b> <code>NQ=F 3단 매크로 손절 덤핑 & 15:59 제로-오버나이트 MOC</code>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
-        "🐻 <b>SOXS (SHORT · 03:58 EST 무조건 휩소 타격)</b>\n"
+        "🐻 <b>SOXS (SHORT · 프리장 RSI≤30 무한 스나이퍼)</b>\n"
         f"▫️ 상태: <code>{act_s_str}</code> | 예산: <code>${budget_s:,.2f}</code> | 익절: <code>+{rate_s}% (고정)</code>"
     )
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔴 SOXS 정지" if act_s else "🟢 SOXS 가동", callback_data="toggle_set_act_SOXS")],
+            [
+                InlineKeyboardButton(
+                    text="🔴 SOXS 스나이퍼 정지" if act_s else "🟢 SOXS 스나이퍼 가동",
+                    callback_data="toggle_set_act_SOXS",
+                )
+            ],
             [InlineKeyboardButton(text="💵 SOXS 시드 설정", callback_data="set_budget_SOXS")],
-            [InlineKeyboardButton(text="🔫 스나이퍼 레이더", callback_data="open_avwap"), InlineKeyboardButton(text="🔙 메인 메뉴", callback_data="back_to_main")],
+            [
+                InlineKeyboardButton(text="🔫 스나이퍼 레이더", callback_data="open_avwap"),
+                InlineKeyboardButton(text="🔙 메인 메뉴", callback_data="back_to_main"),
+            ],
         ]
     )
     return text, keyboard

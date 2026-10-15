@@ -1,12 +1,13 @@
 # =====================================================================
 # FILE: main.py
-# 목적: 03:58 EST 데이장 마감 직전 숏(SOXS) 단일 방향 스나이퍼 코어 오케스트레이터
+# 목적: 프리장(04:00~09:29 EST) SOXS 단방향 RSI<=30 무한 출동 스나이퍼 코어 오케스트레이터
 # 구조: sniper_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 슬림 아키텍처
 # =====================================================================
-# MODIFIED: 04:07 EST 타임쉴드 만료 기반 현재가 추격 타격망(FORCE_BUY) 루프 인젝션
-# MODIFIED: 제3헌법 의거 미사용 AVWAPEngine 임포트 데드코드 소각
-# MODIFIED: execute_macro_defense_plugin 호출 시 buy_order_id 인자 전달 결속 (타임쉴드 중 매크로 돌파 방어)
-# MODIFIED: 03:58 EST 타격 윈도우 보호를 위해 무인 업데이트 락다운 시간대를 03:00~17:00 EST로 확장 (Case 07)
+# MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 암살자 플러그인 및 FORCE_BUY 데드코드 영구 소각
+# MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30~17:00 EST로 전면 확장 (Case 07)
+# NEW: 09:30 EST 정규장 컷오프 및 프리장 미체결 매수 즉시 파기 플러그인(enforce_0930_regular_cutoff_plugin) 메인 루프 결속 (Case 48, 53)
+# NEW: 프리장(04:00~09:29 EST) SOXS RSI<=30.0 즉시 요격 플러그인(execute_premarket_rsi_sniper_strike_plugin) 원자적 편입 (Case 25, 52, 59, 70)
+# MODIFIED: reconcile_zero_holdings_exit_plugin 호출 시 is_active 전달로 OFF 상태 수동 청산 Silent Reset 결속 (Case 46)
 
 import sys
 import os
@@ -27,14 +28,14 @@ from tg_router import router, inject_dependencies
 from candle_recorder import record_candles_loop
 from sniper_plugin import (
     SniperPluginContext,
+    PRE_SNIPER_RSI_THRESHOLD,
     execute_moc_zero_overnight_plugin,
     execute_macro_defense_plugin,
-    enforce_post_0358_cutoff_plugin,
+    enforce_0930_regular_cutoff_plugin,
     reconcile_zero_holdings_exit_plugin,
-    execute_0358_sniper_strike_plugin,
+    execute_premarket_rsi_sniper_strike_plugin,
     manage_mechanical_profit_trap_plugin,
     execute_rsi_monitoring_plugin,
-    execute_0407_force_entry_plugin, # MODIFIED: 04:07 추격 타격 플러그인 결속
 )
 
 logging.getLogger("aiogram").setLevel(logging.CRITICAL)
@@ -83,11 +84,12 @@ shared_holdings = {TRADE_SYMBOL: 0}
 shared_rsi_state = {sym: {"value": 0.0, "level": 0, "vwap": 0.0} for sym in RSI_SYMBOLS}
 
 idempotency_keys = {
-    TRADE_SYMBOL: {"BUY": None, "TRAP": None, "MOC": None, "M_DUMP": None, "FORCE_BUY": None},
+    TRADE_SYMBOL: {"BUY": None, "TRAP": None, "MOC": None, "M_DUMP": None},
 }
 
 holiday_notify_lock = asyncio.Lock()
 last_holiday_notified_date = ""
+
 
 def _run_git_update_sync() -> tuple[bool, str]:
     import subprocess
@@ -142,12 +144,14 @@ def _run_git_update_sync() -> tuple[bool, str]:
 
     return True, f"업데이트 성공:\n{reset_out}"
 
+
 async def auto_update_loop(bot: Bot, chat_id: int):
     while True:
         try:
             now_est = datetime.now(EST_TZ)
-            # MODIFIED: 03:58 EST 스나이핑 타격 직전 재기동 방지를 위해 03:00~17:00 EST 구간 전체 락다운
-            if 3 <= now_est.hour < 17:
+            est_hm = now_est.hour * 100 + now_est.minute
+            # MODIFIED: Case 07 프리장 개장 전부터 애프터장 종료(03:30~17:00 EST)까지 무인 업데이트 전면 차단
+            if 330 <= est_hm < 1700:
                 await asyncio.sleep(3600.0)
                 continue
 
@@ -177,34 +181,40 @@ async def auto_update_loop(bot: Bot, chat_id: int):
 
         await asyncio.sleep(3600.0)
 
+
 async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
     while True:
         try:
             now_est = datetime.now(EST_TZ)
             is_open, _, sess_name, _ = await ctx.client.is_market_open()
-            
+
             if is_open and sess_name != "CLOSED":
                 data = await ctx.client.get_1m_candles_pagination(symbol, count=200)
                 candles = data.get("candles", [])
-                
+
                 if candles:
                     if now_est.hour >= 19:
                         session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
                     else:
                         session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
-                        
+
                     current_price = await ctx.client.get_current_price(symbol)
-                    
+
                     rsi_val, vwap_val = await asyncio.to_thread(calculate_rsi_1m, candles, session_start_est)
-                    
+
                     await execute_rsi_monitoring_plugin(
                         ctx=ctx, symbol=symbol, rsi_val=rsi_val, vwap_val=vwap_val, current_price=current_price
                     )
-                    
+
         except Exception as e:
             print(f"🚨 [RSI 레이더망 {symbol}] 붕괴 방어: {e}", flush=True)
-            
-        await asyncio.sleep(60.0)
+
+        # 프리장 골든타임(04:00~09:29 EST) 중 SOXS는 20초 주기로 고해상도 스캔, 그 외에는 60초 주기 스캔
+        now_est_chk = datetime.now(EST_TZ)
+        est_hm_chk = now_est_chk.hour * 100 + now_est_chk.minute
+        sleep_sec = 20.0 if (symbol == "SOXS" and 400 <= est_hm_chk <= 929) else 60.0
+        await asyncio.sleep(sleep_sec)
+
 
 async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     global last_holiday_notified_date
@@ -220,12 +230,9 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     }
 
     while True:
-        now_est_pre = datetime.now(EST_TZ)
-        est_hm_pre = now_est_pre.hour * 100 + now_est_pre.minute
-        loop_timeout = 0.4 if est_hm_pre in [358, 407] else 1.5
-
+        # 초과 Case 28: 평시 1.5초 비동기 대기망 구축 및 wakeup_event 격발 시 즉시 기상
         try:
-            await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=loop_timeout)
+            await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=1.5)
             ctx.wakeup_event.clear()
         except asyncio.TimeoutError:
             pass
@@ -235,6 +242,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             est_time_int = now_est.hour * 100 + now_est.minute
             today_str = now_est.strftime("%Y-%m-%d")
 
+            # 초과 Case 29: 토스증권 유령 잔고 방어 (통신 실패 시 하위 매매 로직 전면 스킵)
             try:
                 holdings_detail = await ctx.client.get_symbol_holdings_detail(symbol)
                 holdings_qty = int(math.floor(holdings_detail["qty"]))
@@ -279,14 +287,15 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             just_turned_off = (runtime_state["prev_is_active"] is True and is_active is False)
             runtime_state["prev_is_active"] = is_active
 
+            # Case 22: 17:00 EST 가비지 컬렉션(GC) 및 일일 상태 초기화
             if 17 <= now_est.hour < 19 and runtime_state["last_gc_date"] != today_str:
                 runtime_state["last_gc_date"] = today_str
                 ctx.in_memory_ordering_lock[symbol] = False
-                ctx.idempotency_keys[symbol] = {"BUY": None, "TRAP": None, "MOC": None, "M_DUMP": None, "FORCE_BUY": None}
-                
+                ctx.idempotency_keys[symbol] = {"BUY": None, "TRAP": None, "MOC": None, "M_DUMP": None}
+
                 for r_sym in ctx.shared_rsi_state:
                     ctx.shared_rsi_state[r_sym]["level"] = 0
-                
+
                 runtime_state["last_moc_tick"] = 0.0
                 runtime_state["moc_dump_active"] = False
                 if holdings_qty == 0:
@@ -363,6 +372,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 )
                 runtime_state["last_heartbeat_hour"] = now_est.hour
 
+            # 목표 4 & Case 16, 24: 15:59~16:01 EST 제로-오버나이트 MOC 강제 청산
             moc_handled = await execute_moc_zero_overnight_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -377,7 +387,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             current_price = await ctx.client.get_current_price(symbol)
             avg_price_dump = float(holdings_detail.get("avg_price", 0.0)) or last_buy_price
 
-            # MODIFIED: buy_order_id 인자 주입으로 타임쉴드 중 매크로 2.0% 돌파 시 미체결 매수 덫 즉각 파기 연동
+            # 목표 3 & Case 66, 67: NQ=F 매크로 3단 방어망 (1차 진입차단/미체결파기, 2·3차 보유물량 손실권 덤핑)
             macro_dumped = await execute_macro_defense_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -444,12 +454,16 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     await AssassinLedger.save_state(symbol, last_session_id=current_session_id)
                 last_session_id = current_session_id
 
-            is_session_done = await enforce_post_0358_cutoff_plugin(
+            # NEW: 목표 1 & 초과 Case 48, 53 — 09:30 EST 정규장 개장 정각 신규 매수 마감 및 미체결 매수 즉시 파기
+            is_session_done, buy_order_id = await enforce_0930_regular_cutoff_plugin(
+                ctx=ctx,
                 symbol=symbol,
                 est_time_int=est_time_int,
                 is_session_done=is_session_done,
+                buy_order_id=buy_order_id,
             )
 
+            # 목표 1·2 & 초과 Case 46, 49, 51, 52: 잔고 0주 복귀 시 정산 및 프리장 내 무한 재출동 릴리스
             if holdings_qty == 0 and (
                 target_sell_price > 0.0 or buy_order_id or sell_order_id or last_buy_price > 0.0
             ):
@@ -459,18 +473,22 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     last_buy_price=last_buy_price,
                     buy_order_id=buy_order_id,
                     sell_order_id=sell_order_id,
+                    is_active=is_active,
                 )
                 continue
 
-            is_0358_strike = (est_time_int == 358 and now_est.second >= 0)
+            # NEW: 목표 1 & Case 15, 25, 52, 53, 59 — 프리장(04:00~09:29 EST) SOXS RSI<=30.0 실거래 지정가 매수 발사
+            is_premarket_window = (400 <= est_time_int <= 929)
+            live_rsi_val = float(ctx.shared_rsi_state.get(symbol, {}).get("value", 0.0))
             if (
                 is_active
                 and not is_session_done
-                and is_0358_strike
+                and is_premarket_window
                 and holdings_qty == 0
                 and not buy_order_id
+                and (0.0 < live_rsi_val <= PRE_SNIPER_RSI_THRESHOLD)
             ):
-                await execute_0358_sniper_strike_plugin(
+                await execute_premarket_rsi_sniper_strike_plugin(
                     ctx=ctx,
                     symbol=symbol,
                     now_est=now_est,
@@ -478,26 +496,10 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     current_price=current_price,
                     budget=budget,
                     target_profit_rate=target_profit_rate,
+                    rsi_val=live_rsi_val,
                 )
 
-            # MODIFIED: 04:07 타임쉴드 만료 추격 매수 격발망 (15초간 1회 격발 시도)
-            is_0407_force = (est_time_int == 407 and 0 <= now_est.second <= 15)
-            if (
-                is_active
-                and is_0407_force
-                and holdings_qty == 0
-                and buy_order_id
-            ):
-                await execute_0407_force_entry_plugin(
-                    ctx=ctx,
-                    symbol=symbol,
-                    now_est=now_est,
-                    current_session_id=current_session_id,
-                    current_price=current_price,
-                    budget=budget,
-                    buy_order_id=buy_order_id,
-                )
-
+            # 목표 2 & 초과 Case 50, 58, 64, 68: 매수 전량 체결 확인 즉시 +0.64% 지정가 매도 덫(TRAP) 하드 락온
             await manage_mechanical_profit_trap_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -518,6 +520,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
 
         except Exception as e:
             print(f"🚨 [스나이퍼 루프 {symbol}] 감시망 붕괴 방어: {e}", flush=True)
+
 
 async def main():
     session = AiohttpSession(timeout=10.0)
@@ -551,25 +554,25 @@ async def main():
     asyncio.create_task(auto_update_loop(bot, ADMIN_CHAT_ID))
 
     asyncio.create_task(assassin_loop(plugin_ctx, TRADE_SYMBOL))
-    
+
     for sym in RSI_SYMBOLS:
         asyncio.create_task(record_candles_loop(api_client, sym))
         asyncio.create_task(rsi_radar_loop(plugin_ctx, sym))
 
-    print("시스템 코어 및 03:58 EST 숏(SOXS) 단방향 스나이퍼 플러그인 결속 완료...", flush=True)
+    print("시스템 코어: 프리장(04:00~09:29 EST) SOXS 단방향 RSI<=30 무한 출동 스나이퍼 결속 완료...", flush=True)
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=(
-                "✅ <b>[시스템 기동 완료 — 03:58 EST 숏(SOXS) 휩소 스나이퍼]</b>\n"
-                "▫️ 타겟: <b>SOXS(숏)</b> 배타적 1회 출동 (매매 코어 100% 락온)\n"
-                "▫️ 관제: <b>SOXS(숏) & SOXL(롱)</b> 듀얼 RSI 레이더망 백그라운드 가동\n"
-                "▫️ 전략: NQ=F 진폭 2.0% 미만 시 03:58 EST 현재가 기준 <b>-1.0% 역산가</b> 지정가 매수 덫 장전\n"
-                "▫️ 추격: <b>04:07 타임쉴드 만료 시 미체결 덫 파기 및 현재가 추격 강제</b>\n"
-                "▫️ 방어: 3단 매크로 폭격 덤핑 & 24시간 패닉 셀 레이더망(19:00 EST 롤오버) 상시 가동\n"
-                "▫️ 익절: 덫 체결 즉시 팩트 평단가 기준 +0.64% 매도 하드 락온"
+                "✅ <b>[시스템 기동 완료 — 프리장 SOXS 단방향 RSI≤30 실거래 스나이퍼]</b>\n"
+                "▫️ 타겟: <b>SOXS(숏)</b> 배타적 실물 자산 투입 (SOXL 매매 영구 차단)\n"
+                "▫️ 관제: <b>SOXS(🐻) & SOXL(🐂)</b> 듀얼 1분봉 RSI 레이더 상시 가동\n"
+                "▫️ 타격: <b>프리장(04:00~09:29 EST)</b> NQ=F 진폭 2.0% 미만 & <b>SOXS RSI≤30.0</b> 포착 시 현재가 지정가(LIMIT) 즉시 매수\n"
+                "▫️ 회전: 프리장 내 <b>+0.64% 익절</b> 완료 시 잔고 0주 복귀 후 09:29 EST까지 <b>무한 재출동</b>\n"
+                "▫️ 마감: <b>09:30 EST</b> 정규장 개장 정각 신규 매수 마감 및 미체결 매수 주문 즉각 파기\n"
+                "▫️ 방어: <b>NQ=F 3단 매크로 손절 덤핑</b> & <b>15:59 EST 제로-오버나이트 MOC</b> 상시 가동"
             ),
             parse_mode="HTML",
         )
@@ -584,6 +587,7 @@ async def main():
             await asyncio.sleep(5.0)
         else:
             break
+
 
 if __name__ == "__main__":
     try:

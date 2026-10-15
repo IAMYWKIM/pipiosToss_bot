@@ -1,10 +1,11 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: SOXS 단방향 독립 장부 및 NQ=F 실시간 진폭 조회 캐싱, RSI 레이더 엔진
+# 목적: 프리장 SOXS 단방향 실거래 스나이퍼 독립 장부, NQ=F 진폭 캐싱 및 Wilder's RSI(14) 벡터 엔진
 # =====================================================================
 # MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
-# MODIFIED: 제3헌법 의거 미사용 AVWAPEngine 데드코드 클래스 영구 소각
-# MODIFIED: 04:07 EST 타임쉴드 만료 임계 구간(04:06:50~04:07:10) NQ=F 캐시 즉시 갱신 조건 추가 (Case 48, 61)
+# MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 임계 윈도우 데드코드 및 AVWAPEngine 영구 소각
+# MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
+# MODIFIED: SOXS 단일 타겟 하드 락온 및 +0.64% 목표 익절률 고정, 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30, 68)
 
 import os
 import json
@@ -19,6 +20,7 @@ from toss_api import GlobalThrottle
 
 EST_TZ = ZoneInfo("America/New_York")
 
+
 def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: int = 14) -> tuple[float, float]:
     """
     Pandas 기반 백그라운드 벡터 연산.
@@ -26,7 +28,7 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
     """
     if not candles_json:
         return 0.0, 0.0
-        
+
     df = pd.DataFrame(candles_json)
     if df.empty:
         return 0.0, 0.0
@@ -40,18 +42,18 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-    # MODIFIED: 전체 데이터(df)를 대상으로 RSI를 선행 연산하여 과거 데이터 단절 방어 및 ZeroDivision(inf) 안전 처리
+    # MODIFIED: 전체 데이터(df)를 대상으로 RSI를 선행 연산하여 과거 데이터 단절 방어 및 ZeroDivision(inf) 안전 처리 (Case 23, 72)
     delta = df["closePrice"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
-    
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+
     rs = avg_gain / avg_loss
     rsi_series = 100.0 - (100.0 / (1.0 + rs))
     rsi_series = rsi_series.replace([np.inf, -np.inf], 100.0).fillna(0.0)
-    
+
     rsi_val = float(rsi_series.iloc[-1]) if not rsi_series.empty else 0.0
 
     # VWAP 산출 시에만 논리적 거래일 기준(session_df)으로 분리
@@ -62,61 +64,38 @@ def calculate_rsi_1m(candles_json: list, session_start_est: datetime, period: in
         pv = tp * session_df["volume"]
         cum_vol = session_df["volume"].sum()
         vwap_val = float(pv.sum() / cum_vol) if cum_vol > 0.0 else 0.0
-    
+
     return rsi_val, vwap_val
+
 
 class MacroDataCache:
     _nq_cache_data = (0.0, 0.0, 0.0, "WAIT", 0.0, "--:--", 0.0)
     _nq_cache_lock = asyncio.Lock()
 
     @classmethod
-    def _is_sniper_critical_refresh_needed(cls, now_ts: float, last_ts: float) -> bool:
-        if last_ts <= 0.0: return True
-
-        now_est = datetime.fromtimestamp(now_ts, tz=EST_TZ)
-        last_est = datetime.fromtimestamp(last_ts, tz=EST_TZ)
-
-        today_0357_50 = now_est.replace(hour=3, minute=57, second=50, microsecond=0)
-        today_0358_00 = now_est.replace(hour=3, minute=58, second=0, microsecond=0)
-        today_0358_10 = now_est.replace(hour=3, minute=58, second=10, microsecond=0)
-
-        if today_0357_50 <= now_est <= today_0358_10:
-            if now_est >= today_0358_00 and last_est < today_0358_00:
-                return True
-            if now_ts - last_ts >= 2.5:
-                return True
-
-        # NEW: 04:07 EST 타임쉴드 만료 추격 타격 임계 윈도우 즉시 갱신 결속
-        today_0406_50 = now_est.replace(hour=4, minute=6, second=50, microsecond=0)
-        today_0407_00 = now_est.replace(hour=4, minute=7, second=0, microsecond=0)
-        today_0407_10 = now_est.replace(hour=4, minute=7, second=10, microsecond=0)
-
-        if today_0406_50 <= now_est <= today_0407_10:
-            if now_est >= today_0407_00 and last_est < today_0407_00:
-                return True
-            if now_ts - last_ts >= 2.5:
-                return True
-
+    def _is_refresh_needed(cls, now_ts: float, last_ts: float) -> bool:
+        if last_ts <= 0.0:
+            return True
         return (now_ts - last_ts) > 60.0
 
     @classmethod
     async def _refresh_cache_if_needed(cls, force_refresh: bool = False):
         async with cls._nq_cache_lock:
             now = time.time()
-            need_refresh = force_refresh or cls._is_sniper_critical_refresh_needed(
-                now, cls._nq_cache_data[6]
-            )
+            need_refresh = force_refresh or cls._is_refresh_needed(now, cls._nq_cache_data[6])
             if not need_refresh:
                 return
 
             def _fetch():
                 tkr = yf.Ticker("NQ=F")
                 df = tkr.history(period="5d", interval="1m")
-                if df is None or df.empty: return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
+                if df is None or df.empty:
+                    return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
                 df.sort_index(ascending=True, inplace=True)
 
+                # Case 62: 45분 이상 휴장 갭(Gap) 기준 당일 세션 분리로 자정 롤오버 왜곡 방어
                 time_diffs = df.index.to_series().diff()
                 gaps = time_diffs[time_diffs >= pd.Timedelta(minutes=45)]
                 if not gaps.empty:
@@ -125,12 +104,13 @@ class MacroDataCache:
                 else:
                     df_session = df.copy()
 
-                if df_session.empty: return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
+                if df_session.empty:
+                    return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
 
                 curr_val = float(df_session["Close"].iloc[-1])
                 high_val = float(df_session["High"].max())
                 low_val = float(df_session["Low"].min())
-                
+
                 return curr_val, high_val, low_val, "WAIT", 0.0, "--:--"
 
             try:
@@ -166,6 +146,7 @@ class MacroDataCache:
             cls._nq_cache_data[2],
         )
 
+
 class AssassinLedger:
     ALLOWED_SYMBOLS = ("SOXS",)
     DEFAULT_TARGET_PROFIT_RATE = 0.64
@@ -196,7 +177,8 @@ class AssassinLedger:
                 try:
                     with open(filepath, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                        if not isinstance(data, dict): data = {}
+                        if not isinstance(data, dict):
+                            data = {}
                         raw_rate = cls.DEFAULT_TARGET_PROFIT_RATE
                         return (
                             float(data.get("last_buy_price", 0.0)),
@@ -223,12 +205,14 @@ class AssassinLedger:
         filepath = cls._get_file_path(symbol)
         async with GlobalThrottle.get_file_lock(filepath):
             def _read():
-                if not os.path.exists(filepath): return ""
+                if not os.path.exists(filepath):
+                    return ""
                 try:
                     with open(filepath, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         return str(data.get("buy_order_id", "")) if isinstance(data, dict) else ""
-                except Exception: return ""
+                except Exception:
+                    return ""
             return await asyncio.to_thread(_read)
 
     @classmethod
@@ -236,12 +220,14 @@ class AssassinLedger:
         filepath = cls._get_file_path(symbol)
         async with GlobalThrottle.get_file_lock(filepath):
             def _read():
-                if not os.path.exists(filepath): return ""
+                if not os.path.exists(filepath):
+                    return ""
                 try:
                     with open(filepath, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         return str(data.get("entry_trend", "")) if isinstance(data, dict) else ""
-                except Exception: return ""
+                except Exception:
+                    return ""
             return await asyncio.to_thread(_read)
 
     @classmethod
@@ -271,24 +257,39 @@ class AssassinLedger:
                     try:
                         with open(filepath, "r", encoding="utf-8") as f:
                             loaded = json.load(f)
-                            if isinstance(loaded, dict): data = loaded
-                    except Exception: pass
+                            if isinstance(loaded, dict):
+                                data = loaded
+                    except Exception:
+                        pass
 
                 data["target_profit_rate"] = cls.DEFAULT_TARGET_PROFIT_RATE
 
-                if price is not None: data["last_buy_price"] = price
-                if budget is not None: data["budget"] = budget
-                if last_session_id is not None: data["last_session_id"] = last_session_id
-                if is_session_done is not None: data["is_session_done"] = is_session_done
-                if is_active is not None: data["is_active"] = is_active
-                if target_sell_price is not None: data["target_sell_price"] = target_sell_price
-                if buy_order_id is not None: data["buy_order_id"] = buy_order_id
-                if sell_order_id is not None: data["sell_order_id"] = sell_order_id
-                if entry_session is not None: data["entry_session"] = entry_session
-                if entry_time is not None: data["entry_time"] = entry_time
-                if nq_entry_price is not None: data["nq_entry_price"] = nq_entry_price
-                if nq_entry_amp is not None: data["nq_entry_amp"] = nq_entry_amp
-                if entry_trend is not None: data["entry_trend"] = entry_trend
+                if price is not None:
+                    data["last_buy_price"] = price
+                if budget is not None:
+                    data["budget"] = budget
+                if last_session_id is not None:
+                    data["last_session_id"] = last_session_id
+                if is_session_done is not None:
+                    data["is_session_done"] = is_session_done
+                if is_active is not None:
+                    data["is_active"] = is_active
+                if target_sell_price is not None:
+                    data["target_sell_price"] = target_sell_price
+                if buy_order_id is not None:
+                    data["buy_order_id"] = buy_order_id
+                if sell_order_id is not None:
+                    data["sell_order_id"] = sell_order_id
+                if entry_session is not None:
+                    data["entry_session"] = entry_session
+                if entry_time is not None:
+                    data["entry_time"] = entry_time
+                if nq_entry_price is not None:
+                    data["nq_entry_price"] = nq_entry_price
+                if nq_entry_amp is not None:
+                    data["nq_entry_amp"] = nq_entry_amp
+                if entry_trend is not None:
+                    data["entry_trend"] = entry_trend
 
                 for obsolete_key in [
                     "pre_first_flag", "force_downgrade", "force_downgrade_0_6", "is_stage_3",
