@@ -7,6 +7,7 @@
 # NEW: 관제탑(/avwap) 내 NQ=F 3단 매크로 방어선(체결 기준 지수 및 동적 역행 임계치) 실시간 상태 렌더링 주입 (Case 13, 66, 67)
 # MODIFIED: SOXS(🐻) 및 SOXL(🐂) 듀얼 RSI 관제탑 유지 및 SOXS RSI<=30 타격권 상태 표시 결속 (Case 44)
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
+# MODIFIED: 전술 제어반(/settlement) 내 마스터 전원(ON/OFF)과 세션별 실시간 출동상태(09:30 정규장 진입봉쇄 등) 분리 렌더링 결속 (Case 13, 37, 53, 57)
 
 import asyncio
 from datetime import datetime, timedelta
@@ -216,15 +217,19 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     if 400 <= t <= 929:
         session_name_ui = "preMarket"
         market_header = "( <b>🌅 PRE_MARKET · 스나이퍼 골든타임</b> )"
+        pre_window_label = "(04:00~09:29 · 무한 출동 가동중)"
     elif 930 <= t <= 1559:
         session_name_ui = "regularMarket"
         market_header = "( <b>🔥 REG_MARKET · 신규진입 마감</b> )"
+        pre_window_label = "(04:00~09:29 · 출동 마감)"
     elif 1600 <= t <= 1659:
         session_name_ui = "afterMarket"
         market_header = "( <b>🛑 AFT_MARKET</b> )"
+        pre_window_label = "(04:00~09:29 · 출동 마감)"
     else:
         session_name_ui = "dayMarket"
         market_header = "( <b>🌙 데이마켓 · 04:00 대기</b> )"
+        pre_window_label = "(04:00~09:29 · 개장 대기)"
 
     try:
         is_open, _, sess_name, _ = await asyncio.wait_for(api_client.is_market_open(), timeout=3.0)
@@ -322,7 +327,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 📊 <b>현재가 & 5MA(어제 진폭) & 듀얼 RSI(1m)</b>
 🐻 <b>SOXS</b> <code>${price_s:.2f}</code> | <code>{amp_s:.1f}%({yest_amp_s:.1f}%)</code>
 {rsi_ui_str}
-🌅 <b>프리장</b> (04:00~09:29 · 무한 출동 윈도우)
+🌅 <b>프리장</b> {pre_window_label}
 🐻 <b>SOXS</b> <code>[VWAP] ${sess_s['pre_vwap']:.2f}</code>
   ⤷ 팩트: <code>${sess_s['pre_l']:.2f}~${sess_s['pre_h']:.2f} ({sess_s['pre_amp']:.1f}%)</code> | 예상: <code>${pre_exp_l_s:.2f}~${pre_exp_h_s:.2f}</code>
 
@@ -453,10 +458,56 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
+# MODIFIED: Case 13, 37, 53, 57 — 전술 제어반(/settlement) 내 마스터 전원(ON/OFF)과 세션별 실시간 출동상태 분리 렌더링
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
+    now_est = datetime.now(EST_TZ)
+    t = now_est.hour * 100 + now_est.minute
+
     state_s = await AssassinLedger.get_state("SOXS")
-    budget_s, rate_s, act_s = state_s[1], state_s[2], state_s[5]
-    act_s_str = "🟢 ON" if act_s else "🔴 OFF"
+    buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
+
+    last_buy_p = float(state_s[0] or 0.0)
+    budget_s = float(state_s[1] or 100.0)
+    rate_s = float(state_s[2] or 0.64)
+    is_done = bool(state_s[4])
+    act_s = bool(state_s[5])
+    target_sell_p = float(state_s[6] or 0.0)
+    sell_id_s = str(state_s[7] or "")
+    entry_sess = str(state_s[8] or "")
+
+    act_s_str = "🟢 ON (시스템 활성)" if act_s else "🔴 OFF (수동 통제)"
+    has_position_in_ledger = (target_sell_p > 0.0 or bool(sell_id_s) or last_buy_p > 0.0)
+
+    if not act_s:
+        strike_status_str = "⏸️ 가동OFF (자동 매수·방어·MOC 전면 중지)"
+    elif entry_sess == "CANCELED_MACRO":
+        strike_status_str = "🛑 매크로 방어 발동 (금일 신규진입 영구 소각)"
+    elif 400 <= t <= 929:
+        if buy_id_s:
+            strike_status_str = "⏳ 프리장 지정가 매수 체결 대기중"
+        elif has_position_in_ledger:
+            if target_sell_p > 0.0:
+                strike_status_str = f"🎯 보유중 (목표 ${target_sell_p:.2f} 익절 시 무한 재출동)"
+            else:
+                strike_status_str = f"🎯 보유중 (+{rate_s}% 익절 덫 장전중)"
+        elif not is_done:
+            strike_status_str = "🔫 프리장 RSI≤30 무한 출동 감시중 (신규진입 가능)"
+        else:
+            strike_status_str = "🔒 금일 프리장 타격 잠금"
+    elif 930 <= t <= 1558:
+        if has_position_in_ledger:
+            if target_sell_p > 0.0:
+                strike_status_str = f"🔒 09:30 신규진입 마감 (보유분 ${target_sell_p:.2f} 익절·방어 감시)"
+            else:
+                strike_status_str = "🔒 09:30 신규진입 마감 (보유분 익절·방어 감시)"
+        else:
+            strike_status_str = "🔒 09:30 정규장 신규진입 봉쇄 (관망 · 매수불가)"
+    elif 1559 <= t <= 1601:
+        strike_status_str = "🛑 15:59~16:01 제로-오버나이트 MOC 강제 청산 윈도우"
+    elif t >= 1900 or t < 400:
+        strike_status_str = "🌙 데이마켓 대기 (04:00 프리장 개장 전 매수차단)"
+    else:
+        strike_status_str = "⛔ 장외/애프터장 대기 (신규진입 차단)"
 
     text = (
         "⚙️ <b>[단방향 전술 코어 제어반 (프리장 SOXS 스나이퍼)]</b>\n"
@@ -464,8 +515,10 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
         "▫️ <b>타격 원칙:</b> <code>프리장 익절 시 무한 재출동 / 09:30 정규장 진입 봉쇄</code>\n"
         "▫️ <b>방어 체계:</b> <code>NQ=F 3단 매크로 손절 덤핑 & 15:59 제로-오버나이트 MOC</code>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
-        "🐻 <b>SOXS (SHORT · 프리장 RSI≤30 무한 스나이퍼)</b>\n"
-        f"▫️ 상태: <code>{act_s_str}</code> | 예산: <code>${budget_s:,.2f}</code> | 익절: <code>+{rate_s}% (고정)</code>"
+        "🐻 <b>SOXS (SHORT · 단방향 스나이퍼)</b>\n"
+        f"▫️ 마스터 전원: <code>{act_s_str}</code>\n"
+        f"▫️ 현재 출동상태: <code>{strike_status_str}</code>\n"
+        f"▫️ 설정 시드: <code>${budget_s:,.2f}</code> | 목표 익절: <code>+{rate_s}% (고정)</code>"
     )
 
     keyboard = InlineKeyboardMarkup(
