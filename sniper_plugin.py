@@ -3,6 +3,7 @@
 # 목적: 프리장(04:00~09:29 EST) SOXS 단방향 RSI<=30 무한 출동 스나이퍼 및 매크로 3단 방어 상태 머신
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 암살자 타격 함수 영구 소각
+# MODIFIED: 제3헌법 의거 롱(SOXL)/숏(SOXS) RSI<=20 및 RSI<=10 패닉 셀 텔레그램 푸시 알림 기능 영구 폐기
 # NEW: 프리장 골든타임(04:00~09:29 EST) SOXS 1분봉 RSI<=30.0 포착 즉시 wakeup_event 격발 및 지정가(LIMIT) 실거래 요격 (Case 15, 25, 52, 53, 59)
 # NEW: 프리장 타격 시 시드/USD 예수금 부족(target_qty <= 0) 및 주문 API 거절 예외 발생 시 무음 스킵 방지 텔레그램 타전망 결속 (Case 17, 18, 65)
 # NEW: 09:30 EST 정규장 개장 정각 신규 매수 원천 봉쇄 및 프리장 미체결 매수 주문(buy_order_id) 즉각 선취소 (Case 48, 53)
@@ -63,39 +64,15 @@ async def execute_rsi_monitoring_plugin(
     if not state:
         return
 
+    # MODIFIED: 듀얼 관제탑(/avwap) 표출용 실시간 RSI 및 VWAP 상태만 갱신하고, RSI<=20/10 텔레그램 푸시 알림은 영구 폐기
     state["value"] = rsi_val
     state["vwap"] = vwap_val
-    current_level = state["level"]
-
-    icon = "🐻" if symbol == "SOXS" else "🐂"
 
     # Case 25 & Case 59: 프리장(04:00~09:29 EST) 내 SOXS RSI <= 30.0 포착 즉시 메인 루프 기상 트리거 격발
     now_est = datetime.now(EST_TZ)
     est_hm = now_est.hour * 100 + now_est.minute
     if symbol == "SOXS" and (400 <= est_hm <= 929) and (0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD):
         ctx.wakeup_event.set()
-
-    # Case 44: SOXS(🐻) 및 SOXL(🐂) 듀얼 RSI 20-10-30 패닉 셀 경보 상태 머신
-    if rsi_val >= 30.0:
-        if current_level != 0:
-            print(f"♻️ [{icon} RSI 레이더 {symbol}] {rsi_val:.1f} 회복. 경보 상태 머신 릴리스 (Level 0).", flush=True)
-            state["level"] = 0
-        return
-
-    if rsi_val <= 10.0 and current_level == 1:
-        state["level"] = 2
-        await ctx.notify_tg(
-            f"🚨 <b>[{icon} 패닉 셀 심각 {symbol}] 2차 폭포수 과매도 포착</b>\n"
-            f"▫️ 실시간 RSI(1m): <code>{rsi_val:.1f}</code> (10 붕괴)\n"
-            "▫️ 극단적 휩소 우려 (스팸 타전 락온)"
-        )
-    elif rsi_val <= 20.0 and current_level == 0:
-        state["level"] = 1
-        await ctx.notify_tg(
-            f"⚠️ <b>[{icon} 패닉 셀 경고 {symbol}] 1차 투매 구간 진입 포착</b>\n"
-            f"▫️ 실시간 RSI(1m): <code>{rsi_val:.1f}</code> (20 붕괴)\n"
-            "▫️ (스팸 타전 락온. RSI 10 붕괴 또는 30 회복 전까지 타전 금지)"
-        )
 
 
 async def execute_moc_zero_overnight_plugin(
@@ -252,7 +229,6 @@ async def execute_macro_defense_plugin(
                     "▫️ 조치: 프리장 미체결 매수 주문 원자적 파기 및 당일 매수 권한 영구 소각"
                 )
             elif (400 <= est_hm <= 929) and _STRIKE_ALERT_CACHE.get("last_macro1_date") != today_str:
-                # NEW: 미체결 주문이 없더라도 프리장 중 매크로 1차 방어선이 최초 작동해 잠길 때 무음 잠금 방지 알림 타전
                 _STRIKE_ALERT_CACHE["last_macro1_date"] = today_str
                 await ctx.notify_tg(
                     f"🛑 <b>[프리장 스나이퍼 {symbol}] 매크로 1차 방어선 작동 (출동 마감)</b>\n"
@@ -348,7 +324,7 @@ async def execute_macro_defense_plugin(
     return False
 
 
-# NEW: 목표 1 & 초과 Case 48, 53 — 09:30 EST 정규장 개장 시 프리장 미체결 매수 즉시 취소 및 신규 진입 영구 차단
+# 목표 1 & 초과 Case 48, 53 — 09:30 EST 정규장 개장 시 프리장 미체결 매수 즉시 취소 및 신규 진입 영구 차단
 async def enforce_0930_regular_cutoff_plugin(
     ctx: SniperPluginContext, symbol: str, est_time_int: int, is_session_done: bool, buy_order_id: str
 ) -> tuple[bool, str]:
@@ -468,7 +444,7 @@ async def reconcile_zero_holdings_exit_plugin(
         is_manual_exit = (was_holding and not is_take_profit_exit and not is_moc_time and not is_trap_survived)
         is_buy_cancel_exit = (not was_holding and not is_take_profit_exit and not is_moc_time and not is_trap_survived)
 
-        # MODIFIED: 초과 Case 52 — 프리장(04:00~09:29 EST) 내 익절 완료(또는 매크로 아닌 단순 매수취소) 시 is_session_done=False로 무한 재출동 활성화
+        # 초과 Case 52 — 프리장(04:00~09:29 EST) 내 익절 완료(또는 매크로 아닌 단순 매수취소) 시 is_session_done=False로 무한 재출동 활성화
         if (
             is_premarket_now
             and prev_entry_session != "CANCELED_MACRO"
@@ -518,7 +494,7 @@ async def reconcile_zero_holdings_exit_plugin(
         ctx.in_memory_ordering_lock[symbol] = False
 
 
-# NEW: 목표 1 & Case 15, 17, 18, 25, 52, 53, 59, 65, 71 — 프리장(04:00~09:29 EST) SOXS RSI<=30.0 실거래 지정가 매수 요격 플러그인
+# 목표 1 & Case 15, 17, 18, 25, 52, 53, 59, 65, 71 — 프리장(04:00~09:29 EST) SOXS RSI<=30.0 실거래 지정가 매수 요격 플러그인
 async def execute_premarket_rsi_sniper_strike_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
     current_price: float, budget: float, target_profit_rate: float, rsi_val: float,
@@ -589,7 +565,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
 
             target_qty = int(math.floor(actual_budget / target_price))
 
-            # MODIFIED: Case 18 & Case 65 — target_qty <= 0 발생 시 무음 스킵 방지 및 세션당 1회 텔레그램 경고 타전
+            # Case 18 & Case 65 — target_qty <= 0 발생 시 무음 스킵 방지 및 세션당 1회 텔레그램 경고 타전
             if target_qty <= 0:
                 if _STRIKE_ALERT_CACHE.get("last_warn_session") != current_session_id:
                     _STRIKE_ALERT_CACHE["last_warn_session"] = current_session_id
@@ -642,7 +618,6 @@ async def execute_premarket_rsi_sniper_strike_plugin(
             print(f"🚨 [프리장 스나이퍼 타격 방어 {symbol}] {err_str}", flush=True)
             if any(code in err_str for code in ["400", "422", "404", "409", "401", "403", "429"]):
                 ctx.idempotency_keys[symbol]["BUY"] = None
-            # NEW: Case 17 & Case 18 — 주문 API 예외 발생 시 무음 소멸 방지 및 텔레그램 에러 즉시 타전
             if _STRIKE_ALERT_CACHE.get("last_err_msg") != err_str:
                 _STRIKE_ALERT_CACHE["last_err_msg"] = err_str
                 await ctx.notify_tg(

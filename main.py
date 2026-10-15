@@ -4,6 +4,7 @@
 # 구조: sniper_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 슬림 아키텍처
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 암살자 플러그인 및 FORCE_BUY 데드코드 영구 소각
+# MODIFIED: 제3헌법 의거 RSI<=20/10 푸시 알림 폐기에 따른 shared_rsi_state 내 불필요한 level 상태 변수 영구 소각
 # MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30~17:00 EST로 전면 확장 (Case 07)
 # NEW: 09:30 EST 정규장 컷오프 및 프리장 미체결 매수 즉시 파기 플러그인(enforce_0930_regular_cutoff_plugin) 메인 루프 결속 (Case 48, 53)
 # NEW: 프리장(04:00~09:29 EST) SOXS RSI<=30.0 즉시 요격 플러그인(execute_premarket_rsi_sniper_strike_plugin) 원자적 편입 (Case 25, 52, 59, 70)
@@ -88,9 +89,9 @@ in_memory_ordering_lock = {TRADE_SYMBOL: False}
 dual_strike_mutex = asyncio.Lock()
 shared_holdings = {TRADE_SYMBOL: 0}
 
-# MODIFIED: 1.5초 실시간 틱 RSI 점화식 연산을 위한 ewm_state 슬롯 확장
+# MODIFIED: RSI<=20/10 경보 상태 머신 폐기에 따라 불필요한 level 키 소각 및 ewm_state 슬롯 유지
 shared_rsi_state = {
-    sym: {"value": 0.0, "level": 0, "vwap": 0.0, "ewm_state": {}} for sym in RSI_SYMBOLS
+    sym: {"value": 0.0, "vwap": 0.0, "ewm_state": {}} for sym in RSI_SYMBOLS
 }
 
 idempotency_keys = {
@@ -160,7 +161,7 @@ async def auto_update_loop(bot: Bot, chat_id: int):
         try:
             now_est = datetime.now(EST_TZ)
             est_hm = now_est.hour * 100 + now_est.minute
-            # MODIFIED: Case 07 프리장 개장 전부터 애프터장 종료(03:30~17:00 EST)까지 무인 업데이트 전면 차단
+            # Case 07 프리장 개장 전부터 애프터장 종료(03:30~17:00 EST)까지 무인 업데이트 전면 차단
             if 330 <= est_hm < 1700:
                 await asyncio.sleep(3600.0)
                 continue
@@ -210,12 +211,12 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
 
                     current_price = await ctx.client.get_current_price(symbol)
 
+                    # MODIFIED: 불필요한 level 키 제거
                     sym_state = ctx.shared_rsi_state.setdefault(
-                        symbol, {"value": 0.0, "level": 0, "vwap": 0.0, "ewm_state": {}}
+                        symbol, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
                     )
                     ewm_state_buf = sym_state.setdefault("ewm_state", {})
 
-                    # MODIFIED: 실시간 current_price 보정 및 직전 확정 분봉 EWM 기저 상태(ewm_state_buf) 추출 결속
                     rsi_val, vwap_val = await asyncio.to_thread(
                         calculate_rsi_1m, candles, session_start_est, 14, current_price, ewm_state_buf
                     )
@@ -227,7 +228,7 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
         except Exception as e:
             print(f"🚨 [RSI 레이더망 {symbol}] 붕괴 방어: {e}", flush=True)
 
-        # MODIFIED: 프리장 골든타임(04:00~09:29 EST) 중 SOXS 캔들 스캔 주기를 20초 -> 5초로 4배 가속하여 EWM 기저 상태 초고속 동기화
+        # 프리장 골든타임(04:00~09:29 EST) 중 SOXS 캔들 스캔 주기를 5초로 가속하여 EWM 기저 상태 초고속 동기화
         now_est_chk = datetime.now(EST_TZ)
         est_hm_chk = now_est_chk.hour * 100 + now_est_chk.minute
         sleep_sec = 5.0 if (symbol == "SOXS" and 400 <= est_hm_chk <= 929) else 60.0
@@ -305,14 +306,13 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             just_turned_off = (runtime_state["prev_is_active"] is True and is_active is False)
             runtime_state["prev_is_active"] = is_active
 
-            # MODIFIED: Case 22 — 17:00 EST 가비지 컬렉션(GC) 실행 시 미보유 상태면 is_session_done=False 및 EWM 캐시 포함 완전 초기화
+            # MODIFIED: Case 22 — 17:00 EST 가비지 컬렉션(GC) 실행 시 미보유 상태면 is_session_done=False 및 EWM 캐시 초기화 (level 제거)
             if 17 <= now_est.hour < 19 and runtime_state["last_gc_date"] != today_str:
                 runtime_state["last_gc_date"] = today_str
                 ctx.in_memory_ordering_lock[symbol] = False
                 ctx.idempotency_keys[symbol] = {"BUY": None, "TRAP": None, "MOC": None, "M_DUMP": None}
 
                 for r_sym in ctx.shared_rsi_state:
-                    ctx.shared_rsi_state[r_sym]["level"] = 0
                     ctx.shared_rsi_state[r_sym]["ewm_state"] = {}
 
                 runtime_state["last_moc_tick"] = 0.0
@@ -361,7 +361,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 await asyncio.sleep(60.0)
                 continue
 
-            # MODIFIED: Case 01 & 초과 Case 36 — 19:00 EST 데이마켓 진입 시 논리적 거래일(익일 날짜) 기준으로 세션 ID 산출
+            # Case 01 & 초과 Case 36 — 19:00 EST 데이마켓 진입 시 논리적 거래일(익일 날짜) 기준으로 세션 ID 산출
             if 400 <= est_time_int < 930:
                 hardcoded_session = "preMarket"
                 base_h, base_m, base_date = 4, 0, now_est
@@ -478,8 +478,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     await AssassinLedger.save_state(symbol, last_session_id=current_session_id)
                 last_session_id = current_session_id
 
-            # NEW: 초과 Case 52 — 프리장(04:00~09:29 EST) 무한 출동 자가 치유(Self-Healing) 가드
-            # 미보유(0주) & 미체결 주문 없음 & 매크로 차단(CANCELED_MACRO) 아님에도 구버전 잔재 등으로 잠겨 있으면 즉시 해제
+            # 초과 Case 52 — 프리장(04:00~09:29 EST) 무한 출동 자가 치유(Self-Healing) 가드
             if (
                 400 <= est_time_int <= 929
                 and is_session_done
@@ -520,10 +519,10 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 )
                 continue
 
-            # NEW: 1.5초 메인 루프 실시간 틱 RSI(compute_realtime_tick_rsi) 즉시 합성 — 폴링 사각지대(원인 D) 원천 소각
+            # MODIFIED: 불필요한 level 키 제거 및 1.5초 메인 루프 실시간 틱 RSI(compute_realtime_tick_rsi) 즉시 합성
             is_premarket_window = (400 <= est_time_int <= 929)
             sym_rsi_dict = ctx.shared_rsi_state.setdefault(
-                symbol, {"value": 0.0, "level": 0, "vwap": 0.0, "ewm_state": {}}
+                symbol, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
             )
             fallback_rsi = float(sym_rsi_dict.get("value", 0.0))
 

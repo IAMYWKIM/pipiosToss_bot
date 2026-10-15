@@ -3,9 +3,9 @@
 # 목적: 프리장(04:00~09:29 EST) SOXS 단방향 RSI<=30 무한 출동 스나이퍼 텔레그램 UI 렌더링 모듈
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 암살자 스케줄 및 타임쉴드 UI 잔재 영구 소각
+# MODIFIED: 제3헌법 의거 RSI<=20/10 경보 상태 머신(level) 폐기에 따른 /avwap 듀얼 RSI 상태 표출 직관화 (Case 44)
 # MODIFIED: 프리장(04:00~09:29 EST) SOXS RSI<=30 무한 출동 및 09:30 정규장 컷오프 상태 표출 결속 (Case 13, 52, 53, 57)
 # NEW: 관제탑(/avwap) 내 NQ=F 3단 매크로 방어선(체결 기준 지수 및 동적 역행 임계치) 실시간 상태 렌더링 주입 (Case 13, 66, 67)
-# MODIFIED: SOXS(🐻) 및 SOXL(🐂) 듀얼 RSI 관제탑 유지 및 SOXS RSI<=30 타격권 상태 표시 결속 (Case 44)
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
 # MODIFIED: 전술 제어반(/settlement) 내 마스터 전원(ON/OFF)과 세션별 실시간 출동상태(09:30 정규장 진입봉쇄 등) 분리 렌더링 결속 (Case 13, 37, 53, 57)
 
@@ -95,7 +95,7 @@ def parse_session_data(all_candles: list, session_start_est: datetime) -> dict:
     reg_h, reg_l, reg_amp, reg_vwap, reg_body = calc_metrics(reg_df)
     res.update({
         "pre_h": pre_h, "pre_l": pre_l, "pre_amp": pre_amp, "pre_vwap": pre_vwap, "pre_body": pre_body,
-        "reg_h": reg_h, "reg_l": reg_l, "reg_amp": reg_amp, "reg_vwap": reg_vwap, "reg_body": reg_body,
+        "reg_h": reg_h, "reg_l": reg_l, "reg_amp": reg_vwap if False else reg_amp, "reg_vwap": reg_vwap, "reg_body": reg_body,
     })
     return res
 
@@ -172,7 +172,7 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 57 프리장 스나이퍼 헌법 기반 세션별 상태 표출
+# Case 13 & 초과 Case 57 프리장 스나이퍼 헌법 기반 세션별 상태 표출
 def build_compact_status(
     symbol: str, state_tuple: tuple, buy_order_id: str, current_session: str, est_time_int: int, qty: float
 ) -> str:
@@ -269,7 +269,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
     status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, qty_s)
 
-    # MODIFIED: Case 17 텔레그램 HTML 파서 충돌 방지를 위해 원시 부등호('<') 제거 및 '2.0%미만' 한글 치환
+    # Case 17 텔레그램 HTML 파서 충돌 방지를 위해 원시 부등호('<') 제거 및 '2.0%미만' 한글 치환
     nq_entry_p = float(state_s[10] or 0.0)
     nq_entry_a = float(state_s[11] or 0.0)
     macro_1st_str = "🛑 과열차단(≥2.0%)" if nq_amp >= 2.0 else "🟢 진입허용(2.0%미만)"
@@ -283,31 +283,24 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     else:
         macro_3rd_line = ""
 
+    # MODIFIED: RSI<=20/10 경보 상태 머신(level) 폐기에 따라 순수 RSI 수치 기준으로만 관제 상태 렌더링 (Case 17, 44)
     rsi_ui_lines = []
     if shared_rsi_state:
         for r_sym in ("SOXS", "SOXL"):
             if r_sym in shared_rsi_state:
                 rsi_data = shared_rsi_state[r_sym]
                 r_val = float(rsi_data.get("value", 0.0))
-                lv = int(rsi_data.get("level", 0))
 
-                # MODIFIED: Case 17 원시 부등호('>') 제거 및 '30초과' 한글 표기 적용
                 if r_sym == "SOXS":
-                    if lv == 2:
-                        warn_str = "🚨 2차 패닉(≤10 · 스나이퍼 타격권)"
-                    elif lv == 1:
-                        warn_str = "⚠️ 1차 투매(≤20 · 스나이퍼 타격권)"
-                    elif 0.0 < r_val <= 30.0:
+                    if 0.0 < r_val <= 30.0:
                         warn_str = "🔫 스나이퍼 타격권(≤30)"
                     else:
                         warn_str = "🟢 안정(30초과)"
                 else:
-                    if lv == 2:
-                        warn_str = "🚨 2차 패닉(심각)"
-                    elif lv == 1:
-                        warn_str = "⚠️ 1차 투매(과매도)"
+                    if 0.0 < r_val <= 30.0:
+                        warn_str = "📉 과매도(≤30 · 매매차단)"
                     else:
-                        warn_str = "🟢 안정"
+                        warn_str = "🟢 안정(30초과)"
 
                 if r_val > 0.0:
                     icon = "🐻" if r_sym == "SOXS" else "🐂"
@@ -458,7 +451,7 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: Case 13, 37, 53, 57 — 전술 제어반(/settlement) 내 마스터 전원(ON/OFF)과 세션별 실시간 출동상태 분리 렌더링
+# Case 13, 37, 53, 57 — 전술 제어반(/settlement) 내 마스터 전원(ON/OFF)과 세션별 실시간 출동상태 분리 렌더링
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
