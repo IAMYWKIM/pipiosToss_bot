@@ -6,6 +6,7 @@
 # MODIFIED: 프리장(04:00~09:29 EST) SOXS RSI<=30 무한 출동 및 09:30 정규장 컷오프 상태 표출 결속 (Case 13, 52, 53, 57)
 # NEW: 관제탑(/avwap) 내 NQ=F 3단 매크로 방어선(체결 기준 지수 및 동적 역행 임계치) 실시간 상태 렌더링 주입 (Case 13, 66, 67)
 # MODIFIED: SOXS(🐻) 및 SOXL(🐂) 듀얼 RSI 관제탑 유지 및 SOXS RSI<=30 타격권 상태 표시 결속 (Case 44)
+# MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
 
 import asyncio
 from datetime import datetime, timedelta
@@ -263,10 +264,10 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     buy_id_s = await AssassinLedger.get_buy_order_id("SOXS")
     status_s = build_compact_status("SOXS", state_s, buy_id_s, session_name_ui, t, qty_s)
 
-    # NEW: Case 13 & Case 66, 67 NQ=F 3단 매크로 방어선 실시간 현황 표출
+    # MODIFIED: Case 17 텔레그램 HTML 파서 충돌 방지를 위해 원시 부등호('<') 제거 및 '2.0%미만' 한글 치환
     nq_entry_p = float(state_s[10] or 0.0)
     nq_entry_a = float(state_s[11] or 0.0)
-    macro_1st_str = "🛑 과열차단(≥2.0%)" if nq_amp >= 2.0 else "🟢 진입허용(<2.0%)"
+    macro_1st_str = "🛑 과열차단(≥2.0%)" if nq_amp >= 2.0 else "🟢 진입허용(2.0%미만)"
     if qty_s > 0.0 and nq_entry_p > 0.0:
         dyn_thresh = max(nq_entry_a * 0.5, NQ_DYNAMIC_FLOOR_UI)
         nq_diff = ((nq_c - nq_entry_p) / nq_entry_p * 100.0) if nq_c > 0.0 else 0.0
@@ -285,6 +286,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
                 r_val = float(rsi_data.get("value", 0.0))
                 lv = int(rsi_data.get("level", 0))
 
+                # MODIFIED: Case 17 원시 부등호('>') 제거 및 '30초과' 한글 표기 적용
                 if r_sym == "SOXS":
                     if lv == 2:
                         warn_str = "🚨 2차 패닉(≤10 · 스나이퍼 타격권)"
@@ -293,7 +295,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
                     elif 0.0 < r_val <= 30.0:
                         warn_str = "🔫 스나이퍼 타격권(≤30)"
                     else:
-                        warn_str = "🟢 안정(>30)"
+                        warn_str = "🟢 안정(30초과)"
                 else:
                     if lv == 2:
                         warn_str = "🚨 2차 패닉(심각)"
