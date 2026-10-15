@@ -13,6 +13,8 @@
 # MODIFIED: 제3헌법 및 Case 14 의거 미사용 조건주문(conditional-orders) 데드코드 메서드 3종 영구 소각
 # NEW: 스나이퍼 SOXS 단일 타겟 하드 락온 — 비허용 종목(SOXL 등) 주문 API 호출 물리적 원천 차단 쉴드 주입 (Case 09, 54)
 # NEW: 미국 주식 주문 정정(Modify) 시 quantity 파라미터 원천 적출 방어 메서드 구축 (Case 69)
+# MODIFIED: cancel_order 호출 시 json_data={} 명시적 주입 및 POST 요청 기본 JSON 바디 보장으로 HTTP 415 에러 원천 소각 (Case 16, 24)
+# MODIFIED: HTTP 400/403/404/409/415/422 클라이언트 에러 발생 시 무의미한 3초 백오프 재시도 즉시 중단 및 즉각 예외 반환
 
 import asyncio
 import aiohttp
@@ -78,8 +80,13 @@ class GlobalThrottle:
         return cls._file_locks[filepath]
 
 
+class _NonRetryableApiError(Exception):
+    """클라이언트 요청 오류(4xx) 발생 시 무의미한 지수 백오프 재시도를 건너뛰기 위한 내부 예외"""
+    pass
+
+
 class TossApiClient:
-    # NEW: 실거래 스나이퍼 허용 단일 종목 하드 락온 (Case 09, 54)
+    # 실거래 스나이퍼 허용 단일 종목 하드 락온 (Case 09, 54)
     REAL_ALLOWED_SYMBOLS = ("SOXS",)
 
     def __init__(self, client_id: str, client_secret: str):
@@ -104,6 +111,11 @@ class TossApiClient:
         url = f"{self.base_url}{endpoint}"
         req_headers = dict(headers) if headers else {}
 
+        # MODIFIED: POST/PUT/PATCH 요청 시 json_data가 None이면 빈 dict({})를 기본 주입하여 HTTP 415 원천 차단
+        effective_json = json_data
+        if method.upper() in ("POST", "PUT", "PATCH") and effective_json is None:
+            effective_json = {}
+
         for attempt in range(3):
             await GlobalThrottle.wait_api_sync()
 
@@ -113,12 +125,12 @@ class TossApiClient:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.request(
-                        method, url, headers=req_headers, json=json_data, timeout=timeout
+                        method, url, headers=req_headers, json=effective_json, timeout=timeout
                     ) as resp:
 
                         if resp.status == 401:
                             if attempt == 2:
-                                raise Exception("API HTTP 401: Unauthorized (Max retries exceeded)")
+                                raise _NonRetryableApiError("API HTTP 401: Unauthorized (Max retries exceeded)")
 
                             async with self._auth_lock:
                                 failed_auth = req_headers.get("Authorization")
@@ -144,7 +156,10 @@ class TossApiClient:
                                 if isinstance(err_json, dict):
                                     err_obj = err_json.get("error", {})
                                     if isinstance(err_obj, dict):
+                                        err_code = err_obj.get("code", "")
                                         err_msg = err_obj.get("message", err_text)
+                                        if err_code:
+                                            err_msg = f"[{err_code}] {err_msg}"
                                     else:
                                         err_msg = err_json.get("error_description", str(err_obj))
                                 else:
@@ -152,9 +167,16 @@ class TossApiClient:
                                 safe_err = html.escape(str(err_msg))
                             except Exception:
                                 safe_err = html.escape(err_text)
-                            raise Exception(f"API HTTP {resp.status}: {safe_err}")
+
+                            full_err_msg = f"API HTTP {resp.status}: {safe_err}"
+                            # MODIFIED: 4xx 클라이언트 오류(400, 403, 404, 409, 415, 422)는 백오프 재시도 없이 즉시 탈출
+                            if 400 <= resp.status < 500:
+                                raise _NonRetryableApiError(full_err_msg)
+                            raise Exception(full_err_msg)
 
                         return await resp.json()
+            except _NonRetryableApiError as non_retry_err:
+                raise Exception(str(non_retry_err))
             except asyncio.TimeoutError:
                 if attempt == 2:
                     raise Exception("API Timeout")
@@ -350,7 +372,6 @@ class TossApiClient:
                             end = datetime.fromisoformat(end_str).astimezone(ZoneInfo("America/New_York"))
 
                             if session_name == "dayMarket":
-                                # MODIFIED: 시작 시간이 12:00 이후(오후/저녁)일 경우 서머타임/개장시간 유동성과 무관하게 무조건 익일 03:59:59 락온
                                 if start.hour >= 12:
                                     end = (start + timedelta(days=1)).replace(hour=3, minute=59, second=59, microsecond=0)
                                 else:
@@ -449,15 +470,18 @@ class TossApiClient:
         orders = res_dict.get("orders")
         return orders if isinstance(orders, list) else []
 
-    async def cancel_order(self, order_id: str):
+    # MODIFIED: 주문 취소 시 json_data={} 를 명시적으로 전달하여 HTTP 415 Unsupported Media Type 완벽 소각
+    async def cancel_order(self, order_id: str) -> dict:
         if not self.account_seq:
             await self.fetch_account_seq()
-        await self._request(
+        data = await self._request(
             "POST",
             f"/api/v1/orders/{order_id}/cancel",
             "ORDER",
             headers=self._get_headers(requires_account=True),
+            json_data={},
         )
+        return data if isinstance(data, dict) else {}
 
     async def get_order_detail(self, order_id: str) -> dict:
         if not self.account_seq:
@@ -476,7 +500,7 @@ class TossApiClient:
     async def create_order(
         self, symbol: str, side: str, order_type: str, quantity: float, price: str, client_order_id: str
     ) -> dict:
-        # NEW: Case 09 & Case 54 비허용 종목(SOXL 등) 주문 API 호출 물리적 원천 차단 쉴드
+        # Case 09 & Case 54 비허용 종목(SOXL 등) 주문 API 호출 물리적 원천 차단 쉴드
         sym_clean = str(symbol).strip().upper()
         if sym_clean not in self.REAL_ALLOWED_SYMBOLS:
             raise RuntimeError(
@@ -503,7 +527,7 @@ class TossApiClient:
         )
         return data if isinstance(data, dict) else {}
 
-    # NEW: Case 69 미국 주식 주문 정정(Modify) 시 quantity 파라미터 원천 적출 방어
+    # Case 69 미국 주식 주문 정정(Modify) 시 quantity 파라미터 원천 적출 방어
     async def modify_order(
         self,
         order_id: str,

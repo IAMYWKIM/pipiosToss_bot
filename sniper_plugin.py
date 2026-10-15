@@ -10,6 +10,7 @@
 # MODIFIED: 프리장(04:00~09:29 EST) 내 +0.64% 익절 완료 시 is_session_done=False 복원으로 무한 재출동 루프 결속 (Case 52)
 # MODIFIED: 매크로 1·2·3차 방어선 작동 시 entry_session="CANCELED_MACRO" 및 당일 재진입 영구 차단 락온 (Case 66, 67)
 # MODIFIED: 스나이퍼 OFF 상태 중 수동 청산 식별 시 타전 억제(Silent Reset) 분기 결속 (Case 46)
+# NEW: MOC 및 매크로 덤핑 시 미체결 매도 선취소 후 수량 해방(sellableQuantity > 0) 2.0초 폴링 대기 및 거래소 취소 병목 시 기존 매도 주문 가격 즉시 정정(modify_order) 우회 타격망 결속 (Case 16, 24, 69)
 
 import math
 import time
@@ -26,7 +27,7 @@ from quant_engine import AssassinLedger, MacroDataCache
 EST_TZ = ZoneInfo("America/New_York")
 PRE_SNIPER_RSI_THRESHOLD = 30.0
 
-# NEW: 무음 불발(Silent Drop) 방어 및 스팸 억제용 인메모리 경보 캐시 (Case 18)
+# 무음 불발(Silent Drop) 방어 및 스팸 억제용 인메모리 경보 캐시 (Case 18)
 _STRIKE_ALERT_CACHE = {
     "last_warn_session": "",
     "last_err_msg": "",
@@ -54,6 +55,81 @@ class SniperPluginContext:
             print(f"🚨 [텔레그램 전송 붕괴 방어] {e}", flush=True)
 
 
+async def _cancel_open_orders_and_wait_sellable(
+    ctx: SniperPluginContext,
+    symbol: str,
+    sell_order_id: str,
+    cancel_all_sides: bool = False,
+) -> tuple[int, list[str]]:
+    """
+    NEW: MOC 및 매크로 긴급 덤핑 전 기존 미체결 주문(+0.64% TRAP 등)을 중복 없이 선취소하고,
+    미국 거래소에서 수량 잠금이 해제되어 sellableQuantity > 0이 될 때까지 최대 2.0초(0.25초 * 8회) 폴링 대기합니다.
+    만약 장마감 주문 폭주로 취소가 지연/거부되어 여전히 잠겨 있는 SELL 주문이 있다면 해당 주문 ID 리스트를 반환하여
+    즉시 가격 정정(modify_order) 우회 타격이 가능하도록 지원합니다.
+    """
+    canceled_ids = set()
+    surviving_sell_ids = []
+    need_wait_unlock = False
+
+    if sell_order_id:
+        try:
+            await ctx.client.cancel_order(sell_order_id)
+            canceled_ids.add(sell_order_id)
+            need_wait_unlock = True
+        except Exception as e:
+            err_s = str(e)
+            print(f"🚨 [선취소 방어 {symbol}] ({sell_order_id[:10]}): {err_s}", flush=True)
+            if "already-filled" not in err_s and "already-canceled" not in err_s and "order-not-found" not in err_s:
+                surviving_sell_ids.append(sell_order_id)
+        finally:
+            await AssassinLedger.save_state(symbol, sell_order_id="", target_sell_price=0.0)
+
+    try:
+        open_orders = await ctx.client.get_orders(status="OPEN", symbol=symbol)
+    except Exception:
+        open_orders = []
+
+    for order in open_orders:
+        oid = str(order.get("orderId") or "")
+        if not oid:
+            continue
+        side = str(order.get("side") or "")
+        st = str(order.get("status") or "")
+
+        if not cancel_all_sides and side != "SELL":
+            continue
+
+        if side == "SELL" and oid not in surviving_sell_ids:
+            surviving_sell_ids.append(oid)
+
+        # 이미 취소 요청했거나 거래소에서 취소 진행 중(PENDING_CANCEL)인 주문은 중복 취소(409) 스킵 후 대기만 활성화
+        if oid in canceled_ids or st == "PENDING_CANCEL":
+            need_wait_unlock = True
+            continue
+
+        try:
+            await ctx.client.cancel_order(oid)
+            canceled_ids.add(oid)
+            need_wait_unlock = True
+        except Exception as e:
+            print(f"🚨 [미체결 취소 방어 {symbol}] ({oid[:10]}): {e}", flush=True)
+
+    sellable_q_int = 0
+    max_polls = 8 if need_wait_unlock else 1
+    for poll_idx in range(max_polls):
+        if poll_idx > 0 or need_wait_unlock:
+            await asyncio.sleep(0.25)
+        try:
+            sq = await ctx.client.get_sellable_quantity(symbol)
+            sellable_q_int = int(math.floor(sq))
+            if sellable_q_int > 0:
+                break
+        except Exception:
+            pass
+
+    return sellable_q_int, surviving_sell_ids
+
+
 async def execute_rsi_monitoring_plugin(
     ctx: SniperPluginContext, symbol: str, rsi_val: float, vwap_val: float, current_price: float
 ):
@@ -64,7 +140,7 @@ async def execute_rsi_monitoring_plugin(
     if not state:
         return
 
-    # MODIFIED: 듀얼 관제탑(/avwap) 표출용 실시간 RSI 및 VWAP 상태만 갱신하고, RSI<=20/10 텔레그램 푸시 알림은 영구 폐기
+    # 듀얼 관제탑(/avwap) 표출용 실시간 RSI 및 VWAP 상태만 갱신하고, RSI<=20/10 텔레그램 푸시 알림은 영구 폐기
     state["value"] = rsi_val
     state["vwap"] = vwap_val
 
@@ -91,79 +167,95 @@ async def execute_moc_zero_overnight_plugin(
         if current_time - runtime_state["last_moc_tick"] >= 1.5:
             ctx.in_memory_ordering_lock[symbol] = True
             try:
-                if sell_order_id:
-                    try:
-                        await ctx.client.cancel_order(sell_order_id)
-                    except Exception as e:
-                        print(f"🚨 [MOC 매도 주문 취소 방어 {symbol}] {e}", flush=True)
-                    finally:
-                        await AssassinLedger.save_state(symbol, sell_order_id="", target_sell_price=0.0)
-
-                open_orders = await ctx.client.get_orders(status="OPEN", symbol=symbol)
-                cancel_issued = False
-                for order in open_orders:
-                    try:
-                        await ctx.client.cancel_order(order["orderId"])
-                        cancel_issued = True
-                    except Exception as e:
-                        print(f"🚨 [MOC 미체결 취소 방어 {symbol}] {e}", flush=True)
-
-                if cancel_issued:
-                    await asyncio.sleep(0.5)
-                    ctx.idempotency_keys[symbol]["MOC"] = None
-
                 holdings_detail_moc = await ctx.client.get_symbol_holdings_detail(symbol)
                 dump_qty = int(math.floor(holdings_detail_moc["qty"]))
 
-                if dump_qty > 0:
-                    sellable_q = await ctx.client.get_sellable_quantity(symbol)
-                    sellable_q_int = int(math.floor(sellable_q))
-                    if sellable_q_int > 0:
-                        dump_qty = min(dump_qty, sellable_q_int)
-                        current_price = await ctx.client.get_current_price(symbol)
-                        orderbook = await ctx.client.get_orderbook(symbol)
-                        bids = orderbook.get("bids", [])
-                        bid_1_price = float(bids[0]["price"]) if bids and float(bids[0]["price"]) > 0.0 else current_price
+                if dump_qty <= 0:
+                    # 보유 수량이 0주이면 잔여 미체결 주문만 정리 후 마감
+                    if sell_order_id:
+                        try:
+                            await ctx.client.cancel_order(sell_order_id)
+                        except Exception:
+                            pass
+                    await AssassinLedger.save_state(
+                        symbol, buy_order_id="", sell_order_id="", target_sell_price=0.0, is_session_done=True
+                    )
+                    return True
 
-                        if bid_1_price > 0.0:
-                            idem = ctx.idempotency_keys[symbol]["MOC"]
-                            if not idem:
-                                idem = {
-                                    "key": f"MOC_{symbol}_{now_est.strftime('%H%M%S')}"[:36],
-                                    "qty": dump_qty,
-                                    "price": bid_1_price,
-                                }
-                                ctx.idempotency_keys[symbol]["MOC"] = idem
-                            else:
-                                dump_qty = idem["qty"]
-                                bid_1_price = idem["price"]
+                # MODIFIED: 1단계 — 미체결 주문 선취소 및 매도 가능 수량 해방(sellableQuantity > 0) 폴링 대기
+                sellable_q_int, surviving_sell_ids = await _cancel_open_orders_and_wait_sellable(
+                    ctx=ctx, symbol=symbol, sell_order_id=sell_order_id, cancel_all_sides=True
+                )
+                ctx.idempotency_keys[symbol]["MOC"] = None
 
-                            try:
-                                await asyncio.wait_for(
-                                    ctx.client.create_order(
-                                        symbol=symbol, side="SELL", order_type="LIMIT",
-                                        quantity=dump_qty, price=f"{bid_1_price:.2f}",
-                                        client_order_id=idem["key"],
-                                    ), timeout=2.0,
-                                )
-                                print(f"🔴 [MOC 덤핑 스윕 {symbol}] 수량: {dump_qty}주 | 단가: ${bid_1_price:.2f}", flush=True)
-                                await AssassinLedger.save_state(symbol, buy_order_id="", is_session_done=True)
-                                if not runtime_state["moc_dump_active"]:
-                                    runtime_state["moc_dump_active"] = True
-                                    await ctx.notify_tg(
-                                        f"🔴 <b>[스나이퍼 {symbol}] 15:59~16:01 제로-오버나이트 덤핑망 결속</b>\n"
-                                        "▫️ 미체결 주문 선취소 완료 및 1.5초 주기 매수 1호가 스윕 폭격 개시"
-                                    )
-                                ctx.idempotency_keys[symbol]["MOC"] = None
-                            except asyncio.TimeoutError:
-                                print(f"🚨 [MOC 타임아웃 방어 {symbol}] 2초 초과.", flush=True)
-                else:
+                current_price = await ctx.client.get_current_price(symbol)
+                orderbook = await ctx.client.get_orderbook(symbol)
+                bids = orderbook.get("bids", [])
+                bid_1_price = float(bids[0]["price"]) if bids and float(bids[0]["price"]) > 0.0 else current_price
+
+                if bid_1_price <= 0.0:
+                    return True
+
+                if sellable_q_int > 0:
+                    # 정상적으로 기존 매도 주문이 취소되어 매도 가능 수량이 확보된 경우 -> 매수 1호가 신규 LIMIT 주문 발사
+                    exec_qty = min(dump_qty, sellable_q_int)
+                    idem_key = f"MOC_{symbol}_{now_est.strftime('%H%M%S')}_{int(time.time() * 10) % 100}"[:36]
+                    ctx.idempotency_keys[symbol]["MOC"] = {
+                        "key": idem_key,
+                        "qty": exec_qty,
+                        "price": bid_1_price,
+                    }
+
+                    try:
+                        await asyncio.wait_for(
+                            ctx.client.create_order(
+                                symbol=symbol, side="SELL", order_type="LIMIT",
+                                quantity=exec_qty, price=f"{bid_1_price:.2f}",
+                                client_order_id=idem_key,
+                            ), timeout=4.0,
+                        )
+                        print(f"🔴 [MOC 덤핑 스윕 {symbol}] 수량: {exec_qty}주 | 단가: ${bid_1_price:.2f}", flush=True)
+                        await AssassinLedger.save_state(symbol, buy_order_id="", is_session_done=True)
+                        if not runtime_state["moc_dump_active"]:
+                            runtime_state["moc_dump_active"] = True
+                            await ctx.notify_tg(
+                                f"🔴 <b>[스나이퍼 {symbol}] 15:59~16:01 제로-오버나이트 덤핑망 결속</b>\n"
+                                f"▫️ 미체결 주문 선취소 완료 및 매수 1호가(<code>${bid_1_price:.2f}</code>, {exec_qty}주) 스윕 폭격 개시"
+                            )
+                    finally:
+                        ctx.idempotency_keys[symbol]["MOC"] = None
+
+                elif surviving_sell_ids:
+                    # NEW: 2단계 우회 타격 — 장마감 1분 전 거래소 취소 병목/제한으로 인해 취소 후에도 수량이 잠겨 있는 경우,
+                    # 살아있는 기존 매도 주문의 가격을 즉시 매수 1호가(bid_1_price)로 정정(modify_order)하여 강제 체결!
+                    target_mod_id = surviving_sell_ids[0]
+                    await asyncio.wait_for(
+                        ctx.client.modify_order(
+                            order_id=target_mod_id,
+                            price=f"{bid_1_price:.2f}",
+                            order_type="LIMIT",
+                            market_country="US",
+                        ),
+                        timeout=4.0,
+                    )
+                    print(
+                        f"🔴 [MOC 우회 정정 스윕 {symbol}] 기존 주문({target_mod_id[:10]}) 단가 -> ${bid_1_price:.2f} 즉시 하향 정정 완료",
+                        flush=True,
+                    )
                     await AssassinLedger.save_state(symbol, buy_order_id="", is_session_done=True)
+                    if not runtime_state["moc_dump_active"]:
+                        runtime_state["moc_dump_active"] = True
+                        await ctx.notify_tg(
+                            f"🔴 <b>[스나이퍼 {symbol}] 15:59~16:01 제로-오버나이트 정정 스윕 결속</b>\n"
+                            f"▫️ 장마감 취소 병목 우회: 기존 매도 주문을 매수 1호가(<code>${bid_1_price:.2f}</code>)로 즉시 하향 정정 완료"
+                        )
+            except asyncio.TimeoutError:
+                ctx.idempotency_keys[symbol]["MOC"] = None
+                print(f"🚨 [MOC 타임아웃 방어 {symbol}] 4초 초과 (차기 틱 즉시 재타격).", flush=True)
             except Exception as e:
+                ctx.idempotency_keys[symbol]["MOC"] = None
                 err_str = str(e)
                 print(f"🚨 [MOC 방어 {symbol}] {err_str}", flush=True)
-                if any(code in err_str for code in ["400", "422", "404", "409"]):
-                    ctx.idempotency_keys[symbol]["MOC"] = None
             finally:
                 runtime_state["last_moc_tick"] = time.time()
                 ctx.in_memory_ordering_lock[symbol] = False
@@ -198,18 +290,22 @@ async def execute_macro_defense_plugin(
         ctx.in_memory_ordering_lock[symbol] = True
         try:
             canceled_any_buy = False
+            canceled_buy_ids = set()
             if buy_order_id:
                 try:
                     await ctx.client.cancel_order(buy_order_id)
+                    canceled_buy_ids.add(buy_order_id)
                     canceled_any_buy = True
                 except Exception:
                     pass
 
             open_orders_macro = await ctx.client.get_orders(status="OPEN", symbol=symbol)
             for order in open_orders_macro:
-                if order.get("side") == "BUY":
+                oid = str(order.get("orderId") or "")
+                if order.get("side") == "BUY" and oid and oid not in canceled_buy_ids:
                     try:
-                        await ctx.client.cancel_order(order["orderId"])
+                        await ctx.client.cancel_order(oid)
+                        canceled_buy_ids.add(oid)
                         canceled_any_buy = True
                     except Exception:
                         pass
@@ -242,83 +338,70 @@ async def execute_macro_defense_plugin(
     if (is_macro_breach or is_dynamic_breach) and holdings_qty > 0 and avg_price_dump > 0.0 and 0.0 < current_price < avg_price_dump:
         ctx.in_memory_ordering_lock[symbol] = True
         try:
-            if sell_order_id:
-                try:
-                    await ctx.client.cancel_order(sell_order_id)
-                except Exception:
-                    pass
-                finally:
-                    await AssassinLedger.save_state(symbol, sell_order_id="", target_sell_price=0.0)
-                    await asyncio.sleep(0.5)
-
-            open_orders = await ctx.client.get_orders(status="OPEN", symbol=symbol)
-            cancel_issued = False
-            for order in open_orders:
-                if order.get("side") == "SELL":
-                    try:
-                        await ctx.client.cancel_order(order["orderId"])
-                        cancel_issued = True
-                    except Exception:
-                        pass
-            if cancel_issued:
-                await asyncio.sleep(0.5)
-                ctx.idempotency_keys[symbol]["M_DUMP"] = None
-
             holdings_detail_mdump = await ctx.client.get_symbol_holdings_detail(symbol)
             dump_qty = int(math.floor(holdings_detail_mdump["qty"]))
 
             if dump_qty > 0:
-                sellable_q = await ctx.client.get_sellable_quantity(symbol)
-                sellable_q_int = int(math.floor(sellable_q))
-                if sellable_q_int > 0:
-                    dump_qty = min(dump_qty, sellable_q_int)
-                    orderbook = await ctx.client.get_orderbook(symbol)
-                    bids = orderbook.get("bids", [])
-                    bid_1_price = float(bids[0]["price"]) if bids and float(bids[0]["price"]) > 0.0 else current_price
+                # MODIFIED: 미체결 매도 주문 선취소 및 매도 가능 수량 해방(sellableQuantity > 0) 폴링 대기
+                sellable_q_int, surviving_sell_ids = await _cancel_open_orders_and_wait_sellable(
+                    ctx=ctx, symbol=symbol, sell_order_id=sell_order_id, cancel_all_sides=False
+                )
+                ctx.idempotency_keys[symbol]["M_DUMP"] = None
 
-                    if bid_1_price > 0.0:
-                        idem = ctx.idempotency_keys[symbol]["M_DUMP"]
-                        is_new_dump = idem is None
-                        if not idem:
-                            idem = {
-                                "key": f"MDUMP_{symbol}_{now_est.strftime('%H%M%S')}"[:36],
-                                "qty": dump_qty,
-                                "price": bid_1_price,
-                            }
-                            ctx.idempotency_keys[symbol]["M_DUMP"] = idem
-                        else:
-                            dump_qty = idem["qty"]
-                            bid_1_price = idem["price"]
+                orderbook = await ctx.client.get_orderbook(symbol)
+                bids = orderbook.get("bids", [])
+                bid_1_price = float(bids[0]["price"]) if bids and float(bids[0]["price"]) > 0.0 else current_price
 
+                if bid_1_price > 0.0:
+                    dumped_ok = False
+                    if sellable_q_int > 0:
+                        exec_qty = min(dump_qty, sellable_q_int)
+                        idem_key = f"MDUMP_{symbol}_{now_est.strftime('%H%M%S')}_{int(time.time() * 10) % 100}"[:36]
+                        ctx.idempotency_keys[symbol]["M_DUMP"] = {
+                            "key": idem_key,
+                            "qty": exec_qty,
+                            "price": bid_1_price,
+                        }
                         await asyncio.wait_for(
                             ctx.client.create_order(
                                 symbol=symbol, side="SELL", order_type="LIMIT",
-                                quantity=dump_qty, price=f"{bid_1_price:.2f}",
-                                client_order_id=idem["key"],
-                            ), timeout=2.0,
+                                quantity=exec_qty, price=f"{bid_1_price:.2f}",
+                                client_order_id=idem_key,
+                            ), timeout=4.0,
                         )
+                        dumped_ok = True
+                    elif surviving_sell_ids:
+                        # NEW: 취소 지연 시 기존 지정가 매도 주문을 매수 1호가로 즉시 하향 정정(modify_order)
+                        await asyncio.wait_for(
+                            ctx.client.modify_order(
+                                order_id=surviving_sell_ids[0],
+                                price=f"{bid_1_price:.2f}",
+                                order_type="LIMIT",
+                                market_country="US",
+                            ),
+                            timeout=4.0,
+                        )
+                        dumped_ok = True
+
+                    if dumped_ok:
                         await AssassinLedger.save_state(
                             symbol, is_session_done=True, entry_session="CANCELED_MACRO"
                         )
-
-                        if is_new_dump:
-                            if is_macro_breach:
-                                reason_msg = f"NQ=F 당일 전체 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 초과 확증)"
-                            else:
-                                bind_str = " · 하한선 바인딩" if (nq_entry_amp * 0.5 < ctx.nq_dynamic_floor) else ""
-                                reason_msg = f"체결 기준 지수({nq_entry_price:.2f}) 대비 <code>{nq_diff_pct:+.2f}%</code> 상승(숏 역행) (동적 임계치 {dynamic_threshold:.2f}%{bind_str} 이탈)"
-                            await ctx.notify_tg(
-                                f"🚨 <b>[스나이퍼 {symbol}] 매크로 방어선 붕괴 손실 덤핑 격발</b>\n"
-                                f"▫️ 사유: {reason_msg}\n"
-                                "▫️ 손익 상태: 마이너스 (계좌 보호 하드 스톱 발동)\n"
-                                "▫️ 조치: 지정가 매도 덫 파기 및 전량 매수 1호가(LIMIT) 덤핑 퇴근"
-                            )
-                        ctx.idempotency_keys[symbol]["M_DUMP"] = None
+                        if is_macro_breach:
+                            reason_msg = f"NQ=F 당일 전체 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 초과 확증)"
+                        else:
+                            bind_str = " · 하한선 바인딩" if (nq_entry_amp * 0.5 < ctx.nq_dynamic_floor) else ""
+                            reason_msg = f"체결 기준 지수({nq_entry_price:.2f}) 대비 <code>{nq_diff_pct:+.2f}%</code> 상승(숏 역행) (동적 임계치 {dynamic_threshold:.2f}%{bind_str} 이탈)"
+                        await ctx.notify_tg(
+                            f"🚨 <b>[스나이퍼 {symbol}] 매크로 방어선 붕괴 손실 덤핑 격발</b>\n"
+                            f"▫️ 사유: {reason_msg}\n"
+                            "▫️ 손익 상태: 마이너스 (계좌 보호 하드 스톱 발동)\n"
+                            f"▫️ 조치: 지정가 매도 덫 파기 및 전량 매수 1호가(<code>${bid_1_price:.2f}</code>) 스윕 퇴근"
+                        )
         except Exception as e:
-            err_str = str(e)
-            if any(code in err_str for code in ["400", "422", "404", "409"]):
-                ctx.idempotency_keys[symbol]["M_DUMP"] = None
+            print(f"🚨 [매크로 덤핑 방어 {symbol}] {e}", flush=True)
         finally:
+            ctx.idempotency_keys[symbol]["M_DUMP"] = None
             ctx.in_memory_ordering_lock[symbol] = False
         return True
     return False
@@ -335,17 +418,21 @@ async def enforce_0930_regular_cutoff_plugin(
         ctx.in_memory_ordering_lock[symbol] = True
         try:
             canceled_pre_buy = False
+            canceled_ids = set()
             try:
                 await ctx.client.cancel_order(buy_order_id)
+                canceled_ids.add(buy_order_id)
                 canceled_pre_buy = True
             except Exception:
                 pass
 
             open_orders = await ctx.client.get_orders(status="OPEN", symbol=symbol)
             for o in open_orders:
-                if o.get("side") == "BUY":
+                oid = str(o.get("orderId") or "")
+                if o.get("side") == "BUY" and oid and oid not in canceled_ids:
                     try:
-                        await ctx.client.cancel_order(o["orderId"])
+                        await ctx.client.cancel_order(oid)
+                        canceled_ids.add(oid)
                         canceled_pre_buy = True
                     except Exception:
                         pass
