@@ -8,7 +8,8 @@
 # MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
 # NEW: 데이장 진성 타점 판별을 위한 NQ=F 10분봉(10min) 리샘플링 기반 EMA(3)/EMA(6) 실시간 추세("UP"/"DOWN") 벡터 연산 탑재
 # MODIFIED: SOXS 단일 타겟 하드 락온 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
-# NEW: 전술 제어반 목표 익절률(+0.64% vs +1.00%) 선택 영구 보존 및 복리 모드(익절 시 +0.50% / +0.86% 순수익 가산, 손절 시 왕복 수수료 0.14% 포함 실손실 차감) 엔진 탑재
+# MODIFIED: 복리 모드(is_compound) 정산 시 수동 매매·1주 휩소 작전·본진 스나이퍼 모두 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%)을 계산하여 시드에 가감하도록 전면 개선 (Case 76)
+# NEW: 03:58 ~ 04:07 EST 1주 휩소 노출 작전용 목표 매도가(whipsaw_target_price) 원장 보존 슬롯 탑재
 
 import os
 import json
@@ -207,7 +208,7 @@ class MacroDataCache:
                 high_val = float(df_session["High"].max())
                 low_val = float(df_session["Low"].min())
 
-                # NEW: NQ=F 5일 1분봉 시계열에서 10분봉(10min) 리샘플링 및 EMA(3)/EMA(6) 기반 실시간 추세("UP"/"DOWN") 벡터 연산
+                # NQ=F 5일 1분봉 시계열에서 10분봉(10min) 리샘플링 및 EMA(3)/EMA(6) 기반 실시간 추세("UP"/"DOWN") 벡터 연산
                 df_10m_close = df["Close"].resample("10min").last().dropna()
                 if len(df_10m_close) >= 6:
                     ema3_series = df_10m_close.ewm(span=3, adjust=False).mean()
@@ -265,7 +266,7 @@ class MacroDataCache:
 class AssassinLedger:
     ALLOWED_SYMBOLS = ("SOXS",)
     DEFAULT_TARGET_PROFIT_RATE = 0.64
-    # NEW: 전술 제어반 선택 허용 목표 익절률 (+0.64% 고승률 회전형 vs +1.00% 고수익 복리형)
+    # 전술 제어반 선택 허용 목표 익절률 (+0.64% 고승률 회전형 vs +1.00% 고수익 복리형)
     ALLOWED_TARGET_RATES = (0.64, 1.00)
     ROUND_TRIP_COMM_PCT = 0.14
     ONE_WAY_COMM_RATE = 0.0007
@@ -283,7 +284,7 @@ class AssassinLedger:
         sym = cls._validate_symbol(symbol)
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"AssassinLedger_{sym}.json")
 
-    # NEW: 목표 익절률 정규화 검증 (0.64% 또는 1.00% 외 비정상 값 유입 원천 차단)
+    # 목표 익절률 정규화 검증 (0.64% 또는 1.00% 외 비정상 값 유입 원천 차단)
     @classmethod
     def normalize_target_rate(cls, rate_val) -> float:
         try:
@@ -294,7 +295,7 @@ class AssassinLedger:
             pass
         return 0.64
 
-    # NEW: 선택된 목표 익절률에서 왕복 협의 수수료(0.14%)를 공제한 순수익 복리 증액률 반환 (0.64% -> 0.50%, 1.00% -> 0.86%)
+    # 선택된 목표 익절률에서 왕복 협의 수수료(0.14%)를 공제한 순수익 복리 증액률 반환 (0.64% -> 0.50%, 1.00% -> 0.86%)
     @classmethod
     def get_net_compound_rate(cls, target_profit_rate: float) -> float:
         norm_r = cls.normalize_target_rate(target_profit_rate)
@@ -316,7 +317,6 @@ class AssassinLedger:
                         data = json.load(f)
                         if not isinstance(data, dict):
                             data = {}
-                        # MODIFIED: 장부에 저장된 사용자 선택 목표 익절률(0.64 또는 1.00)을 정규화하여 로드
                         raw_rate = cls.normalize_target_rate(
                             data.get("target_profit_rate", cls.DEFAULT_TARGET_PROFIT_RATE)
                         )
@@ -370,6 +370,24 @@ class AssassinLedger:
                     return ""
             return await asyncio.to_thread(_read)
 
+    # NEW: 03:58 ~ 04:07 EST 1주 휩소 노출 작전 전용 목표 매도가 조회
+    @classmethod
+    async def get_whipsaw_target_price(cls, symbol: str) -> float:
+        filepath = cls._get_file_path(symbol)
+        async with GlobalThrottle.get_file_lock(filepath):
+            def _read():
+                if not os.path.exists(filepath):
+                    return 0.0
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if not isinstance(data, dict):
+                            return 0.0
+                        return float(data.get("whipsaw_target_price", 0.0))
+                except Exception:
+                    return 0.0
+            return await asyncio.to_thread(_read)
+
     # 복리 모드(is_compound) 활성화 상태 조회 (기본값 True)
     @classmethod
     async def get_is_compound(cls, symbol: str) -> bool:
@@ -388,7 +406,8 @@ class AssassinLedger:
                     return True
             return await asyncio.to_thread(_read)
 
-    # MODIFIED: 선택된 목표 익절률(0.64% -> 순수익 +0.50%, 1.00% -> 순수익 +0.86%) 연동 복리 시드 산출
+    # MODIFIED: 익절/손절/수동개입/1주휩소 작전 모두 실제 발생한 수익금((매도가 - 매수가) * 실제체결수량 - 왕복수수료 0.14%)을
+    #           기반으로 복리 시드(budget)를 정밀 갱신하도록 전면 개선 (Case 76)
     @classmethod
     def calc_compound_next_budget(
         cls,
@@ -403,14 +422,8 @@ class AssassinLedger:
         if base_budget < cls.MIN_BUDGET_FLOOR:
             base_budget = cls.MIN_BUDGET_FLOOR
 
-        if is_take_profit:
-            net_comp_rate = cls.get_net_compound_rate(target_profit_rate)
-            net_delta_usd = round(base_budget * (net_comp_rate / 100.0), 2)
-            comm_usd = round(base_budget * (cls.ONE_WAY_COMM_RATE * 2.0), 2)
-            new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
-            return new_budget, net_delta_usd, comm_usd
-
-        # 손절 / MOC / 수동 청산 시: 실제 손실금에 왕복 수수료(0.14%)를 포함하여 시드에서 차감
+        # 1순위 (핵심): 실제 체결 단가(entry_price, exit_price)와 실제 체결 수량(filled_qty)이 확인된 경우
+        # -> 시드 규모나 1주 테스트/수동 매매 여부와 무관하게 실제 계좌에서 발생한 순수익금(세전손익 - 왕복수수료)만 정확히 가감!
         if entry_price > 0.0 and exit_price > 0.0 and filled_qty > 0.0:
             invested_usd = float(entry_price) * float(filled_qty)
             returned_usd = float(exit_price) * float(filled_qty)
@@ -420,19 +433,25 @@ class AssassinLedger:
             new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
             return new_budget, net_delta_usd, round(comm_usd, 2)
 
-        # 체결 단가만 확보되고 체결 수량이 누락된 경우 시드 기준 추정 수량으로 역산
+        # 2순위: 체결 단가(entry_price, exit_price)만 확보되고 수량이 누락된 경우 시드 기준 추정 수량(최소 1주)으로 실수익 역산
         if entry_price > 0.0 and exit_price > 0.0:
-            est_qty = math.floor(base_budget / float(entry_price))
-            if est_qty > 0:
-                invested_usd = float(entry_price) * est_qty
-                returned_usd = float(exit_price) * est_qty
-                gross_pnl_usd = returned_usd - invested_usd
-                comm_usd = (invested_usd + returned_usd) * cls.ONE_WAY_COMM_RATE
-                net_delta_usd = round(gross_pnl_usd - comm_usd, 2)
-                new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
-                return new_budget, net_delta_usd, round(comm_usd, 2)
+            est_qty = max(1, math.floor(base_budget / float(entry_price)))
+            invested_usd = float(entry_price) * est_qty
+            returned_usd = float(exit_price) * est_qty
+            gross_pnl_usd = returned_usd - invested_usd
+            comm_usd = (invested_usd + returned_usd) * cls.ONE_WAY_COMM_RATE
+            net_delta_usd = round(gross_pnl_usd - comm_usd, 2)
+            new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
+            return new_budget, net_delta_usd, round(comm_usd, 2)
 
-        # 체결 데이터가 완전히 지연된 경우 최소 왕복 수수료(0.14%) 차감 폴백
+        # 3순위 폴백: API 체결 내역 인덱싱이 완전히 지연된 경우 설정 익절률/수수료 기준 이론치 정산
+        if is_take_profit:
+            net_comp_rate = cls.get_net_compound_rate(target_profit_rate)
+            net_delta_usd = round(base_budget * (net_comp_rate / 100.0), 2)
+            comm_usd = round(base_budget * (cls.ONE_WAY_COMM_RATE * 2.0), 2)
+            new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
+            return new_budget, net_delta_usd, comm_usd
+
         comm_usd = round(base_budget * (cls.ONE_WAY_COMM_RATE * 2.0), 2)
         net_delta_usd = -comm_usd
         new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
@@ -457,6 +476,7 @@ class AssassinLedger:
         nq_entry_amp: float = None,
         entry_trend: str = None,
         is_compound: bool = None,
+        whipsaw_target_price: float = None,
     ):
         filepath = cls._get_file_path(symbol)
         async with GlobalThrottle.get_file_lock(filepath):
@@ -471,7 +491,6 @@ class AssassinLedger:
                     except Exception:
                         pass
 
-                # MODIFIED: target_profit_rate가 명시적으로 전달되면 정규화 저장하고, 없으면 기존 선택값 보존
                 if target_profit_rate is not None:
                     data["target_profit_rate"] = cls.normalize_target_rate(target_profit_rate)
                 else:
@@ -510,6 +529,8 @@ class AssassinLedger:
                     data["entry_trend"] = entry_trend
                 if is_compound is not None:
                     data["is_compound"] = bool(is_compound)
+                if whipsaw_target_price is not None:
+                    data["whipsaw_target_price"] = float(whipsaw_target_price)
 
                 for obsolete_key in [
                     "pre_first_flag", "force_downgrade", "force_downgrade_0_6", "is_stage_3",
@@ -531,4 +552,5 @@ class AssassinLedger:
                 sym, price=0.0, target_sell_price=0.0, buy_order_id="", sell_order_id="",
                 is_session_done=False, entry_session="", entry_time=0.0,
                 nq_entry_price=0.0, nq_entry_amp=0.0, entry_trend="",
+                whipsaw_target_price=0.0,
             )

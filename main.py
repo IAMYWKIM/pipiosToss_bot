@@ -1,17 +1,15 @@
 # =====================================================================
 # FILE: main.py
-# 목적: 프리장 (04:00 ~ 09:29 EST) SOXS 단방향 RSI<=30 무한 출동 스나이퍼 코어 오케스트레이터
-# 구조: sniper_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 슬림 아키텍처
+# 목적: 프리장 (04:07 ~ 09:29 EST) SOXS 단방향 RSI<=30 무한 출동 본진 스나이퍼 및
+#       03:58 ~ 04:07 EST (9분간) 데이장 VWAP 1주 휩소 노출 작전 코어 오케스트레이터
+# 구조: sniper_plugin.py / whipsaw_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 아키텍처
 # =====================================================================
-# MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58 / 04:07 암살자 플러그인 및 FORCE_BUY 데드코드 영구 소각
-# MODIFIED: 제3헌법 의거 RSI<=20/10 푸시 알림 폐기에 따른 shared_rsi_state 내 불필요한 level 상태 변수 영구 소각
+# MODIFIED: 제3헌법 및 Case 43 의거 구버전 데드코드 소각 및 whipsaw_plugin.py 분리 모듈 결속
 # MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30 ~ 17:00 EST로 전면 확장 (Case 07)
-# NEW: 09:30 EST 정규장 컷오프 및 프리장 미체결 매수 즉시 파기 플러그인(enforce_0930_regular_cutoff_plugin) 메인 루프 결속 (Case 48, 53)
-# NEW: 프리장 (04:00 ~ 09:29 EST) SOXS RSI<=30.0 1차 슬리피지 매수 덫 투하 및 조건부 30초 타임쉴드(RSI>30 돌파 시 즉각 매수 / 30초 만료 시 현재가 재장전) 원자적 편입 (Case 25, 52, 59, 69, 70)
-# NEW: 1차 매수 덫 대기(PRE_SNIPER) 중 메인 루프 주기를 1.5초 -> 0.4초 고주파 모드로 자동 가속하여 RSI > 30.0 반등 돌파 즉각 포착 (Case 28, 73)
-# MODIFIED: 17:00 EST GC 가동 시 is_session_done=False 초기화 및 19:00 EST 논리적 거래일 롤오버 적용으로 전일 마감 락 이월 원천 차단 (Case 01, 22, 36)
-# NEW: 프리장 (04:00 ~ 09:29 EST) 미보유·무주문·비매크로차단 상태에서 구버전 잔재 잠금(is_session_done=True) 감지 시 즉시 해제하는 자가 치유(Self-Healing) 가드 주입 (Case 52)
-# MODIFIED: 데이장 (19:00 ~ 03:59 EST) SOXS & SOXL 15초 듀얼 캔들 스캔 가속 및 NQ=F 10분봉 추세 연동(상승추세 시 SOXS<=30 & SOXL>=80 / 하락추세 시 SOXS<=30) 모의 관측 알림 결속 (Case 53, 73, 78)
+# NEW: 03:58 ~ 03:59 EST 데이장 마감 휩소 모의 알림 묵음 바이패스 및 04:00 EST 미결 모의 상태 자동 클리어 결속
+# NEW: 03:58 ~ 04:07 EST (9분간) 데이장 VWAP 기반 1주 고정 '휩소 노출 작전' 및 04:07 EST 미체결 취소 / 보유 1주 현재가 즉시 매도 결속
+# MODIFIED: 본진 프리장 스나이퍼에 04:07 EST 타임쉴드(04:07 ~ 09:29 EST) 적용 및 자가 치유(Self-Healing) 가드 동기화 (Case 52)
+# MODIFIED: 수동 매매·1주 휩소 작전·본진 스나이퍼 청산 시 실제 보유 수량(last_known_qty) 추적 및 실발생 순수익금 기반 복리 정산 연동 (Case 76)
 
 import sys
 import os
@@ -38,7 +36,11 @@ from candle_recorder import record_candles_loop
 from sniper_plugin import (
     SniperPluginContext,
     PRE_SNIPER_RSI_THRESHOLD,
+    _cancel_open_orders_and_wait_sellable,
+    settle_daymarket_sim_before_premarket,
     execute_daymarket_rsi_alert_plugin,
+    execute_whipsaw_vwap_exposure_plugin,
+    enforce_0407_whipsaw_cutoff_plugin,
     execute_moc_zero_overnight_plugin,
     execute_macro_defense_plugin,
     enforce_0930_regular_cutoff_plugin,
@@ -144,6 +146,7 @@ def _run_git_update_sync() -> tuple[bool, str]:
         for mod_file in (
             "main.py",
             "sniper_plugin.py",
+            "whipsaw_plugin.py",
             "tg_router.py",
             "tg_ui_plugin.py",
             "quant_engine.py",
@@ -230,11 +233,11 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
         except Exception as e:
             print(f"🚨 [RSI 레이더망 {symbol}] 붕괴 방어: {e}", flush=True)
 
-        # MODIFIED: 프리장 (04:00 ~ 09:29 EST) 중 SOXS 5초 스캔,
-        #           데이장 (19:00 ~ 03:59 EST) 중 SOXS 및 SOXL 모두 15초 스캔으로 듀얼 EWM 기저 상태 실시간 동기화
+        # 프리장 (04:00 ~ 09:29 EST) 중 SOXS 5초 스캔,
+        # 데이장 (19:00 ~ 03:59 EST) 중 SOXS 및 SOXL 모두 15초 스캔으로 듀얼 EWM 기저 및 VWAP 실시간 동기화
         now_est_chk = datetime.now(EST_TZ)
         est_hm_chk = now_est_chk.hour * 100 + now_est_chk.minute
-        if symbol == "SOXS" and (400 <= est_hm_chk <= 929):
+        if symbol == "SOXS" and (355 <= est_hm_chk <= 929):
             sleep_sec = 5.0
         elif symbol in RSI_SYMBOLS and (est_hm_chk >= 1900 or est_hm_chk <= 359):
             sleep_sec = 15.0
@@ -255,10 +258,11 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
         "last_error_msg": "",
         "last_trap_error_msg": "",
         "fast_shield_mode": False,
+        "last_known_qty": 0,
     }
 
     while True:
-        # MODIFIED: 평시 1.5초 대기, 1차 슬리피지 매수 덫 타임쉴드(PRE_SNIPER) 감시 중에는 0.4초 고주파 대기로 자동 가속
+        # 평시 1.5초 대기, 1차 슬리피지 매수 덫 타임쉴드(PRE_SNIPER) 감시 중에는 0.4초 고주파 대기로 자동 가속
         wait_sec = 0.4 if runtime_state.get("fast_shield_mode", False) else 1.5
         try:
             await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=wait_sec)
@@ -276,6 +280,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 holdings_detail = await ctx.client.get_symbol_holdings_detail(symbol)
                 holdings_qty = int(math.floor(holdings_detail["qty"]))
                 ctx.shared_holdings[symbol] = holdings_qty
+                if holdings_qty > 0:
+                    runtime_state["last_known_qty"] = holdings_qty
 
                 if runtime_state["last_error_msg"] != "":
                     await ctx.notify_tg(
@@ -314,7 +320,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             # 1차 슬리피지 매수 덫이 대기 중일 때 0.4초 고주파 RSI 감시 모드 활성화
             runtime_state["fast_shield_mode"] = bool(
                 is_active
-                and (400 <= est_time_int <= 929)
+                and (407 <= est_time_int <= 929)
                 and entry_session == "PRE_SNIPER"
                 and bool(buy_order_id)
                 and holdings_qty == 0
@@ -337,6 +343,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 runtime_state["last_moc_tick"] = 0.0
                 runtime_state["moc_dump_active"] = False
                 runtime_state["fast_shield_mode"] = False
+                runtime_state["last_known_qty"] = 0
                 if holdings_qty == 0:
                     await AssassinLedger.save_state(
                         symbol,
@@ -350,6 +357,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                         nq_entry_price=0.0,
                         nq_entry_amp=0.0,
                         entry_trend="",
+                        whipsaw_target_price=0.0,
                     )
                 print(f"🧹 [GC {symbol}] 17:00 EST 윈도우 진입. 락 해제 및 자정 초기화 완료.", flush=True)
                 await asyncio.sleep(60.0)
@@ -457,7 +465,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     and len(last_session_id) >= 8
                     and last_session_id[:8] == current_session_id[:8]
                     and (
-                        entry_session == "CANCELED_MACRO"
+                        entry_session in ("CANCELED_MACRO", "WHIPSAW_1SH")
                         or bool(buy_order_id)
                         or bool(sell_order_id)
                         or target_sell_price > 0.0
@@ -488,6 +496,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                             nq_entry_price=0.0,
                             nq_entry_amp=0.0,
                             entry_trend="",
+                            whipsaw_target_price=0.0,
                         )
                         is_session_done = False
                         target_sell_price = 0.0
@@ -498,9 +507,37 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     await AssassinLedger.save_state(symbol, last_session_id=current_session_id)
                 last_session_id = current_session_id
 
-            # 초과 Case 52 — 프리장 (04:00 ~ 09:29 EST) 무한 출동 자가 치유(Self-Healing) 가드
+            # NEW: 04:00 ~ 09:29 EST 프리장 진입 시 혹시 미결된 데이장 [모의] 포지션이 있다면 즉시 무음 클리어 (본진 보호)
+            if 400 <= est_time_int <= 929:
+                await settle_daymarket_sim_before_premarket(
+                    ctx=ctx, symbol=symbol, now_est=now_est, current_price=current_price, silent=True
+                )
+
+            # NEW: 04:07:00 EST 도달 시 휩소 노출 작전(WHIPSAW_1SH) 타임쉴드 만료 정리
+            #      (미체결 1주 매수 주문 즉시 취소 & 데이장/휩소로 매수해 보유 중인 1주 현재가 즉시 매도 처분)
+            if (407 <= est_time_int <= 929) and entry_session == "WHIPSAW_1SH":
+                buy_order_id, entry_session, whip_handled = await enforce_0407_whipsaw_cutoff_plugin(
+                    ctx=ctx,
+                    symbol=symbol,
+                    now_est=now_est,
+                    is_active=is_active,
+                    holdings_qty=holdings_qty,
+                    buy_order_id=buy_order_id,
+                    sell_order_id=sell_order_id,
+                    entry_session=entry_session,
+                    current_price=current_price,
+                    cancel_helper_fn=_cancel_open_orders_and_wait_sellable,
+                )
+                if whip_handled:
+                    ledger_after_cut = await AssassinLedger.get_state(symbol)
+                    is_session_done = ledger_after_cut[4]
+                    target_sell_price = ledger_after_cut[6]
+                    sell_order_id = ledger_after_cut[7]
+                    entry_session = ledger_after_cut[8]
+
+            # 초과 Case 52 — 본진 프리장 (04:07 ~ 09:29 EST) 무한 출동 자가 치유(Self-Healing) 가드
             if (
-                400 <= est_time_int <= 929
+                407 <= est_time_int <= 929
                 and is_session_done
                 and holdings_qty == 0
                 and not buy_order_id
@@ -509,10 +546,10 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 and last_buy_price <= 0.0
                 and entry_session != "CANCELED_MACRO"
             ):
-                await AssassinLedger.save_state(symbol, is_session_done=False)
+                await AssassinLedger.save_state(symbol, is_session_done=False, whipsaw_target_price=0.0)
                 is_session_done = False
                 print(
-                    f"♻️ [프리장 자가 치유 {symbol}] 비정상 마감 락(is_session_done) 자동 해제 완료 ➡️ 프리장 RSI≤30 무한 감시 복귀",
+                    f"♻️ [프리장 자가 치유 {symbol}] 비정상 마감 락(is_session_done) 자동 해제 완료 ➡️ 04:07~09:29 프리장 RSI≤30 무한 감시 복귀",
                     flush=True,
                 )
 
@@ -525,8 +562,9 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 buy_order_id=buy_order_id,
             )
 
-            # MODIFIED: 실시간 틱 RSI(compute_realtime_tick_rsi)를 최우선 합성하여 조건부 30초 타임쉴드 및 데이장 알림에 즉시 공급
-            is_premarket_window = (400 <= est_time_int <= 929)
+            # 실시간 틱 RSI(compute_realtime_tick_rsi)를 최우선 합성하여 조건부 30초 타임쉴드 및 데이장 알림에 즉시 공급
+            is_whipsaw_window = (358 <= est_time_int <= 406)
+            is_premarket_sniper_window = (407 <= est_time_int <= 929)
             is_daymarket_window = (est_time_int >= 1900 or est_time_int <= 359)
             sym_rsi_dict = ctx.shared_rsi_state.setdefault(
                 symbol, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
@@ -543,11 +581,10 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             else:
                 live_rsi_val = fallback_rsi
 
-            # NEW: 프리장 1차 슬리피지 매수 덫 대기 중 조건부 30초 타임쉴드 감시
-            #      (RSI > 30.0 초과 반등 시 30초 전이라도 즉각 현재가 매수 / RSI <= 30.0 유지 시 30초 만료 후 현재가 매수)
+            # 본진 프리장(04:07 ~ 09:29 EST) 1차 슬리피지 매수 덫 대기 중 조건부 30초 타임쉴드 감시
             if (
                 is_active
-                and is_premarket_window
+                and is_premarket_sniper_window
                 and holdings_qty == 0
                 and buy_order_id
                 and entry_session == "PRE_SNIPER"
@@ -565,7 +602,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     rsi_val=live_rsi_val,
                 )
 
-            # 목표 1·2 & 초과 Case 46, 49, 51, 52: 잔고 0주 복귀 시 정산 및 프리장 내 무한 재출동 릴리스
+            # 목표 1·2 & 초과 Case 46, 49, 51, 52, 76: 잔고 0주 복귀 시 실발생 수익금 복리 정산 및 프리장 내 무한 재출동 릴리스
             if holdings_qty == 0 and (
                 target_sell_price > 0.0 or buy_order_id or sell_order_id or last_buy_price > 0.0
             ):
@@ -576,11 +613,13 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     buy_order_id=buy_order_id,
                     sell_order_id=sell_order_id,
                     is_active=is_active,
+                    fallback_qty=float(runtime_state.get("last_known_qty", 0)),
                 )
                 if cleared:
+                    runtime_state["last_known_qty"] = 0
                     continue
 
-            # MODIFIED: 데이장 (19:00 ~ 03:59 EST) NQ=F 10분봉 추세 연동형(상승추세 시 SOXS<=30 & SOXL>=80 / 하락추세 시 SOXS<=30) 모의 관측 알림 가동
+            # 데이장 (19:00 ~ 03:59 EST) NQ=F 10분봉 추세 연동형 2단계 모의 관측 알림 가동 (03:58~03:59 묵음 바이패스 포함)
             if is_active and is_daymarket_window and current_price > 0.0:
                 await execute_daymarket_rsi_alert_plugin(
                     ctx=ctx,
@@ -591,11 +630,39 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     vwap_val=float(sym_rsi_dict.get("vwap", 0.0)),
                 )
 
-            # 목표 1 & Case 15, 25, 52, 53, 59 — 프리장 (04:00 ~ 09:29 EST) SOXS RSI<=30.0 포착 시 1차 슬리피지 매수 덫 즉시 투하
+            # NEW: 03:58 ~ 04:06:59 EST (9분간) 데이장 누적 VWAP 기반 실전 1주 고정 '휩소 노출 작전' 발사
+            if (
+                is_active
+                and is_whipsaw_window
+                and holdings_qty == 0
+                and not buy_order_id
+                and current_price > 0.0
+            ):
+                await execute_whipsaw_vwap_exposure_plugin(
+                    ctx=ctx,
+                    symbol=symbol,
+                    now_est=now_est,
+                    current_session_id=current_session_id,
+                    is_active=is_active,
+                    is_session_done=is_session_done,
+                    holdings_qty=holdings_qty,
+                    buy_order_id=buy_order_id,
+                    current_price=current_price,
+                    day_vwap=float(sym_rsi_dict.get("vwap", 0.0)),
+                )
+                buy_order_id = await AssassinLedger.get_buy_order_id(symbol)
+                if buy_order_id:
+                    ledger_after_w = await AssassinLedger.get_state(symbol)
+                    is_session_done = ledger_after_w[4]
+                    entry_session = ledger_after_w[8]
+                    entry_time = ledger_after_w[9]
+
+            # 목표 1 & Case 15, 25, 52, 53, 59 — 본진 프리장 (04:07 ~ 09:29 EST · 04:07 타임쉴드 적용)
+            # SOXS RSI<=30.0 포착 시 1차 슬리피지 매수 덫 즉시 투하
             if (
                 is_active
                 and not is_session_done
-                and is_premarket_window
+                and is_premarket_sniper_window
                 and holdings_qty == 0
                 and not buy_order_id
                 and (0.0 < live_rsi_val <= PRE_SNIPER_RSI_THRESHOLD)
@@ -611,7 +678,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     rsi_val=live_rsi_val,
                 )
 
-            # 목표 2 & 초과 Case 50, 58, 64: 매수 전량 체결 확인 즉시 선택된 목표 익절가(+0.64% / +1.00%) 지정가 매도 덫(TRAP) 하드 락온
+            # 목표 2 & 초과 Case 50, 58, 64: 매수 전량 체결 확인 즉시 목표 익절가(휩소 VWAP 타점 또는 +0.64% / +1.00%) 지정가 매도 덫(TRAP) 하드 락온
             await manage_mechanical_profit_trap_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -671,7 +738,7 @@ async def main():
         asyncio.create_task(record_candles_loop(api_client, sym))
         asyncio.create_task(rsi_radar_loop(plugin_ctx, sym))
 
-    print("시스템 코어: 프리장 (04:00 ~ 09:29 EST) SOXS 단방향 조건부 30초 타임쉴드 스나이퍼 결속 완료...", flush=True)
+    print("시스템 코어: 03:58~04:07 1주 휩소 노출 작전 & 04:07~09:29 SOXS 본진 스나이퍼 결속 완료...", flush=True)
 
     try:
         boot_state = await AssassinLedger.get_state(TRADE_SYMBOL)
@@ -680,7 +747,7 @@ async def main():
         boot_rate = AssassinLedger.normalize_target_rate(boot_state[2])
         boot_net_rate = AssassinLedger.get_net_compound_rate(boot_rate)
         comp_desc = (
-            f"📈 복리 모드 (익절 시 +{boot_net_rate:.2f}% 증액 · 손절 시 수수료포함 차감)"
+            "📈 복리 모드 (실제 발생 순수익금[세전손익 - 수수료 0.14%] 정밀 가감)"
             if boot_comp
             else "💵 단리 모드 (시드 고정)"
         )
@@ -689,11 +756,11 @@ async def main():
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=(
-                "✅ <b>[시스템 기동 완료 — 프리장 SOXS 단방향 조건부 30초 타임쉴드 스나이퍼]</b>\n"
+                "✅ <b>[시스템 기동 완료 — 03:58 휩소 노출 작전 &amp; 04:07 프리장 SOXS 본진 스나이퍼]</b>\n"
                 "▫️ 타겟: <b>SOXS(숏)</b> 배타적 실물 자산 투입 (SOXL 매매 영구 차단)\n"
-                "▫️ 데이장: <b>19:00 ~ 03:59 EST</b> 매수차단 · <b>[모의] NQ 10분봉 상승추세 시 SOXS≤30 &amp; SOXL≥80 / 하락추세 시 SOXS≤30 단독 포착 (+1.00% 도달 전 리셋 잠금)</b>\n"
-                "▫️ 프리장: <b>04:00 ~ 09:29 EST</b> RSI≤30 포착 즉시 <b>1차 슬리피지(-0.18%) 매수 덫 선(先) 투하</b>\n"
-                "▫️ 타임쉴드: <b>RSI≤30 유지 시 30초 대기 후 현재가 재장전 / 30초 내 RSI 30 초과 반등 시 0.4초 감시 즉각 현재가 매수</b>\n"
+                "▫️ 데이장: <b>19:00 ~ 03:57 EST</b> [모의] 2단계 타임쉴드 &amp; 매크로 손절 추격 · <b>03:58 ~ 03:59 EST 마감 휩소 묵음 바이패스</b>\n"
+                "▫️ 휩소작전: <b>03:58 ~ 04:07 EST (9분간)</b> 데이장 VWAP 역산 <b>1주 고정 실전 테스트</b> (04:07 미체결 취소 · 보유 1주 현재가 즉시 매도)\n"
+                "▫️ 프리장 본진: <b>04:07 ~ 09:29 EST (04:07 타임쉴드)</b> RSI≤30 포착 시 <b>1차 슬리피지(-0.18%) 매수 덫 + 조건부 30초 타임쉴드</b>\n"
                 f"▫️ 익절: 현재 설정 <b>+{boot_rate:.2f}% (순수익 +{boot_net_rate:.2f}%)</b> · 제어반(/settlement)에서 <b>+0.64% / +1.00%</b> 전환\n"
                 f"▫️ 시드: <b>${boot_budget:,.2f}</b> · {comp_desc}\n"
                 "▫️ 방어: <b>09:30 정규장 컷오프</b> · <b>NQ=F 3단 매크로 손절</b> · <b>15:59 ~ 16:01 제로-오버나이트 MOC</b>"
