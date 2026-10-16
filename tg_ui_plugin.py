@@ -8,6 +8,7 @@
 # MODIFIED: 데이장(19:00 ~ 03:57 EST) 프리장 동일 대칭 조건 [모의] 듀얼 2단계 추격 및 03:58 ~ 03:59 EST 묵음 바이패스 상태 표출 (Case 78)
 # MODIFIED: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫(현재가 > 데이장VWAP 종목 1% 역산) 및 04:07 EST 타임쉴드 렌더링 (Case 79, 80)
 # MODIFIED: 관제탑(/avwap) 시안 A(평시) <-> 시안 B(부스터/보유) 조건부 동적 전환 및 프리·정규장 3단 계단식 줄바꿈 레이아웃 적용 (Case 13, 38, 47, 67)
+# MODIFIED: 전술 제어반(/settlement) 상단 장문 설명을 소각하고 핵심 5대 요건(전원·출동상태·익절·운용방식·통합시드) 초슬림 UI로 개편 (Case 37, 38)
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
 # MODIFIED: 메인 메뉴(get_main_menu_text) 내 과도한 내부 수식 설명을 소각하고 핵심 타임라인 및 명령어 중심의 심플 UI로 전면 개편 (Case 38)
 # MODIFIED: 16:00 ~ 18:59 EST 전 구간을 애프터마켓(afterMarket)으로 하드 락온하여 17:00 ~ 18:59 EST 데이마켓 오판 버그 원천 소각 (Case 01, 57)
@@ -599,8 +600,7 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: 전술 제어반(/settlement) 내 양방향 대칭 클라이맥스(<=30.0 & 반대>=79.9[80인지]), RSI>=79.0 0.4초 부스터,
-#           03:58~04:07 듀얼 1주 무비용 매수덫, 데이장 대칭 [모의] 추격 및 애프터마켓 상태 렌더링 (Case 37, 57, 76, 77, 81, 83)
+# MODIFIED: 전술 제어반(/settlement) 상단 장문 설명을 전면 소각하고 핵심 5대 요건만 초슬림 5줄로 렌더링 (Case 37, 38, 57, 76, 77)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
@@ -628,35 +628,27 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
             active_pos_sym = sym_chk
             break
 
-    act_s_str = "🟢 ON (듀얼 시스템 활성)" if act_s else "🔴 OFF (수동 통제)"
-    comp_s_str = (
-        "📈 통합 복리 모드 (실제 발생 순수익금[세전손익 - 왕복수수료 0.14%] 양쪽 동기화 가감)"
-        if is_comp_s
-        else "💵 단리 모드 (설정 시드 고정 출동)"
-    )
+    act_s_str = "🟢 ON" if act_s else "🔴 OFF"
+    comp_s_str = "📈 통합 복리" if is_comp_s else "💵 단리 고정"
     rate_mode_desc = (
-        "🎯 고승률 회전형 (+0.64% 익절 · 5개년 DUAL80_TRAP 승률 91.9% · MDD -10.24%)"
+        f"🎯 +{rate_s:.2f}% (순수익 +{net_rate_s:.2f}%)"
         if abs(rate_s - 0.64) < 1e-4
-        else "🚀 고수익 복리형 (+1.00% 익절 · 5개년 DUAL80_TRAP 승률 88.7% · 복리 +26,733.9%)"
+        else f"🚀 +{rate_s:.2f}% (순수익 +{net_rate_s:.2f}%)"
     )
 
     if not act_s:
-        strike_status_str = "⏸️ 가동OFF (자동 매수·방어·MOC·알림 전면 중지)"
+        strike_status_str = "⏸️ 가동 OFF (수동 대기)"
     elif state_s[8] == "CANCELED_MACRO" or state_l[8] == "CANCELED_MACRO":
-        strike_status_str = "🛑 매크로 방어 발동 (금일 SOXS/SOXL 신규진입 영구 소각)"
+        strike_status_str = "🛑 매크로 방어 (금일 마감)"
     elif 358 <= t <= 406:
-        w_sym = whip_st.get("target_sym", "")
+        w_sym = whip_st.get("target_sym", "") or active_pos_sym
         if (buy_id_s or buy_id_l) and (state_s[8] == "WHIPSAW_1SH" or state_l[8] == "WHIPSAW_1SH"):
-            strike_status_str = (
-                f"🌪️ [{w_sym or active_pos_sym}] 휩소 1주 역산 매수덫 대기 (${whip_st['buy_price']:.2f} ➡️ 목표 VWAP ${whip_st['sell_target']:.2f} · 04:07 미체결 비용$0취소)"
-            )
+            strike_status_str = f"🌪️ [{w_sym}] 휩소 1주 매수덫 (${whip_st['buy_price']:.2f})"
         elif active_pos_sym and (state_s[8] == "WHIPSAW_1SH" or state_l[8] == "WHIPSAW_1SH"):
             tp_w = state_s[6] if active_pos_sym == "SOXS" else state_l[6]
-            strike_status_str = (
-                f"🌪️ [{active_pos_sym}] 휩소 1주 보유중 (목표 VWAP ${tp_w:.2f} · 04:07 미매도 시 현재가 즉시처분)"
-            )
+            strike_status_str = f"🌪️ [{active_pos_sym}] 휩소 1주 보유 (목표 ${tp_w:.2f})"
         else:
-            strike_status_str = "🌪️ 03:58 ~ 04:07 듀얼 휩소 1주 매수덫 구간 (데이장모의 묵음 · 본진 04:07 타임쉴드)"
+            strike_status_str = "🌪️ 휩소 노출 작전중 (03:58 ~ 04:07)"
     elif 407 <= t <= 929:
         if active_pos_sym:
             st_a = state_s if active_pos_sym == "SOXS" else state_l
@@ -665,59 +657,49 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
             es_a = str(st_a[8] or "")
             if bid_a:
                 if es_a == "PRE_SNIPER":
-                    strike_status_str = f"🪤 [{active_pos_sym}] 1차 슬리피지 매수덫 대기 (RSI≤30 30초쉴드 · 30초과 시 즉각매수)"
+                    strike_status_str = f"🪤 [{active_pos_sym}] 1차 매수덫 대기중"
                 else:
-                    strike_status_str = f"⚡ [{active_pos_sym}] 타임쉴드 현재가 재장전 체결 대기중"
+                    strike_status_str = f"⚡ [{active_pos_sym}] 재장전 체결 대기중"
             elif tp_a > 0.0:
-                strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (목표 ${tp_a:.2f} [+{rate_s:.2f}%] 익절 시 양방향 무한 재출동)"
+                strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (목표 ${tp_a:.2f})"
             else:
-                strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (+{rate_s:.2f}% 익절 덫 장전중)"
+                strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (매도덫 장전중)"
         elif not bool(state_s[4]) and not bool(state_l[4]):
-            strike_status_str = "🔫 04:07~09:29 양방향 대칭(≤30.0 &amp; 반대≥79.9 · 79.0 도달 시 0.4초 부스터) 감시중"
+            strike_status_str = "🔫 프리장 본진 감시중"
         else:
-            strike_status_str = "🔒 금일 프리장 타격 잠금"
+            strike_status_str = "🔒 프리장 타격 잠금"
     elif 930 <= t <= 1558:
         if active_pos_sym:
             st_a = state_s if active_pos_sym == "SOXS" else state_l
             tp_a = float(st_a[6] or 0.0)
-            strike_status_str = f"🔒 09:30 신규진입 마감 ([{active_pos_sym}] 보유분 ${tp_a:.2f} [+{rate_s:.2f}%] 감시)"
+            strike_status_str = f"🔒 [{active_pos_sym}] 보유분 감시 (목표 ${tp_a:.2f})"
         else:
-            strike_status_str = "🔒 09:30 정규장 신규진입 봉쇄 (관망 · 매수불가)"
+            strike_status_str = "🔒 정규장 마감 (관망)"
     elif 1559 <= t <= 1601:
-        strike_status_str = "🛑 15:59 ~ 16:01 제로-오버나이트 MOC 강제 청산 윈도우"
+        strike_status_str = "🛑 제로-오버나이트 청산중"
     elif t >= 1900 or t <= 357:
         if day_sim.get("active", False):
             sim_sym = day_sim.get("symbol", "SOXS")
             if day_sim.get("phase") == "TRAP_WAIT":
-                strike_status_str = (
-                    f"🪤 데이장 [모의·{sim_sym}] 1차 슬리피지덫(${day_sim['trap_price']:.2f}) 30초 타임쉴드 대기중"
-                )
+                strike_status_str = f"🪤 [모의·{sim_sym}] 1차덫 대기 (${day_sim['trap_price']:.2f})"
             else:
-                strike_status_str = (
-                    f"🔔 데이장 [모의·{sim_sym}] +1.00% 추격중 (체결 ${day_sim['entry_price']:.2f} ➡️ 목표 ${day_sim['target_price']:.2f} 도달 전 잠금)"
-                )
+                strike_status_str = f"🔔 [모의·{sim_sym}] 추격중 (목표 ${day_sim['target_price']:.2f})"
         else:
-            strike_status_str = "🌙 데이마켓 대기 (프리장 동일 조건 [≤30.0 &amp; 반대≥79.9 · 79.0 부스터] 모의 감시중)"
+            strike_status_str = "🌙 [모의] 데이장 감시중"
     else:
-        strike_status_str = "🛑 애프터마켓 대기 (금일 신규진입 마감 · 19:00 데이장 개장 대기)"
+        strike_status_str = "🛑 애프터마켓 (마감)"
 
     btn_064_label = "✅ 🎯 +0.64% (순+0.50%)" if abs(rate_s - 0.64) < 1e-4 else "🎯 +0.64% (순+0.50%)"
     btn_100_label = "✅ 🚀 +1.00% (순+0.86%)" if abs(rate_s - 1.00) < 1e-4 else "🚀 +1.00% (순+0.86%)"
 
     text = (
-        "⚙️ <b>[양방향 대칭 클라이맥스 듀얼 전술 제어반 (SOXS &amp; SOXL)]</b>\n"
-        "▫️ <b>본진 타점:</b> <code>🔫 04:07 ~ 09:29 EST (매수종목≤30.0 &amp; 반대종목≥79.9[80인지])</code>\n"
-        "▫️ <b>고주파 부스터:</b> <code>⚡ RSI ≥ 79.0 진입 시 1.5초 ➔ 0.4초 가속 &amp; 배치 동시 시세(0.0ms 시차)</code>\n"
-        "▫️ <b>휩소 작전:</b> <code>🌪️ 03:58 ~ 04:07 EST 현재가 상단 종목(데이장VWAP 대비) 1% 역산 1주 매수덫 (무비용)</code>\n"
-        "▫️ <b>데이장 모드:</b> <code>🔔 19:00 ~ 03:57 EST 프리장 동일 대칭 [모의] 2단계 추격 · 03:58~03:59 묵음</code>\n"
-        "▫️ <b>방어 체계:</b> <code>방향성 인지 NQ=F 3단 매크로 손절 &amp; 15:59 ~ 16:01 제로-오버나이트 MOC</code>\n"
+        "⚙️ <b>[ 듀얼 스나이퍼 전술 제어반 ]</b>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
-        "🐻🐂 <b>SOXS &amp; SOXL (단일 포지션 배타적 뮤텍스 운용)</b>\n"
         f"▫️ 마스터 전원: <code>{act_s_str}</code>\n"
-        f"▫️ 현재 출동상태: <code>{strike_status_str}</code>\n"
-        f"▫️ 목표 익절타점: <code>{rate_mode_desc}</code>\n"
-        f"▫️ 시드 운용방식: <code>{comp_s_str}</code>\n"
-        f"▫️ 통합 출동시드: <code>${budget_s:,.2f}</code> | 목표 익절: <code>+{rate_s:.2f}% (순수익 +{net_rate_s:.2f}%)</code>"
+        f"▫️ 출동 상태: <code>{strike_status_str}</code>\n"
+        f"▫️ 목표 익절: <code>{rate_mode_desc}</code>\n"
+        f"▫️ 운용 방식: <code>{comp_s_str}</code>\n"
+        f"▫️ 통합 시드: <code>${budget_s:,.2f}</code>"
     )
 
     keyboard = InlineKeyboardMarkup(
