@@ -10,6 +10,7 @@
 # NEW: 관제탑(/avwap) 및 지시서(/sync) 내 SOXS(🐻) & SOXL(🐂) 듀얼 실시간 시세·VWAP·RSI·방향성 인지 3차 매크로 방어선 동시 표출 (Case 13, 67)
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
 # MODIFIED: 메인 메뉴(get_main_menu_text) 내 과도한 내부 수식 설명을 소각하고 핵심 타임라인 및 명령어 중심의 심플 UI로 전면 개편 (Case 38)
+# MODIFIED: 16:00 ~ 18:59 EST 전 구간을 애프터마켓(afterMarket)으로 하드 락온하여 17:00 ~ 18:59 EST 데이마켓 오판 버그 원천 소각 (Case 01, 57)
 
 import asyncio
 from datetime import datetime, timedelta
@@ -180,7 +181,7 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
 
 
 # MODIFIED: Case 13 & 초과 Case 57 & Case 83 — SOXS 및 SOXL 듀얼 상태, 단일 포지션 뮤텍스,
-#           79.9 클라이맥스 인지 및 79.0 부스터 상태 표출
+#           79.9 클라이맥스 인지, 79.0 부스터 및 16:00~18:59 애프터마켓 상태 정확 표출
 def build_compact_status(
     symbol: str,
     state_tuple: tuple,
@@ -236,7 +237,7 @@ def build_compact_status(
             )
         else:
             state_text = "🌪️ 03:58~04:07 휩소작전 구간(본진 04:07 타임쉴드)"
-    elif current_session == "dayMarket":
+    elif current_session == "dayMarket" and (est_time_int >= 1900 or est_time_int <= 357):
         if day_sim.get("active", False) and day_sim.get("symbol") == symbol:
             if day_sim.get("phase") == "TRAP_WAIT":
                 state_text = (
@@ -255,6 +256,8 @@ def build_compact_status(
             state_text = "🔒 금일 프리장 타격잠금"
     elif 930 <= est_time_int < 1600:
         state_text = "🔒 09:30 정규장 진입마감(관망)"
+    elif 1600 <= est_time_int <= 1859:
+        state_text = "🛑 애프터마켓(신규진입 마감·관망)"
     else:
         state_text = "장외대기"
 
@@ -280,9 +283,10 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         session_name_ui = "regularMarket"
         market_header = "( <b>🔥 REG_MARKET · 신규진입 마감</b> )"
         pre_window_label = "(04:07 ~ 09:29 · 출동 마감)"
-    elif 1600 <= t <= 1659:
+    # MODIFIED: 16:00 ~ 18:59 EST 전 구간을 afterMarket으로 락온하여 17:00~18:59 데이마켓 오판 및 당일 통계 증발 차단
+    elif 1600 <= t <= 1859:
         session_name_ui = "afterMarket"
-        market_header = "( <b>🛑 AFT_MARKET</b> )"
+        market_header = "( <b>🛑 AFT_MARKET · 애프터마켓</b> )"
         pre_window_label = "(04:07 ~ 09:29 · 출동 마감)"
     else:
         session_name_ui = "dayMarket"
@@ -292,10 +296,10 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     try:
         is_open, _, sess_name, _ = await asyncio.wait_for(api_client.is_market_open(), timeout=3.0)
         if not is_open:
-            session_name_ui = "dayMarket"
-            market_header = (
-                "( <b>🌙 주말/휴장일</b> )" if sess_name and "HOLIDAY" in sess_name else "( <b>🌙 시스템 대기</b> )"
-            )
+            if sess_name and "HOLIDAY" in sess_name:
+                market_header = "( <b>🌙 주말/휴장일</b> )"
+            elif not (1600 <= t <= 1859):
+                market_header = "( <b>🌙 시스템 대기</b> )"
     except Exception:
         pass
 
@@ -417,13 +421,13 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
                         warn_str = f"🔔 데이장 대칭 모의포착(≤30.0 &amp; {opp_name}≥79.9)"
                     else:
                         warn_str = "📉 대칭수렴(≤30.0 · 진입마감)"
-                elif opp_val >= 79.0:
+                elif opp_val >= 79.0 and (is_pre_sniper_time or is_day_time):
                     warn_str = f"⚡ 0.4초 부스터 가속중(≤30.0 &amp; {opp_name} {opp_val:.1f} [79.9임박])"
                 else:
                     warn_str = f"⏳ 과매도 대기(≤30.0 · 반대 {opp_name} 79.9미만 차단)"
             elif r_val >= 79.9:
                 warn_str = f"🔥 과열극단 클라이맥스(≥79.9[80인지] · 반대 {opp_name}≤30 대칭충족)"
-            elif r_val >= 79.0:
+            elif r_val >= 79.0 and (is_pre_sniper_time or is_day_time):
                 warn_str = "⚡ 프리-클라이맥스 0.4초 부스터 가속중(≥79.0 · 79.9임박)"
             else:
                 warn_str = "🟢 중립(30초과~79미만)"
@@ -489,8 +493,9 @@ async def build_sync_board(api_client) -> str:
         market_state = "🔫 프리장 양방향 대칭 스나이퍼 가동"
     elif 930 <= t <= 1559:
         market_state = "🔥 정규장 (신규매수 마감)"
-    elif 1600 <= t <= 1659:
-        market_state = "⛔ 장마감"
+    # MODIFIED: 16:00 ~ 18:59 EST 전 구간을 애프터마켓으로 락온하여 17:00~18:59 데이마켓 오판 해결
+    elif 1600 <= t <= 1859:
+        market_state = "🛑 애프터마켓 (신규매수 마감)"
     else:
         market_state = "🌙 데이마켓 (🔔[모의] 대칭 2단계 추격)"
 
@@ -580,6 +585,8 @@ async def build_sync_board(api_client) -> str:
                 flag_str = "🌪️ [WHIPSAW_1SH: 1주 VWAP 타점 · 04:07 현재가정리]"
             else:
                 flag_str = f"⚡ [{d['entry_session'] or 'HOLD'}: +{d['target_profit_rate']:.2f}% (순+{d['net_profit_rate']:.2f}%)]"
+        elif 930 <= t <= 1859:
+            flag_str = f"🔒 금일 신규진입 마감 (관망 · 목표 +{d['target_profit_rate']:.2f}%)"
         else:
             flag_str = f"⏳ 대기 ({sym}≤30 &amp; {opp_sym}≥79.9 · 목표 +{d['target_profit_rate']:.2f}%)"
         return (
@@ -605,7 +612,7 @@ async def build_sync_board(api_client) -> str:
 
 
 # MODIFIED: 전술 제어반(/settlement) 내 양방향 대칭 클라이맥스(<=30.0 & 반대>=79.9[80인지]), RSI>=79.0 0.4초 부스터,
-#           03:58~04:07 듀얼 1주 무비용 매수덫, 데이장 대칭 [모의] 추격 및 통합 실수익 복리 상태 렌더링 (Case 37, 57, 76, 77, 81, 83)
+#           03:58~04:07 듀얼 1주 무비용 매수덫, 데이장 대칭 [모의] 추격 및 애프터마켓 상태 렌더링 (Case 37, 57, 76, 77, 81, 83)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
@@ -704,7 +711,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
         else:
             strike_status_str = "🌙 데이마켓 대기 (프리장 동일 조건 [≤30.0 &amp; 반대≥79.9 · 79.0 부스터] 모의 감시중)"
     else:
-        strike_status_str = "⛔ 장외/애프터장 대기 (신규진입 차단)"
+        strike_status_str = "🛑 애프터마켓 대기 (금일 신규진입 마감 · 19:00 데이장 개장 대기)"
 
     btn_064_label = "✅ 🎯 +0.64% (순+0.50%)" if abs(rate_s - 0.64) < 1e-4 else "🎯 +0.64% (순+0.50%)"
     btn_100_label = "✅ 🚀 +1.00% (순+0.86%)" if abs(rate_s - 1.00) < 1e-4 else "🚀 +1.00% (순+0.86%)"
