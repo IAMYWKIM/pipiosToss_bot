@@ -1,6 +1,6 @@
 # =====================================================================
 # FILE: toss_api.py
-# 목적: 토스증권 Open API 통신 엣지 케이스 방어 및 중앙 통제소 가동
+# 목적: 토스증권 Open API 통신 엣지 케이스 방어 및 듀얼 스나이퍼(SOXS/SOXL) 중앙 통제소 가동
 # =====================================================================
 # MODIFIED: pandas_market_calendars 외부 라이브러리 기반 NYSE 휴무일 절대 식별망 주입
 # MODIFIED: 캘린더 블로킹 연산 방어를 위한 asyncio.to_thread 스레드 격리 헌법 준수
@@ -9,12 +9,11 @@
 # MODIFIED: 토스 인증 모듈(_do_authenticate) HTTP 상태 코드 검증망 주입을 통한 JSON 파싱 붕괴(HTML 응답) 원천 차단
 # MODIFIED: API Null 및 비표준 문자열 페이로드 응답 시 isinstance 검증을 통한 AttributeError 체이닝 붕괴 완벽 방어 (Case 03, 04)
 # MODIFIED: 매도 가능 수량(sellableQuantity) 프로빙 API 통신망 개통
-# MODIFIED: 데이장 조기 개장(18:00 EDT 등) 시 익일 마감 롤오버 누락 방어망 주입 (start.hour >= 12 하향 락온)
-# MODIFIED: 제3헌법 및 Case 14 의거 미사용 조건주문(conditional-orders) 데드코드 메서드 3종 영구 소각
-# NEW: 스나이퍼 SOXS 단일 타겟 하드 락온 — 비허용 종목(SOXL 등) 주문 API 호출 물리적 원천 차단 쉴드 주입 (Case 09, 54)
-# NEW: 미국 주식 주문 정정(Modify) 시 quantity 파라미터 원천 적출 방어 메서드 구축 (Case 69)
-# MODIFIED: cancel_order 호출 시 json_data={} 명시적 주입 및 POST 요청 기본 JSON 바디 보장으로 HTTP 415 에러 원천 소각 (Case 16, 24)
-# MODIFIED: HTTP 400/403/404/409/415/422 클라이언트 에러 발생 시 무의미한 3초 백오프 재시도 즉시 중단 및 즉각 예외 반환
+# MODIFIED: 제3헌법 및 Case 14 의거 미사용 조건주문(conditional-orders) 데드코드 메서드 영구 소각
+# MODIFIED: 양방향 대칭 클라이맥스 듀얼 스나이퍼 전환에 따른 허용 종목 화이트리스트("SOXS", "SOXL") 락온 및 제3종목 물리적 차단 (Case 09, 54)
+# NEW: 다건 현재가 일괄 조회(get_current_prices_batch) 헬퍼 탑재 및 미국 주식 주문 정정(Modify) 시 quantity 파라미터 원천 적출 (Case 69)
+# MODIFIED: cancel_order 호출 시 json_data={} 명시적 주입 및 POST 요청 기본 JSON 바디 보장으로 HTTP 415 에러 원천 소각 (Case 75)
+# MODIFIED: HTTP 400/403/404/409/415/422 클라이언트 에러 발생 시 무의미한 백오프 재시도 즉시 중단 및 즉각 예외 반환 (Case 21)
 
 import asyncio
 import aiohttp
@@ -86,8 +85,8 @@ class _NonRetryableApiError(Exception):
 
 
 class TossApiClient:
-    # 실거래 스나이퍼 허용 단일 종목 하드 락온 (Case 09, 54)
-    REAL_ALLOWED_SYMBOLS = ("SOXS",)
+    # MODIFIED: 양방향 대칭 클라이맥스 듀얼 스나이퍼 허용 종목 화이트리스트 하드 락온 (Case 09, 54)
+    REAL_ALLOWED_SYMBOLS = ("SOXS", "SOXL")
 
     def __init__(self, client_id: str, client_secret: str):
         self.client_id = client_id
@@ -111,7 +110,7 @@ class TossApiClient:
         url = f"{self.base_url}{endpoint}"
         req_headers = dict(headers) if headers else {}
 
-        # MODIFIED: POST/PUT/PATCH 요청 시 json_data가 None이면 빈 dict({})를 기본 주입하여 HTTP 415 원천 차단
+        # Case 75: POST/PUT/PATCH 요청 시 json_data가 None이면 빈 dict({})를 기본 주입하여 HTTP 415 원천 차단
         effective_json = json_data
         if method.upper() in ("POST", "PUT", "PATCH") and effective_json is None:
             effective_json = {}
@@ -169,7 +168,7 @@ class TossApiClient:
                                 safe_err = html.escape(err_text)
 
                             full_err_msg = f"API HTTP {resp.status}: {safe_err}"
-                            # MODIFIED: 4xx 클라이언트 오류(400, 403, 404, 409, 415, 422)는 백오프 재시도 없이 즉시 탈출
+                            # Case 21: 4xx 클라이언트 오류(400, 403, 404, 409, 415, 422)는 백오프 재시도 없이 즉시 탈출
                             if 400 <= resp.status < 500:
                                 raise _NonRetryableApiError(full_err_msg)
                             raise Exception(full_err_msg)
@@ -442,6 +441,38 @@ class TossApiClient:
         price_raw = result[0].get("lastPrice")
         return float(price_raw) if price_raw is not None else 0.0
 
+    # NEW: SOXS 및 SOXL 다건 현재가 단일 API 일괄 조회 헬퍼 (TPS 절감 및 동시 틱 RSI 합성 지원)
+    async def get_current_prices_batch(self, symbols: tuple = ("SOXS", "SOXL")) -> dict:
+        out = {str(s).strip().upper(): 0.0 for s in symbols}
+        if not symbols:
+            return out
+        if not self.token:
+            await self.authenticate()
+        sym_query = ",".join(out.keys())
+        try:
+            data = await self._request(
+                "GET", f"/api/v1/prices?symbols={sym_query}", "MARKET_DATA", headers=self._get_headers()
+            )
+            if isinstance(data, dict):
+                result = data.get("result")
+                if isinstance(result, list):
+                    for item in result:
+                        if isinstance(item, dict):
+                            s_key = str(item.get("symbol") or "").strip().upper()
+                            p_raw = item.get("lastPrice")
+                            if s_key in out and p_raw is not None:
+                                out[s_key] = float(p_raw)
+        except Exception:
+            pass
+
+        for s_key, val in list(out.items()):
+            if val <= 0.0:
+                try:
+                    out[s_key] = await self.get_current_price(s_key)
+                except Exception:
+                    out[s_key] = 0.0
+        return out
+
     async def get_orderbook(self, symbol: str) -> dict:
         if not self.token:
             await self.authenticate()
@@ -470,7 +501,7 @@ class TossApiClient:
         orders = res_dict.get("orders")
         return orders if isinstance(orders, list) else []
 
-    # MODIFIED: 주문 취소 시 json_data={} 를 명시적으로 전달하여 HTTP 415 Unsupported Media Type 완벽 소각
+    # Case 75: 주문 취소 시 json_data={} 를 명시적으로 전달하여 HTTP 415 Unsupported Media Type 완벽 소각
     async def cancel_order(self, order_id: str) -> dict:
         if not self.account_seq:
             await self.fetch_account_seq()
@@ -500,11 +531,11 @@ class TossApiClient:
     async def create_order(
         self, symbol: str, side: str, order_type: str, quantity: float, price: str, client_order_id: str
     ) -> dict:
-        # Case 09 & Case 54 비허용 종목(SOXL 등) 주문 API 호출 물리적 원천 차단 쉴드
+        # Case 09 & Case 54: 허용 종목("SOXS", "SOXL") 외 제3종목 주문 API 호출 물리적 원천 차단 쉴드
         sym_clean = str(symbol).strip().upper()
         if sym_clean not in self.REAL_ALLOWED_SYMBOLS:
             raise RuntimeError(
-                f"🚨 [Case 09/54 위반] SOXS 외 비허용 종목 주문 요청 원천 차단: symbol={sym_clean}"
+                f"🚨 [Case 09/54 위반] 허용 종목(SOXS/SOXL) 외 주문 요청 원천 차단: symbol={sym_clean}"
             )
 
         if not self.account_seq:
@@ -527,7 +558,7 @@ class TossApiClient:
         )
         return data if isinstance(data, dict) else {}
 
-    # Case 69 미국 주식 주문 정정(Modify) 시 quantity 파라미터 원천 적출 방어
+    # Case 69: 미국 주식 주문 정정(Modify) 시 quantity 파라미터 원천 적출 방어
     async def modify_order(
         self,
         order_id: str,

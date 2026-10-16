@@ -1,15 +1,15 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: 프리장 SOXS 단방향 실거래 스나이퍼 독립 장부, NQ=F 진폭/10분봉 추세 캐싱 및 Wilder's RSI(14) 벡터/틱 합성 엔진
+# 목적: 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 통합 시드 원장,
+#       NQ=F 당일 진폭 캐싱 및 Wilder's RSI(14) 벡터/틱 합성 엔진
 # =====================================================================
 # MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
-# NEW: 20초 폴링 사각지대(원인 D) 소각을 위한 Wilder's EWM 기저 상태(ewm_state_out) 추출 및 1.5초 O(1) 실시간 틱 RSI 점화식(compute_realtime_tick_rsi) 신설
-# MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 임계 윈도우 데드코드 및 AVWAPEngine 영구 소각
+# NEW: 폴링 사각지대(원인 D) 소각을 위한 Wilder's EWM 기저 상태(ewm_state_out) 추출 및 O(1) 실시간 틱 RSI 점화식(compute_realtime_tick_rsi) 탑재 (Case 73)
+# MODIFIED: 제3헌법 및 Case 43 의거 구버전 NQ=F 10분봉 EMA 추세 분기망 및 AVWAPEngine 데드코드 영구 소각
 # MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
-# NEW: 데이장 진성 타점 판별을 위한 NQ=F 10분봉(10min) 리샘플링 기반 EMA(3)/EMA(6) 실시간 추세("UP"/"DOWN") 벡터 연산 탑재
-# MODIFIED: SOXS 단일 타겟 하드 락온 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
-# MODIFIED: 복리 모드(is_compound) 정산 시 수동 매매·1주 휩소 작전·본진 스나이퍼 모두 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%)을 계산하여 시드에 가감하도록 전면 개선 (Case 76)
-# NEW: 03:58 ~ 04:07 EST 1주 휩소 노출 작전용 목표 매도가(whipsaw_target_price) 원장 보존 슬롯 탑재
+# MODIFIED: 듀얼 스나이퍼 화이트리스트 ALLOWED_SYMBOLS = ("SOXS", "SOXL") 확장 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
+# MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76, 77)
+# NEW: 매크로 1·2·3차 방어선 작동 시 SOXS/SOXL 양쪽 원장 동시 잠금(lock_all_symbols_macro) 및 프리장 재출동 동시 해제 헬퍼 탑재 (Case 52, 80, 82)
 
 import os
 import json
@@ -36,7 +36,7 @@ def calculate_rsi_1m(
     """
     Pandas 기반 백그라운드 벡터 연산.
     VWAP와 RSI를 1개의 데이터프레임에서 동시 산출하여 CPU 블로킹 및 API 중복 호출 원천 차단.
-    NEW: current_price 실시간 종가 보정 및 직전 확정 분봉(iloc[-2])의 Wilder's EWM 기저 상태를 ewm_state_out에 기록.
+    current_price 실시간 종가 보정 및 직전 확정 분봉(iloc[-2])의 Wilder's EWM 기저 상태를 ewm_state_out에 기록.
     """
     if not candles_json:
         return 0.0, 0.0
@@ -77,7 +77,7 @@ def calculate_rsi_1m(
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
 
-    # 1.5초 메인 루프에서 O(1) 실시간 틱 RSI를 합성할 수 있도록 직전 확정 분봉(iloc[-2])의 EWM 기저 상태 추출
+    # 메인 루프에서 O(1) 실시간 틱 RSI를 합성할 수 있도록 직전 확정 분봉(iloc[-2])의 EWM 기저 상태 추출 (Case 73)
     if isinstance(ewm_state_out, dict):
         if len(df) >= 2:
             ewm_state_out["prev_close"] = float(df["closePrice"].iloc[-2])
@@ -118,9 +118,9 @@ def compute_realtime_tick_rsi(
     live_price: float, ewm_state: dict, fallback_rsi: float = 0.0, period: int = 14
 ) -> float:
     """
-    1.5초 메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 RSI 합성 엔진.
+    메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 RSI 합성 엔진 (Case 73).
     직전 확정 분봉(t-1)의 Wilder's EWM 기저 상태에 실시간 현재가(live_price)를 대입하여
-    추가 API 호출 0회로 순간적인 급락 타점(RSI <= 30.0)을 1.5초 이내에 즉시 포착합니다.
+    추가 API 호출 0회로 순간적인 대칭 클라이맥스(매수종목 RSI <= 30.0 & 반대종목 RSI >= 80.0)를 즉시 포착합니다.
     """
     if live_price is None or live_price <= 0.0 or not isinstance(ewm_state, dict):
         return float(fallback_rsi or 0.0)
@@ -157,7 +157,8 @@ def compute_realtime_tick_rsi(
 
 
 class MacroDataCache:
-    _nq_cache_data = (0.0, 0.0, 0.0, "WAIT", 0.0, "--:--", 0.0)
+    # MODIFIED: 제3헌법 및 Case 43 의거 구버전 NQ 10분봉 EMA 추세 분기 데드코드 소각 및 당일 진폭 캐시 슬림화
+    _nq_cache_data = (0.0, 0.0, 0.0, 0.0)
     _nq_cache_lock = asyncio.Lock()
 
     @classmethod
@@ -170,7 +171,7 @@ class MacroDataCache:
     async def _refresh_cache_if_needed(cls, force_refresh: bool = False):
         async with cls._nq_cache_lock:
             now = time.time()
-            need_refresh = force_refresh or cls._is_refresh_needed(now, cls._nq_cache_data[6])
+            need_refresh = force_refresh or cls._is_refresh_needed(now, cls._nq_cache_data[3])
             if not need_refresh:
                 return
 
@@ -178,7 +179,7 @@ class MacroDataCache:
                 tkr = yf.Ticker("NQ=F")
                 df = tkr.history(period="5d", interval="1m")
                 if df is None or df.empty:
-                    return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
+                    return 0.0, 0.0, 0.0
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
                 df = df[~df.index.duplicated(keep="last")]
@@ -190,9 +191,9 @@ class MacroDataCache:
 
                 df = df[df["Close"] > 0.0].copy()
                 if df.empty:
-                    return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
+                    return 0.0, 0.0, 0.0
 
-                # Case 62: 45분 이상 휴장 갭(Gap) 기준 당일 세션 분리로 자정 롤오버 왜곡 방어
+                # Case 62: 45분 이상 휴장 갭(Gap) 기준 당일 세션 분리로 자정 롤오버 진폭 왜곡 방어
                 time_diffs = df.index.to_series().diff()
                 gaps = time_diffs[time_diffs >= pd.Timedelta(minutes=45)]
                 if not gaps.empty:
@@ -202,45 +203,25 @@ class MacroDataCache:
                     df_session = df.copy()
 
                 if df_session.empty:
-                    return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
+                    return 0.0, 0.0, 0.0
 
                 curr_val = float(df_session["Close"].iloc[-1])
                 high_val = float(df_session["High"].max())
                 low_val = float(df_session["Low"].min())
-
-                # NQ=F 5일 1분봉 시계열에서 10분봉(10min) 리샘플링 및 EMA(3)/EMA(6) 기반 실시간 추세("UP"/"DOWN") 벡터 연산
-                df_10m_close = df["Close"].resample("10min").last().dropna()
-                if len(df_10m_close) >= 6:
-                    ema3_series = df_10m_close.ewm(span=3, adjust=False).mean()
-                    ema6_series = df_10m_close.ewm(span=6, adjust=False).mean()
-                    ema3_val = float(ema3_series.iloc[-1])
-                    ema6_val = float(ema6_series.iloc[-1])
-                    is_up_trend = (curr_val >= ema6_val) and (ema3_val >= ema6_val)
-                    trend_str = "UP" if is_up_trend else "DOWN"
-                    ema_diff_pct = ((curr_val - ema6_val) / ema6_val * 100.0) if ema6_val > 0.0 else 0.0
-                    base_ema_str = f"{ema6_val:.2f}"
-                elif not df_10m_close.empty:
-                    ema_last = float(df_10m_close.iloc[-1])
-                    trend_str = "UP" if curr_val >= ema_last else "DOWN"
-                    ema_diff_pct = ((curr_val - ema_last) / ema_last * 100.0) if ema_last > 0.0 else 0.0
-                    base_ema_str = f"{ema_last:.2f}"
-                else:
-                    trend_str, ema_diff_pct, base_ema_str = "DOWN", 0.0, f"{curr_val:.2f}"
-
-                return curr_val, high_val, low_val, trend_str, ema_diff_pct, base_ema_str
+                return curr_val, high_val, low_val
 
             try:
-                c, h, l, tr, chg, b_str = await asyncio.wait_for(
+                c, h, l = await asyncio.wait_for(
                     asyncio.to_thread(_fetch), timeout=5.0
                 )
                 if l > 0.0:
-                    cls._nq_cache_data = (c, h, l, tr, chg, b_str, now)
+                    cls._nq_cache_data = (c, h, l, now)
                 else:
                     prev = cls._nq_cache_data
-                    cls._nq_cache_data = (prev[0], prev[1], prev[2], prev[3], prev[4], prev[5], now)
+                    cls._nq_cache_data = (prev[0], prev[1], prev[2], now)
             except Exception as e:
                 prev = cls._nq_cache_data
-                cls._nq_cache_data = (prev[0], prev[1], prev[2], prev[3], prev[4], prev[5], now)
+                cls._nq_cache_data = (prev[0], prev[1], prev[2], now)
                 print(f"🚨 [NQ=F 캐시 갱신 방어] {e}", flush=True)
 
     @classmethod
@@ -253,20 +234,15 @@ class MacroDataCache:
         cls, force_refresh: bool = False
     ) -> tuple[str, float, str, float, float, float]:
         await cls._refresh_cache_if_needed(force_refresh=force_refresh)
-        return (
-            cls._nq_cache_data[3],
-            cls._nq_cache_data[4],
-            cls._nq_cache_data[5],
-            cls._nq_cache_data[0],
-            cls._nq_cache_data[1],
-            cls._nq_cache_data[2],
-        )
+        c, h, l = cls._nq_cache_data[0], cls._nq_cache_data[1], cls._nq_cache_data[2]
+        return ("DUAL80", 0.0, f"{c:.2f}", c, h, l)
 
 
 class AssassinLedger:
-    ALLOWED_SYMBOLS = ("SOXS",)
+    # MODIFIED: 양방향 대칭 클라이맥스 듀얼 스나이퍼 화이트리스트 락온 (Case 09, 54)
+    ALLOWED_SYMBOLS = ("SOXS", "SOXL")
     DEFAULT_TARGET_PROFIT_RATE = 0.64
-    # 전술 제어반 선택 허용 목표 익절률 (+0.64% 고승률 회전형 vs +1.00% 고수익 복리형)
+    # 전술 제어반 선택 허용 목표 익절률 (+0.64% 고승률 회전형 vs +1.00% 고수익 복리형) (Case 68)
     ALLOWED_TARGET_RATES = (0.64, 1.00)
     ROUND_TRIP_COMM_PCT = 0.14
     ONE_WAY_COMM_RATE = 0.0007
@@ -276,7 +252,7 @@ class AssassinLedger:
     def _validate_symbol(cls, symbol: str) -> str:
         sym = str(symbol).strip().upper()
         if sym not in cls.ALLOWED_SYMBOLS:
-            raise ValueError(f"🚨 [Case 09 위반] 허용되지 않은 타 종목 접근 영구 차단: {sym}")
+            raise ValueError(f"🚨 [Case 09 위반] 허용되지 않은 제3종목 접근 영구 차단: {sym}")
         return sym
 
     @classmethod
@@ -284,7 +260,7 @@ class AssassinLedger:
         sym = cls._validate_symbol(symbol)
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"AssassinLedger_{sym}.json")
 
-    # 목표 익절률 정규화 검증 (0.64% 또는 1.00% 외 비정상 값 유입 원천 차단)
+    # 목표 익절률 정규화 검증 (0.64% 또는 1.00% 외 비정상 값 유입 원천 차단) (Case 68)
     @classmethod
     def normalize_target_rate(cls, rate_val) -> float:
         try:
@@ -370,7 +346,7 @@ class AssassinLedger:
                     return ""
             return await asyncio.to_thread(_read)
 
-    # NEW: 03:58 ~ 04:07 EST 1주 휩소 노출 작전 전용 목표 매도가 조회
+    # 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전 전용 목표 매도가(VWAP) 조회
     @classmethod
     async def get_whipsaw_target_price(cls, symbol: str) -> float:
         filepath = cls._get_file_path(symbol)
@@ -406,8 +382,8 @@ class AssassinLedger:
                     return True
             return await asyncio.to_thread(_read)
 
-    # MODIFIED: 익절/손절/수동개입/1주휩소 작전 모두 실제 발생한 수익금((매도가 - 매수가) * 실제체결수량 - 왕복수수료 0.14%)을
-    #           기반으로 복리 시드(budget)를 정밀 갱신하도록 전면 개선 (Case 76)
+    # Case 76: 익절/손절/수동개입/1주휩소 작전 모두 실제 발생한 순수익금((매도가 - 매수가) * 실제체결수량 - 왕복수수료 0.14%)을
+    #          기반으로 통합 복리 시드(budget)를 정밀 갱신
     @classmethod
     def calc_compound_next_budget(
         cls,
@@ -423,7 +399,6 @@ class AssassinLedger:
             base_budget = cls.MIN_BUDGET_FLOOR
 
         # 1순위 (핵심): 실제 체결 단가(entry_price, exit_price)와 실제 체결 수량(filled_qty)이 확인된 경우
-        # -> 시드 규모나 1주 테스트/수동 매매 여부와 무관하게 실제 계좌에서 발생한 순수익금(세전손익 - 왕복수수료)만 정확히 가감!
         if entry_price > 0.0 and exit_price > 0.0 and filled_qty > 0.0:
             invested_usd = float(entry_price) * float(filled_qty)
             returned_usd = float(exit_price) * float(filled_qty)
@@ -544,6 +519,46 @@ class AssassinLedger:
                 os.replace(tmp_path, filepath)
 
             await asyncio.to_thread(_write)
+
+    # NEW: 통합 시드 풀(Unified Seed Pool) 및 전술 제어반 공통 설정(시드, 목표익절률, 복리여부, 마스터전원) 양쪽 원장 동시 동기화 (Case 76, 77)
+    @classmethod
+    async def sync_global_settings(
+        cls,
+        budget: float = None,
+        target_profit_rate: float = None,
+        is_compound: bool = None,
+        is_active: bool = None,
+    ):
+        for sym in cls.ALLOWED_SYMBOLS:
+            await cls.save_state(
+                sym,
+                budget=budget,
+                target_profit_rate=target_profit_rate,
+                is_compound=is_compound,
+                is_active=is_active,
+            )
+
+    # NEW: 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 당일 진입 영구 차단 (Case 82)
+    @classmethod
+    async def lock_all_symbols_macro(cls, last_session_id: str = None):
+        for sym in cls.ALLOWED_SYMBOLS:
+            kwargs = {
+                "buy_order_id": "",
+                "is_session_done": True,
+                "entry_session": "CANCELED_MACRO",
+                "whipsaw_target_price": 0.0,
+            }
+            if last_session_id is not None:
+                kwargs["last_session_id"] = last_session_id
+            await cls.save_state(sym, **kwargs)
+
+    # NEW: 프리장 내 익절 완료 또는 04:07 휩소 정리 완료 시 양쪽 장부 동시 무한 재출동 락 해제 (Case 52, 80)
+    @classmethod
+    async def unlock_all_symbols_for_reentry(cls):
+        for sym in cls.ALLOWED_SYMBOLS:
+            st = await cls.get_state(sym)
+            if st[8] != "CANCELED_MACRO":
+                await cls.save_state(sym, is_session_done=False, whipsaw_target_price=0.0)
 
     @classmethod
     async def reset_all_ledgers(cls):
