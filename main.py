@@ -11,7 +11,7 @@
 # NEW: 1차 매수 덫 대기(PRE_SNIPER) 중 메인 루프 주기를 1.5초 -> 0.4초 고주파 모드로 자동 가속하여 RSI > 30.0 반등 돌파 즉각 포착 (Case 28, 73)
 # MODIFIED: 17:00 EST GC 가동 시 is_session_done=False 초기화 및 19:00 EST 논리적 거래일 롤오버 적용으로 전일 마감 락 이월 원천 차단 (Case 01, 22, 36)
 # NEW: 프리장 (04:00 ~ 09:29 EST) 미보유·무주문·비매크로차단 상태에서 구버전 잔재 잠금(is_session_done=True) 감지 시 즉시 해제하는 자가 치유(Self-Healing) 가드 주입 (Case 52)
-# NEW: 데이장 (19:00 ~ 03:59 EST) SOXS 15초 캔들 스캔 가속 및 [모의] +1.00% 익절가 도달 추격형 알림 플러그인(execute_daymarket_rsi_alert_plugin) 메인 루프 결속 (Case 53, 78)
+# MODIFIED: 데이장 (19:00 ~ 03:59 EST) SOXS & SOXL 15초 듀얼 캔들 스캔 가속 및 NQ=F 10분봉 추세 연동(상승추세 시 SOXS<=30 & SOXL>=80 / 하락추세 시 SOXS<=30) 모의 관측 알림 결속 (Case 53, 73, 78)
 
 import sys
 import os
@@ -230,12 +230,13 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
         except Exception as e:
             print(f"🚨 [RSI 레이더망 {symbol}] 붕괴 방어: {e}", flush=True)
 
-        # 프리장 (04:00 ~ 09:29 EST) 중 SOXS 5초 스캔, 데이장 (19:00 ~ 03:59 EST) 중 SOXS 15초 스캔으로 EWM 기저 상태 동기화
+        # MODIFIED: 프리장 (04:00 ~ 09:29 EST) 중 SOXS 5초 스캔,
+        #           데이장 (19:00 ~ 03:59 EST) 중 SOXS 및 SOXL 모두 15초 스캔으로 듀얼 EWM 기저 상태 실시간 동기화
         now_est_chk = datetime.now(EST_TZ)
         est_hm_chk = now_est_chk.hour * 100 + now_est_chk.minute
         if symbol == "SOXS" and (400 <= est_hm_chk <= 929):
             sleep_sec = 5.0
-        elif symbol == "SOXS" and (est_hm_chk >= 1900 or est_hm_chk <= 359):
+        elif symbol in RSI_SYMBOLS and (est_hm_chk >= 1900 or est_hm_chk <= 359):
             sleep_sec = 15.0
         else:
             sleep_sec = 60.0
@@ -579,7 +580,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 if cleared:
                     continue
 
-            # NEW: 데이장 (19:00 ~ 03:59 EST) [모의] +1.00% 익절 도달 추격 및 RSI <= 30.0 포착 알림 플러그인 가동 (Case 53, 78)
+            # MODIFIED: 데이장 (19:00 ~ 03:59 EST) NQ=F 10분봉 추세 연동형(상승추세 시 SOXS<=30 & SOXL>=80 / 하락추세 시 SOXS<=30) 모의 관측 알림 가동
             if is_active and is_daymarket_window and current_price > 0.0:
                 await execute_daymarket_rsi_alert_plugin(
                     ctx=ctx,
@@ -690,7 +691,7 @@ async def main():
             text=(
                 "✅ <b>[시스템 기동 완료 — 프리장 SOXS 단방향 조건부 30초 타임쉴드 스나이퍼]</b>\n"
                 "▫️ 타겟: <b>SOXS(숏)</b> 배타적 실물 자산 투입 (SOXL 매매 영구 차단)\n"
-                "▫️ 데이장: <b>19:00 ~ 03:59 EST</b> 매수차단 · <b>[모의] RSI≤30 포착 알림 (+1.00% 도달 전 리셋 잠금)</b>\n"
+                "▫️ 데이장: <b>19:00 ~ 03:59 EST</b> 매수차단 · <b>[모의] NQ 10분봉 상승추세 시 SOXS≤30 &amp; SOXL≥80 / 하락추세 시 SOXS≤30 단독 포착 (+1.00% 도달 전 리셋 잠금)</b>\n"
                 "▫️ 프리장: <b>04:00 ~ 09:29 EST</b> RSI≤30 포착 즉시 <b>1차 슬리피지(-0.18%) 매수 덫 선(先) 투하</b>\n"
                 "▫️ 타임쉴드: <b>RSI≤30 유지 시 30초 대기 후 현재가 재장전 / 30초 내 RSI 30 초과 반등 시 0.4초 감시 즉각 현재가 매수</b>\n"
                 f"▫️ 익절: 현재 설정 <b>+{boot_rate:.2f}% (순수익 +{boot_net_rate:.2f}%)</b> · 제어반(/settlement)에서 <b>+0.64% / +1.00%</b> 전환\n"

@@ -12,7 +12,7 @@
 # MODIFIED: 스나이퍼 OFF 상태 중 수동 청산 식별 시 타전 억제(Silent Reset) 분기 결속 (Case 46)
 # NEW: MOC 및 매크로 덤핑 시 미체결 매도 선취소 후 수량 해방(sellableQuantity > 0) 2.0초 폴링 대기 및 거래소 취소 병목 시 기존 매도 주문 가격 즉시 정정(modify_order) 우회 타격망 결속 (Case 16, 24, 69, 75)
 # NEW: 전술 제어반 목표 익절률(+0.64% vs +1.00%) 동적 연동, 보유 중 익절률 변경 시 매도 덫 자동 재장전 및 복리 모드(+0.50% / +0.86% 순수익 가산, 손절 시 수수료 0.14% 포함 실손실 차감) 결속 (Case 76, 77)
-# MODIFIED: 데이장 (19:00 ~ 03:59 EST) SOXS RSI<=30.0 [모의] 알림 추격 시스템 — 1회 모의 진입 알림 후 현재가가 +1.00% 모의 익절가에 도달하기 전까지 절대 알림을 리셋하지 않고 다중 알림을 원천 차단하는 타점 추적기 탑재 (Case 01, 36, 53, 78)
+# MODIFIED: 데이장 (19:00 ~ 03:59 EST) SOXS RSI<=30.0 [모의] 알림 추격 시스템 — NQ=F 10분봉 상승추세("UP") 시 SOXL RSI>=80.0 악조건 강제 / 하락추세("DOWN") 시 SOXS RSI<=30.0 단독 포착 및 +1.00% 도달 전 리셋 잠금 결속 (Case 01, 36, 53, 73, 78)
 
 import math
 import time
@@ -24,13 +24,20 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 
 from toss_api import TossApiClient
-from quant_engine import AssassinLedger, MacroDataCache
+from quant_engine import (
+    AssassinLedger,
+    MacroDataCache,
+    compute_realtime_tick_rsi,
+)
 
 EST_TZ = ZoneInfo("America/New_York")
 PRE_SNIPER_RSI_THRESHOLD = 30.0
 
 # 데이장 (19:00 ~ 03:59 EST) [모의] 알림 리셋 기준 목표 수익률 (+1.00% 익절가 도달 시에만 리셋)
 DAY_SIM_RESET_PROFIT_RATE = 1.00
+# NEW: 데이장 NQ=F 10분봉 상승추세("UP") 시 추가로 강제할 SOXL(롱) 최소 RSI 악조건 임계치 (80.0 이상)
+DAY_SIM_SOXL_RSI_THRESHOLD = 80.0
+_DAY_SIM_LOCK = asyncio.Lock()
 
 # NEW: 프리장 (04:00 ~ 09:29 EST) 1차 슬리피지 지정가 매수 덫 & 조건부 30초 타임쉴드 상수
 BUY_TRAP_SLIPPAGE_PCT = 0.18          # 1차 매수 덫 슬리피지 할인율 (-0.18%, 예: $44.91 -> $44.83)
@@ -48,6 +55,8 @@ _STRIKE_ALERT_CACHE = {
     "day_sim_target_price": 0.0,
     "day_sim_min_price": 0.0,
     "day_sim_entry_time_str": "",
+    "day_sim_nq_trend": "",
+    "day_sim_soxl_rsi": 0.0,
 }
 
 
@@ -59,6 +68,8 @@ def get_daymarket_sim_status() -> dict:
         "target_price": float(_STRIKE_ALERT_CACHE.get("day_sim_target_price", 0.0)),
         "min_price": float(_STRIKE_ALERT_CACHE.get("day_sim_min_price", 0.0)),
         "entry_time": str(_STRIKE_ALERT_CACHE.get("day_sim_entry_time_str", "")),
+        "nq_trend": str(_STRIKE_ALERT_CACHE.get("day_sim_nq_trend", "")),
+        "soxl_rsi": float(_STRIKE_ALERT_CACHE.get("day_sim_soxl_rsi", 0.0)),
     }
 
 
@@ -158,7 +169,9 @@ async def _cancel_open_orders_and_wait_sellable(
 
 
 # MODIFIED: 데이장 (19:00 ~ 03:59 EST) SOXS RSI <= 30.0 [모의] 타점 추적 알림 플러그인
-#           — 1회 모의 포착 알림 발송 후 +1.00% 모의 익절가 도달 전까지 알림 리셋을 영구 금지하여 다중 알림 스팸 100% 차단 (Case 78)
+#           — NQ=F 10분봉 추세가 상승("UP")일 때는 SOXL RSI >= 80.0 악조건을 강제하여 역추세 드리프트 허수 알림을 차단하고,
+#             하락("DOWN")일 때는 악조건 없이 SOXS RSI <= 30.0 단독 조건으로 포착하며,
+#             1회 포착 후 현재가가 +1.00% 모의 익절가에 도달하기 전까지 다중 알림을 원천 잠금 (Case 53, 73, 78)
 async def execute_daymarket_rsi_alert_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -175,99 +188,150 @@ async def execute_daymarket_rsi_alert_plugin(
     if not is_day_market:
         return
 
-    # Case 01 & 초과 Case 36: 19:00 EST 기준 논리적 거래일 산출 및 새 데이장 개장 시 모의 추적 상태 초기화
-    logical_dt = (now_est + timedelta(days=1)) if now_est.hour >= 19 else now_est
-    logical_date_str = logical_dt.strftime("%Y-%m-%d")
+    async with _DAY_SIM_LOCK:
+        # Case 01 & 초과 Case 36: 19:00 EST 기준 논리적 거래일 산출 및 새 데이장 개장 시 모의 추적 상태 초기화
+        logical_dt = (now_est + timedelta(days=1)) if now_est.hour >= 19 else now_est
+        logical_date_str = logical_dt.strftime("%Y-%m-%d")
 
-    if _STRIKE_ALERT_CACHE.get("day_logical_date") != logical_date_str:
-        _STRIKE_ALERT_CACHE["day_logical_date"] = logical_date_str
-        _STRIKE_ALERT_CACHE["day_sim_active"] = False
-        _STRIKE_ALERT_CACHE["day_sim_entry_price"] = 0.0
-        _STRIKE_ALERT_CACHE["day_sim_target_price"] = 0.0
-        _STRIKE_ALERT_CACHE["day_sim_min_price"] = 0.0
-        _STRIKE_ALERT_CACHE["day_sim_entry_time_str"] = ""
-
-    state_s = await AssassinLedger.get_state(symbol)
-    is_active = bool(state_s[5])
-    if not is_active:
-        return
-
-    if current_price <= 0.0:
-        try:
-            current_price = await ctx.client.get_current_price(symbol)
-        except Exception:
-            current_price = 0.0
-    if current_price <= 0.0:
-        return
-
-    cur_p_fl = math.floor(current_price * 100.0) / 100.0
-    if cur_p_fl <= 0.0:
-        return
-
-    # [상태 1] 이미 데이장 [모의] 포지션이 잡혀서 +1.00% 익절가 도달을 추격 중인 상태
-    # -> +1.00% 익절가(day_sim_target_price)에 도달하기 전까지는 RSI가 아무리 등락해도 절대 리셋하거나 재알림을 보내지 않음!
-    if _STRIKE_ALERT_CACHE.get("day_sim_active", False):
-        prev_min_p = float(_STRIKE_ALERT_CACHE.get("day_sim_min_price", 0.0))
-        if prev_min_p <= 0.0 or cur_p_fl < prev_min_p:
-            _STRIKE_ALERT_CACHE["day_sim_min_price"] = cur_p_fl
-
-        target_p = float(_STRIKE_ALERT_CACHE.get("day_sim_target_price", 0.0))
-        entry_p = float(_STRIKE_ALERT_CACHE.get("day_sim_entry_price", 0.0))
-        min_p = float(_STRIKE_ALERT_CACHE.get("day_sim_min_price", cur_p_fl))
-        entry_t_str = str(_STRIKE_ALERT_CACHE.get("day_sim_entry_time_str", "--:--:--"))
-
-        if target_p > 0.0 and cur_p_fl >= target_p:
-            # +1.00% 모의 익절가 도달 확증! -> 모의 익절 완료 타전 후 차기 RSI<=30 감시 리셋
+        if _STRIKE_ALERT_CACHE.get("day_logical_date") != logical_date_str:
+            _STRIKE_ALERT_CACHE["day_logical_date"] = logical_date_str
             _STRIKE_ALERT_CACHE["day_sim_active"] = False
             _STRIKE_ALERT_CACHE["day_sim_entry_price"] = 0.0
             _STRIKE_ALERT_CACHE["day_sim_target_price"] = 0.0
             _STRIKE_ALERT_CACHE["day_sim_min_price"] = 0.0
             _STRIKE_ALERT_CACHE["day_sim_entry_time_str"] = ""
+            _STRIKE_ALERT_CACHE["day_sim_nq_trend"] = ""
+            _STRIKE_ALERT_CACHE["day_sim_soxl_rsi"] = 0.0
 
-            sim_gross_pct = ((cur_p_fl / entry_p - 1.0) * 100.0) if entry_p > 0.0 else 1.00
-            sim_net_pct = sim_gross_pct - 0.14
-            max_dd_pct = ((min_p / entry_p - 1.0) * 100.0) if entry_p > 0.0 else 0.0
+        state_s = await AssassinLedger.get_state(symbol)
+        is_active = bool(state_s[5])
+        if not is_active:
+            return
+
+        if current_price <= 0.0:
+            try:
+                current_price = await ctx.client.get_current_price(symbol)
+            except Exception:
+                current_price = 0.0
+        if current_price <= 0.0:
+            return
+
+        cur_p_fl = math.floor(current_price * 100.0) / 100.0
+        if cur_p_fl <= 0.0:
+            return
+
+        # [상태 1] 이미 데이장 [모의] 포지션이 잡혀서 +1.00% 익절가 도달을 추격 중인 상태
+        # -> +1.00% 익절가(day_sim_target_price)에 도달하기 전까지는 RSI가 아무리 등락해도 절대 리셋하거나 재알림을 보내지 않음!
+        if _STRIKE_ALERT_CACHE.get("day_sim_active", False):
+            prev_min_p = float(_STRIKE_ALERT_CACHE.get("day_sim_min_price", 0.0))
+            if prev_min_p <= 0.0 or cur_p_fl < prev_min_p:
+                _STRIKE_ALERT_CACHE["day_sim_min_price"] = cur_p_fl
+
+            target_p = float(_STRIKE_ALERT_CACHE.get("day_sim_target_price", 0.0))
+            entry_p = float(_STRIKE_ALERT_CACHE.get("day_sim_entry_price", 0.0))
+            min_p = float(_STRIKE_ALERT_CACHE.get("day_sim_min_price", cur_p_fl))
+            entry_t_str = str(_STRIKE_ALERT_CACHE.get("day_sim_entry_time_str", "--:--:--"))
+            entry_nq_tr = str(_STRIKE_ALERT_CACHE.get("day_sim_nq_trend", ""))
+            entry_soxl_r = float(_STRIKE_ALERT_CACHE.get("day_sim_soxl_rsi", 0.0))
+
+            if target_p > 0.0 and cur_p_fl >= target_p:
+                # +1.00% 모의 익절가 도달 확증! -> 모의 익절 완료 타전 후 차기 RSI<=30 감시 리셋
+                _STRIKE_ALERT_CACHE["day_sim_active"] = False
+                _STRIKE_ALERT_CACHE["day_sim_entry_price"] = 0.0
+                _STRIKE_ALERT_CACHE["day_sim_target_price"] = 0.0
+                _STRIKE_ALERT_CACHE["day_sim_min_price"] = 0.0
+                _STRIKE_ALERT_CACHE["day_sim_entry_time_str"] = ""
+                _STRIKE_ALERT_CACHE["day_sim_nq_trend"] = ""
+                _STRIKE_ALERT_CACHE["day_sim_soxl_rsi"] = 0.0
+
+                sim_gross_pct = ((cur_p_fl / entry_p - 1.0) * 100.0) if entry_p > 0.0 else 1.00
+                sim_net_pct = sim_gross_pct - 0.14
+                max_dd_pct = ((min_p / entry_p - 1.0) * 100.0) if entry_p > 0.0 else 0.0
+                tr_badge = "상승추세[UP] 악조건통과" if entry_nq_tr == "UP" else "하락추세[DOWN] 단독포착"
+
+                await ctx.notify_tg(
+                    f"🎯 <b>[데이장 모의 익절 달성] {symbol} +1.00% 목표가 도달 ➡️ 알림 락 리셋 완료</b>\n"
+                    f"▫️ 모의 타점: 진입 <code>${entry_p:.2f}</code> (<code>{entry_t_str} EST</code> · {tr_badge} · 당시 SOXL RSI <code>{entry_soxl_r:.1f}</code>) ➡️ 도달 <code>${cur_p_fl:.2f}</code> (목표 <code>${target_p:.2f}</code>)\n"
+                    f"▫️ 경유 최저가: <code>${min_p:.2f}</code> (최대 역행 <code>{max_dd_pct:+.2f}%</code>)\n"
+                    f"▫️ 모의 수익률: 세전 <code>+{sim_gross_pct:.2f}%</code> / 세후 순수익 <code>+{sim_net_pct:.2f}%</code> (수수료 0.14% 차감)\n"
+                    "▫️ 후속 조치: <code>+1.00% 익절 도달이 확인되어 데이장 차기 SOXS RSI≤30 모의 감시가 재장전되었습니다.</code>"
+                )
+            return
+
+        # [상태 2] 미진입 대기 상태(day_sim_active == False)에서 1차 조건: SOXS RSI <= 30.0 최초 포착 시
+        if 0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD:
+            # NQ=F 10분봉 실시간 추세("UP" / "DOWN") 및 지수 데이터 조회
+            nq_trend, nq_ema_diff, nq_ema6_str, nq_c_global, nq_h_global, nq_l_global = (
+                await MacroDataCache.get_nq_sniper_signal()
+            )
+
+            # 온디맨드(On-Demand)로 SOXL 실시간 현재가를 조회하여 O(1) 실시간 틱 RSI 합성
+            soxl_state = (ctx.shared_rsi_state or {}).get("SOXL", {})
+            soxl_fallback_rsi = float(soxl_state.get("value", 0.0)) if isinstance(soxl_state, dict) else 0.0
+            soxl_ewm = soxl_state.get("ewm_state", {}) if isinstance(soxl_state, dict) else {}
+
+            try:
+                soxl_price = await ctx.client.get_current_price("SOXL")
+            except Exception:
+                soxl_price = 0.0
+
+            if soxl_price > 0.0:
+                soxl_live_rsi = compute_realtime_tick_rsi(
+                    live_price=soxl_price,
+                    ewm_state=soxl_ewm,
+                    fallback_rsi=soxl_fallback_rsi,
+                )
+                if isinstance(soxl_state, dict):
+                    soxl_state["value"] = soxl_live_rsi
+            else:
+                soxl_live_rsi = soxl_fallback_rsi
+
+            # NEW: 핵심 추세 조건부 필터!
+            # NQ=F 10분봉이 상승 추세("UP")일 때는 반드시 SOXL RSI >= 80.0 악조건을 충족해야만 알림 발송!
+            # NQ=F 10분봉이 하락 추세("DOWN")일 때는 악조건 없이 SOXS RSI <= 30.0 단독 조건으로 즉시 통과!
+            if nq_trend == "UP" and soxl_live_rsi < DAY_SIM_SOXL_RSI_THRESHOLD:
+                return
+
+            sim_tp_100 = math.ceil(cur_p_fl * (1.0 + DAY_SIM_RESET_PROFIT_RATE / 100.0) * 100.0) / 100.0
+            sim_tp_064 = math.ceil(cur_p_fl * 1.0064 * 100.0) / 100.0
+            slip_disc = max(BUY_TRAP_MIN_DISC_USD, round(cur_p_fl * (BUY_TRAP_SLIPPAGE_PCT / 100.0), 2))
+            sim_trap_buy = max(0.01, math.floor((cur_p_fl - slip_disc) * 100.0) / 100.0)
+
+            _STRIKE_ALERT_CACHE["day_sim_active"] = True
+            _STRIKE_ALERT_CACHE["day_sim_entry_price"] = cur_p_fl
+            _STRIKE_ALERT_CACHE["day_sim_target_price"] = sim_tp_100
+            _STRIKE_ALERT_CACHE["day_sim_min_price"] = cur_p_fl
+            _STRIKE_ALERT_CACHE["day_sim_entry_time_str"] = now_est.strftime("%H:%M:%S")
+            _STRIKE_ALERT_CACHE["day_sim_nq_trend"] = nq_trend
+            _STRIKE_ALERT_CACHE["day_sim_soxl_rsi"] = soxl_live_rsi
+
+            if vwap_val <= 0.0 and ctx.shared_rsi_state and symbol in ctx.shared_rsi_state:
+                vwap_val = float(ctx.shared_rsi_state[symbol].get("vwap", 0.0))
+
+            nq_amp_global = (
+                ((nq_h_global - nq_l_global) / nq_l_global * 100.0) if nq_l_global > 0.0 else 0.0
+            )
+            vwap_str = f"${vwap_val:.2f}" if vwap_val > 0.0 else "집계중"
+
+            if nq_trend == "UP":
+                trend_filter_desc = (
+                    f"📈 NQ 10분봉 상승추세(기준 {nq_ema6_str} 대비 {nq_ema_diff:+.2f}%) ➡️ 악조건(SOXL RSI≥80) 통과"
+                )
+            else:
+                trend_filter_desc = (
+                    f"📉 NQ 10분봉 하락추세(기준 {nq_ema6_str} 대비 {nq_ema_diff:+.2f}%) ➡️ 악조건 면제(SOXS≤30 단독)"
+                )
 
             await ctx.notify_tg(
-                f"🎯 <b>[데이장 모의 익절 달성] {symbol} +1.00% 목표가 도달 ➡️ 알림 락 리셋 완료</b>\n"
-                f"▫️ 모의 타점: 진입 <code>${entry_p:.2f}</code> (<code>{entry_t_str} EST</code>) ➡️ 도달 <code>${cur_p_fl:.2f}</code> (목표 <code>${target_p:.2f}</code>)\n"
-                f"▫️ 경유 최저가: <code>${min_p:.2f}</code> (최대 역행 <code>{max_dd_pct:+.2f}%</code>)\n"
-                f"▫️ 모의 수익률: 세전 <code>+{sim_gross_pct:.2f}%</code> / 세후 순수익 <code>+{sim_net_pct:.2f}%</code> (수수료 0.14% 차감)\n"
-                "▫️ 후속 조치: <code>+1.00% 익절 도달이 확인되어 데이장 차기 SOXS RSI≤30 모의 감시가 재장전되었습니다.</code>"
+                f"🔔 <b>[데이장 모의 관측] {symbol} 진성 타점 포착 ➡️ +1.00% 도달 추격 개시 (매수차단)</b>\n"
+                f"▫️ 포착 시각: <code>{now_est.strftime('%H:%M:%S')} EST</code> (0세션 데이마켓)\n"
+                f"▫️ 듀얼 1분봉 RSI: 🐻SOXS <code>{rsi_val:.1f}</code> (기준 ≤ 30.0) | 🐂SOXL <code>{soxl_live_rsi:.1f}</code>\n"
+                f"▫️ 선물 추세 필터: <code>{trend_filter_desc}</code>\n"
+                f"▫️ 모의 진입가: <code>${cur_p_fl:.2f}</code> (슬리피지 덫 참고가: <code>${sim_trap_buy:.2f}</code>) | VWAP: <code>{vwap_str}</code>\n"
+                f"▫️ NQ=F 당일 진폭: <code>{nq_amp_global:.2f}%</code> (현재지수 <code>{nq_c_global:.2f}</code>)\n"
+                f"▫️ 리셋 목표가(+1.00%): <code>${sim_tp_100:.2f}</code> (참고 +0.64%: <code>${sim_tp_064:.2f}</code>)\n"
+                f"▫️ 다중알림 잠금: <code>현재가가 +1.00% (${sim_tp_100:.2f}) 에 도달하기 전까지 추가 알림이 100% 차단됩니다.</code>"
             )
-        return
-
-    # [상태 2] 미진입 대기 상태(day_sim_active == False)에서 SOXS RSI <= 30.0 최초 포착 시
-    if 0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD:
-        sim_tp_100 = math.ceil(cur_p_fl * (1.0 + DAY_SIM_RESET_PROFIT_RATE / 100.0) * 100.0) / 100.0
-        sim_tp_064 = math.ceil(cur_p_fl * 1.0064 * 100.0) / 100.0
-        slip_disc = max(BUY_TRAP_MIN_DISC_USD, round(cur_p_fl * (BUY_TRAP_SLIPPAGE_PCT / 100.0), 2))
-        sim_trap_buy = max(0.01, math.floor((cur_p_fl - slip_disc) * 100.0) / 100.0)
-
-        _STRIKE_ALERT_CACHE["day_sim_active"] = True
-        _STRIKE_ALERT_CACHE["day_sim_entry_price"] = cur_p_fl
-        _STRIKE_ALERT_CACHE["day_sim_target_price"] = sim_tp_100
-        _STRIKE_ALERT_CACHE["day_sim_min_price"] = cur_p_fl
-        _STRIKE_ALERT_CACHE["day_sim_entry_time_str"] = now_est.strftime("%H:%M:%S")
-
-        if vwap_val <= 0.0 and ctx.shared_rsi_state and symbol in ctx.shared_rsi_state:
-            vwap_val = float(ctx.shared_rsi_state[symbol].get("vwap", 0.0))
-
-        nq_c_global, nq_h_global, nq_l_global = await MacroDataCache.get_cached_nq_data()
-        nq_amp_global = (
-            ((nq_h_global - nq_l_global) / nq_l_global * 100.0) if nq_l_global > 0.0 else 0.0
-        )
-        vwap_str = f"${vwap_val:.2f}" if vwap_val > 0.0 else "집계중"
-
-        await ctx.notify_tg(
-            f"🔔 <b>[데이장 모의 관측] {symbol} RSI≤30 포착 ➡️ +1.00% 도달 추격 개시 (매수차단)</b>\n"
-            f"▫️ 포착 시각: <code>{now_est.strftime('%H:%M:%S')} EST</code> (0세션 데이마켓)\n"
-            f"▫️ 실시간 1분봉 RSI: <code>{rsi_val:.1f}</code> (기준 ≤ 30.0)\n"
-            f"▫️ 모의 진입가: <code>${cur_p_fl:.2f}</code> (슬리피지 덫 참고가: <code>${sim_trap_buy:.2f}</code>) | VWAP: <code>{vwap_str}</code>\n"
-            f"▫️ NQ=F 당일 진폭: <code>{nq_amp_global:.2f}%</code> (현재지수 <code>{nq_c_global:.2f}</code>)\n"
-            f"▫️ 리셋 목표가(+1.00%): <code>${sim_tp_100:.2f}</code> (참고 +0.64%: <code>${sim_tp_064:.2f}</code>)\n"
-            f"▫️ 다중알림 잠금: <code>현재가가 +1.00% (${sim_tp_100:.2f}) 에 도달하기 전까지 추가 알림이 100% 차단됩니다.</code>"
-        )
 
 
 async def execute_rsi_monitoring_plugin(

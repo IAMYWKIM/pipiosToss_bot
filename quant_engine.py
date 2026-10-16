@@ -1,11 +1,12 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: 프리장 SOXS 단방향 실거래 스나이퍼 독립 장부, NQ=F 진폭 캐싱 및 Wilder's RSI(14) 벡터/틱 합성 엔진
+# 목적: 프리장 SOXS 단방향 실거래 스나이퍼 독립 장부, NQ=F 진폭/10분봉 추세 캐싱 및 Wilder's RSI(14) 벡터/틱 합성 엔진
 # =====================================================================
 # MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
 # NEW: 20초 폴링 사각지대(원인 D) 소각을 위한 Wilder's EWM 기저 상태(ewm_state_out) 추출 및 1.5초 O(1) 실시간 틱 RSI 점화식(compute_realtime_tick_rsi) 신설
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 03:58/04:07 임계 윈도우 데드코드 및 AVWAPEngine 영구 소각
 # MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
+# NEW: 데이장 진성 타점 판별을 위한 NQ=F 10분봉(10min) 리샘플링 기반 EMA(3)/EMA(6) 실시간 추세("UP"/"DOWN") 벡터 연산 탑재
 # MODIFIED: SOXS 단일 타겟 하드 락온 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
 # NEW: 전술 제어반 목표 익절률(+0.64% vs +1.00%) 선택 영구 보존 및 복리 모드(익절 시 +0.50% / +0.86% 순수익 가산, 손절 시 왕복 수수료 0.14% 포함 실손실 차감) 엔진 탑재
 
@@ -179,7 +180,16 @@ class MacroDataCache:
                     return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
+                df = df[~df.index.duplicated(keep="last")]
                 df.sort_index(ascending=True, inplace=True)
+
+                for col in ["High", "Low", "Close"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+                df = df[df["Close"] > 0.0].copy()
+                if df.empty:
+                    return 0.0, 0.0, 0.0, "WAIT", 0.0, "--:--"
 
                 # Case 62: 45분 이상 휴장 갭(Gap) 기준 당일 세션 분리로 자정 롤오버 왜곡 방어
                 time_diffs = df.index.to_series().diff()
@@ -197,7 +207,26 @@ class MacroDataCache:
                 high_val = float(df_session["High"].max())
                 low_val = float(df_session["Low"].min())
 
-                return curr_val, high_val, low_val, "WAIT", 0.0, "--:--"
+                # NEW: NQ=F 5일 1분봉 시계열에서 10분봉(10min) 리샘플링 및 EMA(3)/EMA(6) 기반 실시간 추세("UP"/"DOWN") 벡터 연산
+                df_10m_close = df["Close"].resample("10min").last().dropna()
+                if len(df_10m_close) >= 6:
+                    ema3_series = df_10m_close.ewm(span=3, adjust=False).mean()
+                    ema6_series = df_10m_close.ewm(span=6, adjust=False).mean()
+                    ema3_val = float(ema3_series.iloc[-1])
+                    ema6_val = float(ema6_series.iloc[-1])
+                    is_up_trend = (curr_val >= ema6_val) and (ema3_val >= ema6_val)
+                    trend_str = "UP" if is_up_trend else "DOWN"
+                    ema_diff_pct = ((curr_val - ema6_val) / ema6_val * 100.0) if ema6_val > 0.0 else 0.0
+                    base_ema_str = f"{ema6_val:.2f}"
+                elif not df_10m_close.empty:
+                    ema_last = float(df_10m_close.iloc[-1])
+                    trend_str = "UP" if curr_val >= ema_last else "DOWN"
+                    ema_diff_pct = ((curr_val - ema_last) / ema_last * 100.0) if ema_last > 0.0 else 0.0
+                    base_ema_str = f"{ema_last:.2f}"
+                else:
+                    trend_str, ema_diff_pct, base_ema_str = "DOWN", 0.0, f"{curr_val:.2f}"
+
+                return curr_val, high_val, low_val, trend_str, ema_diff_pct, base_ema_str
 
             try:
                 c, h, l, tr, chg, b_str = await asyncio.wait_for(
