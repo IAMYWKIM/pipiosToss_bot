@@ -4,6 +4,7 @@
 #       03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 텔레그램 UI 렌더링 모듈
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 NQ 10분봉 추세 UI 잔재 소각 및 양방향 대칭 클라이맥스(DUAL80_TRAP) 단일화 반영
+# NEW: RSI >= 79.0 프리-클라이맥스 0.4초 고주파 부스터 및 RSI >= 79.9 (80.0 클라이맥스 인지) 상태 표출 반영 (Case 28, 81, 83)
 # MODIFIED: 데이장(19:00 ~ 03:57 EST) 프리장 동일 대칭 조건 [모의] 듀얼 2단계 추격 및 03:58 ~ 03:59 EST 묵음 바이패스 상태 표출 (Case 78)
 # MODIFIED: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫(현재가 > 데이장VWAP 종목 1% 역산) 및 04:07 EST 타임쉴드 렌더링 (Case 79, 80)
 # NEW: 관제탑(/avwap) 및 지시서(/sync) 내 SOXS(🐻) & SOXL(🐂) 듀얼 실시간 시세·VWAP·RSI·방향성 인지 3차 매크로 방어선 동시 표출 (Case 13, 67)
@@ -40,8 +41,9 @@ async def get_main_menu_text() -> str:
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
         "🔹 19:00 ~ 03:57: 🌙 <b>0세션 데이마켓 ([모의] 대칭 클라이맥스 2단계 추격 · 매수차단)</b>\n"
         "      (실거래 매수 100% 차단 · 프리장 본진과 동일한 조건으로 운영장 확대 검증)\n"
-        "      (🐻 SOXS 포착: SOXS RSI ≤ 30.0 &amp; SOXL RSI ≥ 80.0 동시 충족)\n"
-        "      (🐂 SOXL 포착: SOXL RSI ≤ 30.0 &amp; SOXS RSI ≥ 80.0 동시 충족)\n"
+        "      (🐻 SOXS 포착: SOXS RSI ≤ 30.0 &amp; SOXL RSI ≥ 79.9[80인지] 동시 충족)\n"
+        "      (🐂 SOXL 포착: SOXL RSI ≤ 30.0 &amp; SOXS RSI ≥ 79.9[80인지] 동시 충족)\n"
+        "      (⚡ <b>0.4초 프리-클라이맥스 부스터</b>: RSI ≥ 79.0 진입 시 1.5초 ➔ 0.4초 가속 &amp; 배치 동시 시세 합성)\n"
         "      (🪤 포착 시 1차 슬리피지[-0.18%] 매수 덫 + 조건부 30초 타임쉴드 가상 체결)\n"
         "      (🔒 모의 익절[+1.00%] 또는 방향성 인지 매크로 모의 손절 도달 전까지 중복 알림 잠금)\n"
         "🔹 03:58 ~ 03:59: 🔇 <b>데이장 마감 휩소 묵음 바이패스</b>\n"
@@ -53,8 +55,9 @@ async def get_main_menu_text() -> str:
         "      (⏱️ <b>04:07 EST 타임쉴드 해제</b>: 미체결 시 비용 $0 즉시 취소 / 1주 보유 시 현재가 즉시 매도 후 본진 인계)\n"
         "🔹 04:07 ~ 09:29: 🔫 <b>프리장 본진 '양방향 대칭 클라이맥스 듀얼 스나이퍼 (DUAL80_TRAP)'</b>\n"
         "      (단일 포지션 배타적 뮤텍스 · NQ=F 당일 진폭 2.0% 미만 통과 필수)\n"
-        "      (🐻 SOXS 타격: SOXS RSI ≤ 30.0 &amp; SOXL RSI ≥ 80.0 동시 수렴 시)\n"
-        "      (🐂 SOXL 타격: SOXL RSI ≤ 30.0 &amp; SOXS RSI ≥ 80.0 동시 수렴 시)\n"
+        "      (🐻 SOXS 타격: SOXS RSI ≤ 30.0 &amp; SOXL RSI ≥ 79.9[80인지] 동시 수렴 시)\n"
+        "      (🐂 SOXL 타격: SOXL RSI ≤ 30.0 &amp; SOXS RSI ≥ 79.9[80인지] 동시 수렴 시)\n"
+        "      (⚡ <b>RSI ≥ 79.0 프리-클라이맥스 0.4초 고주파 부스터</b> 가동으로 순간 피크 스파이크 100% 포착)\n"
         "      (🪤 포착 즉시 슬리피지[-0.18%] 할인 1차 지정가 매수 덫 선[先] 투하 + 조건부 30초 타임쉴드)\n"
         f"      (전량 체결 즉시 팩트 평단가 +{active_rate:.2f}% 매도 덫 하드 락온 · 익절 시 09:29까지 무한 재출동)\n"
         "🔹 09:30 ~ 15:58: 🔥 <b>정규장 본장 (09:30 신규 매수 마감)</b>\n"
@@ -193,8 +196,8 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 57 — SOXS 및 SOXL 듀얼 상태, 단일 포지션 뮤텍스, 듀얼 휩소 1주 매수덫,
-#           데이장 대칭 클라이맥스 2단계 [모의] 추격 상태 표출
+# MODIFIED: Case 13 & 초과 Case 57 & Case 83 — SOXS 및 SOXL 듀얼 상태, 단일 포지션 뮤텍스,
+#           79.9 클라이맥스 인지 및 79.0 부스터 상태 표출
 def build_compact_status(
     symbol: str,
     state_tuple: tuple,
@@ -261,10 +264,10 @@ def build_compact_status(
                     f"🔔 데이장[모의] 추격(${day_sim['entry_price']:.2f}➡️${day_sim['target_price']:.2f} 도달전 잠금)"
                 )
         else:
-            state_text = f"🔔 데이장[모의] 대칭감시({symbol}≤30 &amp; {opp_sym}≥80)"
+            state_text = f"🔔 데이장[모의] 대칭감시({symbol}≤30 &amp; {opp_sym}≥79.9)"
     elif 407 <= est_time_int <= 929:
         if not is_done:
-            state_text = f"🔫 프리장 대칭감시({symbol}≤30 &amp; {opp_sym}≥80 · +{active_rate:.2f}%)"
+            state_text = f"🔫 프리장 대칭감시({symbol}≤30 &amp; {opp_sym}≥79.9 · +{active_rate:.2f}%)"
         else:
             state_text = "🔒 금일 프리장 타격잠금"
     elif 930 <= est_time_int < 1600:
@@ -399,7 +402,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     day_sim = get_daymarket_sim_status()
 
-    # 세션별 양방향 대칭 클라이맥스(<=30.0 & 반대>=80.0) 듀얼 RSI 관제 상태 렌더링 (Case 17, 44, 57, 78, 81)
+    # 세션별 양방향 대칭 클라이맥스(<=30.0 & 반대>=79.9) 및 79.0 부스터 듀얼 RSI 관제 상태 렌더링 (Case 17, 44, 57, 78, 81, 83)
     rsi_ui_lines = []
     day_vwap_s = 0.0
     day_vwap_l = 0.0
@@ -424,19 +427,23 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
                 else:
                     warn_str = f"🔒 모의 +1% 추격중(목표 ${day_sim['target_price']:.2f})"
             elif 0.0 < r_val <= 30.0:
-                if opp_val >= 80.0:
+                if opp_val >= 79.9:
                     if is_pre_sniper_time:
-                        warn_str = f"🔫 대칭 클라이맥스 타격권(≤30 &amp; {opp_name}≥80)"
+                        warn_str = f"🔫 대칭 클라이맥스 타격권(≤30.0 &amp; {opp_name}≥79.9)"
                     elif is_day_time:
-                        warn_str = f"🔔 데이장 대칭 모의포착(≤30 &amp; {opp_name}≥80)"
+                        warn_str = f"🔔 데이장 대칭 모의포착(≤30.0 &amp; {opp_name}≥79.9)"
                     else:
-                        warn_str = "📉 대칭수렴(≤30 · 진입마감)"
+                        warn_str = "📉 대칭수렴(≤30.0 · 진입마감)"
+                elif opp_val >= 79.0:
+                    warn_str = f"⚡ 0.4초 부스터 가속중(≤30.0 &amp; {opp_name} {opp_val:.1f} [79.9임박])"
                 else:
-                    warn_str = f"⏳ 과매도 대기(≤30 · 반대 {opp_name} 80미만 차단)"
-            elif r_val >= 80.0:
-                warn_str = f"🔥 과열극단(≥80 · 반대 {opp_name}≤30 대칭충족)"
+                    warn_str = f"⏳ 과매도 대기(≤30.0 · 반대 {opp_name} 79.9미만 차단)"
+            elif r_val >= 79.9:
+                warn_str = f"🔥 과열극단 클라이맥스(≥79.9[80인지] · 반대 {opp_name}≤30 대칭충족)"
+            elif r_val >= 79.0:
+                warn_str = "⚡ 프리-클라이맥스 0.4초 부스터 가속중(≥79.0 · 79.9임박)"
             else:
-                warn_str = "🟢 중립(30초과~80미만)"
+                warn_str = "🟢 중립(30초과~79미만)"
 
             if r_val > 0.0:
                 icon = "🐻" if r_sym == "SOXS" else "🐂"
@@ -591,7 +598,7 @@ async def build_sync_board(api_client) -> str:
             else:
                 flag_str = f"⚡ [{d['entry_session'] or 'HOLD'}: +{d['target_profit_rate']:.2f}% (순+{d['net_profit_rate']:.2f}%)]"
         else:
-            flag_str = f"⏳ 대기 ({sym}≤30 &amp; {opp_sym}≥80 · 목표 +{d['target_profit_rate']:.2f}%)"
+            flag_str = f"⏳ 대기 ({sym}≤30 &amp; {opp_sym}≥79.9 · 목표 +{d['target_profit_rate']:.2f}%)"
         return (
             f"{icon} <b>[{sym}] 양방향 대칭 클라이맥스 지시서</b>\n"
             f"{comp_label}: <code>${d['budget']:,.2f}</code> | 🎯 {flag_str}\n"
@@ -614,8 +621,8 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: 전술 제어반(/settlement) 내 양방향 대칭 클라이맥스(DUAL80_TRAP), 03:58~04:07 듀얼 1주 무비용 매수덫,
-#           데이장 프리장 동일 대칭 [모의] 추격 및 통합 실수익 복리 상태 렌더링 (Case 37, 57, 76, 77, 81)
+# MODIFIED: 전술 제어반(/settlement) 내 양방향 대칭 클라이맥스(<=30.0 & 반대>=79.9[80인지]), RSI>=79.0 0.4초 부스터,
+#           03:58~04:07 듀얼 1주 무비용 매수덫, 데이장 대칭 [모의] 추격 및 통합 실수익 복리 상태 렌더링 (Case 37, 57, 76, 77, 81, 83)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
@@ -637,7 +644,6 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     net_rate_s = AssassinLedger.get_net_compound_rate(rate_s)
     act_s = bool(state_s[5])
 
-    # 현재 활성 주문 또는 보유 포지션이 있는 종목 식별
     active_pos_sym = ""
     for sym_chk, st_chk, bid_chk in (("SOXS", state_s, buy_id_s), ("SOXL", state_l, buy_id_l)):
         if float(st_chk[0] or 0.0) > 0.0 or float(st_chk[6] or 0.0) > 0.0 or bool(st_chk[7]) or bool(bid_chk):
@@ -689,7 +695,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
             else:
                 strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (+{rate_s:.2f}% 익절 덫 장전중)"
         elif not bool(state_s[4]) and not bool(state_l[4]):
-            strike_status_str = "🔫 04:07~09:29 양방향 대칭 클라이맥스(≤30 &amp; 반대≥80) 무한 감시중"
+            strike_status_str = "🔫 04:07~09:29 양방향 대칭(≤30.0 &amp; 반대≥79.9 · 79.0 도달 시 0.4초 부스터) 감시중"
         else:
             strike_status_str = "🔒 금일 프리장 타격 잠금"
     elif 930 <= t <= 1558:
@@ -713,7 +719,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
                     f"🔔 데이장 [모의·{sim_sym}] +1.00% 추격중 (체결 ${day_sim['entry_price']:.2f} ➡️ 목표 ${day_sim['target_price']:.2f} 도달 전 잠금)"
                 )
         else:
-            strike_status_str = "🌙 데이마켓 대기 (프리장 동일 조건 [SOXS≤30&amp;SOXL≥80] 또는 [SOXL≤30&amp;SOXS≥80] 모의 감시중)"
+            strike_status_str = "🌙 데이마켓 대기 (프리장 동일 조건 [≤30.0 &amp; 반대≥79.9 · 79.0 부스터] 모의 감시중)"
     else:
         strike_status_str = "⛔ 장외/애프터장 대기 (신규진입 차단)"
 
@@ -722,7 +728,8 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
 
     text = (
         "⚙️ <b>[양방향 대칭 클라이맥스 듀얼 전술 제어반 (SOXS &amp; SOXL)]</b>\n"
-        "▫️ <b>본진 타점:</b> <code>🔫 04:07 ~ 09:29 EST (SOXS≤30 &amp; SOXL≥80) OR (SOXL≤30 &amp; SOXS≥80)</code>\n"
+        "▫️ <b>본진 타점:</b> <code>🔫 04:07 ~ 09:29 EST (매수종목≤30.0 &amp; 반대종목≥79.9[80인지])</code>\n"
+        "▫️ <b>고주파 부스터:</b> <code>⚡ RSI ≥ 79.0 진입 시 1.5초 ➔ 0.4초 가속 &amp; 배치 동시 시세(0.0ms 시차)</code>\n"
         "▫️ <b>휩소 작전:</b> <code>🌪️ 03:58 ~ 04:07 EST 현재가 상단 종목(데이장VWAP 대비) 1% 역산 1주 매수덫 (무비용)</code>\n"
         "▫️ <b>데이장 모드:</b> <code>🔔 19:00 ~ 03:57 EST 프리장 동일 대칭 [모의] 2단계 추격 · 03:58~03:59 묵음</code>\n"
         "▫️ <b>방어 체계:</b> <code>방향성 인지 NQ=F 3단 매크로 손절 &amp; 15:59 ~ 16:01 제로-오버나이트 MOC</code>\n"

@@ -1,10 +1,11 @@
 # =====================================================================
 # FILE: sniper_plugin.py
-# 목적: 프리장 (04:07 ~ 09:29 EST) 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=80.0)
+# 목적: 프리장 (04:07 ~ 09:29 EST) 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지])
 #       무한 출동 듀얼 스나이퍼(SOXS/SOXL), 방향성 인지 매크로 3단 방어, 15:59 MOC 및 통합 실수익 복리 정산 코어
 # =====================================================================
 # MODIFIED: 제3헌법 의거 1,000줄 초과 방지를 위해 데이장 [모의] 및 03:58~04:07 듀얼 1주 휩소 작전을 whipsaw_plugin.py로 모듈 분리
-# MODIFIED: 프리장 본진(04:07 ~ 09:29 EST) 타격 조건을 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 AND 반대종목 RSI>=80.0)로 단일화 (Case 54, 81)
+# MODIFIED: 프리장 본진(04:07 ~ 09:29 EST) 타격 조건을 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 AND 반대종목 RSI>=79.9)로 단일화 (Case 54, 81, 83)
+# NEW: RSI >= 79.0 프리-클라이맥스 진입 시 wakeup_event 즉각 격발 및 뮤텍스 내부 다건 배치 시세(SOXS,SOXL) 0.0ms 동시 검증 탑재 (Case 25, 28, 83)
 # NEW: 이종 종목 간 동시 타격 및 이중 보유를 원천 봉쇄하는 단일 포지션 배타적 뮤텍스(Cross-Symbol Single-Position Mutex) 탑재 (Case 71)
 # MODIFIED: 방향성 인지형(Direction-Aware) NQ=F 매크로 3차 방어선(SOXS는 NQ 상승 역행 / SOXL은 NQ 하락 역행) 및 글로벌 매크로 락아웃 결속 (Case 67, 82)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 기반 실제 발생 순수익금((매도가-매수가)*체결수량 - 수수료 0.14%) 복리 정산 및 양쪽 장부 동시 동기화 (Case 76, 77)
@@ -27,6 +28,7 @@ from quant_engine import (
 )
 from whipsaw_plugin import (
     PRE_SNIPER_RSI_THRESHOLD,
+    PRE_CLIMAX_BOOSTER_RSI,
     OPP_CLIMAX_RSI_THRESHOLD,
     BUY_TRAP_SLIPPAGE_PCT,
     BUY_TRAP_MIN_DISC_USD,
@@ -160,17 +162,19 @@ async def execute_rsi_monitoring_plugin(
     now_est = datetime.now(EST_TZ)
     est_hm = now_est.hour * 100 + now_est.minute
 
-    # Case 25 & Case 59 & Case 81: 프리장 (04:00 ~ 09:29 EST) 내 양방향 대칭 클라이맥스 포착 또는
-    # 1차 매수 덫 대기 중 RSI > 30.0 반등 돌파 시 메인 루프 즉시 기상
+    # Case 25 & Case 59 & Case 83: 프리장 (04:00 ~ 09:29 EST) 내 과매도(<=30.0), 프리-클라이맥스 부스터(>=79.0),
+    # 또는 1차 매수 덫 대기 중 RSI > 30.0 반등 돌파 시 메인 루프 즉시 기상
     if symbol in ("SOXS", "SOXL") and (400 <= est_hm <= 929):
         if (
             0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD
-            or rsi_val >= OPP_CLIMAX_RSI_THRESHOLD
+            or rsi_val >= PRE_CLIMAX_BOOSTER_RSI
             or rsi_val > PRE_SNIPER_RSI_THRESHOLD
         ):
             ctx.wakeup_event.set()
-    # 데이장 (19:00 ~ 03:59 EST) 내 양방향 대칭 클라이맥스 [모의] 2단계 추격 알림 플러그인 실행 (03:58~03:59 묵음 내장)
+    # 데이장 (19:00 ~ 03:59 EST) 내 프리-클라이맥스(>=79.0) 기상 및 [모의] 2단계 추격 알림 실행 (03:58~03:59 묵음 내장)
     elif symbol in ("SOXS", "SOXL") and (est_hm >= 1900 or est_hm <= 359):
+        if rsi_val >= PRE_CLIMAX_BOOSTER_RSI or (0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD):
+            ctx.wakeup_event.set()
         await execute_daymarket_rsi_alert_plugin(
             ctx=ctx,
             symbol=symbol,
@@ -312,11 +316,9 @@ async def execute_macro_defense_plugin(
     # Case 67: 보유 종목 방향성(SOXS 숏 vs SOXL 롱)에 따른 NQ=F 역행 폭 산출
     if nq_entry_price > 0.0 and nq_c_global > 0.0:
         if symbol == "SOXS":
-            # SOXS(숏) 보유 시: NQ=F 상승이 역행
             nq_adverse_pct = (nq_c_global - nq_entry_price) / nq_entry_price * 100.0
             adverse_label = "상승(숏 역행)"
         else:
-            # SOXL(롱) 보유 시: NQ=F 하락이 역행
             nq_adverse_pct = (nq_entry_price - nq_c_global) / nq_entry_price * 100.0
             adverse_label = "하락(롱 역행)"
     else:
@@ -746,7 +748,7 @@ async def reconcile_zero_holdings_exit_plugin(
                 await ctx.notify_tg(
                     f"🎉 <b>[듀얼 스나이퍼 {sym_icon}{symbol}] 프리장 익절 성공 ➡️ 양방향 대칭 무한 재출동 복귀</b>\n"
                     f"▫️ 잔고 0주 (지정가 익절 매도 체결 확인){pnl_str}{compound_str}\n"
-                    "▫️ 후속 조치: 09:29 EST까지 차기 양방향 대칭 클라이맥스(≤30 &amp; 반대≥80) 연속 감시 재개"
+                    "▫️ 후속 조치: 09:29 EST까지 차기 양방향 대칭 클라이맥스(≤30.0 &amp; 반대≥79.9) 연속 감시 재개"
                 )
             else:
                 await ctx.notify_tg(
@@ -766,8 +768,8 @@ async def reconcile_zero_holdings_exit_plugin(
 
 
 # MODIFIED: 프리장 골든타임 (04:07 ~ 09:29 EST · 04:07 타임쉴드 적용) 양방향 대칭 클라이맥스 단일화 타격
-#           — (SOXS RSI <= 30.0 AND SOXL RSI >= 80.0) 또는 (SOXL RSI <= 30.0 AND SOXS RSI >= 80.0) 포착 시
-#             단일 포지션 배타적 뮤텍스 검증 후 1차 슬리피지(-0.18%) 지정가 매수 덫 선(先) 투하 (Case 54, 59, 71, 81)
+#           — (SOXS RSI <= 30.0 AND SOXL RSI >= 79.9) 또는 (SOXL RSI <= 30.0 AND SOXS RSI >= 79.9) 포착 시
+#             단일 포지션 배타적 뮤텍스 및 배치 시세 동시 검증 후 1차 슬리피지(-0.18%) 지정가 매수 덫 선(先) 투하 (Case 54, 59, 71, 81, 83)
 async def execute_premarket_rsi_sniper_strike_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -787,7 +789,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
     if not (407 <= est_hm <= 929):
         return
 
-    # Case 54 & Case 81: 양방향 대칭 클라이맥스 단일화 게이트 (매수 대상 RSI <= 30.0 AND 반대 종목 RSI >= 80.0 필수)
+    # Case 54 & Case 81 & Case 83: 양방향 대칭 클라이맥스 단일화 게이트 (매수 대상 RSI <= 30.0 AND 반대 종목 RSI >= 79.9 필수)
     if not (0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD and opp_rsi_val >= OPP_CLIMAX_RSI_THRESHOLD):
         return
 
@@ -835,7 +837,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                 )
                 return
 
-            # Case 54 & Case 81: 뮤텍스 내부에서 양쪽 최신 현재가를 일괄 조회하여 대칭 클라이맥스 조건(<=30.0 & 반대>=80.0) 이중 검증
+            # Case 54 & Case 81 & Case 83: 뮤텍스 내부에서 양쪽 최신 현재가를 단일 배치 API로 동시 조회하여 시차 0.0ms로 대칭 클라이맥스 이중 검증
             prices_batch = await ctx.client.get_current_prices_batch(("SOXS", "SOXL"))
             latest_price = float(prices_batch.get(symbol, 0.0)) or current_price
             opp_latest_p = float(prices_batch.get(opp_sym, 0.0))
@@ -952,7 +954,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                 disc_actual = cur_p_floored - trap_buy_price
                 await ctx.notify_tg(
                     f"🪤 <b>[프리장 듀얼 스나이퍼] {sym_icon}{symbol} 대칭 클라이맥스 포착 ➡️ 1차 슬리피지 매수 덫 투하</b>\n"
-                    f"▫️ 대칭 클라이맥스: {sym_icon}{symbol} RSI <code>{rsi_val:.1f}</code> (≤30.0) &amp; {opp_icon}{opp_sym} RSI <code>{opp_rsi_recheck:.1f}</code> (≥80.0)\n"
+                    f"▫️ 대칭 클라이맥스: {sym_icon}{symbol} RSI <code>{rsi_val:.1f}</code> (≤30.0) &amp; {opp_icon}{opp_sym} RSI <code>{opp_rsi_recheck:.1f}</code> (≥79.9[80인지])\n"
                     f"▫️ 포착 현재가: <code>${cur_p_floored:.2f}</code> ➡️ 1차 매수 덫(LIMIT): <code>${trap_buy_price:.2f}</code> (슬리피지 <code>-${disc_actual:.2f}</code> 할인 · {mode_tag} <code>${budget:,.2f}</code> ➔ <code>{target_qty}주</code>)\n"
                     f"▫️ NQ=F 기준점: <code>{nq_c_global:.2f}</code> (당일 진폭 <code>{nq_amp_global:.2f}%</code>)\n"
                     f"▫️ 조건부 30초 타임쉴드: <code>RSI≤30 유지 시 30초간 저가 덫 대기 / 30초 내 RSI 30 초과 반등 시 즉각 현재가 매수 ({comp_tail})</code>"
@@ -1336,7 +1338,6 @@ async def manage_mechanical_profit_trap_plugin(
                         })
 
                     await AssassinLedger.save_state(symbol, **kwargs)
-                    # 수동 매수 포함 포지션 보유 중 반대 종목 신규 진입 잠금 동기화 (Case 71)
                     await AssassinLedger.save_state(opp_sym, is_session_done=True)
 
                     gross_tp_pct = ((calculated_target / avg_price - 1.0) * 100.0) if avg_price > 0.0 else active_rate

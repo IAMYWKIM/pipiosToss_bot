@@ -5,7 +5,9 @@
 #       03:58~04:07 EST (9분간) 데이장 VWAP 상단 종목 1% 역산 듀얼 1주 휩소 매수 덫 전용 플러그인
 # =====================================================================
 # MODIFIED: 제3헌법 의거 sniper_plugin.py 1,000줄 초과 방지를 위한 모듈 분리 및 NQ 10분봉 추세 데드코드 영구 소각 (Case 43)
-# MODIFIED: 데이장 [모의] 스나이퍼를 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=80.0)로 단일화 (Case 78, 81)
+# MODIFIED: 데이장 [모의] 스나이퍼를 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9)로 단일화 (Case 78, 81, 83)
+# NEW: PRE_CLIMAX_BOOSTER_RSI = 79.0 (1.5초 -> 0.4초 고주파 부스터 가속) 및 OPP_CLIMAX_RSI_THRESHOLD = 79.9 (79.9를 80.0 클라이맥스로 즉시 인지) 탑재 (Case 28, 83)
+# NEW: 데이장 [모의] 포착 시 get_current_prices_batch(("SOXS", "SOXL")) 단일 배치 호출로 양쪽 현재가 동시 조회 및 0.0ms 시차 틱 RSI 합성 (Case 83)
 # NEW: 데이장 [모의] 2단계 가상 체결(TRAP_WAIT -> HOLDING) 및 방향성 인지(SOXS: NQ 상승역행 / SOXL: NQ 하락역행) 매크로 모의 손절 탑재 (Case 67, 78)
 # NEW: 03:58 ~ 03:59 EST 데이장 마감 직전 휩소 알림 100% 묵음 바이패스(Silent Bypass) 및 04:00 EST 프리장 전환 자동 클리어 탑재 (Case 78)
 # MODIFIED: 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전 — 선취 매수 폐기 및 현재가 > 데이장 VWAP 종목 기준 1% 역산 지정가 매수 덫 전용화 (Case 79, 80)
@@ -24,8 +26,13 @@ from quant_engine import (
 )
 
 EST_TZ = ZoneInfo("America/New_York")
+
+# 매수 대상 종목 과매도 임계치 (30.0 이하 엄격 고정)
 PRE_SNIPER_RSI_THRESHOLD = 30.0
-OPP_CLIMAX_RSI_THRESHOLD = 80.0
+# NEW: 반대편 대세 종목이 79.0 이상에 진입하면 1.5초 루프를 0.4초 고주파로 당기는 프리-클라이맥스 부스터 임계치 (Case 28, 83)
+PRE_CLIMAX_BOOSTER_RSI = 79.0
+# MODIFIED: 순간 스파이크 누락 방지를 위해 반대편 대세 종목 RSI 79.9 이상을 80.0 클라이맥스로 즉시 인지 (Case 81, 83)
+OPP_CLIMAX_RSI_THRESHOLD = 79.9
 
 # 데이장 (19:00 ~ 03:57 EST) [모의] 알림 리셋 기준 목표 수익률 (+1.00% 익절가 도달 또는 매크로 손절 시 리셋)
 DAY_SIM_RESET_PROFIT_RATE = 1.00
@@ -59,7 +66,7 @@ _WHIPSAW_SIM_CACHE = {
     "day_sim_start_ts": 0.0,          # 포착 시각 타임스탬프 (30초 타임쉴드 측정용)
     "day_sim_entry_time_str": "",
     "day_sim_buy_rsi": 0.0,           # 포착 당시 매수종목 RSI (<= 30.0)
-    "day_sim_opp_rsi": 0.0,           # 포착 당시 반대종목 RSI (>= 80.0)
+    "day_sim_opp_rsi": 0.0,           # 포착 당시 반대종목 RSI (>= 79.9)
     "day_sim_nq_entry_price": 0.0,    # 모의 진입 시점 NQ=F 지수 (방향성 인지 매크로 3차 방어용)
     "day_sim_nq_entry_amp": 0.0,      # 모의 진입 시점 NQ=F 당일 진폭
     # 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전 런타임 스냅샷
@@ -175,8 +182,8 @@ async def settle_daymarket_sim_before_premarket(
             )
 
 
-# MODIFIED: 데이장 (19:00 ~ 03:57 EST) 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스(매수종목<=30 & 반대종목>=80)
-#           [모의] 듀얼 2단계 체결 시뮬레이션 & 방향성 인지 매크로 모의 손절 & 03:58~03:59 묵음 바이패스 (Case 78, 81)
+# MODIFIED: 데이장 (19:00 ~ 03:57 EST) 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스(매수종목<=30.0 & 반대종목>=79.9)
+#           [모의] 듀얼 2단계 체결 시뮬레이션 & 방향성 인지 매크로 모의 손절 & 03:58~03:59 묵음 바이패스 (Case 78, 81, 83)
 async def execute_daymarket_rsi_alert_plugin(
     ctx,
     symbol: str,
@@ -227,7 +234,6 @@ async def execute_daymarket_rsi_alert_plugin(
         # =====================================================================
         if _WHIPSAW_SIM_CACHE.get("day_sim_active", False):
             active_sim_sym = str(_WHIPSAW_SIM_CACHE.get("day_sim_symbol", "SOXS"))
-            # 활성 모의 포지션의 대상 종목이 아닌 틱 호출은 중복 연산 방지를 위해 스킵
             if symbol != active_sim_sym:
                 return
 
@@ -354,11 +360,9 @@ async def execute_daymarket_rsi_alert_plugin(
                 dyn_thresh = max(nq_entry_a * 0.5, ctx.nq_dynamic_floor) if nq_entry_a > 0.0 else ctx.nq_dynamic_floor
                 if nq_entry_p > 0.0 and nq_c_now > 0.0:
                     if active_sim_sym == "SOXS":
-                        # SOXS(숏) 보유 시: NQ=F 상승이 역행
                         nq_adverse_pct = (nq_c_now - nq_entry_p) / nq_entry_p * 100.0
                         adverse_dir_label = "상승(숏 역행)"
                     else:
-                        # SOXL(롱) 보유 시: NQ=F 하락이 역행
                         nq_adverse_pct = (nq_entry_p - nq_c_now) / nq_entry_p * 100.0
                         adverse_dir_label = "하락(롱 역행)"
                 else:
@@ -400,7 +404,7 @@ async def execute_daymarket_rsi_alert_plugin(
 
         # =====================================================================
         # [상태 2] 미진입 대기 상태(day_sim_active == False)에서 양방향 대칭 클라이맥스 최초 포착 시
-        #          — (SOXS RSI <= 30.0 AND SOXL RSI >= 80.0) 또는 (SOXL RSI <= 30.0 AND SOXS RSI >= 80.0)
+        #          — (SOXS RSI <= 30.0 AND SOXL RSI >= 79.9) 또는 (SOXL RSI <= 30.0 AND SOXS RSI >= 79.9)
         # =====================================================================
         if not (0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD):
             return
@@ -419,8 +423,11 @@ async def execute_daymarket_rsi_alert_plugin(
         opp_fallback_rsi = float(opp_state.get("value", 0.0)) if isinstance(opp_state, dict) else 0.0
         opp_ewm = opp_state.get("ewm_state", {}) if isinstance(opp_state, dict) else {}
 
+        # Case 83: 단일 배치 API(get_current_prices_batch)로 두 종목의 실시간 현재가를 동시 조회하여 시차 0.0ms로 합성
         try:
-            opp_price = await ctx.client.get_current_price(opp_sym)
+            batch_prices = await ctx.client.get_current_prices_batch(("SOXS", "SOXL"))
+            current_price = float(batch_prices.get(symbol, 0.0)) or current_price
+            opp_price = float(batch_prices.get(opp_sym, 0.0))
         except Exception:
             opp_price = 0.0
 
@@ -435,16 +442,11 @@ async def execute_daymarket_rsi_alert_plugin(
         else:
             opp_live_rsi = opp_fallback_rsi
 
-        # Case 78 & Case 81: 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스 게이트!
-        # 매수 대상 종목 RSI <= 30.0 이면서 동시에 반대편 대세 종목 RSI >= 80.0 이어야만 포착!
+        # Case 78 & Case 81 & Case 83: 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스 게이트!
+        # 매수 대상 종목 RSI <= 30.0 이면서 동시에 반대편 대세 종목 RSI >= 79.9 (80.0 클라이맥스 인지) 이어야만 포착!
         if opp_live_rsi < OPP_CLIMAX_RSI_THRESHOLD:
             return
 
-        if current_price <= 0.0:
-            try:
-                current_price = await ctx.client.get_current_price(symbol)
-            except Exception:
-                current_price = 0.0
         cur_p_fl = math.floor(current_price * 100.0) / 100.0
         if cur_p_fl <= 0.0:
             return
@@ -484,7 +486,7 @@ async def execute_daymarket_rsi_alert_plugin(
         await ctx.notify_tg(
             f"🔔 <b>[데이장 모의 관측] {sym_icon}{symbol} 양방향 대칭 클라이맥스 포착 ➡️ 2단계 타임쉴드 &amp; +1.00% 추격 개시 (매수차단)</b>\n"
             f"▫️ 포착 시각: <code>{now_est.strftime('%H:%M:%S')} EST</code> (0세션 데이마켓 · 프리장 본진 동일 조건)\n"
-            f"▫️ 대칭 클라이맥스: {sym_icon}{symbol} RSI <code>{rsi_val:.1f}</code> (기준 ≤ 30.0) &amp; {opp_icon}{opp_sym} RSI <code>{opp_live_rsi:.1f}</code> (기준 ≥ 80.0)\n"
+            f"▫️ 대칭 클라이맥스: {sym_icon}{symbol} RSI <code>{rsi_val:.1f}</code> (기준 ≤ 30.0) &amp; {opp_icon}{opp_sym} RSI <code>{opp_live_rsi:.1f}</code> (기준 ≥ 79.9[80인지])\n"
             f"▫️ 포착 현재가: <code>${cur_p_fl:.2f}</code> | 🪤 1차 슬리피지 덫: <code>${sim_trap_buy:.2f}</code> (-0.18%) | VWAP: <code>{vwap_str}</code>\n"
             f"▫️ 30초 타임쉴드: <code>30초 내 ${sim_trap_buy:.2f} 도달 시 저가체결(목표 ${trap_tp_100:.2f}) / RSI 30초과 반등 또는 30초 만료 시 현재가체결</code>\n"
             f"▫️ NQ=F 당일 진폭: <code>{nq_amp_global:.2f}%</code> (현재지수 <code>{nq_c_global:.2f}</code>)\n"
@@ -527,7 +529,6 @@ async def execute_whipsaw_vwap_exposure_plugin(
     today_str = now_est.strftime("%Y-%m-%d")
 
     async with _WHIPSAW_LOCK:
-        # 새로운 날짜 진입 시 듀얼 휩소 노출 작전 일일 캐시 초기화
         if _WHIPSAW_SIM_CACHE.get("whipsaw_date") != today_str:
             _WHIPSAW_SIM_CACHE["whipsaw_date"] = today_str
             _WHIPSAW_SIM_CACHE["whipsaw_target_sym"] = ""
@@ -540,11 +541,9 @@ async def execute_whipsaw_vwap_exposure_plugin(
             _WHIPSAW_SIM_CACHE["whipsaw_cutoff_done"] = False
             _WHIPSAW_SIM_CACHE["whipsaw_last_dump_tick"] = 0.0
 
-        # 당일 이미 휩소 1주 매수 덫 주문을 발사한 경우 즉시 리턴
         if _WHIPSAW_SIM_CACHE.get("whipsaw_order_fired", False):
             return
 
-        # 양쪽 종목 중 하나라도 이미 보유 물량이나 미체결 주문이 존재하면 휩소 작전 스킵 (단일 포지션 뮤텍스)
         total_shared_hold = sum(int(v) for v in (ctx.shared_holdings or {}).values())
         if total_shared_hold > 0 or holdings_qty > 0 or bool(buy_order_id):
             _WHIPSAW_SIM_CACHE["whipsaw_order_fired"] = True
@@ -570,10 +569,8 @@ async def execute_whipsaw_vwap_exposure_plugin(
                     candidates.append((premium_ratio, cand_sym, c_p_fl, c_vwap_fl))
 
             if not candidates:
-                # 아직 두 종목 모두 VWAP 데이터가 준비되지 않았거나 VWAP 상단 종목이 없으면 대기 (선취 매수 절대 금지)
                 return
 
-            # 현재가 / 데이장 VWAP 괴리율이 가장 높은 상단 종목 선정
             candidates.sort(key=lambda x: x[0], reverse=True)
             best_prem, chosen_sym, chosen_spot, chosen_vwap = candidates[0]
 
@@ -679,7 +676,6 @@ async def execute_whipsaw_vwap_exposure_plugin(
                         last_session_id=current_session_id,
                         whipsaw_target_price=target_sell_p,
                     )
-                    # 반대 종목도 04:07 EST까지 잠금 유지
                     await AssassinLedger.save_state(
                         opp_sym,
                         is_session_done=True,
@@ -711,7 +707,6 @@ async def execute_whipsaw_vwap_exposure_plugin(
 
 
 # Case 80: 04:07:00 EST 정각 듀얼 휩소 노출 작전 9분 타임쉴드 만료 정리 플러그인
-#          (미체결 1주 매수 덫 비용 $0 취소 & 체결되어 보유 중인 1주 현재가 즉시 매도 처리 후 양쪽 본진 인계)
 async def enforce_0407_whipsaw_cutoff_plugin(
     ctx,
     symbol: str,
@@ -736,9 +731,7 @@ async def enforce_0407_whipsaw_cutoff_plugin(
 
     sym_icon = "🐻" if symbol == "SOXS" else "🐂"
 
-    # -----------------------------------------------------------------
     # [분기 1] 04:07 EST 도달 시점에 1주 매수 덫이 미체결(holdings_qty == 0)인 경우 -> 비용 $0 즉시 취소 후 본진 인계
-    # -----------------------------------------------------------------
     if holdings_qty == 0 and buy_order_id:
         ctx.in_memory_ordering_lock[symbol] = True
         try:
@@ -794,9 +787,7 @@ async def enforce_0407_whipsaw_cutoff_plugin(
         finally:
             ctx.in_memory_ordering_lock[symbol] = False
 
-    # -----------------------------------------------------------------
     # [분기 2] 04:07 EST 도달 시점에 휩소/데이장 1주가 체결되어 보유 중(holdings_qty > 0)인 경우 -> 현재가 즉시 매도!
-    # -----------------------------------------------------------------
     if holdings_qty > 0:
         now_ts = time.time()
         if now_ts - float(_WHIPSAW_SIM_CACHE.get("whipsaw_last_dump_tick", 0.0)) < 1.5:

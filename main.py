@@ -1,6 +1,6 @@
 # =====================================================================
 # FILE: main.py
-# 목적: 프리장 (04:07 ~ 09:29 EST) 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=80.0)
+# 목적: 프리장 (04:07 ~ 09:29 EST) 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지])
 #       무한 출동 듀얼 스나이퍼(SOXS/SOXL) 및 03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 오케스트레이터
 # 구조: sniper_plugin.py / whipsaw_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 아키텍처
 # =====================================================================
@@ -8,6 +8,7 @@
 # MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30 ~ 17:00 EST로 전면 확장 (Case 07)
 # MODIFIED: SOXS 및 SOXL 양방향 대칭 클라이맥스 듀얼 감시 루프(TRADE_SYMBOLS = ("SOXS", "SOXL")) 가동 (Case 09, 54, 71, 81)
 # MODIFIED: 03:55 ~ 09:29 EST 구간 동안 SOXS 및 SOXL 모두 5.0초 듀얼 캔들 스캔 가속으로 EWM 기저 및 VWAP 실시간 동기화 (Case 73)
+# NEW: RSI >= 79.0 프리-클라이맥스 진입 시 1.5초 -> 0.4초 고주파 부스터(fast_shield_mode) 자동 가속 및 다건 배치(SOXS,SOXL) 0.0ms 동시 틱 RSI 합성 (Case 28, 83)
 # NEW: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 작전 및 04:07 EST 미체결 취소 / 보유 1주 현재가 즉시 매도 결속 (Case 79, 80)
 # MODIFIED: 프리장 자가 치유(Self-Healing) 가드 작동 시 양쪽 종목 모두 무포지션·무주문인지 교차 검증 후 해제 (Case 52, 71)
 # MODIFIED: 수동 매매·1주 휩소 작전·본진 듀얼 스나이퍼 청산 시 실제 보유 수량(last_known_qty) 추적 및 통합 복리 정산 연동 (Case 76)
@@ -37,6 +38,7 @@ from candle_recorder import record_candles_loop
 from sniper_plugin import (
     SniperPluginContext,
     PRE_SNIPER_RSI_THRESHOLD,
+    PRE_CLIMAX_BOOSTER_RSI,
     OPP_CLIMAX_RSI_THRESHOLD,
     _cancel_open_orders_and_wait_sellable,
     settle_daymarket_sim_before_premarket,
@@ -266,7 +268,9 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     }
 
     while True:
-        # Case 28: 평시 1.5초 대기, 본진 1차 슬리피지 매수 덫 타임쉴드(PRE_SNIPER) 감시 중에는 0.4초 고주파 대기로 자동 가속
+        # Case 28 & Case 83: 평시 1.5초 대기,
+        # ① 본진 1차 슬리피지 매수 덫 타임쉴드(PRE_SNIPER) 대기 중이거나
+        # ② 어느 한 종목이라도 RSI >= 79.0 프리-클라이맥스 구간 진입 시 0.4초 고주파 대기로 자동 가속!
         wait_sec = 0.4 if runtime_state.get("fast_shield_mode", False) else 1.5
         try:
             await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=wait_sec)
@@ -321,14 +325,43 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             ) = ledger_tuple
             buy_order_id = await AssassinLedger.get_buy_order_id(symbol)
 
-            # 1차 슬리피지 매수 덫이 대기 중일 때 0.4초 고주파 RSI 감시 모드 활성화
-            runtime_state["fast_shield_mode"] = bool(
+            sym_rsi_dict = ctx.shared_rsi_state.setdefault(
+                symbol, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
+            )
+            opp_rsi_dict = ctx.shared_rsi_state.setdefault(
+                opp_sym, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
+            )
+            cached_my_rsi = float(sym_rsi_dict.get("value", 0.0))
+            cached_opp_rsi = float(opp_rsi_dict.get("value", 0.0))
+
+            is_whipsaw_window = (358 <= est_time_int <= 406)
+            is_premarket_sniper_window = (407 <= est_time_int <= 929)
+            is_daymarket_window = (est_time_int >= 1900 or est_time_int <= 359)
+            is_daymarket_active_window = (est_time_int >= 1900 or est_time_int <= 357)
+
+            # Case 28 & Case 83: 1차 슬리피지 매수 덫 대기 중이거나 프리-클라이맥스(RSI >= 79.0) 진입 시 0.4초 고주파 모드 활성화
+            is_trap_waiting = bool(
                 is_active
-                and (407 <= est_time_int <= 929)
+                and is_premarket_sniper_window
                 and entry_session == "PRE_SNIPER"
                 and bool(buy_order_id)
                 and holdings_qty == 0
             )
+            is_pre_climax_booster = bool(
+                is_active
+                and (is_premarket_sniper_window or is_daymarket_active_window)
+                and not is_session_done
+                and holdings_qty == 0
+                and ctx.shared_holdings.get(opp_sym, 0) == 0
+                and not buy_order_id
+                and (
+                    cached_my_rsi >= PRE_CLIMAX_BOOSTER_RSI
+                    or cached_opp_rsi >= PRE_CLIMAX_BOOSTER_RSI
+                    or (0.0 < cached_my_rsi <= PRE_SNIPER_RSI_THRESHOLD and cached_opp_rsi >= 78.0)
+                    or (0.0 < cached_opp_rsi <= PRE_SNIPER_RSI_THRESHOLD and cached_my_rsi >= 78.0)
+                )
+            )
+            runtime_state["fast_shield_mode"] = bool(is_trap_waiting or is_pre_climax_booster)
 
             if runtime_state["prev_is_active"] is None:
                 runtime_state["prev_is_active"] = is_active
@@ -439,7 +472,23 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             if moc_handled:
                 continue
 
-            current_price = await ctx.client.get_current_price(symbol)
+            # Case 83: 프리-클라이맥스 가속 구간이거나 매수 대상 종목이 과매도(<=30.0)일 때는
+            # 단일 배치 API(get_current_prices_batch)로 SOXS와 SOXL 현재가를 동시 조회하여 시차 0.0ms 보장!
+            need_batch_price_sync = bool(
+                runtime_state["fast_shield_mode"]
+                or (0.0 < cached_my_rsi <= PRE_SNIPER_RSI_THRESHOLD)
+                or (cached_opp_rsi >= 78.0)
+            )
+            opp_current_price = 0.0
+            if need_batch_price_sync and (is_premarket_sniper_window or is_daymarket_active_window):
+                batch_prices = await ctx.client.get_current_prices_batch(("SOXS", "SOXL"))
+                current_price = float(batch_prices.get(symbol, 0.0))
+                opp_current_price = float(batch_prices.get(opp_sym, 0.0))
+                if current_price <= 0.0:
+                    current_price = await ctx.client.get_current_price(symbol)
+            else:
+                current_price = await ctx.client.get_current_price(symbol)
+
             avg_price_dump = float(holdings_detail.get("avg_price", 0.0)) or last_buy_price
 
             # 목표 5 & Case 66, 67, 82: 방향성 인지 NQ=F 매크로 3단 방어망 (1차 진입차단/미체결파기, 2·3차 보유물량 손실권 덤핑)
@@ -585,18 +634,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 buy_order_id=buy_order_id,
             )
 
-            # 실시간 틱 RSI(compute_realtime_tick_rsi) 합성 및 반대편 종목 실시간 RSI 조회
-            is_whipsaw_window = (358 <= est_time_int <= 406)
-            is_premarket_sniper_window = (407 <= est_time_int <= 929)
-            is_daymarket_window = (est_time_int >= 1900 or est_time_int <= 359)
-            sym_rsi_dict = ctx.shared_rsi_state.setdefault(
-                symbol, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
-            )
-            opp_rsi_dict = ctx.shared_rsi_state.setdefault(
-                opp_sym, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
-            )
+            # Case 73 & Case 83: 실시간 틱 RSI(compute_realtime_tick_rsi) 동시 합성
             fallback_rsi = float(sym_rsi_dict.get("value", 0.0))
-
             if current_price > 0.0:
                 live_rsi_val = compute_realtime_tick_rsi(
                     live_price=current_price,
@@ -607,7 +646,56 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             else:
                 live_rsi_val = fallback_rsi
 
-            opp_live_rsi_val = float(opp_rsi_dict.get("value", 0.0))
+            opp_fallback_rsi = float(opp_rsi_dict.get("value", 0.0))
+            if opp_current_price > 0.0:
+                opp_live_rsi_val = compute_realtime_tick_rsi(
+                    live_price=opp_current_price,
+                    ewm_state=opp_rsi_dict.get("ewm_state", {}),
+                    fallback_rsi=opp_fallback_rsi,
+                )
+                opp_rsi_dict["value"] = opp_live_rsi_val
+            else:
+                opp_live_rsi_val = opp_fallback_rsi
+
+            # 만약 이번 틱에 새로 live_rsi_val <= 30.0 에 진입했는데 아직 배치 조회를 안 했다면 즉시 반대 종목 현재가를 온디맨드 조회하여 0.0ms 동기화!
+            if (
+                (is_premarket_sniper_window or is_daymarket_active_window)
+                and is_active
+                and not is_session_done
+                and holdings_qty == 0
+                and (0.0 < live_rsi_val <= PRE_SNIPER_RSI_THRESHOLD)
+                and opp_current_price <= 0.0
+            ):
+                try:
+                    opp_p_ondemand = await ctx.client.get_current_price(opp_sym)
+                    if opp_p_ondemand > 0.0:
+                        opp_live_rsi_val = compute_realtime_tick_rsi(
+                            live_price=opp_p_ondemand,
+                            ewm_state=opp_rsi_dict.get("ewm_state", {}),
+                            fallback_rsi=opp_fallback_rsi,
+                        )
+                        opp_rsi_dict["value"] = opp_live_rsi_val
+                except Exception:
+                    pass
+
+            # 차기 루프 대기 시간(0.4초 부스터)을 최신 합성 RSI 기준으로 즉시 업데이트 (Case 28, 83)
+            runtime_state["fast_shield_mode"] = bool(
+                is_trap_waiting
+                or (
+                    is_active
+                    and (is_premarket_sniper_window or is_daymarket_active_window)
+                    and not is_session_done
+                    and holdings_qty == 0
+                    and ctx.shared_holdings.get(opp_sym, 0) == 0
+                    and not buy_order_id
+                    and (
+                        live_rsi_val >= PRE_CLIMAX_BOOSTER_RSI
+                        or opp_live_rsi_val >= PRE_CLIMAX_BOOSTER_RSI
+                        or (0.0 < live_rsi_val <= PRE_SNIPER_RSI_THRESHOLD and opp_live_rsi_val >= 78.0)
+                        or (0.0 < opp_live_rsi_val <= PRE_SNIPER_RSI_THRESHOLD and live_rsi_val >= 78.0)
+                    )
+                )
+            )
 
             # 본진 프리장(04:07 ~ 09:29 EST) 1차 슬리피지 매수 덫 대기 중 조건부 30초 타임쉴드 감시
             if (
@@ -686,8 +774,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     entry_session = ledger_after_w[8]
                     entry_time = ledger_after_w[9]
 
-            # 목표 3 & Case 15, 25, 52, 53, 54, 59, 71, 81 — 본진 프리장 (04:07 ~ 09:29 EST · 04:07 타임쉴드 적용)
-            # 양방향 대칭 클라이맥스(매수종목 RSI <= 30.0 AND 반대종목 RSI >= 80.0) 포착 시 1차 슬리피지 매수 덫 즉시 투하
+            # 목표 3 & Case 15, 25, 52, 53, 54, 59, 71, 81, 83 — 본진 프리장 (04:07 ~ 09:29 EST · 04:07 타임쉴드 적용)
+            # 양방향 대칭 클라이맥스(매수종목 RSI <= 30.0 AND 반대종목 RSI >= 79.9[80.0 클라이맥스 인지]) 포착 시 1차 슬리피지 매수 덫 즉시 투하
             if (
                 is_active
                 and not is_session_done
@@ -784,7 +872,7 @@ async def main():
         asyncio.create_task(record_candles_loop(api_client, sym))
         asyncio.create_task(rsi_radar_loop(plugin_ctx, sym))
 
-    print("시스템 코어: 03:58~04:07 듀얼 1주 무비용 휩소 매수덫 & 04:07~09:29 양방향 대칭 클라이맥스 듀얼 스나이퍼 결속 완료...", flush=True)
+    print("시스템 코어: RSI>=79.0 0.4초 부스터 & 79.9 클라이맥스 양방향 대칭 듀얼 스나이퍼 결속 완료...", flush=True)
 
     try:
         boot_state = await AssassinLedger.get_state("SOXS")
@@ -802,11 +890,12 @@ async def main():
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=(
-                "✅ <b>[시스템 기동 완료 — 양방향 대칭 클라이맥스 듀얼 스나이퍼 &amp; 무비용 휩소 매수덫]</b>\n"
+                "✅ <b>[시스템 기동 완료 — 양방향 대칭 클라이맥스 듀얼 스나이퍼 &amp; 0.4초 프리-클라이맥스 부스터]</b>\n"
                 "▫️ 타겟: <b>🐻SOXS(숏) &amp; 🐂SOXL(롱)</b> 단일 포지션 배타적 뮤텍스 운용\n"
-                "▫️ 대칭 타점: <b>(SOXS RSI≤30 &amp; SOXL RSI≥80)</b> 또는 <b>(SOXL RSI≤30 &amp; SOXS RSI≥80)</b> 동시 충족 시에만 진입\n"
+                "▫️ 대칭 타점: <b>(SOXS RSI≤30.0 &amp; SOXL RSI≥79.9[80인지])</b> 또는 <b>(SOXL RSI≤30.0 &amp; SOXS RSI≥79.9[80인지])</b>\n"
+                "▫️ 고주파 부스터: <b>RSI≥79.0 진입 시 1.5초 ➡️ 0.4초 가속 &amp; 다건 배치 동시 시세(0.0ms 시차) 합성</b>\n"
                 "▫️ 데이장: <b>19:00 ~ 03:57 EST</b> 프리장 동일 대칭 조건 [모의] 2단계 추격 · <b>03:58 ~ 03:59 EST 마감 휩소 묵음</b>\n"
-                "▫️ 휩소작전: <b>03:58 ~ 04:07 EST (9분간)</b> 현재가 &gt; 데이장VWAP 종목 <b>1% 역산 1주 매수덫</b> (04:07 미체결 비용$0 취소 · 보유 시 현재가 매도)\n"
+                "▫️ 휩소작전: <b>03:58 ~ 04:07 EST (9분간)</b> 데이장VWAP 상단 종목 <b>1% 역산 1주 매수덫</b> (04:07 미체결 비용$0 취소 · 보유 시 현재가 매도)\n"
                 "▫️ 프리장 본진: <b>04:07 ~ 09:29 EST (04:07 타임쉴드)</b> 대칭 포착 시 <b>1차 슬리피지(-0.18%) 매수 덫 + 조건부 30초 타임쉴드</b>\n"
                 f"▫️ 익절: 현재 설정 <b>+{boot_rate:.2f}% (순수익 +{boot_net_rate:.2f}%)</b> · 제어반(/settlement)에서 <b>+0.64% / +1.00%</b> 전환\n"
                 f"▫️ 통합시드: <b>${boot_budget:,.2f}</b> · {comp_desc}\n"
