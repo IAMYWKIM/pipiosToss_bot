@@ -12,6 +12,7 @@
 # NEW: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 작전 및 04:07 EST 미체결 취소 / 보유 1주 현재가 즉시 매도 결속 (Case 79, 80)
 # MODIFIED: 프리장 자가 치유(Self-Healing) 가드 작동 시 양쪽 종목 모두 무포지션·무주문인지 교차 검증 후 해제 (Case 52, 71)
 # MODIFIED: 수동 매매·1주 휩소 작전·본진 듀얼 스나이퍼 청산 시 실제 보유 수량(last_known_qty) 추적 및 통합 복리 정산 연동 (Case 76)
+# MODIFIED: 시스템 기동 완료 텔레그램 메시지를 "정상작동 중입니다." 단일 라인으로 슬림화 및 미사용 지역 변수 소각 (Case 38)
 
 import sys
 import os
@@ -874,33 +875,12 @@ async def main():
 
     print("시스템 코어: RSI>=79.0 0.4초 부스터 & 79.9 클라이맥스 양방향 대칭 듀얼 스나이퍼 결속 완료...", flush=True)
 
+    # MODIFIED: 기동 완료 시 복잡한 전술 브리핑을 제거하고 단일 상태 메시지만 전송 (Case 38)
     try:
-        boot_state = await AssassinLedger.get_state("SOXS")
-        boot_comp = await AssassinLedger.get_is_compound("SOXS")
-        boot_budget = float(boot_state[1] or 100.0)
-        boot_rate = AssassinLedger.normalize_target_rate(boot_state[2])
-        boot_net_rate = AssassinLedger.get_net_compound_rate(boot_rate)
-        comp_desc = (
-            "📈 통합 복리 모드 (실제 발생 순수익금[세전손익 - 수수료 0.14%] 정밀 가감)"
-            if boot_comp
-            else "💵 단리 모드 (시드 고정)"
-        )
-
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=(
-                "✅ <b>[시스템 기동 완료 — 양방향 대칭 클라이맥스 듀얼 스나이퍼 &amp; 0.4초 프리-클라이맥스 부스터]</b>\n"
-                "▫️ 타겟: <b>🐻SOXS(숏) &amp; 🐂SOXL(롱)</b> 단일 포지션 배타적 뮤텍스 운용\n"
-                "▫️ 대칭 타점: <b>(SOXS RSI≤30.0 &amp; SOXL RSI≥79.9[80인지])</b> 또는 <b>(SOXL RSI≤30.0 &amp; SOXS RSI≥79.9[80인지])</b>\n"
-                "▫️ 고주파 부스터: <b>RSI≥79.0 진입 시 1.5초 ➡️ 0.4초 가속 &amp; 다건 배치 동시 시세(0.0ms 시차) 합성</b>\n"
-                "▫️ 데이장: <b>19:00 ~ 03:57 EST</b> 프리장 동일 대칭 조건 [모의] 2단계 추격 · <b>03:58 ~ 03:59 EST 마감 휩소 묵음</b>\n"
-                "▫️ 휩소작전: <b>03:58 ~ 04:07 EST (9분간)</b> 데이장VWAP 상단 종목 <b>1% 역산 1주 매수덫</b> (04:07 미체결 비용$0 취소 · 보유 시 현재가 매도)\n"
-                "▫️ 프리장 본진: <b>04:07 ~ 09:29 EST (04:07 타임쉴드)</b> 대칭 포착 시 <b>1차 슬리피지(-0.18%) 매수 덫 + 조건부 30초 타임쉴드</b>\n"
-                f"▫️ 익절: 현재 설정 <b>+{boot_rate:.2f}% (순수익 +{boot_net_rate:.2f}%)</b> · 제어반(/settlement)에서 <b>+0.64% / +1.00%</b> 전환\n"
-                f"▫️ 통합시드: <b>${boot_budget:,.2f}</b> · {comp_desc}\n"
-                "▫️ 방어: <b>09:30 정규장 컷오프</b> · <b>방향성 인지 NQ=F 3단 매크로 손절</b> · <b>15:59 ~ 16:01 제로-오버나이트 MOC</b>"
-            ),
+            text="✅ <b>정상작동 중입니다.</b>",
             parse_mode="HTML",
         )
     except Exception:
