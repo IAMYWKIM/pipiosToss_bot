@@ -1,16 +1,17 @@
 # =====================================================================
 # FILE: tg_ui_plugin.py
-# 목적: 프리장 (04:07 ~ 09:29 EST) 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 및
+# 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
+#       양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 및
 #       03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 텔레그램 UI 렌더링 모듈
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 NQ 10분봉 추세 UI 잔재 및 미사용 상수(NQ_UI_BETA) 소각
 # NEW: RSI >= 79.0 프리-클라이맥스 0.4초 고주파 부스터 및 RSI >= 79.9 (80.0 클라이맥스 인지) 상태 표출 반영 (Case 28, 81, 83)
 # MODIFIED: 데이장(19:00 ~ 03:57 EST) 프리장 동일 대칭 조건 [모의] 듀얼 2단계 추격 및 03:58 ~ 03:59 EST 묵음 바이패스 상태 표출 (Case 78)
 # MODIFIED: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫(현재가 > 데이장VWAP 종목 1% 역산) 및 04:07 EST 타임쉴드 렌더링 (Case 79, 80)
+# MODIFIED: 프리장 본진 골든타임을 04:07 ~ 08:14 EST로 하드 락온하고 08:15 EST 거시지표 선제 컷오프 상태를 전 화면(/start, /avwap, /sync, /settlement)에 동기화 (Case 53, 57, 84)
 # MODIFIED: 관제탑(/avwap) 시안 A(평시) <-> 시안 B(부스터/보유) 조건부 동적 전환 및 프리·정규장 3단 계단식 줄바꿈 레이아웃 적용 (Case 13, 38, 47, 67)
 # MODIFIED: 전술 제어반(/settlement) 상단 장문 설명을 소각하고 핵심 5대 요건(전원·출동상태·익절·운용방식·통합시드) 초슬림 UI로 개편 (Case 37, 38)
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
-# MODIFIED: 메인 메뉴(get_main_menu_text) 내 과도한 내부 수식 설명을 소각하고 핵심 타임라인 및 명령어 중심의 심플 UI로 전면 개편 (Case 38)
 # MODIFIED: 16:00 ~ 18:59 EST 전 구간을 애프터마켓(afterMarket)으로 하드 락온하여 17:00 ~ 18:59 EST 데이마켓 오판 버그 원천 소각 (Case 01, 57)
 
 import asyncio
@@ -26,7 +27,7 @@ EST_TZ = ZoneInfo("America/New_York")
 NQ_DYNAMIC_FLOOR_UI = 0.8
 
 
-# MODIFIED: 메인 메뉴(/start 및 메인 복귀) 화면에서 복잡한 내부 수식 설명을 제거하고 핵심 스케줄과 명령어만 깔끔하게 표출 (Case 38)
+# MODIFIED: 메인 메뉴(/start 및 메인 복귀) 화면에 04:07 ~ 08:14 EST 프리장 본진 및 08:15 EST 거시지표 선제 컷오프 스케줄 반영 (Case 38, 84)
 async def get_main_menu_text() -> str:
     now_est = datetime.now(EST_TZ)
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
@@ -44,8 +45,8 @@ async def get_main_menu_text() -> str:
         "🔹 19:00 ~ 03:57: 🌙 <b>[모의] 데이장</b>\n"
         "🔹 03:58 ~ 03:59: 🔇 <b>휩소 묵음</b>\n"
         "🔹 03:58 ~ 04:07: 🌪️ <b>'휩소 노출 작전'</b>\n"
-        "🔹 04:07 ~ 09:29: 🔫 <b>프리장 본진</b>\n"
-        "🔹 09:30 ~ 15:58: 🔥 <b>정규장 본장</b>\n"
+        "🔹 04:07 ~ 08:14: 🔫 <b>프리장 본진 골든타임</b>\n"
+        "🔹 08:15 ~ 15:58: 🔒 <b>지표방어 컷오프 · 정규장 본장</b>\n"
         "🔹 15:59 ~ 16:01: 🛑 <b>제로-오버나이트</b>\n"
         "🔹 17:00: 🧹 <b>가비지 컬렉션(GC)</b>\n\n"
         "🛠 <b>[ 핵심 명령어 ]</b>\n"
@@ -179,7 +180,7 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 38, 57, 83 — 시안 A(평시/마감) ⟷ 시안 B(보유/주문/뮤텍스 대기) 조건부 동적 상태 표출
+# MODIFIED: Case 13 & 초과 Case 38, 57, 83, 84 — 시안 A(평시/08:15 마감) ⟷ 시안 B(보유/주문/뮤텍스 대기) 조건부 동적 상태 표출
 def build_compact_status(
     symbol: str,
     state_tuple: tuple,
@@ -239,11 +240,14 @@ def build_compact_status(
                 state_text = f"🔔 데이장[모의] 추격(목표 ${day_sim['target_price']:.2f})"
         else:
             state_text = f"🔔 [모의] 대칭감시(≤30 &amp; {opp_sym}≥79.9)"
-    elif 407 <= est_time_int <= 929:
+    # MODIFIED: 초과 Case 53, 57, 84 — 04:07 ~ 08:14 EST 초중반 골든타임 대칭감시 / 08:15 EST 이후 지표방어 마감
+    elif 407 <= est_time_int <= 814:
         if not is_done:
             state_text = f"🔫 대칭감시(≤30 &amp; {opp_sym}≥79.9)"
         else:
             state_text = "🔒 프리장 타격잠금"
+    elif 815 <= est_time_int < 930:
+        state_text = "🔒 08:15 지표방어 마감(관망)"
     elif 930 <= est_time_int < 1600:
         state_text = "🔒 마감(관망)"
     elif 1600 <= est_time_int <= 1859:
@@ -254,13 +258,14 @@ def build_compact_status(
     return f"{sym_icon} <b>{symbol}</b> <code>[{state_flag}]</code> {state_text}"
 
 
-# MODIFIED: 필수 관제 정보 보존 + 3단 계단식 줄바꿈 + 시안 A / 시안 B 조건부 동적 렌더링 (Case 13, 38, 47, 67, 83)
+# MODIFIED: 필수 관제 정보 보존 + 3단 계단식 줄바꿈 + 04:07 ~ 08:14 골든타임 & 08:15 선제 컷오프 시안 A / B 동적 렌더링 (Case 13, 38, 47, 67, 83, 84)
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
     is_day_time = (t >= 1900 or t <= 359)
     is_whipsaw_time = (358 <= t <= 406)
-    is_pre_sniper_time = (407 <= t <= 929)
+    is_pre_sniper_time = (407 <= t <= 814)
+    is_pre_cutoff_time = (815 <= t <= 929)
 
     if is_whipsaw_time:
         session_name_ui = "preMarket" if t >= 400 else "dayMarket"
@@ -269,20 +274,24 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     elif is_pre_sniper_time:
         session_name_ui = "preMarket"
         market_header = "( <b>🌅 프리장 골든타임</b> )"
-        pre_window_label = "(04:07 ~ 09:29 · 대칭 출동중)"
+        pre_window_label = "(04:07 ~ 08:14 · 대칭 출동중)"
+    elif is_pre_cutoff_time:
+        session_name_ui = "preMarket"
+        market_header = "( <b>🔒 프리장 후반 · 08:15 지표방어 마감</b> )"
+        pre_window_label = "(04:07 ~ 08:14 · 출동 마감)"
     elif 930 <= t <= 1559:
         session_name_ui = "regularMarket"
         market_header = "( <b>🔥 정규장 · 신규진입 마감</b> )"
-        pre_window_label = "(04:07 ~ 09:29 · 출동 마감)"
+        pre_window_label = "(04:07 ~ 08:14 · 출동 마감)"
     # Case 01, 57: 16:00 ~ 18:59 EST 전 구간을 afterMarket으로 락온
     elif 1600 <= t <= 1859:
         session_name_ui = "afterMarket"
         market_header = "( <b>🛑 애프터마켓</b> )"
-        pre_window_label = "(04:07 ~ 09:29 · 출동 마감)"
+        pre_window_label = "(04:07 ~ 08:14 · 출동 마감)"
     else:
         session_name_ui = "dayMarket"
         market_header = "( <b>🌙 데이마켓 · 🔔[모의] 감시</b> )"
-        pre_window_label = "(03:58 휩소1주 · 04:07 본진 대기)"
+        pre_window_label = "(03:58 휩소1주 · 04:07 ~ 08:14 본진 대기)"
 
     try:
         is_open, _, sess_name, _ = await asyncio.wait_for(api_client.is_market_open(), timeout=3.0)
@@ -380,7 +389,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     day_sim = get_daymarket_sim_status()
 
-    # Case 17, 38, 44, 57, 78, 81, 83: 평시(시안 A: "🟢 중립") <-> 부스터/타격권(시안 B) 조건부 단축 RSI 렌더링
+    # Case 17, 38, 44, 57, 78, 81, 83, 84: 평시(시안 A: "🟢 중립") <-> 부스터/타격권(시안 B) 조건부 단축 RSI 렌더링
     rsi_ui_lines = []
     if shared_rsi_state:
         r_s = float((shared_rsi_state.get("SOXS") or {}).get("value", 0.0))
@@ -478,11 +487,13 @@ async def build_sync_board(api_client) -> str:
 
     if 358 <= t <= 406:
         market_state = "🌪️ 03:58~04:07 듀얼 휩소 1주 작전"
-    elif 407 <= t <= 929:
+    # MODIFIED: 초과 Case 53, 57, 84 — 04:07 ~ 08:14 EST 프리장 골든타임 가동 / 08:15 ~ 09:29 EST 지표방어 마감 분리
+    elif 407 <= t <= 814:
         market_state = "🔫 프리장 양방향 대칭 스나이퍼 가동"
+    elif 815 <= t <= 929:
+        market_state = "🔒 프리장 후반 (08:15 지표방어 마감)"
     elif 930 <= t <= 1559:
         market_state = "🔥 정규장 (신규매수 마감)"
-    # MODIFIED: 16:00 ~ 18:59 EST 전 구간을 애프터마켓으로 락온하여 17:00~18:59 데이마켓 오판 해결
     elif 1600 <= t <= 1859:
         market_state = "🛑 애프터마켓 (신규매수 마감)"
     else:
@@ -574,7 +585,8 @@ async def build_sync_board(api_client) -> str:
                 flag_str = "🌪️ [WHIPSAW_1SH: 1주 VWAP 타점 · 04:07 현재가정리]"
             else:
                 flag_str = f"⚡ [{d['entry_session'] or 'HOLD'}: +{d['target_profit_rate']:.2f}% (순+{d['net_profit_rate']:.2f}%)]"
-        elif 930 <= t <= 1859:
+        # MODIFIED: 초과 Case 84 — 08:15 ~ 18:59 EST 미보유 시 신규진입 마감 표출
+        elif 815 <= t <= 1859:
             flag_str = f"🔒 금일 신규진입 마감 (관망 · 목표 +{d['target_profit_rate']:.2f}%)"
         else:
             flag_str = f"⏳ 대기 ({sym}≤30 &amp; {opp_sym}≥79.9 · 목표 +{d['target_profit_rate']:.2f}%)"
@@ -600,7 +612,7 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: 전술 제어반(/settlement) 상단 장문 설명을 전면 소각하고 핵심 5대 요건만 초슬림 5줄로 렌더링 (Case 37, 38, 57, 76, 77)
+# MODIFIED: 전술 제어반(/settlement) 초슬림 5줄 요건 및 04:07 ~ 08:14 골든타임 / 08:15 선제 컷오프 출동 상태 렌더링 (Case 37, 38, 57, 76, 77, 84)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
@@ -649,7 +661,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
             strike_status_str = f"🌪️ [{active_pos_sym}] 휩소 1주 보유 (목표 ${tp_w:.2f})"
         else:
             strike_status_str = "🌪️ 휩소 노출 작전중 (03:58 ~ 04:07)"
-    elif 407 <= t <= 929:
+    elif 407 <= t <= 814:
         if active_pos_sym:
             st_a = state_s if active_pos_sym == "SOXS" else state_l
             bid_a = buy_id_s if active_pos_sym == "SOXS" else buy_id_l
@@ -665,14 +677,16 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
             else:
                 strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (매도덫 장전중)"
         elif not bool(state_s[4]) and not bool(state_l[4]):
-            strike_status_str = "🔫 프리장 본진 감시중"
+            strike_status_str = "🔫 프리장 본진 감시중 (04:07 ~ 08:14)"
         else:
             strike_status_str = "🔒 프리장 타격 잠금"
-    elif 930 <= t <= 1558:
+    elif 815 <= t <= 1558:
         if active_pos_sym:
             st_a = state_s if active_pos_sym == "SOXS" else state_l
             tp_a = float(st_a[6] or 0.0)
             strike_status_str = f"🔒 [{active_pos_sym}] 보유분 감시 (목표 ${tp_a:.2f})"
+        elif t < 930:
+            strike_status_str = "🔒 08:15 지표방어 마감 (관망)"
         else:
             strike_status_str = "🔒 정규장 마감 (관망)"
     elif 1559 <= t <= 1601:

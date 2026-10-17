@@ -1,16 +1,17 @@
 # =====================================================================
 # FILE: main.py
-# 목적: 프리장 (04:07 ~ 09:29 EST) 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지])
+# 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
+#       양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지])
 #       무한 출동 듀얼 스나이퍼(SOXS/SOXL) 및 03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 오케스트레이터
 # 구조: sniper_plugin.py / whipsaw_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 아키텍처
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 데드코드 소각 및 whipsaw_plugin.py 분리 모듈 결속 (8대 코어 모듈)
 # MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30 ~ 17:00 EST로 전면 확장 (Case 07)
 # MODIFIED: SOXS 및 SOXL 양방향 대칭 클라이맥스 듀얼 감시 루프(TRADE_SYMBOLS = ("SOXS", "SOXL")) 가동 (Case 09, 54, 71, 81)
-# MODIFIED: 03:55 ~ 09:29 EST 구간 동안 SOXS 및 SOXL 모두 5.0초 듀얼 캔들 스캔 가속으로 EWM 기저 및 VWAP 실시간 동기화 (Case 73)
+# MODIFIED: 03:55 ~ 08:14 EST 구간 동안 SOXS 및 SOXL 모두 5.0초 듀얼 캔들 스캔 가속으로 EWM 기저 및 VWAP 실시간 동기화 (Case 73, 84)
 # NEW: RSI >= 79.0 프리-클라이맥스 진입 시 1.5초 -> 0.4초 고주파 부스터(fast_shield_mode) 자동 가속 및 다건 배치(SOXS,SOXL) 0.0ms 동시 틱 RSI 합성 (Case 28, 83)
 # NEW: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 작전 및 04:07 EST 미체결 취소 / 보유 1주 현재가 즉시 매도 결속 (Case 79, 80)
-# MODIFIED: 프리장 자가 치유(Self-Healing) 가드 작동 시 양쪽 종목 모두 무포지션·무주문인지 교차 검증 후 해제 (Case 52, 71)
+# MODIFIED: 프리장 본진 신규 진입·무한 재출동·자가 치유(Self-Healing) 허용 구간을 04:07 ~ 08:14 EST로 락온 및 08:15 EST 거시지표 선제 컷오프 결속 (Case 48, 52, 53, 71, 84)
 # MODIFIED: 수동 매매·1주 휩소 작전·본진 듀얼 스나이퍼 청산 시 실제 보유 수량(last_known_qty) 추적 및 통합 복리 정산 연동 (Case 76)
 # MODIFIED: 시스템 기동 완료 텔레그램 메시지를 "정상작동 중입니다." 단일 라인으로 슬림화 및 미사용 지역 변수 소각 (Case 38)
 
@@ -239,11 +240,11 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
         except Exception as e:
             print(f"🚨 [RSI 레이더망 {symbol}] 붕괴 방어: {e}", flush=True)
 
-        # Case 73: 03:55 ~ 09:29 EST 구간 중 SOXS 및 SOXL 모두 5.0초 스캔,
+        # MODIFIED: Case 73 & Case 84 — 03:55 ~ 08:14 EST 구간 중 SOXS 및 SOXL 모두 5.0초 스캔,
         #          19:00 ~ 03:54 EST 구간 중 SOXS 및 SOXL 모두 15.0초 스캔으로 듀얼 EWM 기저 및 VWAP 실시간 동기화
         now_est_chk = datetime.now(EST_TZ)
         est_hm_chk = now_est_chk.hour * 100 + now_est_chk.minute
-        if symbol in RSI_SYMBOLS and (355 <= est_hm_chk <= 929):
+        if symbol in RSI_SYMBOLS and (355 <= est_hm_chk <= 814):
             sleep_sec = 5.0
         elif symbol in RSI_SYMBOLS and (est_hm_chk >= 1900 or est_hm_chk <= 354):
             sleep_sec = 15.0
@@ -336,7 +337,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             cached_opp_rsi = float(opp_rsi_dict.get("value", 0.0))
 
             is_whipsaw_window = (358 <= est_time_int <= 406)
-            is_premarket_sniper_window = (407 <= est_time_int <= 929)
+            # MODIFIED: 초과 Case 53, 84 — 프리장 본진 스나이퍼 허용 구간을 04:07 ~ 08:14 EST 초중반 황금 구간으로 락온
+            is_premarket_sniper_window = (407 <= est_time_int <= 814)
             is_daymarket_window = (est_time_int >= 1900 or est_time_int <= 359)
             is_daymarket_active_window = (est_time_int >= 1900 or est_time_int <= 357)
 
@@ -596,10 +598,10 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     sell_order_id = ledger_after_cut[7]
                     entry_session = ledger_after_cut[8]
 
-            # 초과 Case 52 & Case 71 — 본진 프리장 (04:07 ~ 09:29 EST) 교차 검증 자가 치유(Self-Healing) 가드
+            # MODIFIED: 초과 Case 52, 71, 84 — 본진 프리장 초중반 골든타임 (04:07 ~ 08:14 EST) 교차 검증 자가 치유(Self-Healing) 가드
             # 본인 종목뿐만 아니라 반대편 종목(opp_sym)도 미보유·무주문·비매크로차단 상태일 때만 잠금 자동 해제!
             if (
-                407 <= est_time_int <= 929
+                407 <= est_time_int <= 814
                 and is_session_done
                 and holdings_qty == 0
                 and not buy_order_id
@@ -622,11 +624,12 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     await AssassinLedger.save_state(symbol, is_session_done=False, whipsaw_target_price=0.0)
                     is_session_done = False
                     print(
-                        f"♻️ [프리장 자가 치유 {symbol}] 비정상 마감 락(is_session_done) 자동 해제 완료 ➡️ 04:07~09:29 양방향 대칭 감시 복귀",
+                        f"♻️ [프리장 자가 치유 {symbol}] 비정상 마감 락(is_session_done) 자동 해제 완료 ➡️ 04:07~08:14 양방향 대칭 감시 복귀",
                         flush=True,
                     )
 
-            # 목표 3 & 초과 Case 48, 53 — 09:30 EST 정규장 개장 정각 신규 매수 마감 및 미체결 매수 즉시 파기
+            # MODIFIED: 목표 3 & 초과 Case 48, 53, 84 — 08:15 EST 거시지표 발표 15분 전 선제 컷오프 (08:15 ~ 15:59 EST)
+            #           신규 매수 영구 마감 및 미체결 매수 주문 즉시 파기
             is_session_done, buy_order_id = await enforce_0930_regular_cutoff_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -698,7 +701,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 )
             )
 
-            # 본진 프리장(04:07 ~ 09:29 EST) 1차 슬리피지 매수 덫 대기 중 조건부 30초 타임쉴드 감시
+            # 본진 프리장 골든타임(04:07 ~ 08:14 EST) 1차 슬리피지 매수 덫 대기 중 조건부 30초 타임쉴드 감시
             if (
                 is_active
                 and is_premarket_sniper_window
@@ -719,7 +722,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     rsi_val=live_rsi_val,
                 )
 
-            # 목표 3·4 & 초과 Case 46, 49, 51, 52, 76: 잔고 0주 복귀 시 통합 실수익 복리 정산 및 프리장 내 무한 재출동 릴리스
+            # 목표 3·4 & 초과 Case 46, 49, 51, 52, 76, 84: 잔고 0주 복귀 시 통합 실수익 복리 정산 및 08:14 EST까지 무한 재출동 릴리스
             if holdings_qty == 0 and (
                 target_sell_price > 0.0 or buy_order_id or sell_order_id or last_buy_price > 0.0
             ):
@@ -775,7 +778,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     entry_session = ledger_after_w[8]
                     entry_time = ledger_after_w[9]
 
-            # 목표 3 & Case 15, 25, 52, 53, 54, 59, 71, 81, 83 — 본진 프리장 (04:07 ~ 09:29 EST · 04:07 타임쉴드 적용)
+            # 목표 3 & Case 15, 25, 52, 53, 54, 59, 71, 81, 83, 84 — 본진 프리장 초중반 골든타임 (04:07 ~ 08:14 EST)
             # 양방향 대칭 클라이맥스(매수종목 RSI <= 30.0 AND 반대종목 RSI >= 79.9[80.0 클라이맥스 인지]) 포착 시 1차 슬리피지 매수 덫 즉시 투하
             if (
                 is_active
@@ -873,7 +876,7 @@ async def main():
         asyncio.create_task(record_candles_loop(api_client, sym))
         asyncio.create_task(rsi_radar_loop(plugin_ctx, sym))
 
-    print("시스템 코어: RSI>=79.0 0.4초 부스터 & 79.9 클라이맥스 양방향 대칭 듀얼 스나이퍼 결속 완료...", flush=True)
+    print("시스템 코어: 04:07~08:14 골든타임 & RSI>=79.0 0.4초 부스터 & 79.9 클라이맥스 양방향 대칭 듀얼 스나이퍼 결속 완료...", flush=True)
 
     # MODIFIED: 기동 완료 시 복잡한 전술 브리핑을 제거하고 단일 상태 메시지만 전송 (Case 38)
     try:

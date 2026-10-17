@@ -1,10 +1,12 @@
 # =====================================================================
 # FILE: tg_router.py
-# 목적: 프리장(04:07~09:29 EST) 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 및
-#       03:58~04:07 듀얼 1주 무비용 휩소 매수덫 텔레그램 라우팅 컨트롤러
+# 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
+#       양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 및
+#       03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수덫 텔레그램 라우팅 컨트롤러
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 잔재 소각 및 whipsaw_plugin.py 프리플라이트 컴파일 검증 결속 (8대 코어 모듈)
 # MODIFIED: 전술 제어반(/settlement) 설정 변경(전원, 목표익절률, 복리모드, 통합시드) 시 SOXS/SOXL 양쪽 원장 동시 동기화(sync_global_settings) (Case 37, 76, 77)
+# MODIFIED: 통합 시드 설정 및 장부 초기화 안내 문구에 04:07 ~ 08:14 EST 프리장 초중반 골든타임 및 08:15 선제 컷오프 기준 반영 (Case 53, 84)
 # MODIFIED: 예산 입력 시 음수/0/NaN/Inf 유입으로 인한 장부 오염 방어 로직 유지 (Case 37)
 # MODIFIED: /reset 명령을 통한 SOXS 및 SOXL 듀얼 원장 원자적 0점 소각 및 wakeup_event 즉각 동기화 (Case 02)
 # MODIFIED: 모든 인라인 콜백 제자리 갱신(edit_text) 및 except Exception as e 문법 무결성 사수 (Case 17, 26)
@@ -238,6 +240,7 @@ async def process_toggle_compound(callback_query: types.CallbackQuery, state: FS
             pass
 
 
+# MODIFIED: 초과 Case 37, 84 — 04:07 ~ 08:14 EST 프리장 초중반 골든타임 기준 통합 시드 설정 안내문 동기화
 @router.callback_query(F.data.startswith("set_budget_SOXS"))
 async def process_set_budget(callback_query: types.CallbackQuery, state: FSMContext):
     user = getattr(callback_query, "from_user", None)
@@ -255,7 +258,7 @@ async def process_set_budget(callback_query: types.CallbackQuery, state: FSMCont
     )
     text = (
         "⌨️ <b>듀얼 스나이퍼(SOXS/SOXL) 통합 투입 시드 설정 (USD)</b>\n\n"
-        "▫️ 04:07 ~ 09:29 EST 프리장 양방향 대칭 클라이맥스 본진 스나이퍼 출동 시 투입할 통합 기준 달러 예산을 숫자로 전송하십시오.\n"
+        "▫️ 04:07 ~ 08:14 EST 프리장 초중반 골든타임 양방향 대칭 클라이맥스 본진 스나이퍼 출동 시 투입할 통합 기준 달러 예산을 숫자로 전송하십시오.\n"
         "▫️ (참고: 03:58 ~ 04:07 EST 듀얼 휩소 노출 작전은 시드와 무관하게 무조건 1주만 역산 매수 덫을 설치합니다.)\n"
         f"▫️ {mode_desc}"
     )
@@ -333,7 +336,7 @@ async def process_execute_reset(callback_query: types.CallbackQuery, state: FSMC
         )
         await callback_query.message.edit_text(
             "✅ <b>[SOXS &amp; SOXL 듀얼 장부 영구 소각 완료]</b>\n"
-            "▫️ 양쪽 로컬 장부가 0점으로 원자적 초기화되었습니다 (프리장 내 양방향 대칭 클라이맥스 감시 즉시 복귀).",
+            "▫️ 양쪽 로컬 장부가 0점으로 원자적 초기화되었습니다 (04:07 ~ 08:14 EST 프리장 골든타임 내 양방향 대칭 클라이맥스 감시 즉시 복귀).",
             reply_markup=keyboard,
             parse_mode="HTML",
         )

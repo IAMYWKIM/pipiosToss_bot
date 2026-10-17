@@ -1,10 +1,12 @@
 # =====================================================================
 # FILE: sniper_plugin.py
-# 목적: 프리장 (04:07 ~ 09:29 EST) 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지])
+# 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
+#       양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지])
 #       무한 출동 듀얼 스나이퍼(SOXS/SOXL), 방향성 인지 매크로 3단 방어, 15:59 MOC 및 통합 실수익 복리 정산 코어
 # =====================================================================
 # MODIFIED: 제3헌법 의거 1,000줄 초과 방지를 위해 데이장 [모의] 및 03:58~04:07 듀얼 1주 휩소 작전을 whipsaw_plugin.py로 모듈 분리
-# MODIFIED: 프리장 본진(04:07 ~ 09:29 EST) 타격 조건을 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 AND 반대종목 RSI>=79.9)로 단일화 (Case 54, 81, 83)
+# MODIFIED: 프리장 본진 타격 및 무한 재출동 허용 윈도우를 04:07 ~ 08:14 EST 초중반 황금 구간으로 하드 락온 (Case 52, 53, 84)
+# NEW: 08:15:00 EST 거시지표 발표 15분 전 선제 컷오프(est_time_int >= 815) 및 미체결 매수 주문 즉각 선취소 결속 (Case 48, 84)
 # NEW: RSI >= 79.0 프리-클라이맥스 진입 시 wakeup_event 즉각 격발 및 뮤텍스 내부 다건 배치 시세(SOXS,SOXL) 0.0ms 동시 검증 탑재 (Case 25, 28, 83)
 # NEW: 이종 종목 간 동시 타격 및 이중 보유를 원천 봉쇄하는 단일 포지션 배타적 뮤텍스(Cross-Symbol Single-Position Mutex) 탑재 (Case 71)
 # MODIFIED: 방향성 인지형(Direction-Aware) NQ=F 매크로 3차 방어선(SOXS는 NQ 상승 역행 / SOXL은 NQ 하락 역행) 및 글로벌 매크로 락아웃 결속 (Case 67, 82)
@@ -162,9 +164,9 @@ async def execute_rsi_monitoring_plugin(
     now_est = datetime.now(EST_TZ)
     est_hm = now_est.hour * 100 + now_est.minute
 
-    # Case 25 & Case 59 & Case 83: 프리장 (04:00 ~ 09:29 EST) 내 과매도(<=30.0), 프리-클라이맥스 부스터(>=79.0),
+    # MODIFIED: Case 25, 59, 83, 84 — 프리장 골든타임 (04:00 ~ 08:14 EST) 내 과매도(<=30.0), 프리-클라이맥스 부스터(>=79.0),
     # 또는 1차 매수 덫 대기 중 RSI > 30.0 반등 돌파 시 메인 루프 즉시 기상
-    if symbol in ("SOXS", "SOXL") and (400 <= est_hm <= 929):
+    if symbol in ("SOXS", "SOXL") and (400 <= est_hm <= 814):
         if (
             0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD
             or rsi_val >= PRE_CLIMAX_BOOSTER_RSI
@@ -299,7 +301,7 @@ async def execute_moc_zero_overnight_plugin(
     return True
 
 
-# MODIFIED: 방향성 인지형(Direction-Aware) NQ=F 매크로 3단 방어망 및 글로벌 매크로 락아웃 (Case 66, 67, 82)
+# MODIFIED: 방향성 인지형(Direction-Aware) NQ=F 매크로 3단 방어망 및 글로벌 매크로 락아웃 (Case 66, 67, 82, 84)
 async def execute_macro_defense_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, is_active: bool,
     is_session_done: bool, holdings_qty: int, current_price: float, avg_price_dump: float,
@@ -336,7 +338,7 @@ async def execute_macro_defense_plugin(
 
     sym_icon = "🐻" if symbol == "SOXS" else "🐂"
 
-    # 1차 방어선: NQ=F 진폭 2.0% 이상 시 프리장 신규 진입 차단 및 양쪽 미체결 매수 주문 즉각 파기 (Case 66, 82)
+    # 1차 방어선: NQ=F 진폭 2.0% 이상 시 프리장 신규 진입 차단 및 양쪽 미체결 매수 주문 즉각 파기 (Case 66, 82, 84)
     if is_macro_breach and (not is_session_done or bool(buy_order_id)):
         ctx.in_memory_ordering_lock[symbol] = True
         try:
@@ -378,7 +380,7 @@ async def execute_macro_defense_plugin(
                     f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 이상)\n"
                     "▫️ 조치: 프리장 미체결 매수 주문 원자적 파기 및 금일 SOXS/SOXL 매수 권한 영구 소각"
                 )
-            elif (400 <= est_hm <= 929) and _STRIKE_ALERT_CACHE.get("last_macro1_date") != today_str:
+            elif (400 <= est_hm <= 814) and _STRIKE_ALERT_CACHE.get("last_macro1_date") != today_str:
                 _STRIKE_ALERT_CACHE["last_macro1_date"] = today_str
                 await ctx.notify_tg(
                     "🛑 <b>[프리장 듀얼 스나이퍼] 매크로 1차 방어선 작동 (출동 마감)</b>\n"
@@ -460,11 +462,12 @@ async def execute_macro_defense_plugin(
     return False
 
 
-# Case 48, 53 — 09:30 EST 정규장 개장 시 프리장 미체결 매수 즉시 취소 및 신규 진입 영구 차단
+# MODIFIED: 초과 Case 48, 53, 84 — 08:15 EST 거시지표 발표 15분 전 선제 컷오프 (08:15 ~ 15:59 EST 전 구간 감시)
+#           프리장 미체결 매수 주문(buy_order_id) 즉각 선취소 및 신규 매수 진입 영구 차단
 async def enforce_0930_regular_cutoff_plugin(
     ctx: SniperPluginContext, symbol: str, est_time_int: int, is_session_done: bool, buy_order_id: str
 ) -> tuple[bool, str]:
-    if not (930 <= est_time_int < 1600):
+    if not (815 <= est_time_int < 1600):
         return is_session_done, buy_order_id
 
     if buy_order_id and not ctx.in_memory_ordering_lock[symbol]:
@@ -499,8 +502,8 @@ async def enforce_0930_regular_cutoff_plugin(
 
             if canceled_pre_buy:
                 await ctx.notify_tg(
-                    f"🔒 <b>[09:30 정규장 컷오프 {sym_icon}{symbol}] 프리장 미체결 매수 주문 선취소 완료</b>\n"
-                    "▫️ 사유: 09:30 EST 정규장 개장 (정규장 지연 체결 원천 봉쇄)\n"
+                    f"🔒 <b>[08:15 거시지표 선제 컷오프 {sym_icon}{symbol}] 미체결 매수 주문 선취소 완료</b>\n"
+                    "▫️ 사유: 08:15 EST 거시지표 방어 컷오프 도달 (08:30 지표 쇼크 및 정규장 지연 체결 원천 봉쇄)\n"
                     "▫️ 조치: 미체결 매수 파기 및 당일 신규 매수 영구 마감"
                 )
         finally:
@@ -509,14 +512,18 @@ async def enforce_0930_regular_cutoff_plugin(
 
     if not is_session_done:
         await AssassinLedger.save_state(symbol, is_session_done=True)
-        print(f"🔒 [09:30 프리장 골든타임 마감 {symbol}] 정규장 신규 매수 영구 차단.", flush=True)
+        print(f"🔒 [08:15 프리장 골든타임 마감 {symbol}] 거시지표 방어 및 정규장 신규 매수 영구 차단.", flush=True)
         return True, buy_order_id
 
     return is_session_done, buy_order_id
 
 
+# NEW: 명시적 함수명 별칭 제공 (하위 호환성 100% 보장)
+enforce_0815_pre_macro_cutoff_plugin = enforce_0930_regular_cutoff_plugin
+
+
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 기반 실제 발생 수익금((매도가 - 매수가) * 체결수량 - 왕복수수료) 복리 정산 및
-#           프리장 내 청산 완료 시 SOXS/SOXL 양쪽 장부 동시 무한 재출동 락 해제 (Case 52, 76, 80)
+#           프리장 골든타임(04:00 ~ 08:14 EST) 내 청산 완료 시 SOXS/SOXL 양쪽 장부 동시 무한 재출동 락 해제 (Case 52, 76, 80, 84)
 async def reconcile_zero_holdings_exit_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -554,7 +561,8 @@ async def reconcile_zero_holdings_exit_plugin(
 
         now_est_check = datetime.now(EST_TZ)
         est_hm_now = now_est_check.hour * 100 + now_est_check.minute
-        is_premarket_now = (400 <= est_hm_now <= 929)
+        # MODIFIED: 초과 Case 52, 84 — 오직 04:00 ~ 08:14 EST 프리장 초중반 골든타임 내에서만 무한 재출동 허용
+        is_premarket_now = (400 <= est_hm_now <= 814)
         is_moc_time = (now_est_check.hour == 15 and now_est_check.minute >= 59) or (
             now_est_check.hour == 16 and 0 <= now_est_check.minute <= 5
         )
@@ -681,8 +689,8 @@ async def reconcile_zero_holdings_exit_plugin(
             else:
                 compound_str = f"\n▫️ 💵 <b>단리 시드 고정</b>: <code>${current_budget:,.2f}</code>"
 
-        # 초과 Case 52 & Case 80 — 프리장 (04:00 ~ 09:29 EST) 내 익절 완료, 매수 취소, 또는 1주 휩소 작전(WHIPSAW_1SH) 정리 시
-        # SOXS/SOXL 양쪽 장부 모두 is_session_done=False로 복원하여 04:07 ~ 09:29 EST 본진 양방향 대칭 스나이퍼 무한 출동 활성화!
+        # 초과 Case 52, 80, 84 — 프리장 골든타임 (04:00 ~ 08:14 EST) 내 익절 완료, 매수 취소, 또는 1주 휩소 작전(WHIPSAW_1SH) 정리 시
+        # SOXS/SOXL 양쪽 장부 모두 is_session_done=False로 복원하여 04:07 ~ 08:14 EST 본진 양방향 대칭 스나이퍼 무한 출동 활성화!
         if (
             is_premarket_now
             and prev_entry_session != "CANCELED_MACRO"
@@ -714,7 +722,7 @@ async def reconcile_zero_holdings_exit_plugin(
         if updated_budget is not None:
             await AssassinLedger.sync_global_settings(budget=updated_budget)
 
-        # 프리장 내 재출동 조건 충족 시 반대편 종목 잠금도 함께 해제 (Case 52, 80)
+        # 프리장 골든타임(04:07 ~ 08:14 EST) 내 재출동 조건 충족 시 반대편 종목 잠금도 함께 해제 (Case 52, 80, 84)
         if not next_is_session_done:
             await AssassinLedger.unlock_all_symbols_for_reentry()
 
@@ -735,24 +743,24 @@ async def reconcile_zero_holdings_exit_plugin(
                 await ctx.notify_tg(
                     f"⏱️ <b>[듀얼 휩소 작전 04:07 정산 완료 {sym_icon}{symbol}] 1주 현재가 매도 체결 ➡️ 본진 듀얼 스나이퍼 인계</b>\n"
                     f"▫️ 잔고 0주 (04:07 타임쉴드 해제 완료){pnl_str}{compound_str}\n"
-                    "▫️ 후속 조치: 04:07 ~ 09:29 EST 본진 양방향 대칭 클라이맥스 듀얼 스나이퍼 무한 출동 감시 개시"
+                    "▫️ 후속 조치: 04:07 ~ 08:14 EST 본진 양방향 대칭 클라이맥스 듀얼 스나이퍼 무한 출동 감시 개시"
                 )
             else:
                 await ctx.notify_tg(
                     f"🎉 <b>[듀얼 휩소 작전 1주 익절 성공 {sym_icon}{symbol}] 데이장 VWAP 타점 달성 ➡️ 본진 대기</b>\n"
                     f"▫️ 잔고 0주 (1주 지정가 매도 덫 체결 확인){pnl_str}{compound_str}\n"
-                    "▫️ 후속 조치: 04:07 ~ 09:29 EST 본진 양방향 대칭 클라이맥스 듀얼 스나이퍼 무한 출동 감시 대기"
+                    "▫️ 후속 조치: 04:07 ~ 08:14 EST 본진 양방향 대칭 클라이맥스 듀얼 스나이퍼 무한 출동 감시 대기"
                 )
         elif is_take_profit_exit:
             if not next_is_session_done:
                 await ctx.notify_tg(
                     f"🎉 <b>[듀얼 스나이퍼 {sym_icon}{symbol}] 프리장 익절 성공 ➡️ 양방향 대칭 무한 재출동 복귀</b>\n"
                     f"▫️ 잔고 0주 (지정가 익절 매도 체결 확인){pnl_str}{compound_str}\n"
-                    "▫️ 후속 조치: 09:29 EST까지 차기 양방향 대칭 클라이맥스(≤30.0 &amp; 반대≥79.9) 연속 감시 재개"
+                    "▫️ 후속 조치: 08:14 EST까지 차기 양방향 대칭 클라이맥스(≤30.0 &amp; 반대≥79.9) 연속 감시 재개"
                 )
             else:
                 await ctx.notify_tg(
-                    f"🎉 <b>[듀얼 스나이퍼 {sym_icon}{symbol}] 정규장 익절 타격 성공 (당일 퇴근 완료)</b>\n"
+                    f"🎉 <b>[듀얼 스나이퍼 {sym_icon}{symbol}] 익절 타격 성공 (08:15 컷오프 이후 당일 퇴근 완료)</b>\n"
                     f"▫️ 잔고 0주 (지정가 익절 매도 체결 확인){pnl_str}{compound_str}\n"
                     "▫️ 당일 신규 진입 권한 영구 소각"
                 )
@@ -767,9 +775,9 @@ async def reconcile_zero_holdings_exit_plugin(
         ctx.in_memory_ordering_lock[symbol] = False
 
 
-# MODIFIED: 프리장 골든타임 (04:07 ~ 09:29 EST · 04:07 타임쉴드 적용) 양방향 대칭 클라이맥스 단일화 타격
+# MODIFIED: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 04:07 타임쉴드 및 08:15 선제 컷오프 적용) 양방향 대칭 클라이맥스 단일화 타격
 #           — (SOXS RSI <= 30.0 AND SOXL RSI >= 79.9) 또는 (SOXL RSI <= 30.0 AND SOXS RSI >= 79.9) 포착 시
-#             단일 포지션 배타적 뮤텍스 및 배치 시세 동시 검증 후 1차 슬리피지(-0.18%) 지정가 매수 덫 선(先) 투하 (Case 54, 59, 71, 81, 83)
+#             단일 포지션 배타적 뮤텍스 및 배치 시세 동시 검증 후 1차 슬리피지(-0.18%) 지정가 매수 덫 선(先) 투하 (Case 54, 59, 71, 81, 83, 84)
 async def execute_premarket_rsi_sniper_strike_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -785,8 +793,8 @@ async def execute_premarket_rsi_sniper_strike_plugin(
         return
 
     est_hm = now_est.hour * 100 + now_est.minute
-    # Case 53 & Case 80: 03:58 ~ 04:06:59 EST 동안은 듀얼 1주 휩소 노출 작전 시간대이므로 본진 스나이퍼는 04:07 ~ 09:29 EST에만 작동!
-    if not (407 <= est_hm <= 929):
+    # MODIFIED: Case 53, 80, 84 — 오직 04:07 ~ 08:14 EST 초중반 황금 구간에서만 본진 스나이퍼 신규 진입 허용!
+    if not (407 <= est_hm <= 814):
         return
 
     # Case 54 & Case 81 & Case 83: 양방향 대칭 클라이맥스 단일화 게이트 (매수 대상 RSI <= 30.0 AND 반대 종목 RSI >= 79.9 필수)
@@ -976,7 +984,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
             ctx.in_memory_ordering_lock[symbol] = False
 
 
-# 조건부 30초 타임쉴드 및 즉각 매수 전환 플러그인 (SOXS / SOXL 본진 PRE_SNIPER 공통)
+# 조건부 30초 타임쉴드 및 즉각 매수 전환 플러그인 (SOXS / SOXL 본진 PRE_SNIPER 공통 — 04:07 ~ 08:14 EST)
 async def rearm_premarket_buy_trap_after_30s_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -1000,7 +1008,8 @@ async def rearm_premarket_buy_trap_after_30s_plugin(
         return buy_order_id, entry_session
 
     est_hm = now_est.hour * 100 + now_est.minute
-    if not (407 <= est_hm <= 929):
+    # MODIFIED: 초과 Case 59, 84 — 04:07 ~ 08:14 EST 골든타임 내에서만 타임쉴드 현재가 재장전 허용 (08:15 정각에는 컷오프가 선취소)
+    if not (407 <= est_hm <= 814):
         return buy_order_id, entry_session
 
     elapsed = time.time() - entry_time
