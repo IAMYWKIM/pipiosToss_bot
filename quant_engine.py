@@ -1,14 +1,15 @@
 # =====================================================================
 # FILE: quant_engine.py
 # 목적: 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 통합 시드 원장,
-#       NQ=F 당일 진폭 캐싱 및 Wilder's RSI(14) + 하이킨 아시(Heikin-Ashi) 1분봉 벡터/틱 합성 엔진
+#       NQ=F 당일 진폭 + 최근 10분/3분 단기 변화율(Velocity) 15초 캐싱 및
+#       Wilder's RSI(14) + 하이킨 아시(Heikin-Ashi) 1분봉 벡터/틱 합성 엔진
 # =====================================================================
 # MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
 # NEW: 폴링 사각지대(원인 D) 소각을 위한 Wilder's EWM 기저 상태(ewm_state_out) 추출 및 O(1) 실시간 틱 RSI 점화식(compute_realtime_tick_rsi) 탑재 (Case 73)
 # NEW: 200봉 전체 100% 벡터화 하이킨 아시(Heikin-Ashi, ewm alpha=0.5) 기저 추출 및 O(1) 실시간 틱 하이킨 아시 양봉 판별식(compute_realtime_tick_heikin_ashi) 탑재 (Case 85)
 # MODIFIED: 기존 +0.64% / +1.00% 선택 모드를 전면 폐기하고 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 상수로 100% 단일화 (Case 85)
-# MODIFIED: 제3헌법 및 Case 43 의거 구버전 NQ=F 10분봉 EMA 추세 분기망 및 AVWAPEngine 데드코드 영구 소각
-# MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
+# NEW: 초과 Case 61 & Case 89 — MacroDataCache 갱신 주기를 15.0초로 가속하고 NQ=F 최근 10분 변화율(nq_vel_10m) 및 3분 변화율(nq_vel_3m) 벡터 산출 탑재 (🚀 NQ_VEL_BYPASS 지원)
+# MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
 # MODIFIED: 듀얼 스나이퍼 화이트리스트 ALLOWED_SYMBOLS = ("SOXS", "SOXL") 확장 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76)
 # MODIFIED: lock_all_symbols_macro 호출 시 수동 보유 종목(MANUAL) 표식 보존 및 과열장(NQ>=2.0%) 수동 청산 후 자동 매매 오작동 해금 차단 (Case 50, 66, 82)
@@ -230,15 +231,17 @@ def compute_realtime_tick_heikin_ashi(
 
 
 class MacroDataCache:
-    # 제3헌법 및 Case 43 의거 구버전 NQ 10분봉 EMA 추세 분기 데드코드 소각 및 당일 진폭 캐시 슬림화
-    _nq_cache_data = (0.0, 0.0, 0.0, 0.0)
+    # MODIFIED: 초과 Case 61 & Case 89 — 당일 진폭(curr, high, low)에 더해 최근 10분 변화율(vel_10m) 및 3분 변화율(vel_3m)을
+    #           15.0초 주기로 캐싱하여 고점 트레일링 중 하이킨 아시 음봉 바이패스(🚀 NQ_VEL_BYPASS)를 실시간 지원
+    # 튜플 구조: (curr_val, high_val, low_val, updated_ts, nq_vel_10m, nq_vel_3m)
+    _nq_cache_data = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     _nq_cache_lock = asyncio.Lock()
 
     @classmethod
     def _is_refresh_needed(cls, now_ts: float, last_ts: float) -> bool:
         if last_ts <= 0.0:
             return True
-        return (now_ts - last_ts) > 60.0
+        return (now_ts - last_ts) > 15.0
 
     @classmethod
     async def _refresh_cache_if_needed(cls, force_refresh: bool = False):
@@ -252,19 +255,24 @@ class MacroDataCache:
                 tkr = yf.Ticker("NQ=F")
                 df = tkr.history(period="5d", interval="1m")
                 if df is None or df.empty:
-                    return 0.0, 0.0, 0.0
+                    return 0.0, 0.0, 0.0, 0.0, 0.0
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
                 df = df[~df.index.duplicated(keep="last")]
                 df.sort_index(ascending=True, inplace=True)
 
-                for col in ["High", "Low", "Close"]:
+                for col in ["Open", "High", "Low", "Close"]:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
                 df = df[df["Close"] > 0.0].copy()
                 if df.empty:
-                    return 0.0, 0.0, 0.0
+                    return 0.0, 0.0, 0.0, 0.0, 0.0
+
+                if "Open" in df.columns:
+                    df["Open"] = np.where(df["Open"] > 0.0, df["Open"], df["Close"])
+                else:
+                    df["Open"] = df["Close"]
 
                 # Case 62: 45분 이상 휴장 갭(Gap) 기준 당일 세션 분리로 자정 롤오버 진폭 왜곡 방어
                 time_diffs = df.index.to_series().diff()
@@ -276,25 +284,33 @@ class MacroDataCache:
                     df_session = df.copy()
 
                 if df_session.empty:
-                    return 0.0, 0.0, 0.0
+                    return 0.0, 0.0, 0.0, 0.0, 0.0
 
                 curr_val = float(df_session["Close"].iloc[-1])
                 high_val = float(df_session["High"].max())
                 low_val = float(df_session["Low"].min())
-                return curr_val, high_val, low_val
+
+                # NEW: 초과 Case 89 — 최근 10분 변화율(nq_vel_10m) 및 3분 단기 변화율(nq_vel_3m) 벡터 산출
+                first_open = float(df_session["Open"].iloc[0]) or float(df_session["Close"].iloc[0])
+                ref_10m = float(df_session["Close"].iloc[-11]) if len(df_session) >= 11 else first_open
+                ref_3m = float(df_session["Close"].iloc[-4]) if len(df_session) >= 4 else first_open
+
+                vel_10m = ((curr_val - ref_10m) / ref_10m * 100.0) if ref_10m > 0.0 else 0.0
+                vel_3m = ((curr_val - ref_3m) / ref_3m * 100.0) if ref_3m > 0.0 else 0.0
+                return curr_val, high_val, low_val, vel_10m, vel_3m
 
             try:
-                c, h, l = await asyncio.wait_for(
+                c, h, l, v10, v3 = await asyncio.wait_for(
                     asyncio.to_thread(_fetch), timeout=5.0
                 )
                 if l > 0.0:
-                    cls._nq_cache_data = (c, h, l, now)
+                    cls._nq_cache_data = (c, h, l, now, v10, v3)
                 else:
                     prev = cls._nq_cache_data
-                    cls._nq_cache_data = (prev[0], prev[1], prev[2], now)
+                    cls._nq_cache_data = (prev[0], prev[1], prev[2], now, prev[4], prev[5])
             except Exception as e:
                 prev = cls._nq_cache_data
-                cls._nq_cache_data = (prev[0], prev[1], prev[2], now)
+                cls._nq_cache_data = (prev[0], prev[1], prev[2], now, prev[4], prev[5])
                 print(f"🚨 [NQ=F 캐시 갱신 방어] {e}", flush=True)
 
     @classmethod
@@ -303,24 +319,49 @@ class MacroDataCache:
         return cls._nq_cache_data[0], cls._nq_cache_data[1], cls._nq_cache_data[2]
 
     @classmethod
+    async def get_cached_nq_velocity(cls, force_refresh: bool = False) -> tuple[float, float]:
+        """최근 10분 변화율(nq_vel_10m)과 3분 변화율(nq_vel_3m)을 반환합니다 (초과 Case 89)."""
+        await cls._refresh_cache_if_needed(force_refresh=force_refresh)
+        return float(cls._nq_cache_data[4]), float(cls._nq_cache_data[5])
+
+    @classmethod
+    async def is_nq_velocity_favorable_surge(
+        cls, symbol: str, surge_threshold: float = 0.20, force_refresh: bool = False
+    ) -> tuple[bool, float, float]:
+        """
+        보유 종목(SOXS 또는 SOXL) 기준으로 NQ=F가 유리한 방향으로 ±surge_threshold(기본 0.20%) 이상
+        급등 또는 급락 중인지 판별하여 하이킨 아시 음봉 바이패스(🚀 NQ_VEL_BYPASS) 여부를 반환합니다 (초과 Case 89).
+        """
+        vel_10m, vel_3m = await cls.get_cached_nq_velocity(force_refresh=force_refresh)
+        th = abs(float(surge_threshold or 0.20))
+        if symbol == "SOXS":
+            is_surge = (min(vel_10m, vel_3m) <= -th)
+        elif symbol == "SOXL":
+            is_surge = (max(vel_10m, vel_3m) >= th)
+        else:
+            is_surge = False
+        return bool(is_surge), vel_10m, vel_3m
+
+    @classmethod
     async def get_nq_sniper_signal(
         cls, force_refresh: bool = False
     ) -> tuple[str, float, str, float, float, float]:
         await cls._refresh_cache_if_needed(force_refresh=force_refresh)
         c, h, l = cls._nq_cache_data[0], cls._nq_cache_data[1], cls._nq_cache_data[2]
-        return ("DUAL80", 0.0, f"{c:.2f}", c, h, l)
+        return ("DUAL80", float(cls._nq_cache_data[4]), f"{c:.2f}", c, h, l)
 
 
 class AssassinLedger:
     # 양방향 대칭 클라이맥스 듀얼 스나이퍼 화이트리스트 락온 (Case 09, 54)
     ALLOWED_SYMBOLS = ("SOXS", "SOXL")
-    # 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 상수로 100% 단일화 (Case 68, 85)
+    # 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)' 상수로 100% 단일화 (Case 68, 85, 89)
     DEFAULT_TARGET_PROFIT_RATE = 1.00
     ALLOWED_TARGET_RATES = (1.00,)
     TRAIL_ARM_PROFIT_RATE = 1.00          # +1.00% 도달 시 하이킨 아시 트레일링 점화(Arming)
     TRAIL_FLOOR_LOCK_RATE = 1.00          # 트레일링 점화 즉시 최소 +1.00% 익절 보존선 하드 락온
     TRAIL_DROP_CALLBACK_PCT = 0.30        # 최고가(Peak) 대비 -0.30% 콜백 발생 시 즉시 익절 스윕
     TRAIL_SAFETY_CAP_RATE = 5.00          # 매수 체결 직후 거래소에 선장전하는 상단 안전 캡 (+5.00% LIMIT)
+    NQ_VELOCITY_SURGE_PCT = 0.20          # NEW: NQ=F 10분/3분 변화율 ±0.20% 이상 급등락 시 HA음봉 바이패스 임계치 (Case 89)
     ROUND_TRIP_COMM_PCT = 0.14
     ONE_WAY_COMM_RATE = 0.0007
     MIN_BUDGET_FLOOR = 10.0
@@ -603,8 +644,8 @@ class AssassinLedger:
                 is_active=is_active,
             )
 
-    # MODIFIED: 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 잠금하되,
-    #           현재 수동 보유 중(entry_session == "MANUAL")인 종목은 force_all=False일 때 MANUAL 표식을 보존 (Case 50, 82)
+    # 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 잠금하되,
+    # 현재 수동 보유 중(entry_session == "MANUAL")인 종목은 force_all=False일 때 MANUAL 표식을 보존 (Case 50, 82)
     @classmethod
     async def lock_all_symbols_macro(cls, last_session_id: str = None, force_all: bool = False):
         for sym in cls.ALLOWED_SYMBOLS:
@@ -624,8 +665,8 @@ class AssassinLedger:
                 kwargs["last_session_id"] = last_session_id
             await cls.save_state(sym, **kwargs)
 
-    # MODIFIED: 프리장 골든타임 내 익절 완료 또는 04:07 휩소 정리 완료 시 양쪽 장부 동시 무한 재출동 락 해제하되,
-    #           당일 NQ=F 진폭이 이미 2.0% 이상인 과열 장세라면 자동 스나이퍼 재해금을 차단하고 CANCELED_MACRO 유지 (Case 52, 66, 80, 84)
+    # 프리장 골든타임 내 익절 완료 또는 04:07 휩소 정리 완료 시 양쪽 장부 동시 무한 재출동 락 해제하되,
+    # 당일 NQ=F 진폭이 이미 2.0% 이상인 과열 장세라면 자동 스나이퍼 재해금을 차단하고 CANCELED_MACRO 유지 (Case 52, 66, 80, 84)
     @classmethod
     async def unlock_all_symbols_for_reentry(cls):
         nq_h = float(MacroDataCache._nq_cache_data[1] or 0.0)

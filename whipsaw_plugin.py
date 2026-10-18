@@ -1,12 +1,12 @@
 # =====================================================================
 # FILE: whipsaw_plugin.py
-# 목적: 데이장(19:00~03:57 EST) 프리장 동일 조건(양방향 대칭 클라이맥스 + 하이킨 아시 트레일링) [모의] 듀얼 2단계 추격,
+# 목적: 데이장(19:00~03:57 EST) 프리장 동일 조건(양방향 대칭 클라이맥스 + 하이킨 아시 트레일링 + 🚀 NQ_VEL_BYPASS) [모의] 듀얼 2단계 추격,
 #       03:58~03:59 EST 마감 휩소 묵음 바이패스 및
 #       03:58~04:07 EST (9분간) 데이장 VWAP 상단 종목 1% 역산 듀얼 1주 휩소 매수 덫 전용 플러그인
 # =====================================================================
-# MODIFIED: 제3헌법 의거 sniper_plugin.py 1,000줄 초과 방지를 위한 모듈 분리 및 구버전 +0.64% 참고 타점 데드코드 영구 소각
+# MODIFIED: 제3헌법 의거 모듈 분리 및 구버전 +0.64% 참고 타점 데드코드 영구 소각
 # MODIFIED: 데이장 [모의] 스나이퍼를 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9)로 단일화 (Case 78, 81, 83)
-# NEW: 데이장 [모의] 2단계 추격(HOLDING)에도 본진과 동일하게 '+1.00% 점화 후 하이킨 아시 양봉 홀딩 & 고점 대비 -0.30% 콜백/HA음봉 전환 모의 익절' 동기화 탑재
+# MODIFIED: 데이장 [모의] 2단계 추격(HOLDING)에 본진과 동일하게 '+1.00% 점화 후 하이킨 아시 양봉 홀딩 & NQ=F ±0.20% 급등락 시 HA음봉 바이패스(🚀 NQ_VEL_BYPASS) & 고점 -0.30% 콜백/HA음봉 모의 익절' 동기화 (Case 78, 89)
 # NEW: PRE_CLIMAX_BOOSTER_RSI = 79.0 (1.5초 -> 0.4초 고주파 부스터 가속) 및 OPP_CLIMAX_RSI_THRESHOLD = 79.9 (79.9를 80.0 클라이맥스로 즉시 인지) 탑재 (Case 28, 83)
 # NEW: 데이장 [모의] 포착 시 get_current_prices_batch(("SOXS", "SOXL")) 단일 배치 호출로 양쪽 현재가 동시 조회 및 0.0ms 시차 틱 RSI 합성 (Case 83)
 # NEW: 03:58 ~ 03:59 EST 데이장 마감 직전 휩소 알림 100% 묵음 바이패스(Silent Bypass) 및 04:00 EST 프리장 전환 자동 클리어 탑재 (Case 78)
@@ -35,9 +35,10 @@ PRE_CLIMAX_BOOSTER_RSI = 79.0
 # 순간 스파이크 누락 방지를 위해 반대편 대세 종목 RSI 79.9 이상을 80.0 클라이맥스로 즉시 인지 (Case 81, 83)
 OPP_CLIMAX_RSI_THRESHOLD = 79.9
 
-# 데이장 (19:00 ~ 03:57 EST) [모의] 하이킨 아시 트레일링 점화 기준 수익률 (+1.00% 도달 시 점화) 및 콜백 폭 (-0.30%)
+# 데이장 (19:00 ~ 03:57 EST) [모의] 하이킨 아시 트레일링 점화 기준 수익률 (+1.00%), 콜백 폭 (-0.30%) 및 NQ 급등락 바이패스 임계치 (±0.20%)
 DAY_SIM_ARM_PROFIT_RATE = AssassinLedger.TRAIL_ARM_PROFIT_RATE
 DAY_SIM_TRAIL_DROP_PCT = AssassinLedger.TRAIL_DROP_CALLBACK_PCT
+DAY_SIM_NQ_VEL_SURGE_PCT = AssassinLedger.NQ_VELOCITY_SURGE_PCT
 _DAY_SIM_LOCK = asyncio.Lock()
 _WHIPSAW_LOCK = asyncio.Lock()
 
@@ -50,7 +51,7 @@ BUY_TRAP_REARM_WAIT_SEC = 30.0        # RSI <= 30.0 유지 시 1차 매수 덫 �
 WHIPSAW_FIXED_QTY = 1                 # 시드 무관 무조건 1주 고정 테스트
 WHIPSAW_PROFIT_FACTOR = 1.01          # 데이장 VWAP = 1.01 * 매수덫가격 (1% 역산 하단 매수 덫)
 
-# MODIFIED: 구버전 +0.64% 참고 필드 소각 및 데이장 [모의] 하이킨 아시 트레일링 상태 필드 결속
+# 데이장 [모의] 하이킨 아시 트레일링(🚀 NQ_VEL_BYPASS 포함) 및 03:58 휩소 런타임 상태 캐시
 _WHIPSAW_SIM_CACHE = {
     "day_logical_date": "",
     "day_sim_active": False,
@@ -63,6 +64,7 @@ _WHIPSAW_SIM_CACHE = {
     "day_sim_arm_price": 0.0,         # +1.00% 트레일링 점화 기준가 (보존선 겸용)
     "day_sim_target_price": 0.0,      # UI 표출용 목표가 (점화 전에는 arm_price, 점화 후에는 유효 스탑가)
     "day_sim_trail_armed": False,     # +1.00% 돌파 트레일링 점화 여부
+    "day_sim_nq_vel_bypass": False,   # NEW: 트레일링 중 NQ=F ±0.20% 급등락 HA음봉 바이패스 작동 여부 (Case 89)
     "day_sim_armed_ts": 0.0,          # 트레일링 점화 시각 타임스탬프
     "day_sim_armed_hm": 0,            # 트레일링 점화 분봉 시각 (HHMM)
     "day_sim_min_price": 0.0,         # 경유 최저가 (MAE)
@@ -99,6 +101,7 @@ def _reset_day_sim_state():
     _WHIPSAW_SIM_CACHE["day_sim_arm_price"] = 0.0
     _WHIPSAW_SIM_CACHE["day_sim_target_price"] = 0.0
     _WHIPSAW_SIM_CACHE["day_sim_trail_armed"] = False
+    _WHIPSAW_SIM_CACHE["day_sim_nq_vel_bypass"] = False
     _WHIPSAW_SIM_CACHE["day_sim_armed_ts"] = 0.0
     _WHIPSAW_SIM_CACHE["day_sim_armed_hm"] = 0
     _WHIPSAW_SIM_CACHE["day_sim_min_price"] = 0.0
@@ -123,6 +126,7 @@ def get_daymarket_sim_status() -> dict:
         "fill_type": str(_WHIPSAW_SIM_CACHE.get("day_sim_fill_type", "")),
         "target_price": float(_WHIPSAW_SIM_CACHE.get("day_sim_target_price", 0.0)),
         "trail_armed": bool(_WHIPSAW_SIM_CACHE.get("day_sim_trail_armed", False)),
+        "nq_vel_bypass": bool(_WHIPSAW_SIM_CACHE.get("day_sim_nq_vel_bypass", False)),
         "min_price": float(_WHIPSAW_SIM_CACHE.get("day_sim_min_price", 0.0)),
         "max_price": float(_WHIPSAW_SIM_CACHE.get("day_sim_max_price", 0.0)),
         "entry_time": str(_WHIPSAW_SIM_CACHE.get("day_sim_entry_time_str", "")),
@@ -186,7 +190,7 @@ async def settle_daymarket_sim_before_premarket(
 
 
 # MODIFIED: 데이장 (19:00 ~ 03:57 EST) 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스(매수종목<=30.0 & 반대종목>=79.9)
-#           [모의] 2단계 체결 시뮬레이션 + 하이킨 아시 트레일링(HA_HYB_1.0) + 방향성 인지 매크로 손절 & 03:58~03:59 묵음 바이패스 (Case 78, 81, 83)
+#           [모의] 2단계 체결 시뮬레이션 + 하이킨 아시 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS) + 방향성 인지 매크로 손절 & 03:58~03:59 묵음 바이패스 (Case 78, 81, 83, 89)
 async def execute_daymarket_rsi_alert_plugin(
     ctx,
     symbol: str,
@@ -303,6 +307,7 @@ async def execute_daymarket_rsi_alert_plugin(
                     _WHIPSAW_SIM_CACHE["day_sim_arm_price"] = new_arm_100
                     _WHIPSAW_SIM_CACHE["day_sim_target_price"] = new_arm_100
                     _WHIPSAW_SIM_CACHE["day_sim_trail_armed"] = False
+                    _WHIPSAW_SIM_CACHE["day_sim_nq_vel_bypass"] = False
                     _WHIPSAW_SIM_CACHE["day_sim_min_price"] = min(confirmed_entry, cur_p_fl)
                     _WHIPSAW_SIM_CACHE["day_sim_max_price"] = max(confirmed_entry, cur_p_fl)
                     _WHIPSAW_SIM_CACHE["day_sim_nq_entry_price"] = nq_c_now
@@ -310,7 +315,7 @@ async def execute_daymarket_rsi_alert_plugin(
                 return
 
             # -----------------------------------------------------------------
-            # [단계 1-B] HOLDING : 모의 체결 완료 후 +1.00% 점화 하이킨 아시 트레일링 & 매크로 2·3차 모의 손절 감시
+            # [단계 1-B] HOLDING : 모의 체결 완료 후 +1.00% 점화 하이킨 아시 트레일링(🚀 NQ_VEL_BYPASS 포함) & 매크로 2·3차 모의 손절 감시
             # -----------------------------------------------------------------
             prev_min_p = float(_WHIPSAW_SIM_CACHE.get("day_sim_min_price", 0.0))
             if prev_min_p <= 0.0 or cur_p_fl < prev_min_p:
@@ -338,6 +343,12 @@ async def execute_daymarket_rsi_alert_plugin(
             ewm_d = sym_state_d.get("ewm_state", {}) if isinstance(sym_state_d, dict) else {}
             is_ha_bull, live_ha_o, live_ha_c = compute_realtime_tick_heikin_ashi(cur_p_fl, ewm_d)
 
+            # NEW: 초과 Case 89 — 데이장 모의 추격 중에도 NQ=F 단기 변화율(10m/3m) ±0.20% 유리 급변 시 HA음봉 바이패스 판정
+            is_nq_favorable_surge, nq_vel_10m, _ = await MacroDataCache.is_nq_velocity_favorable_surge(
+                symbol=active_sim_sym, surge_threshold=DAY_SIM_NQ_VEL_SURGE_PCT
+            )
+            _WHIPSAW_SIM_CACHE["day_sim_nq_vel_bypass"] = bool(is_nq_favorable_surge)
+
             # 1) +1.00% 점화선 도달 확인 및 하이킨 아시 트레일링 추적
             if arm_p > 0.0 and cur_p_fl >= arm_p:
                 if not _WHIPSAW_SIM_CACHE.get("day_sim_trail_armed", False):
@@ -357,7 +368,12 @@ async def execute_daymarket_rsi_alert_plugin(
                 armed_hm = int(_WHIPSAW_SIM_CACHE.get("day_sim_armed_hm", est_hm))
 
                 is_cb_exit = (peak_p > arm_p or elapsed_arm >= 2.5) and (cur_p_fl <= effective_stop_p)
-                is_ha_exit = (not is_ha_bull) and (elapsed_arm >= 4.0 or est_hm != armed_hm or peak_p >= arm_p * 1.002)
+                # MODIFIED: 초과 Case 89 — NQ=F가 유리 방향으로 ±0.20% 이상 급등/급락 중이면 HA음봉 모의 익절을 바이패스!
+                is_ha_exit = (
+                    not is_ha_bull
+                    and not is_nq_favorable_surge
+                    and (elapsed_arm >= 4.0 or est_hm != armed_hm or peak_p >= arm_p * 1.002)
+                )
 
                 if is_cb_exit or is_ha_exit:
                     sim_exit_p = max(arm_p, cur_p_fl) if is_ha_exit else effective_stop_p
@@ -370,7 +386,7 @@ async def execute_daymarket_rsi_alert_plugin(
                     exit_trig_str = (
                         f"고점(${peak_p:.2f} / +{peak_pct:.2f}%) 대비 -0.30% 콜백 스탑(${effective_stop_p:.2f})"
                         if is_cb_exit
-                        else f"하이킨 아시 1분봉 음봉 전환(HA시가 ${live_ha_o:.2f} ≥ HA종가 ${live_ha_c:.2f} · 고점 ${peak_p:.2f})"
+                        else f"하이킨 아시 1분봉 음봉 전환(HA시가 ${live_ha_o:.2f} ≥ HA종가 ${live_ha_c:.2f} · 고점 ${peak_p:.2f} · NQ 10m {nq_vel_10m:+.2f}%)"
                     )
 
                     await ctx.notify_tg(
@@ -493,6 +509,7 @@ async def execute_daymarket_rsi_alert_plugin(
         _WHIPSAW_SIM_CACHE["day_sim_arm_price"] = sim_arm_100
         _WHIPSAW_SIM_CACHE["day_sim_target_price"] = sim_arm_100
         _WHIPSAW_SIM_CACHE["day_sim_trail_armed"] = False
+        _WHIPSAW_SIM_CACHE["day_sim_nq_vel_bypass"] = False
         _WHIPSAW_SIM_CACHE["day_sim_min_price"] = cur_p_fl
         _WHIPSAW_SIM_CACHE["day_sim_max_price"] = cur_p_fl
         _WHIPSAW_SIM_CACHE["day_sim_start_ts"] = time.time()
@@ -516,7 +533,7 @@ async def execute_daymarket_rsi_alert_plugin(
             f"▫️ 포착 현재가: <code>${cur_p_fl:.2f}</code> | 🪤 1차 슬리피지 덫: <code>${sim_trap_buy:.2f}</code> (-0.18%) | VWAP: <code>{vwap_str}</code>\n"
             f"▫️ 30초 타임쉴드: <code>30초 내 ${sim_trap_buy:.2f} 도달 시 저가체결(점화가 ${trap_arm_100:.2f}) / RSI 30초과 반등 또는 30초 만료 시 현재가체결</code>\n"
             f"▫️ NQ=F 당일 진폭: <code>{nq_amp_global:.2f}%</code> (현재지수 <code>{nq_c_global:.2f}</code>)\n"
-            f"▫️ 트레일링 점화가(+1.00%): <code>${sim_arm_100:.2f}</code> (점화 후 HA 1분봉 양봉 홀딩 &amp; 고점 -0.30% 콜백/HA음봉 시 모의 익절)\n"
+            f"▫️ 트레일링 점화가(+1.00%): <code>${sim_arm_100:.2f}</code> (점화 후 HA 1분봉 양봉 홀딩 · NQ ±{DAY_SIM_NQ_VEL_SURGE_PCT:.2f}% 급변 시 HA음봉 바이패스 · 고점 -0.30% 콜백/HA음봉 시 모의 익절)\n"
             f"▫️ 다중알림 잠금: <code>모의 트레일링 익절 또는 매크로 손절 도달 전까지 추가 알림이 100% 차단됩니다.</code>"
         )
 

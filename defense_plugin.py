@@ -3,9 +3,10 @@
 # 목적: 방향성 인지 NQ=F 매크로 3단 방어망(수동 진입 시 2차 과열 방어 패스 &
 #       04:07~08:14 EST 내 NQ<2.0% 3차 역행 손절 시 최저점 역트레일링[RE_BOT_TRAIL] 점화),
 #       08:15 EST 거시지표 발표 15분 전 선제 컷오프, 15:59~16:01 EST MOC 2단계 방탄 청산
-#       및 트레일링·최저점 추적 런타임 상태 캐시 전담 플러그인 (초과 Case 88 분리 모듈)
+#       및 트레일링(🚀 NQ_VEL_BYPASS 포함)·최저점 추적 런타임 상태 캐시 전담 플러그인 (초과 Case 88, 89)
 # =====================================================================
-# NEW: 제3헌법 및 초과 Case 88 의거 주석·공백 포함 물리적 1,000줄 이하(약 435줄) 달성을 위해 sniper_plugin.py에서 방어·컷오프·MOC 모듈 분리
+# MODIFIED: 제3헌법 및 초과 Case 88 의거 sniper_plugin.py에서 방어·컷오프·MOC 모듈 분리
+# NEW: 초과 Case 89 — NQ_VELOCITY_SURGE_PCT(0.20%) 상수 동기화 및 _TRAIL_RUNTIME_CACHE 내 nq_vel_bypass·nq_vel_10m·nq_vel_3m 슬롯 확장
 # MODIFIED: 수동 진입(MANUAL) 포지션 첫 틱 선행 식별 및 NQ=F>=2.0% 구간 2차 과열 방어선 100% 패스·3차 역행 방어 전용 가동 (Case 50, 66, 67, 86)
 # MODIFIED: 04:07 ~ 08:14 EST 중 NQ=F<2.0% 내 3차 역행 안전망 손절 시 당일 퇴근 대신 최저점 역트레일링(STAGE3_STOP_TRACK) 점화 (Case 87)
 # MODIFIED: 08:15:00 EST 거시지표 선제 컷오프 시 최저점 추적 캐시 파기 및 미체결 매수 주문 즉각 선취소 결속 (Case 48, 53, 84, 87)
@@ -25,11 +26,12 @@ from whipsaw_plugin import (
 
 EST_TZ = ZoneInfo("America/New_York")
 
-# 단일 '하이킨 아시 + 고점 트레일링 (HA_HYB_1.0)' 핵심 상수 (AssassinLedger 동기화)
+# 단일 '하이킨 아시 + 고점 트레일링 (HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)' 핵심 상수 (AssassinLedger 동기화)
 TRAIL_ARM_PROFIT_RATE = AssassinLedger.TRAIL_ARM_PROFIT_RATE          # +1.00% 도달 시 트레일링 점화(Arming)
 TRAIL_FLOOR_LOCK_RATE = AssassinLedger.TRAIL_FLOOR_LOCK_RATE          # 점화 즉시 최소 +1.00% 익절 보존선 락온
 TRAIL_DROP_CALLBACK_PCT = AssassinLedger.TRAIL_DROP_CALLBACK_PCT      # 최고가(Peak) 대비 -0.30% 콜백 스탑
 TRAIL_SAFETY_CAP_RATE = AssassinLedger.TRAIL_SAFETY_CAP_RATE          # 거래소 선장전 상단 안전 캡 (+5.00% LIMIT)
+NQ_VELOCITY_SURGE_PCT = AssassinLedger.NQ_VELOCITY_SURGE_PCT          # NEW: NQ=F 10분/3분 변화율 ±0.20% 급등락 시 HA음봉 바이패스 임계치 (Case 89)
 
 # 3차 안전망 손절 후 '손절가 하회 최저점 역트레일링 반등 재진입 (🪤 RE_BOT_TRAIL)' 상수 (Case 87)
 BOTTOM_REBOUND_PCT = 0.30                                             # 경유 최저점(post_stop_low) 대비 반등 돌파 폭 (+0.30%)
@@ -42,7 +44,7 @@ _STRIKE_ALERT_CACHE = {
     "last_macro1_date": "",
 }
 
-# 종목별 실시간 하이킨 아시 + 고점 트레일링(HA_HYB_1.0) 런타임 추적 캐시
+# MODIFIED: 종목별 실시간 하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS) 런타임 추적 캐시 (Case 85, 89)
 _TRAIL_RUNTIME_CACHE = {
     sym: {
         "armed": False,
@@ -57,6 +59,9 @@ _TRAIL_RUNTIME_CACHE = {
         "ha_bull": True,
         "ha_open": 0.0,
         "ha_close": 0.0,
+        "nq_vel_bypass": False,
+        "nq_vel_10m": 0.0,
+        "nq_vel_3m": 0.0,
         "sweep_fired": False,
         "last_sweep_ts": 0.0,
     }
@@ -93,6 +98,9 @@ def _reset_trailing_runtime_state(symbol: str):
             "ha_bull": True,
             "ha_open": 0.0,
             "ha_close": 0.0,
+            "nq_vel_bypass": False,
+            "nq_vel_10m": 0.0,
+            "nq_vel_3m": 0.0,
             "sweep_fired": False,
             "last_sweep_ts": 0.0,
         })
