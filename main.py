@@ -4,9 +4,9 @@
 #       양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지])
 #       무한 출동 듀얼 스나이퍼(SOXS/SOXL), 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 무제한 익절 추적,
 #       3차 손절 후 최저점 역트레일링 +0.30% 반등 재진입(RE_BOT_TRAIL) 및 03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 오케스트레이터
-# 구조: sniper_plugin.py / whipsaw_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 아키텍처
+# 구조: sniper_plugin.py / defense_plugin.py / whipsaw_plugin.py 3대 전술 플러그인과 SniperPluginContext로 결속된 아키텍처
 # =====================================================================
-# MODIFIED: 제3헌법 및 Case 43 의거 구버전 데드코드 소각 및 whipsaw_plugin.py 분리 모듈 결속 (8대 코어 모듈)
+# MODIFIED: 제3헌법 및 초과 Case 88 의거 defense_plugin.py 분리 모듈을 포함한 9대 코어 모듈 프리플라이트 컴파일 검증 결속 (Case 11, 88)
 # MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30 ~ 17:00 EST로 전면 확장 (Case 07)
 # MODIFIED: SOXS 및 SOXL 양방향 대칭 클라이맥스 듀얼 감시 루프(TRADE_SYMBOLS = ("SOXS", "SOXL")) 가동 (Case 09, 54, 71, 81)
 # MODIFIED: 03:55 ~ 08:14 EST 구간 및 포지션 보유(수동 포함)/트레일링 점화/최저점 추적 중 5.0초 듀얼 캔들 스캔 가속으로 EWM·HA 기저 및 VWAP 실시간 동기화 (Case 73, 84, 85, 87)
@@ -15,7 +15,7 @@
 # NEW: 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 역행 손절 후 최저점 역트레일링 +0.30% 양봉 반등 재진입(execute_post_stop_bottom_rebound_plugin) 결속 (Case 87)
 # MODIFIED: 프리장 본진 신규 진입·무한 재출동·자가 치유(Self-Healing) 허용 구간을 04:07 ~ 08:14 EST로 락온 및 08:15 EST 거시지표 선제 컷오프 결속 (Case 48, 52, 53, 71, 84)
 # MODIFIED: 수동 매매·1주 휩소 작전·본진 하이킨 아시 트레일링 청산 시 실제 보유 수량(last_known_qty) 추적 및 통합 복리 정산 연동 (Case 76)
-# MODIFIED: 시스템 기동 완료 텔레그램 메시지를 "정상작동 중입니다." 단일 라인으로 슬림화 및 미사용 지역 변수 소각 (Case 38)
+# MODIFIED: 시스템 기동 완료 텔레그램 메시지를 "정상작동 중입니다." 단일 라인으로 슬림화 및 주석 포함 물리적 592줄 유지 (Case 38, 88)
 
 import sys
 import os
@@ -107,7 +107,6 @@ in_memory_ordering_lock = {sym: False for sym in TRADE_SYMBOLS}
 dual_strike_mutex = asyncio.Lock()
 shared_holdings = {sym: 0 for sym in TRADE_SYMBOLS}
 
-# RSI<=20/10 경보 상태 머신 폐기에 따라 불필요한 level 키 소각 및 ewm_state(Wilder's RSI + Heikin-Ashi 기저) 슬롯 유지
 shared_rsi_state = {
     sym: {"value": 0.0, "vwap": 0.0, "ewm_state": {}} for sym in RSI_SYMBOLS
 }
@@ -157,9 +156,11 @@ def _run_git_update_sync() -> tuple[bool, str]:
         return False, f"Hard Reset 붕괴 (원상 복구됨):\n{reset_err}"
 
     try:
+        # MODIFIED: Case 11 & Case 88 — 분리된 defense_plugin.py를 포함한 9대 코어 모듈 프리플라이트 컴파일 검증
         for mod_file in (
             "main.py",
             "sniper_plugin.py",
+            "defense_plugin.py",
             "whipsaw_plugin.py",
             "tg_router.py",
             "tg_ui_plugin.py",
@@ -282,11 +283,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     }
 
     while True:
-        # Case 28 & Case 83 & Case 85 & Case 87: 평시 1.5초 대기,
-        # ① 본진 1차 슬리피지 매수 덫 타임쉴드(PRE_SNIPER) 대기 중이거나
-        # ② 미보유 감시 중 RSI >= 79.0 프리-클라이맥스 구간 진입 시 또는
-        # ③ 보유 포지션(수동 포함)이 하이킨 아시 트레일링 점화(+0.80% 근접 포함) 상태이거나
-        # ④ 3차 안전망 손절 후 최저점 역트레일링 추적(RE_BOT_TRAIL) 중일 때 0.4초 고주파 대기로 자동 가속!
+        # Case 28 & Case 83 & Case 85 & Case 87: 평시 1.5초 대기, 4대 부스터 조건 충족 시 0.4초 고주파 대기로 자동 가속
         wait_sec = 0.4 if runtime_state.get("fast_shield_mode", False) else 1.5
         try:
             await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=wait_sec)
@@ -842,8 +839,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     entry_session = ledger_after_w[8]
                     entry_time = ledger_after_w[9]
 
-            # NEW: 초과 Case 87 — 본진 프리장 초중반 골든타임 (04:07 ~ 08:14 EST) 내
-            #      3차 역행 안전망 손절 후 '손절가 하회 최저점 역트레일링 +0.30% 양봉 반등 재진입 (🪤 RE_BOT_TRAIL)' 감시 및 타격!
+            # 초과 Case 87 — 본진 프리장 초중반 골든타임 (04:07 ~ 08:14 EST) 내
+            # 3차 역행 안전망 손절 후 '손절가 하회 최저점 역트레일링 +0.30% 양봉 반등 재진입 (🪤 RE_BOT_TRAIL)' 감시 및 타격!
             if (
                 is_active
                 and not is_session_done
@@ -975,7 +972,7 @@ async def main():
         asyncio.create_task(record_candles_loop(api_client, sym))
         asyncio.create_task(rsi_radar_loop(plugin_ctx, sym))
 
-    print("시스템 코어: 04:07~08:14 골든타임 & HA트레일링(HA_HYB_1.0) & 최저점 반등 재진입(RE_BOT_TRAIL) 결속 완료...", flush=True)
+    print("시스템 코어: 04:07~08:14 골든타임 & HA트레일링(HA_HYB_1.0) & 최저점 반등 재진입(RE_BOT_TRAIL) 9대 모듈 결속 완료...", flush=True)
 
     # 기동 완료 시 단일 상태 메시지만 전송 (Case 38)
     try:

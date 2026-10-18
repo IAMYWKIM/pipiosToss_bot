@@ -4,7 +4,7 @@
 #       양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL), 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)',
 #       3차 손절 후 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL) 및 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수덫 텔레그램 라우팅 컨트롤러
 # =====================================================================
-# MODIFIED: 제3헌법 및 Case 43 의거 구버전 익절률 선택 콜백(set_rate_SOXS_) 데드코드 영구 소각 및 8대 코어 모듈 프리플라이트 컴파일 검증 결속
+# MODIFIED: 제3헌법 및 초과 Case 88 의거 defense_plugin.py 분리 모듈을 포함한 9대 코어 모듈 프리플라이트 컴파일 검증 결속 (Case 11, 88)
 # MODIFIED: 전술 제어반(/settlement) 설정 변경(전원, 복리모드, 통합시드) 시 SOXS/SOXL 양쪽 원장 동시 동기화(sync_global_settings) (Case 37, 76)
 # MODIFIED: 통합 시드 설정 및 장부 초기화 안내 문구에 단일 '🔥 +1.00% 점화 하이킨 아시 트레일링' 및 '🪤 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL)' 반영 (Case 53, 84, 87)
 # MODIFIED: 예산 입력 시 음수/0/NaN/Inf 유입으로 인한 장부 오염 방어 로직 유지 (Case 37)
@@ -217,7 +217,7 @@ async def process_toggle_compound(callback_query: types.CallbackQuery, state: FS
             pass
 
 
-# MODIFIED: 초과 Case 37, 84, 87 — 단일 하이킨 아시 트레일링(HA_HYB_1.0) 및 최저점 반등 재진입(RE_BOT_TRAIL) 통합 시드 설정 안내문
+# 초과 Case 37, 84, 87 — 단일 하이킨 아시 트레일링(HA_HYB_1.0) 및 최저점 반등 재진입(RE_BOT_TRAIL) 통합 시드 설정 안내문
 @router.callback_query(F.data.startswith("set_budget_SOXS"))
 async def process_set_budget(callback_query: types.CallbackQuery, state: FSMContext):
     user = getattr(callback_query, "from_user", None)
@@ -387,9 +387,11 @@ async def process_execute_update(callback_query: types.CallbackQuery, state: FSM
                 run_cmd(f"git reset --hard {current_hash}")
                 return False, f"Hard Reset 붕괴:\n{reset_err}"
             try:
+                # MODIFIED: Case 11 & Case 88 — 분리된 defense_plugin.py를 포함한 9대 코어 모듈 프리플라이트 컴파일 검증
                 for mod_file in (
                     "main.py",
                     "sniper_plugin.py",
+                    "defense_plugin.py",
                     "whipsaw_plugin.py",
                     "tg_router.py",
                     "tg_ui_plugin.py",

@@ -1,8 +1,9 @@
 # =====================================================================
 # FILE: plugin_updater.py
-# 목적: 깃허브 코드 다운로드 검증 및 롤백 (프리플라이트 파이썬 컴파일)
+# 목적: 깃허브 코드 다운로드 검증 및 롤백 (9대 코어 모듈 프리플라이트 파이썬 컴파일)
 # =====================================================================
-# MODIFIED: 분리된 whipsaw_plugin.py 및 tg_ui_plugin.py 모듈을 프리플라이트 컴파일 검증 리스트에 동기화 결속 (8대 코어 모듈) (Case 11)
+# MODIFIED: 제3헌법 및 초과 Case 88 의거 분리된 defense_plugin.py, whipsaw_plugin.py, tg_ui_plugin.py를 포함한
+#           9대 코어 모듈 전체를 프리플라이트 컴파일 검증 리스트에 동기화 결속 (Case 11, 88)
 # MODIFIED: subprocess.communicate 30초 타임아웃 주입 및 프로세스 Kill 결속 (네트워크 교착 방어)
 
 import os
@@ -44,9 +45,11 @@ def main():
         sys.exit(0)
 
     try:
+        # MODIFIED: Case 11 & Case 88 — defense_plugin.py를 포함한 9대 코어 모듈 프리플라이트 컴파일 검증
         for mod_file in (
             "main.py",
             "sniper_plugin.py",
+            "defense_plugin.py",
             "whipsaw_plugin.py",
             "tg_router.py",
             "tg_ui_plugin.py",
@@ -56,7 +59,7 @@ def main():
         ):
             if os.path.exists(mod_file):
                 py_compile.compile(mod_file, doraise=True)
-        print("✅ 프리플라이트 파이썬 컴파일 검증 통과.")
+        print("✅ 9대 코어 모듈 프리플라이트 파이썬 컴파일 검증 통과.")
         sys.exit(0)
     except py_compile.PyCompileError as e:
         print(f"🚨 치명적 문법 에러 감지. 레스큐 롤백 즉시 가동:\n{e}", file=sys.stderr)
