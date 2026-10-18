@@ -2,17 +2,18 @@
 # FILE: main.py
 # 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
 #       양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지])
-#       무한 출동 듀얼 스나이퍼(SOXS/SOXL) 및 03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 오케스트레이터
+#       무한 출동 듀얼 스나이퍼(SOXS/SOXL), 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 무제한 익절 추적
+#       및 03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 오케스트레이터
 # 구조: sniper_plugin.py / whipsaw_plugin.py 전술 플러그인과 SniperPluginContext로 결속된 아키텍처
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 데드코드 소각 및 whipsaw_plugin.py 분리 모듈 결속 (8대 코어 모듈)
 # MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30 ~ 17:00 EST로 전면 확장 (Case 07)
 # MODIFIED: SOXS 및 SOXL 양방향 대칭 클라이맥스 듀얼 감시 루프(TRADE_SYMBOLS = ("SOXS", "SOXL")) 가동 (Case 09, 54, 71, 81)
-# MODIFIED: 03:55 ~ 08:14 EST 구간 동안 SOXS 및 SOXL 모두 5.0초 듀얼 캔들 스캔 가속으로 EWM 기저 및 VWAP 실시간 동기화 (Case 73, 84)
-# NEW: RSI >= 79.0 프리-클라이맥스 진입 시 1.5초 -> 0.4초 고주파 부스터(fast_shield_mode) 자동 가속 및 다건 배치(SOXS,SOXL) 0.0ms 동시 틱 RSI 합성 (Case 28, 83)
+# MODIFIED: 03:55 ~ 08:14 EST 구간 및 포지션 보유/트레일링 점화 중 5.0초 듀얼 캔들 스캔 가속으로 EWM·HA 기저 및 VWAP 실시간 동기화 (Case 73, 84)
+# NEW: RSI >= 79.0 프리-클라이맥스 진입 또는 보유 포지션 하이킨 아시 트레일링 점화(+0.80% 근접 포함) 시 0.4초 고주파 부스터(fast_shield_mode) 자동 가속 (Case 28, 83)
 # NEW: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 작전 및 04:07 EST 미체결 취소 / 보유 1주 현재가 즉시 매도 결속 (Case 79, 80)
 # MODIFIED: 프리장 본진 신규 진입·무한 재출동·자가 치유(Self-Healing) 허용 구간을 04:07 ~ 08:14 EST로 락온 및 08:15 EST 거시지표 선제 컷오프 결속 (Case 48, 52, 53, 71, 84)
-# MODIFIED: 수동 매매·1주 휩소 작전·본진 듀얼 스나이퍼 청산 시 실제 보유 수량(last_known_qty) 추적 및 통합 복리 정산 연동 (Case 76)
+# MODIFIED: 수동 매매·1주 휩소 작전·본진 하이킨 아시 트레일링 청산 시 실제 보유 수량(last_known_qty) 추적 및 통합 복리 정산 연동 (Case 76)
 # MODIFIED: 시스템 기동 완료 텔레그램 메시지를 "정상작동 중입니다." 단일 라인으로 슬림화 및 미사용 지역 변수 소각 (Case 38)
 
 import sys
@@ -43,6 +44,8 @@ from sniper_plugin import (
     PRE_CLIMAX_BOOSTER_RSI,
     OPP_CLIMAX_RSI_THRESHOLD,
     _cancel_open_orders_and_wait_sellable,
+    _reset_trailing_runtime_state,
+    get_trailing_runtime_status,
     settle_daymarket_sim_before_premarket,
     execute_daymarket_rsi_alert_plugin,
     execute_whipsaw_vwap_exposure_plugin,
@@ -100,7 +103,7 @@ in_memory_ordering_lock = {sym: False for sym in TRADE_SYMBOLS}
 dual_strike_mutex = asyncio.Lock()
 shared_holdings = {sym: 0 for sym in TRADE_SYMBOLS}
 
-# RSI<=20/10 경보 상태 머신 폐기에 따라 불필요한 level 키 소각 및 ewm_state 슬롯 유지
+# RSI<=20/10 경보 상태 머신 폐기에 따라 불필요한 level 키 소각 및 ewm_state(Wilder's RSI + Heikin-Ashi 기저) 슬롯 유지
 shared_rsi_state = {
     sym: {"value": 0.0, "vwap": 0.0, "ewm_state": {}} for sym in RSI_SYMBOLS
 }
@@ -240,11 +243,15 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
         except Exception as e:
             print(f"🚨 [RSI 레이더망 {symbol}] 붕괴 방어: {e}", flush=True)
 
-        # MODIFIED: Case 73 & Case 84 — 03:55 ~ 08:14 EST 구간 중 SOXS 및 SOXL 모두 5.0초 스캔,
-        #          19:00 ~ 03:54 EST 구간 중 SOXS 및 SOXL 모두 15.0초 스캔으로 듀얼 EWM 기저 및 VWAP 실시간 동기화
+        # MODIFIED: Case 73 & Case 84 — 03:55 ~ 08:14 EST 구간이거나 포지션 보유/트레일링 점화 중에는 5.0초 고속 스캔을 유지하여
+        #           Wilder's RSI 및 하이킨 아시(Heikin-Ashi) 1분봉 기저 상태를 오차 없이 동기화
         now_est_chk = datetime.now(EST_TZ)
         est_hm_chk = now_est_chk.hour * 100 + now_est_chk.minute
-        if symbol in RSI_SYMBOLS and (355 <= est_hm_chk <= 814):
+        is_holding_or_trailing = (
+            ctx.shared_holdings.get(symbol, 0) > 0
+            or bool(get_trailing_runtime_status(symbol).get("armed", False))
+        )
+        if symbol in RSI_SYMBOLS and ((355 <= est_hm_chk <= 814) or is_holding_or_trailing):
             sleep_sec = 5.0
         elif symbol in RSI_SYMBOLS and (est_hm_chk >= 1900 or est_hm_chk <= 354):
             sleep_sec = 15.0
@@ -272,7 +279,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     while True:
         # Case 28 & Case 83: 평시 1.5초 대기,
         # ① 본진 1차 슬리피지 매수 덫 타임쉴드(PRE_SNIPER) 대기 중이거나
-        # ② 어느 한 종목이라도 RSI >= 79.0 프리-클라이맥스 구간 진입 시 0.4초 고주파 대기로 자동 가속!
+        # ② 미보유 감시 중 RSI >= 79.0 프리-클라이맥스 구간 진입 시 또는
+        # ③ 보유 포지션이 하이킨 아시 트레일링 점화(+0.80% 근접 포함) 상태일 때 0.4초 고주파 대기로 자동 가속!
         wait_sec = 0.4 if runtime_state.get("fast_shield_mode", False) else 1.5
         try:
             await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=wait_sec)
@@ -337,12 +345,20 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             cached_opp_rsi = float(opp_rsi_dict.get("value", 0.0))
 
             is_whipsaw_window = (358 <= est_time_int <= 406)
-            # MODIFIED: 초과 Case 53, 84 — 프리장 본진 스나이퍼 허용 구간을 04:07 ~ 08:14 EST 초중반 황금 구간으로 락온
+            # 초과 Case 53, 84 — 프리장 본진 스나이퍼 허용 구간을 04:07 ~ 08:14 EST 초중반 황금 구간으로 락온
             is_premarket_sniper_window = (407 <= est_time_int <= 814)
             is_daymarket_window = (est_time_int >= 1900 or est_time_int <= 359)
             is_daymarket_active_window = (est_time_int >= 1900 or est_time_int <= 357)
 
-            # Case 28 & Case 83: 1차 슬리피지 매수 덫 대기 중이거나 프리-클라이맥스(RSI >= 79.0) 진입 시 0.4초 고주파 모드 활성화
+            trail_st_pre = get_trailing_runtime_status(symbol)
+            is_trail_armed_now = bool(
+                is_active
+                and holdings_qty > 0
+                and entry_session != "WHIPSAW_1SH"
+                and trail_st_pre.get("armed", False)
+            )
+
+            # Case 28 & Case 83: 1차 슬리피지 매수 덫 대기 중, 프리-클라이맥스(RSI >= 79.0) 진입 시, 또는 하이킨 아시 트레일링 점화 시 0.4초 고주파 모드 활성화
             is_trap_waiting = bool(
                 is_active
                 and is_premarket_sniper_window
@@ -364,14 +380,16 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     or (0.0 < cached_opp_rsi <= PRE_SNIPER_RSI_THRESHOLD and cached_my_rsi >= 78.0)
                 )
             )
-            runtime_state["fast_shield_mode"] = bool(is_trap_waiting or is_pre_climax_booster)
+            runtime_state["fast_shield_mode"] = bool(
+                is_trap_waiting or is_pre_climax_booster or is_trail_armed_now
+            )
 
             if runtime_state["prev_is_active"] is None:
                 runtime_state["prev_is_active"] = is_active
             just_turned_off = (runtime_state["prev_is_active"] is True and is_active is False)
             runtime_state["prev_is_active"] = is_active
 
-            # Case 22 — 17:00 EST 가비지 컬렉션(GC) 실행 시 미보유 상태면 is_session_done=False 및 EWM 캐시 초기화
+            # Case 22 — 17:00 EST 가비지 컬렉션(GC) 실행 시 미보유 상태면 is_session_done=False, 트레일링 캐시 및 EWM 캐시 초기화
             if 17 <= now_est.hour < 19 and runtime_state["last_gc_date"] != today_str:
                 runtime_state["last_gc_date"] = today_str
                 ctx.in_memory_ordering_lock[symbol] = False
@@ -385,6 +403,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 runtime_state["fast_shield_mode"] = False
                 runtime_state["last_known_qty"] = 0
                 if holdings_qty == 0:
+                    _reset_trailing_runtime_state(symbol)
                     await AssassinLedger.save_state(
                         symbol,
                         price=0.0,
@@ -458,7 +477,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             if now_est.hour != runtime_state["last_heartbeat_hour"]:
                 print(
                     f"💓 [맥박 {symbol}] {now_est.strftime('%Y-%m-%d %H:%M:%S')} EST | "
-                    f"세션: {hardcoded_session} | 활성: {is_active} | 잔고: {holdings_qty}주 | 목표: +{target_profit_rate:.2f}%",
+                    f"세션: {hardcoded_session} | 활성: {is_active} | 잔고: {holdings_qty}주 | 모드: HA트레일링(+1.00%점화)",
                     flush=True,
                 )
                 runtime_state["last_heartbeat_hour"] = now_est.hour
@@ -546,6 +565,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                         except Exception:
                             can_reset = False
                     if can_reset:
+                        _reset_trailing_runtime_state(symbol)
                         await AssassinLedger.save_state(
                             symbol,
                             price=0.0,
@@ -598,7 +618,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     sell_order_id = ledger_after_cut[7]
                     entry_session = ledger_after_cut[8]
 
-            # MODIFIED: 초과 Case 52, 71, 84 — 본진 프리장 초중반 골든타임 (04:07 ~ 08:14 EST) 교차 검증 자가 치유(Self-Healing) 가드
+            # 초과 Case 52, 71, 84 — 본진 프리장 초중반 골든타임 (04:07 ~ 08:14 EST) 교차 검증 자가 치유(Self-Healing) 가드
             # 본인 종목뿐만 아니라 반대편 종목(opp_sym)도 미보유·무주문·비매크로차단 상태일 때만 잠금 자동 해제!
             if (
                 407 <= est_time_int <= 814
@@ -628,8 +648,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                         flush=True,
                     )
 
-            # MODIFIED: 목표 3 & 초과 Case 48, 53, 84 — 08:15 EST 거시지표 발표 15분 전 선제 컷오프 (08:15 ~ 15:59 EST)
-            #           신규 매수 영구 마감 및 미체결 매수 주문 즉시 파기
+            # 목표 3 & 초과 Case 48, 53, 84 — 08:15 EST 거시지표 발표 15분 전 선제 컷오프 (08:15 ~ 15:59 EST)
+            # 신규 매수 영구 마감 및 미체결 매수 주문 즉시 파기
             is_session_done, buy_order_id = await enforce_0930_regular_cutoff_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -682,9 +702,21 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 except Exception:
                     pass
 
-            # 차기 루프 대기 시간(0.4초 부스터)을 최신 합성 RSI 기준으로 즉시 업데이트 (Case 28, 83)
+            # NEW: 포지션 보유 중 하이킨 아시 트레일링 점화(armed) 또는 점화 근접(+0.80% 이상) 시 0.4초 고주파 부스터 가동
+            is_trailing_booster = bool(
+                is_active
+                and holdings_qty > 0
+                and entry_session != "WHIPSAW_1SH"
+                and (
+                    bool(get_trailing_runtime_status(symbol).get("armed", False))
+                    or (avg_price_dump > 0.0 and current_price >= avg_price_dump * 1.008)
+                )
+            )
+
+            # 차기 루프 대기 시간(0.4초 부스터)을 최신 합성 RSI 및 트레일링 상태 기준으로 즉시 업데이트 (Case 28, 83)
             runtime_state["fast_shield_mode"] = bool(
                 is_trap_waiting
+                or is_trailing_booster
                 or (
                     is_active
                     and (is_premarket_sniper_window or is_daymarket_active_window)
@@ -802,7 +834,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     opp_rsi_val=opp_live_rsi_val,
                 )
 
-            # 목표 4 & 초과 Case 50, 58, 64: 매수 전량 체결 확인 즉시 목표 익절가(휩소 VWAP 타점 또는 +0.64% / +1.00%) 지정가 매도 덫(TRAP) 하드 락온
+            # 목표 4 & 초과 Case 50, 58, 64: 매수 전량 체결 확인 즉시 상단 안전 캡(+5.00%) 선장전 및
+            # +1.00% 도달 시 하이킨 아시(Heikin-Ashi) + 고점 트레일링(HA_HYB_1.0) 0.1초 즉시 정정 스윕 가동
             await manage_mechanical_profit_trap_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -819,6 +852,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 sell_order_id=sell_order_id,
                 entry_session=entry_session,
                 runtime_state=runtime_state,
+                current_price=current_price,
             )
 
         except Exception as e:
@@ -837,13 +871,13 @@ async def main():
     except Exception as e:
         print(f"🚨 [초기 기동 방어] 계좌 연동 지연 (자동 재시도 예정): {e}", flush=True)
 
-    # 기동 시 SOXS 기준 통합 시드·익절률·복리모드·전원을 SOXL 원장에도 동기화
+    # 기동 시 SOXS 기준 통합 시드·단일 트레일링 설정·복리모드·전원을 SOXL 원장에도 동기화
     try:
         boot_s = await AssassinLedger.get_state("SOXS")
         boot_c = await AssassinLedger.get_is_compound("SOXS")
         await AssassinLedger.sync_global_settings(
             budget=float(boot_s[1] or 100.0),
-            target_profit_rate=AssassinLedger.normalize_target_rate(boot_s[2]),
+            target_profit_rate=AssassinLedger.DEFAULT_TARGET_PROFIT_RATE,
             is_compound=boot_c,
             is_active=bool(boot_s[5]),
         )
@@ -876,9 +910,9 @@ async def main():
         asyncio.create_task(record_candles_loop(api_client, sym))
         asyncio.create_task(rsi_radar_loop(plugin_ctx, sym))
 
-    print("시스템 코어: 04:07~08:14 골든타임 & RSI>=79.0 0.4초 부스터 & 79.9 클라이맥스 양방향 대칭 듀얼 스나이퍼 결속 완료...", flush=True)
+    print("시스템 코어: 04:07~08:14 골든타임 & 단일 하이킨 아시 트레일링(HA_HYB_1.0) 듀얼 스나이퍼 결속 완료...", flush=True)
 
-    # MODIFIED: 기동 완료 시 복잡한 전술 브리핑을 제거하고 단일 상태 메시지만 전송 (Case 38)
+    # 기동 완료 시 단일 상태 메시지만 전송 (Case 38)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.send_message(

@@ -1,14 +1,16 @@
 # =====================================================================
 # FILE: quant_engine.py
 # 목적: 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 통합 시드 원장,
-#       NQ=F 당일 진폭 캐싱 및 Wilder's RSI(14) 벡터/틱 합성 엔진
+#       NQ=F 당일 진폭 캐싱 및 Wilder's RSI(14) + 하이킨 아시(Heikin-Ashi) 1분봉 벡터/틱 합성 엔진
 # =====================================================================
 # MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
 # NEW: 폴링 사각지대(원인 D) 소각을 위한 Wilder's EWM 기저 상태(ewm_state_out) 추출 및 O(1) 실시간 틱 RSI 점화식(compute_realtime_tick_rsi) 탑재 (Case 73)
+# NEW: 200봉 전체 100% 벡터화 하이킨 아시(Heikin-Ashi, ewm alpha=0.5) 기저 추출 및 O(1) 실시간 틱 하이킨 아시 양봉 판별식(compute_realtime_tick_heikin_ashi) 탑재
+# MODIFIED: 기존 +0.64% / +1.00% 선택 모드를 전면 폐기하고 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 상수로 100% 단일화
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 NQ=F 10분봉 EMA 추세 분기망 및 AVWAPEngine 데드코드 영구 소각
 # MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
 # MODIFIED: 듀얼 스나이퍼 화이트리스트 ALLOWED_SYMBOLS = ("SOXS", "SOXL") 확장 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
-# MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76, 77)
+# MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76)
 # NEW: 매크로 1·2·3차 방어선 작동 시 SOXS/SOXL 양쪽 원장 동시 잠금(lock_all_symbols_macro) 및 프리장 재출동 동시 해제 헬퍼 탑재 (Case 52, 80, 82)
 
 import os
@@ -35,8 +37,9 @@ def calculate_rsi_1m(
 ) -> tuple[float, float]:
     """
     Pandas 기반 백그라운드 벡터 연산.
-    VWAP와 RSI를 1개의 데이터프레임에서 동시 산출하여 CPU 블로킹 및 API 중복 호출 원천 차단.
-    current_price 실시간 종가 보정 및 직전 확정 분봉(iloc[-2])의 Wilder's EWM 기저 상태를 ewm_state_out에 기록.
+    VWAP, Wilder's RSI(14), 하이킨 아시(Heikin-Ashi) 1분봉을 1개의 데이터프레임에서 동시 산출하여
+    CPU 블로킹 및 API 중복 호출을 원천 차단합니다.
+    current_price 실시간 종가 보정 및 직전 확정 분봉(iloc[-2])의 Wilder's EWM + Heikin-Ashi 기저 상태를 ewm_state_out에 기록합니다.
     """
     if not candles_json:
         return 0.0, 0.0
@@ -50,7 +53,8 @@ def calculate_rsi_1m(
     df = df[~df.index.duplicated(keep="last")]
     df.sort_index(ascending=True, inplace=True)
 
-    for col in ["highPrice", "lowPrice", "closePrice", "volume"]:
+    # MODIFIED: 하이킨 아시(Heikin-Ashi) 벡터 연산을 위해 openPrice 컬럼을 포함하여 5대 OHLCV 정규화
+    for col in ["openPrice", "highPrice", "lowPrice", "closePrice", "volume"]:
         if col not in df.columns:
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
@@ -59,17 +63,25 @@ def calculate_rsi_1m(
     if df.empty:
         return 0.0, 0.0
 
+    # openPrice 결측 시 종가로 안전 폴백
+    df["openPrice"] = np.where(df["openPrice"] > 0.0, df["openPrice"], df["closePrice"])
+    df["highPrice"] = np.where(df["highPrice"] > 0.0, df["highPrice"], df["closePrice"])
+    df["lowPrice"] = np.where(df["lowPrice"] > 0.0, df["lowPrice"], df["closePrice"])
+
     # 실시간 현재가(current_price)가 주입된 경우 최신 진행 분봉(iloc[-1])의 종가·고가·저가 즉시 동기화
     if current_price is not None and current_price > 0.0:
         last_idx = df.index[-1]
-        df.at[last_idx, "closePrice"] = float(current_price)
-        if float(df.at[last_idx, "highPrice"]) < float(current_price):
-            df.at[last_idx, "highPrice"] = float(current_price)
+        cur_p_float = float(current_price)
+        df.at[last_idx, "closePrice"] = cur_p_float
+        if float(df.at[last_idx, "openPrice"]) <= 0.0:
+            df.at[last_idx, "openPrice"] = cur_p_float
+        if float(df.at[last_idx, "highPrice"]) < cur_p_float:
+            df.at[last_idx, "highPrice"] = cur_p_float
         cur_low = float(df.at[last_idx, "lowPrice"])
-        if cur_low <= 0.0 or cur_low > float(current_price):
-            df.at[last_idx, "lowPrice"] = float(current_price)
+        if cur_low <= 0.0 or cur_low > cur_p_float:
+            df.at[last_idx, "lowPrice"] = cur_p_float
 
-    # 전체 데이터(df)를 대상으로 RSI를 선행 연산하여 과거 데이터 단절 방어 및 ZeroDivision(inf) 안전 처리 (Case 23, 72)
+    # 1. 전체 데이터(df)를 대상으로 Wilder's RSI(14) 선행 벡터 연산 (Case 23, 72)
     delta = df["closePrice"].diff()
     gain = delta.where(delta > 0.0, 0.0)
     loss = -delta.where(delta < 0.0, 0.0)
@@ -77,18 +89,40 @@ def calculate_rsi_1m(
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
 
-    # 메인 루프에서 O(1) 실시간 틱 RSI를 합성할 수 있도록 직전 확정 분봉(iloc[-2])의 EWM 기저 상태 추출 (Case 73)
+    # 2. NEW: 전체 데이터(df)를 대상으로 하이킨 아시(Heikin-Ashi) 1분봉 100% 벡터 연산 (for 루프 금지)
+    ha_close = (df["openPrice"] + df["highPrice"] + df["lowPrice"] + df["closePrice"]) / 4.0
+    ha_seed = ha_close.shift(1)
+    ha_seed.iloc[0] = (float(df["openPrice"].iloc[0]) + float(ha_close.iloc[0])) / 2.0
+    ha_open = ha_seed.ewm(alpha=0.5, adjust=False).mean()
+
+    # 메인 루프에서 O(1) 실시간 틱 RSI 및 실시간 틱 하이킨 아시를 합성할 수 있도록 직전 확정 분봉(iloc[-2]) 기저 추출 (Case 73)
     if isinstance(ewm_state_out, dict):
+        cur_o = float(df["openPrice"].iloc[-1])
+        cur_h = float(df["highPrice"].iloc[-1])
+        cur_l = float(df["lowPrice"].iloc[-1])
+        last_ha_o = float(ha_open.iloc[-1])
+        last_ha_c = float(ha_close.iloc[-1])
+
         if len(df) >= 2:
             ewm_state_out["prev_close"] = float(df["closePrice"].iloc[-2])
             ewm_state_out["prev_avg_gain"] = float(avg_gain.iloc[-2])
             ewm_state_out["prev_avg_loss"] = float(avg_loss.iloc[-2])
-            ewm_state_out["ready"] = True
-        elif len(df) == 1:
+            ewm_state_out["prev_ha_open"] = float(ha_open.iloc[-2])
+            ewm_state_out["prev_ha_close"] = float(ha_close.iloc[-2])
+        else:
             ewm_state_out["prev_close"] = float(df["closePrice"].iloc[-1])
             ewm_state_out["prev_avg_gain"] = float(avg_gain.iloc[-1])
             ewm_state_out["prev_avg_loss"] = float(avg_loss.iloc[-1])
-            ewm_state_out["ready"] = True
+            ewm_state_out["prev_ha_open"] = last_ha_o
+            ewm_state_out["prev_ha_close"] = last_ha_c
+
+        ewm_state_out["cur_bar_open"] = cur_o
+        ewm_state_out["cur_bar_high"] = cur_h
+        ewm_state_out["cur_bar_low"] = cur_l
+        ewm_state_out["ha_open"] = last_ha_o
+        ewm_state_out["ha_close"] = last_ha_c
+        ewm_state_out["ha_bull"] = bool(last_ha_c > last_ha_o)
+        ewm_state_out["ready"] = True
 
     rs = avg_gain / avg_loss
     rsi_series = 100.0 - (100.0 / (1.0 + rs))
@@ -120,7 +154,7 @@ def compute_realtime_tick_rsi(
     """
     메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 RSI 합성 엔진 (Case 73).
     직전 확정 분봉(t-1)의 Wilder's EWM 기저 상태에 실시간 현재가(live_price)를 대입하여
-    추가 API 호출 0회로 순간적인 대칭 클라이맥스(매수종목 RSI <= 30.0 & 반대종목 RSI >= 80.0)를 즉시 포착합니다.
+    추가 API 호출 0회로 순간적인 대칭 클라이맥스(매수종목 RSI <= 30.0 & 반대종목 RSI >= 79.9)를 즉시 포착합니다.
     """
     if live_price is None or live_price <= 0.0 or not isinstance(ewm_state, dict):
         return float(fallback_rsi or 0.0)
@@ -154,6 +188,45 @@ def compute_realtime_tick_rsi(
         return float(fallback_rsi or 50.0)
 
     return max(0.01, min(100.0, float(rsi)))
+
+
+def compute_realtime_tick_heikin_ashi(
+    live_price: float, ewm_state: dict
+) -> tuple[bool, float, float]:
+    """
+    NEW: 메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 하이킨 아시(Heikin-Ashi) 1분봉 합성 엔진.
+    직전 확정 분봉(t-1)의 HA_Open·HA_Close 기저 상태와 현재 진행 분봉의 시가·고가·저가에
+    실시간 현재가(live_price)를 대입하여 추가 API 호출 0회로 실시간 양봉 유지 여부(is_ha_bull)를 판별합니다.
+    """
+    if not isinstance(ewm_state, dict) or not ewm_state.get("ready", False):
+        return True, 0.0, 0.0
+
+    if live_price is None or live_price <= 0.0:
+        return (
+            bool(ewm_state.get("ha_bull", True)),
+            float(ewm_state.get("ha_open", 0.0)),
+            float(ewm_state.get("ha_close", 0.0)),
+        )
+
+    p_float = float(live_price)
+    prev_ha_o = float(ewm_state.get("prev_ha_open", p_float))
+    prev_ha_c = float(ewm_state.get("prev_ha_close", p_float))
+    cur_o = float(ewm_state.get("cur_bar_open", p_float)) or p_float
+    cur_h = max(float(ewm_state.get("cur_bar_high", p_float)) or p_float, p_float)
+    cur_l_raw = float(ewm_state.get("cur_bar_low", p_float))
+    cur_l = min(cur_l_raw, p_float) if cur_l_raw > 0.0 else p_float
+
+    ewm_state["cur_bar_high"] = cur_h
+    ewm_state["cur_bar_low"] = cur_l
+
+    live_ha_open = (prev_ha_o + prev_ha_c) / 2.0 if (prev_ha_o > 0.0 and prev_ha_c > 0.0) else cur_o
+    live_ha_close = (cur_o + cur_h + cur_l + p_float) / 4.0
+    is_ha_bull = bool(live_ha_close > live_ha_open)
+
+    ewm_state["ha_open"] = live_ha_open
+    ewm_state["ha_close"] = live_ha_close
+    ewm_state["ha_bull"] = is_ha_bull
+    return is_ha_bull, live_ha_open, live_ha_close
 
 
 class MacroDataCache:
@@ -241,9 +314,13 @@ class MacroDataCache:
 class AssassinLedger:
     # MODIFIED: 양방향 대칭 클라이맥스 듀얼 스나이퍼 화이트리스트 락온 (Case 09, 54)
     ALLOWED_SYMBOLS = ("SOXS", "SOXL")
-    DEFAULT_TARGET_PROFIT_RATE = 0.64
-    # 전술 제어반 선택 허용 목표 익절률 (+0.64% 고승률 회전형 vs +1.00% 고수익 복리형) (Case 68)
-    ALLOWED_TARGET_RATES = (0.64, 1.00)
+    # MODIFIED: 기존 +0.64% / +1.00% 선택제를 폐기하고 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 상수로 100% 단일화
+    DEFAULT_TARGET_PROFIT_RATE = 1.00
+    ALLOWED_TARGET_RATES = (1.00,)
+    TRAIL_ARM_PROFIT_RATE = 1.00          # +1.00% 도달 시 하이킨 아시 트레일링 점화(Arming)
+    TRAIL_FLOOR_LOCK_RATE = 1.00          # 트레일링 점화 즉시 최소 +1.00% 익절 보존선 하드 락온
+    TRAIL_DROP_CALLBACK_PCT = 0.30        # 최고가(Peak) 대비 -0.30% 콜백 발생 시 즉시 익절 스윕
+    TRAIL_SAFETY_CAP_RATE = 5.00          # 매수 체결 직후 거래소에 선장전하는 상단 안전 캡 (+5.00% LIMIT)
     ROUND_TRIP_COMM_PCT = 0.14
     ONE_WAY_COMM_RATE = 0.0007
     MIN_BUDGET_FLOOR = 10.0
@@ -260,22 +337,15 @@ class AssassinLedger:
         sym = cls._validate_symbol(symbol)
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"AssassinLedger_{sym}.json")
 
-    # 목표 익절률 정규화 검증 (0.64% 또는 1.00% 외 비정상 값 유입 원천 차단) (Case 68)
+    # MODIFIED: 단일 하이킨 아시 트레일링 모드 락온에 따라 점화 기준 수익률 1.00% 단일 반환 (Case 68)
     @classmethod
-    def normalize_target_rate(cls, rate_val) -> float:
-        try:
-            r = float(rate_val)
-            if math.isfinite(r) and abs(r - 1.00) < 1e-4:
-                return 1.00
-        except Exception:
-            pass
-        return 0.64
+    def normalize_target_rate(cls, rate_val=None) -> float:
+        return 1.00
 
-    # 선택된 목표 익절률에서 왕복 협의 수수료(0.14%)를 공제한 순수익 복리 증액률 반환 (0.64% -> 0.50%, 1.00% -> 0.86%)
+    # 최소 익절 보존선(+1.00%)에서 왕복 협의 수수료(0.14%)를 공제한 최소 보장 순수익률 (+0.86%) 반환
     @classmethod
-    def get_net_compound_rate(cls, target_profit_rate: float) -> float:
-        norm_r = cls.normalize_target_rate(target_profit_rate)
-        return round(norm_r - cls.ROUND_TRIP_COMM_PCT, 2)
+    def get_net_compound_rate(cls, target_profit_rate: float = 1.00) -> float:
+        return round(cls.TRAIL_FLOOR_LOCK_RATE - cls.ROUND_TRIP_COMM_PCT, 2)
 
     @classmethod
     async def get_state(
@@ -382,8 +452,8 @@ class AssassinLedger:
                     return True
             return await asyncio.to_thread(_read)
 
-    # Case 76: 익절/손절/수동개입/1주휩소 작전 모두 실제 발생한 순수익금((매도가 - 매수가) * 실제체결수량 - 왕복수수료 0.14%)을
-    #          기반으로 통합 복리 시드(budget)를 정밀 갱신
+    # Case 76: 하이킨 아시 트레일링 익절(+1.00% ~ +5.00%+) / 손절 / 수동개입 / 1주휩소 작전 모두
+    #          실제 발생한 순수익금((실제매도가 - 실제매수가) * 실제체결수량 - 왕복수수료 0.14%)을 기반으로 통합 복리 시드(budget) 정밀 갱신
     @classmethod
     def calc_compound_next_budget(
         cls,
@@ -392,7 +462,7 @@ class AssassinLedger:
         entry_price: float = 0.0,
         exit_price: float = 0.0,
         filled_qty: float = 0.0,
-        target_profit_rate: float = 0.64,
+        target_profit_rate: float = 1.00,
     ) -> tuple[float, float, float]:
         base_budget = float(current_budget) if (current_budget and math.isfinite(current_budget)) else 100.0
         if base_budget < cls.MIN_BUDGET_FLOOR:
@@ -419,7 +489,7 @@ class AssassinLedger:
             new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
             return new_budget, net_delta_usd, round(comm_usd, 2)
 
-        # 3순위 폴백: API 체결 내역 인덱싱이 완전히 지연된 경우 설정 익절률/수수료 기준 이론치 정산
+        # 3순위 폴백: API 체결 내역 인덱싱이 완전히 지연된 경우 최소 보존 익절률(+1.00%, 순+0.86%)/수수료 기준 정산
         if is_take_profit:
             net_comp_rate = cls.get_net_compound_rate(target_profit_rate)
             net_delta_usd = round(base_budget * (net_comp_rate / 100.0), 2)
@@ -466,12 +536,7 @@ class AssassinLedger:
                     except Exception:
                         pass
 
-                if target_profit_rate is not None:
-                    data["target_profit_rate"] = cls.normalize_target_rate(target_profit_rate)
-                else:
-                    data["target_profit_rate"] = cls.normalize_target_rate(
-                        data.get("target_profit_rate", cls.DEFAULT_TARGET_PROFIT_RATE)
-                    )
+                data["target_profit_rate"] = cls.DEFAULT_TARGET_PROFIT_RATE
 
                 if "is_compound" not in data:
                     data["is_compound"] = True
@@ -520,7 +585,7 @@ class AssassinLedger:
 
             await asyncio.to_thread(_write)
 
-    # NEW: 통합 시드 풀(Unified Seed Pool) 및 전술 제어반 공통 설정(시드, 목표익절률, 복리여부, 마스터전원) 양쪽 원장 동시 동기화 (Case 76, 77)
+    # 통합 시드 풀(Unified Seed Pool) 및 전술 제어반 공통 설정(시드, 복리여부, 마스터전원) 양쪽 원장 동시 동기화 (Case 76)
     @classmethod
     async def sync_global_settings(
         cls,
@@ -533,12 +598,12 @@ class AssassinLedger:
             await cls.save_state(
                 sym,
                 budget=budget,
-                target_profit_rate=target_profit_rate,
+                target_profit_rate=cls.DEFAULT_TARGET_PROFIT_RATE,
                 is_compound=is_compound,
                 is_active=is_active,
             )
 
-    # NEW: 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 당일 진입 영구 차단 (Case 82)
+    # 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 당일 진입 영구 차단 (Case 82)
     @classmethod
     async def lock_all_symbols_macro(cls, last_session_id: str = None):
         for sym in cls.ALLOWED_SYMBOLS:
@@ -552,7 +617,7 @@ class AssassinLedger:
                 kwargs["last_session_id"] = last_session_id
             await cls.save_state(sym, **kwargs)
 
-    # NEW: 프리장 내 익절 완료 또는 04:07 휩소 정리 완료 시 양쪽 장부 동시 무한 재출동 락 해제 (Case 52, 80)
+    # 프리장 골든타임 내 익절 완료 또는 04:07 휩소 정리 완료 시 양쪽 장부 동시 무한 재출동 락 해제 (Case 52, 80, 84)
     @classmethod
     async def unlock_all_symbols_for_reentry(cls):
         for sym in cls.ALLOWED_SYMBOLS:
