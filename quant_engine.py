@@ -5,13 +5,13 @@
 # =====================================================================
 # MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
 # NEW: 폴링 사각지대(원인 D) 소각을 위한 Wilder's EWM 기저 상태(ewm_state_out) 추출 및 O(1) 실시간 틱 RSI 점화식(compute_realtime_tick_rsi) 탑재 (Case 73)
-# NEW: 200봉 전체 100% 벡터화 하이킨 아시(Heikin-Ashi, ewm alpha=0.5) 기저 추출 및 O(1) 실시간 틱 하이킨 아시 양봉 판별식(compute_realtime_tick_heikin_ashi) 탑재
-# MODIFIED: 기존 +0.64% / +1.00% 선택 모드를 전면 폐기하고 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 상수로 100% 단일화
+# NEW: 200봉 전체 100% 벡터화 하이킨 아시(Heikin-Ashi, ewm alpha=0.5) 기저 추출 및 O(1) 실시간 틱 하이킨 아시 양봉 판별식(compute_realtime_tick_heikin_ashi) 탑재 (Case 85)
+# MODIFIED: 기존 +0.64% / +1.00% 선택 모드를 전면 폐기하고 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 상수로 100% 단일화 (Case 85)
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 NQ=F 10분봉 EMA 추세 분기망 및 AVWAPEngine 데드코드 영구 소각
 # MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 60초 캐싱/타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
 # MODIFIED: 듀얼 스나이퍼 화이트리스트 ALLOWED_SYMBOLS = ("SOXS", "SOXL") 확장 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76)
-# NEW: 매크로 1·2·3차 방어선 작동 시 SOXS/SOXL 양쪽 원장 동시 잠금(lock_all_symbols_macro) 및 프리장 재출동 동시 해제 헬퍼 탑재 (Case 52, 80, 82)
+# MODIFIED: lock_all_symbols_macro 호출 시 수동 보유 종목(MANUAL) 표식 보존 및 과열장(NQ>=2.0%) 수동 청산 후 자동 매매 오작동 해금 차단 (Case 50, 66, 82)
 
 import os
 import json
@@ -53,7 +53,7 @@ def calculate_rsi_1m(
     df = df[~df.index.duplicated(keep="last")]
     df.sort_index(ascending=True, inplace=True)
 
-    # MODIFIED: 하이킨 아시(Heikin-Ashi) 벡터 연산을 위해 openPrice 컬럼을 포함하여 5대 OHLCV 정규화
+    # 하이킨 아시(Heikin-Ashi) 벡터 연산을 위해 openPrice 컬럼을 포함하여 5대 OHLCV 정규화
     for col in ["openPrice", "highPrice", "lowPrice", "closePrice", "volume"]:
         if col not in df.columns:
             df[col] = 0.0
@@ -89,13 +89,13 @@ def calculate_rsi_1m(
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
 
-    # 2. NEW: 전체 데이터(df)를 대상으로 하이킨 아시(Heikin-Ashi) 1분봉 100% 벡터 연산 (for 루프 금지)
+    # 2. 전체 데이터(df)를 대상으로 하이킨 아시(Heikin-Ashi) 1분봉 100% 벡터 연산 (for 루프 금지)
     ha_close = (df["openPrice"] + df["highPrice"] + df["lowPrice"] + df["closePrice"]) / 4.0
     ha_seed = ha_close.shift(1)
     ha_seed.iloc[0] = (float(df["openPrice"].iloc[0]) + float(ha_close.iloc[0])) / 2.0
     ha_open = ha_seed.ewm(alpha=0.5, adjust=False).mean()
 
-    # 메인 루프에서 O(1) 실시간 틱 RSI 및 실시간 틱 하이킨 아시를 합성할 수 있도록 직전 확정 분봉(iloc[-2]) 기저 추출 (Case 73)
+    # 메인 루프에서 O(1) 실시간 틱 RSI 및 실시간 틱 하이킨 아시를 합성할 수 있도록 직전 확정 분봉(iloc[-2]) 기저 추출 (Case 73, 85)
     if isinstance(ewm_state_out, dict):
         cur_o = float(df["openPrice"].iloc[-1])
         cur_h = float(df["highPrice"].iloc[-1])
@@ -194,7 +194,7 @@ def compute_realtime_tick_heikin_ashi(
     live_price: float, ewm_state: dict
 ) -> tuple[bool, float, float]:
     """
-    NEW: 메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 하이킨 아시(Heikin-Ashi) 1분봉 합성 엔진.
+    메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 하이킨 아시(Heikin-Ashi) 1분봉 합성 엔진 (Case 85).
     직전 확정 분봉(t-1)의 HA_Open·HA_Close 기저 상태와 현재 진행 분봉의 시가·고가·저가에
     실시간 현재가(live_price)를 대입하여 추가 API 호출 0회로 실시간 양봉 유지 여부(is_ha_bull)를 판별합니다.
     """
@@ -230,7 +230,7 @@ def compute_realtime_tick_heikin_ashi(
 
 
 class MacroDataCache:
-    # MODIFIED: 제3헌법 및 Case 43 의거 구버전 NQ 10분봉 EMA 추세 분기 데드코드 소각 및 당일 진폭 캐시 슬림화
+    # 제3헌법 및 Case 43 의거 구버전 NQ 10분봉 EMA 추세 분기 데드코드 소각 및 당일 진폭 캐시 슬림화
     _nq_cache_data = (0.0, 0.0, 0.0, 0.0)
     _nq_cache_lock = asyncio.Lock()
 
@@ -312,9 +312,9 @@ class MacroDataCache:
 
 
 class AssassinLedger:
-    # MODIFIED: 양방향 대칭 클라이맥스 듀얼 스나이퍼 화이트리스트 락온 (Case 09, 54)
+    # 양방향 대칭 클라이맥스 듀얼 스나이퍼 화이트리스트 락온 (Case 09, 54)
     ALLOWED_SYMBOLS = ("SOXS", "SOXL")
-    # MODIFIED: 기존 +0.64% / +1.00% 선택제를 폐기하고 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 상수로 100% 단일화
+    # 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 상수로 100% 단일화 (Case 68, 85)
     DEFAULT_TARGET_PROFIT_RATE = 1.00
     ALLOWED_TARGET_RATES = (1.00,)
     TRAIL_ARM_PROFIT_RATE = 1.00          # +1.00% 도달 시 하이킨 아시 트레일링 점화(Arming)
@@ -337,7 +337,7 @@ class AssassinLedger:
         sym = cls._validate_symbol(symbol)
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"AssassinLedger_{sym}.json")
 
-    # MODIFIED: 단일 하이킨 아시 트레일링 모드 락온에 따라 점화 기준 수익률 1.00% 단일 반환 (Case 68)
+    # 단일 하이킨 아시 트레일링 모드 락온에 따라 점화 기준 수익률 1.00% 단일 반환 (Case 68)
     @classmethod
     def normalize_target_rate(cls, rate_val=None) -> float:
         return 1.00
@@ -603,23 +603,38 @@ class AssassinLedger:
                 is_active=is_active,
             )
 
-    # 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 당일 진입 영구 차단 (Case 82)
+    # MODIFIED: 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 잠금하되,
+    #           현재 수동 보유 중(entry_session == "MANUAL")인 종목은 force_all=False일 때 MANUAL 표식을 보존 (Case 50, 82)
     @classmethod
-    async def lock_all_symbols_macro(cls, last_session_id: str = None):
+    async def lock_all_symbols_macro(cls, last_session_id: str = None, force_all: bool = False):
         for sym in cls.ALLOWED_SYMBOLS:
+            st = await cls.get_state(sym)
+            is_active_manual_hold = (
+                not force_all
+                and str(st[8] or "") == "MANUAL"
+                and (float(st[0] or 0.0) > 0.0 or float(st[6] or 0.0) > 0.0 or bool(st[7]))
+            )
             kwargs = {
                 "buy_order_id": "",
                 "is_session_done": True,
-                "entry_session": "CANCELED_MACRO",
+                "entry_session": "MANUAL" if is_active_manual_hold else "CANCELED_MACRO",
                 "whipsaw_target_price": 0.0,
             }
             if last_session_id is not None:
                 kwargs["last_session_id"] = last_session_id
             await cls.save_state(sym, **kwargs)
 
-    # 프리장 골든타임 내 익절 완료 또는 04:07 휩소 정리 완료 시 양쪽 장부 동시 무한 재출동 락 해제 (Case 52, 80, 84)
+    # MODIFIED: 프리장 골든타임 내 익절 완료 또는 04:07 휩소 정리 완료 시 양쪽 장부 동시 무한 재출동 락 해제하되,
+    #           당일 NQ=F 진폭이 이미 2.0% 이상인 과열 장세라면 자동 스나이퍼 재해금을 차단하고 CANCELED_MACRO 유지 (Case 52, 66, 80, 84)
     @classmethod
     async def unlock_all_symbols_for_reentry(cls):
+        nq_h = float(MacroDataCache._nq_cache_data[1] or 0.0)
+        nq_l = float(MacroDataCache._nq_cache_data[2] or 0.0)
+        nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
+        if nq_amp >= 2.0:
+            await cls.lock_all_symbols_macro(force_all=False)
+            return
+
         for sym in cls.ALLOWED_SYMBOLS:
             st = await cls.get_state(sym)
             if st[8] != "CANCELED_MACRO":

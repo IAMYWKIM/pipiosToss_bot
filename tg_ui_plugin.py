@@ -5,7 +5,8 @@
 #       및 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 텔레그램 UI 렌더링 모듈
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 +0.64% / +1.00% 익절률 선택 버튼 및 데드코드 영구 소각
-# NEW: 단일 '🔥 하이킨 아시 + 고점 트레일링 (점화 +1.00% · 보존 +1.00% · 고점 -0.30% 콜백)' 상태 및 실시간 HA(🕯️양봉/🌑음봉) 표출 반영
+# NEW: 단일 '🔥 하이킨 아시 + 고점 트레일링 (점화 +1.00% · 보존 +1.00% · 고점 -0.30% 콜백)' 상태 및 실시간 HA(🕯️양봉/🌑음봉) 표출 반영 (Case 85)
+# NEW: 수동 진입(MANUAL) 보유 시 '2차 과열방어 패스 · 3차 역행방어 가동' 상태 및 진입 기준 지수 표출 동기화 (Case 50, 66, 67)
 # NEW: RSI >= 79.0 프리-클라이맥스 0.4초 고주파 부스터 및 RSI >= 79.9 (80.0 클라이맥스 인지) 상태 표출 반영 (Case 28, 81, 83)
 # MODIFIED: 데이장(19:00 ~ 03:57 EST) 프리장 동일 대칭 조건 [모의] 듀얼 2단계 추격 및 03:58 ~ 03:59 EST 묵음 바이패스 상태 표출 (Case 78)
 # MODIFIED: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫(현재가 > 데이장VWAP 종목 1% 역산) 및 04:07 EST 타임쉴드 렌더링 (Case 79, 80)
@@ -31,7 +32,7 @@ EST_TZ = ZoneInfo("America/New_York")
 NQ_DYNAMIC_FLOOR_UI = 0.8
 
 
-# MODIFIED: 메인 메뉴(/start 및 메인 복귀) 화면에 단일 하이킨 아시 트레일링(HA_HYB_1.0) 및 04:07 ~ 08:14 EST 골든타임 스케줄 반영 (Case 38, 84)
+# 메인 메뉴(/start 및 메인 복귀) 화면에 단일 하이킨 아시 트레일링(HA_HYB_1.0) 및 04:07 ~ 08:14 EST 골든타임 스케줄 반영 (Case 38, 84, 85)
 async def get_main_menu_text() -> str:
     now_est = datetime.now(EST_TZ)
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
@@ -182,7 +183,7 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 38, 57, 83, 84 — 시안 A(평시/08:15 마감) ⟷ 시안 B(보유/하이킨아시 트레일링/주문) 조건부 동적 상태 표출
+# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 83, 84, 85 — 수동 진입(MANUAL) 보유 시 2차 패스 / 3차 가동 및 HA트레일링 상태 구분 표출
 def build_compact_status(
     symbol: str,
     state_tuple: tuple,
@@ -206,6 +207,11 @@ def build_compact_status(
     whip_st = get_whipsaw_runtime_status()
     trail_st = get_trailing_runtime_status(symbol)
     ha_badge = "🕯️HA양봉" if ha_bull else "🌑HA음봉"
+    is_manual_hold = (
+        qty > 0
+        and not buy_order_id
+        and entry_session not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
+    )
 
     if not is_active:
         state_text = "⏸️ 가동OFF(수동대기)"
@@ -218,11 +224,16 @@ def build_compact_status(
         elif trail_st.get("armed", False):
             pk_p = float(trail_st.get("peak_price", 0.0))
             st_p = float(trail_st.get("stop_price", target_sell_price))
-            state_text = f"🔥 HA트레일링({int(qty)}주 · 고점 ${pk_p:.2f} / 스탑 ${st_p:.2f} · {ha_badge})"
+            prefix_tag = "🔥 수동·HA트레일링" if is_manual_hold else "🔥 HA트레일링"
+            state_text = f"{prefix_tag}({int(qty)}주 · 고점 ${pk_p:.2f} / 스탑 ${st_p:.2f} · {ha_badge})"
         elif target_sell_price > 0.0:
-            state_text = f"🎯 보유({int(qty)}주 · +1.00% 점화 ${target_sell_price:.2f} · {ha_badge})"
+            if is_manual_hold:
+                state_text = f"🎯 수동보유({int(qty)}주 · +1.00% 점화 ${target_sell_price:.2f} · 2차패스/3차가동 · {ha_badge})"
+            else:
+                state_text = f"🎯 보유({int(qty)}주 · +1.00% 점화 ${target_sell_price:.2f} · {ha_badge})"
         else:
-            state_text = f"🎯 보유({int(qty)}주 · 안전캡 장전중 · {ha_badge})"
+            prefix_tag = "🎯 수동보유" if is_manual_hold else "🎯 보유"
+            state_text = f"{prefix_tag}({int(qty)}주 · 안전캡 장전중 · {ha_badge})"
     elif buy_order_id:
         if entry_session == "WHIPSAW_1SH":
             w_bp = whip_st.get("buy_price", 0.0)
@@ -234,7 +245,7 @@ def build_compact_status(
     elif opp_qty > 0 or bool(opp_buy_id):
         state_text = f"🔒 대기({opp_sym} 운용중)"
     elif entry_session == "CANCELED_MACRO":
-        state_text = "🛑 매크로방어(금일마감)"
+        state_text = "🛑 매크로방어(자동마감)"
     elif 358 <= est_time_int <= 406:
         if whip_st.get("target_sym") == symbol and whip_st.get("locked_vwap", 0.0) > 0.0:
             state_text = f"🌪️ 휩소타겟(덫 ${whip_st['buy_price']:.2f} ➡️ ${whip_st['sell_target']:.2f})"
@@ -266,7 +277,7 @@ def build_compact_status(
     return f"{sym_icon} <b>{symbol}</b> <code>[{state_flag}]</code> {state_text}"
 
 
-# MODIFIED: 필수 관제 정보 보존 + 3단 계단식 줄바꿈 + 실시간 하이킨 아시(🕯️양봉/🌑음봉) 및 트레일링 상태 동적 렌더링 (Case 13, 38, 47, 67, 83, 84)
+# MODIFIED: 수동 진입(MANUAL) 시 2차 과열방어 패스 및 3차 수동역행방어 상태 동적 렌더링 (Case 13, 38, 47, 50, 67, 83, 84, 85)
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
@@ -380,30 +391,52 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         opp_qty=qty_s, opp_buy_id=buy_id_s, is_compound=is_comp_s, ha_bull=ha_bull_l,
     )
 
-    # Case 17 & Case 67: 평시(시안 A)에는 1·2차 방어선만 표출하고, 포지션 보유 시(시안 B) 3차 역행방어선을 동적 추가
-    macro_1st_str = "🛑 과열차단(≥2.0%)" if nq_amp >= 2.0 else "🟢 진입허용(2.0%미만)"
-    if qty_s > 0.0 and float(state_s[10] or 0.0) > 0.0:
-        nq_entry_p = float(state_s[10])
-        nq_entry_a = float(state_s[11] or 0.0)
+    is_manual_s = (
+        qty_s > 0.0
+        and not buy_id_s
+        and str(state_s[8] or "") not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
+    )
+    is_manual_l = (
+        qty_l > 0.0
+        and not buy_id_l
+        and str(state_l[8] or "") not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
+    )
+
+    # Case 17 & Case 50 & Case 67: 수동 보유 시에는 2차 과열방어 패스 상태를 명시하고 3차 수동역행방어 기준점을 동적 표시
+    if is_manual_s or is_manual_l:
+        if nq_amp >= 2.0:
+            macro_1st_str = "🟢 수동보유(2차 과열방어 패스 · ≥2.0%)"
+        else:
+            macro_1st_str = "🟢 수동보유(2차 방어 패스)"
+    else:
+        macro_1st_str = "🛑 과열차단(≥2.0%)" if nq_amp >= 2.0 else "🟢 진입허용(2.0%미만)"
+
+    if qty_s > 0.0:
+        nq_entry_p = float(state_s[10] or 0.0) or nq_c
+        nq_entry_a = float(state_s[11] or 0.0) or nq_amp
         dyn_thresh = max(nq_entry_a * 0.5, NQ_DYNAMIC_FLOOR_UI)
-        nq_adv = ((nq_c - nq_entry_p) / nq_entry_p * 100.0) if nq_c > 0.0 else 0.0
+        nq_adv = ((nq_c - nq_entry_p) / nq_entry_p * 100.0) if (nq_c > 0.0 and nq_entry_p > 0.0) else 0.0
+        tag_3rd = "3차 수동역행방어" if is_manual_s else "3차 역행방어"
         macro_3rd_line = (
-            f"\n▫️ 3차 역행방어(🐻SOXS): <code>{nq_adv:+.2f}%</code> 상승역행 (한도 <code>+{dyn_thresh:.2f}%</code>)"
+            f"\n▫️ {tag_3rd}(🐻SOXS): <code>{nq_adv:+.2f}%</code> 상승역행 "
+            f"(기준 <code>{nq_entry_p:.2f}</code> / 한도 <code>+{dyn_thresh:.2f}%</code>)"
         )
-    elif qty_l > 0.0 and float(state_l[10] or 0.0) > 0.0:
-        nq_entry_p = float(state_l[10])
-        nq_entry_a = float(state_l[11] or 0.0)
+    elif qty_l > 0.0:
+        nq_entry_p = float(state_l[10] or 0.0) or nq_c
+        nq_entry_a = float(state_l[11] or 0.0) or nq_amp
         dyn_thresh = max(nq_entry_a * 0.5, NQ_DYNAMIC_FLOOR_UI)
-        nq_adv = ((nq_entry_p - nq_c) / nq_entry_p * 100.0) if nq_c > 0.0 else 0.0
+        nq_adv = ((nq_entry_p - nq_c) / nq_entry_p * 100.0) if (nq_c > 0.0 and nq_entry_p > 0.0) else 0.0
+        tag_3rd = "3차 수동역행방어" if is_manual_l else "3차 역행방어"
         macro_3rd_line = (
-            f"\n▫️ 3차 역행방어(🐂SOXL): <code>{nq_adv:+.2f}%</code> 하락역행 (한도 <code>+{dyn_thresh:.2f}%</code>)"
+            f"\n▫️ {tag_3rd}(🐂SOXL): <code>{nq_adv:+.2f}%</code> 하락역행 "
+            f"(기준 <code>{nq_entry_p:.2f}</code> / 한도 <code>+{dyn_thresh:.2f}%</code>)"
         )
     else:
         macro_3rd_line = ""
 
     day_sim = get_daymarket_sim_status()
 
-    # Case 17, 38, 44, 57, 78, 81, 83, 84: 실시간 RSI + 하이킨 아시(🕯️HA양봉/🌑HA음봉) 통합 렌더링
+    # Case 17, 38, 44, 57, 78, 81, 83, 84, 85: 실시간 RSI + 하이킨 아시(🕯️HA양봉/🌑HA음봉) 통합 렌더링
     rsi_ui_lines = []
     if shared_rsi_state:
         r_s = float((shared_rsi_state.get("SOXS") or {}).get("value", 0.0))
@@ -596,15 +629,20 @@ async def build_sync_board(api_client) -> str:
         profit_sign = "+" if d["profit_usd"] >= 0 else "-"
         comp_label = "📈 통합복리시드" if d["is_compound"] else "💵 단리시드"
         tr_st = d["trail_st"]
+        es_str = str(d["entry_session"] or "")
+        is_man = es_str not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
         if d["qty"] > 0:
-            if d["entry_session"] == "WHIPSAW_1SH":
+            if es_str == "WHIPSAW_1SH":
                 flag_str = "🌪️ [WHIPSAW_1SH: 1주 VWAP 타점 · 04:07 현재가정리]"
             elif tr_st.get("armed", False):
                 pk_p = float(tr_st.get("peak_price", 0.0))
                 st_p = float(tr_st.get("stop_price", d["target_sell_p"]))
-                flag_str = f"🔥 [HA트레일링 가동중: 고점 ${pk_p:.2f} / 스탑 ${st_p:.2f}]"
+                m_tag = "MANUAL·HA트레일링(2차패스/3차방어)" if is_man else "HA트레일링 가동중"
+                flag_str = f"🔥 [{m_tag}: 고점 ${pk_p:.2f} / 스탑 ${st_p:.2f}]"
+            elif is_man:
+                flag_str = f"🎯 [MANUAL: +1.00% 점화가 ${d['target_sell_p']:.2f} 대기 · 2차패스/3차방어]"
             else:
-                flag_str = f"🎯 [{d['entry_session'] or 'HOLD'}: +1.00% 점화가 ${d['target_sell_p']:.2f} 대기]"
+                flag_str = f"🎯 [{es_str or 'HOLD'}: +1.00% 점화가 ${d['target_sell_p']:.2f} 대기]"
         elif 815 <= t <= 1859:
             flag_str = "🔒 금일 신규진입 마감 (관망 · 🔥HA트레일링)"
         else:
@@ -631,7 +669,7 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: 전술 제어반(/settlement) 내 기존 +0.64% / +1.00% 선택 버튼 완전 소각 및 단일 '🔥 HA·트레일링' 모드 고정 렌더링
+# MODIFIED: 전술 제어반(/settlement)에서 매크로 마감 중에도 수동 보유(active_pos_sym) 시 보유·트레일링 상태를 최우선 표출 (Case 50, 57, 77, 85)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     t = now_est.hour * 100 + now_est.minute
@@ -663,58 +701,51 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
 
     if not act_s:
         strike_status_str = "⏸️ 가동 OFF (수동 대기)"
-    elif state_s[8] == "CANCELED_MACRO" or state_l[8] == "CANCELED_MACRO":
-        strike_status_str = "🛑 매크로 방어 (금일 마감)"
-    elif 358 <= t <= 406:
-        w_sym = whip_st.get("target_sym", "") or active_pos_sym
-        if (buy_id_s or buy_id_l) and (state_s[8] == "WHIPSAW_1SH" or state_l[8] == "WHIPSAW_1SH"):
-            strike_status_str = f"🌪️ [{w_sym}] 휩소 1주 매수덫 (${whip_st['buy_price']:.2f})"
-        elif active_pos_sym and (state_s[8] == "WHIPSAW_1SH" or state_l[8] == "WHIPSAW_1SH"):
-            tp_w = state_s[6] if active_pos_sym == "SOXS" else state_l[6]
-            strike_status_str = f"🌪️ [{active_pos_sym}] 휩소 1주 보유 (목표 ${tp_w:.2f})"
-        else:
-            strike_status_str = "🌪️ 휩소 노출 작전중 (03:58 ~ 04:07)"
-    elif 407 <= t <= 814:
-        if active_pos_sym:
-            st_a = state_s if active_pos_sym == "SOXS" else state_l
-            bid_a = buy_id_s if active_pos_sym == "SOXS" else buy_id_l
-            tp_a = float(st_a[6] or 0.0)
-            es_a = str(st_a[8] or "")
-            tr_a = get_trailing_runtime_status(active_pos_sym)
-            if bid_a:
-                if es_a == "PRE_SNIPER":
-                    strike_status_str = f"🪤 [{active_pos_sym}] 1차 매수덫 대기중"
-                else:
-                    strike_status_str = f"⚡ [{active_pos_sym}] 재장전 체결 대기중"
-            elif tr_a.get("armed", False):
-                pk_a = float(tr_a.get("peak_price", 0.0))
-                sp_a = float(tr_a.get("stop_price", tp_a))
-                strike_status_str = f"🔥 [{active_pos_sym}] HA트레일링 (고점 ${pk_a:.2f} / 스탑 ${sp_a:.2f})"
-            elif tp_a > 0.0:
-                strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (점화가 ${tp_a:.2f} 대기)"
+    elif 1559 <= t <= 1601:
+        strike_status_str = "🛑 제로-오버나이트 청산중"
+    elif active_pos_sym:
+        st_a = state_s if active_pos_sym == "SOXS" else state_l
+        bid_a = buy_id_s if active_pos_sym == "SOXS" else buy_id_l
+        tp_a = float(st_a[6] or 0.0)
+        es_a = str(st_a[8] or "")
+        tr_a = get_trailing_runtime_status(active_pos_sym)
+        is_man_a = (not bid_a and es_a not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH"))
+        if bid_a:
+            if es_a == "WHIPSAW_1SH":
+                strike_status_str = f"🌪️ [{active_pos_sym}] 휩소 1주 매수덫 (${whip_st['buy_price']:.2f})"
+            elif es_a == "PRE_SNIPER":
+                strike_status_str = f"🪤 [{active_pos_sym}] 1차 매수덫 대기중"
             else:
-                strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (안전캡 장전중)"
-        elif not bool(state_s[4]) and not bool(state_l[4]):
+                strike_status_str = f"⚡ [{active_pos_sym}] 재장전 체결 대기중"
+        elif es_a == "WHIPSAW_1SH":
+            strike_status_str = f"🌪️ [{active_pos_sym}] 휩소 1주 보유 (목표 ${tp_a:.2f})"
+        elif tr_a.get("armed", False):
+            pk_a = float(tr_a.get("peak_price", 0.0))
+            sp_a = float(tr_a.get("stop_price", tp_a))
+            m_lbl = f"수동·{active_pos_sym}" if is_man_a else active_pos_sym
+            strike_status_str = f"🔥 [{m_lbl}] HA트레일링 (고점 ${pk_a:.2f} / 스탑 ${sp_a:.2f})"
+        elif tp_a > 0.0:
+            if is_man_a:
+                strike_status_str = f"🎯 [수동·{active_pos_sym}] 보유중 (점화가 ${tp_a:.2f} · 2차패스/3차가동)"
+            else:
+                strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (점화가 ${tp_a:.2f} 대기)"
+        else:
+            m_lbl = f"수동·{active_pos_sym}" if is_man_a else active_pos_sym
+            strike_status_str = f"🎯 [{m_lbl}] 보유중 (안전캡 장전중)"
+    elif state_s[8] == "CANCELED_MACRO" or state_l[8] == "CANCELED_MACRO":
+        strike_status_str = "🛑 매크로 방어 (자동출동 마감 · 수동개입시 3차가동)"
+    elif 358 <= t <= 406:
+        strike_status_str = "🌪️ 휩소 노출 작전중 (03:58 ~ 04:07)"
+    elif 407 <= t <= 814:
+        if not bool(state_s[4]) and not bool(state_l[4]):
             strike_status_str = "🔫 프리장 본진 감시중 (04:07 ~ 08:14)"
         else:
             strike_status_str = "🔒 프리장 타격 잠금"
     elif 815 <= t <= 1558:
-        if active_pos_sym:
-            st_a = state_s if active_pos_sym == "SOXS" else state_l
-            tp_a = float(st_a[6] or 0.0)
-            tr_a = get_trailing_runtime_status(active_pos_sym)
-            if tr_a.get("armed", False):
-                pk_a = float(tr_a.get("peak_price", 0.0))
-                sp_a = float(tr_a.get("stop_price", tp_a))
-                strike_status_str = f"🔥 [{active_pos_sym}] HA트레일링 (고점 ${pk_a:.2f} / 스탑 ${sp_a:.2f})"
-            else:
-                strike_status_str = f"🔒 [{active_pos_sym}] 보유분 감시 (점화가 ${tp_a:.2f})"
-        elif t < 930:
+        if t < 930:
             strike_status_str = "🔒 08:15 지표방어 마감 (관망)"
         else:
             strike_status_str = "🔒 정규장 마감 (관망)"
-    elif 1559 <= t <= 1601:
-        strike_status_str = "🛑 제로-오버나이트 청산중"
     elif t >= 1900 or t <= 357:
         if day_sim.get("active", False):
             sim_sym = day_sim.get("symbol", "SOXS")
