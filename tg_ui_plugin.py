@@ -2,7 +2,8 @@
 # FILE: tg_ui_plugin.py
 # 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
 #       양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL), 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)',
-#       3차 손절 후 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL) 및 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 텔레그램 UI 렌더링 모듈
+#       3차 손절 후 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL), 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 및
+#       일~목 18:00 ~ 18:59 EST CME 선물 신세션 개장 대기 텔레그램 UI 렌더링 모듈
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 +0.64% / +1.00% 익절률 선택 버튼 및 데드코드 영구 소각
 # NEW: 단일 '🔥 하이킨 아시 + 고점 트레일링 (점화 +1.00% · 보존 +1.00% · 고점 -0.30% 콜백)' 상태 및 실시간 HA(🕯️양봉/🌑음봉) 표출 반영 (Case 85)
@@ -15,7 +16,8 @@
 # MODIFIED: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫(현재가 > 데이장VWAP 종목 1% 역산) 및 04:07 EST 타임쉴드 렌더링 (Case 79, 80)
 # MODIFIED: 프리장 본진 골든타임을 04:07 ~ 08:14 EST로 하드 락온하고 08:15 EST 거시지표 선제 컷오프 상태를 전 화면(/start, /avwap, /sync, /settlement)에 동기화 (Case 53, 57, 84)
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
-# MODIFIED: 16:00 ~ 18:59 EST 전 구간을 애프터마켓(afterMarket)으로 하드 락온하여 17:00 ~ 18:59 EST 데이마켓 오판 버그 원천 소각 (Case 01, 57)
+# NEW: 초과 Case 57 & Case 90 — 금요일 17:00 EST ~ 일요일 17:59 EST 주말 휴장 확정 및
+#      일~목요일 18:00 ~ 18:59 EST 구간을 '( 🌐 선물 신세션 개장 · 19:00 데이장 대기 )' 및 '⏳ 데이장 대기(19:00 개장 · 선물 가동중)'으로 명확히 분리 표출
 
 import asyncio
 from datetime import datetime, timedelta
@@ -35,7 +37,8 @@ EST_TZ = ZoneInfo("America/New_York")
 NQ_DYNAMIC_FLOOR_UI = 0.8
 
 
-# 메인 메뉴(/start 및 메인 복귀) 화면에 단일 하이킨 아시 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS) 및 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL) 스케줄 반영 (Case 38, 84, 85, 87, 89)
+# 메인 메뉴(/start 및 메인 복귀) 화면에 18:00 선물 신세션 개장, 단일 하이킨 아시 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS) 및
+# 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL) 스케줄 반영 (Case 38, 84, 85, 87, 89, 90)
 async def get_main_menu_text() -> str:
     now_est = datetime.now(EST_TZ)
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
@@ -48,6 +51,7 @@ async def get_main_menu_text() -> str:
         f"🕒 <b>[ 듀얼 스나이퍼 &amp; 하이킨 아시 트레일링 스케줄 ({dst_status_text}) ]</b>\n"
         f"▫️ 익절·복구: <b>🔥 +1.00% 점화 HA·트레일링(🚀NQ급변 바이패스) &amp; 🪤 3차손절 후 최저점 반등 ({comp_mode_str})</b>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
+        "🔹 18:00 ~ 18:59: 🌐 <b>선물 신세션 개장 (19:00 데이장 대기)</b>\n"
         "🔹 19:00 ~ 03:57: 🌙 <b>[모의] 데이장</b>\n"
         "🔹 03:58 ~ 03:59: 🔇 <b>휩소 묵음</b>\n"
         "🔹 03:58 ~ 04:07: 🌪️ <b>'휩소 노출 작전'</b>\n"
@@ -186,8 +190,8 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 83, 84, 85, 86, 87, 89 — 수동 진입(MANUAL) 2차 패스 / 3차 가동,
-#           HA트레일링(🚀HA음봉바이패스 포함) 및 3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 상태 표출
+# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 83, 84, 85, 86, 87, 89, 90 —
+#           일~목 18:00~18:59 EST '⏳ 데이장 대기(19:00 개장 · 선물 가동중)' 및 주말 '🌙 휴장(관망)' 분리 표출
 def build_compact_status(
     symbol: str,
     state_tuple: tuple,
@@ -257,7 +261,12 @@ def build_compact_status(
             state_text = "⚡ 재장전 매수 체결대기"
     elif opp_qty > 0 or bool(opp_buy_id):
         state_text = f"🔒 대기({opp_sym} 운용중)"
-    elif entry_session == "CANCELED_MACRO":
+    elif current_session == "HOLIDAY":
+        state_text = "🌙 휴장(관망)"
+    elif current_session == "cmeOpenWait" or (1800 <= est_time_int <= 1859 and current_session != "HOLIDAY"):
+        # NEW: 초과 Case 90 — 일~목 18:00 ~ 18:59 EST CME 선물 신세션 개장 및 19:00 데이장 대기 상태 표출
+        state_text = "⏳ 데이장 대기(19:00 개장 · 선물 가동중)"
+    elif entry_session == "CANCELED_MACRO" and (400 <= est_time_int <= 1759):
         state_text = "🛑 매크로방어(자동마감)"
     elif 358 <= est_time_int <= 406:
         if whip_st.get("target_sym") == symbol and whip_st.get("locked_vwap", 0.0) > 0.0:
@@ -288,7 +297,7 @@ def build_compact_status(
         state_text = "🔒 08:15 지표방어 마감(관망)"
     elif 930 <= est_time_int < 1600:
         state_text = "🔒 마감(관망)"
-    elif 1600 <= est_time_int <= 1859:
+    elif 1600 <= est_time_int <= 1759:
         state_text = "🛑 마감(관망)"
     else:
         state_text = "🛑 장외대기"
@@ -296,17 +305,29 @@ def build_compact_status(
     return f"{sym_icon} <b>{symbol}</b> <code>[{state_flag}]</code> {state_text}"
 
 
-# MODIFIED: 수동 진입(MANUAL) 2차 과열방어 패스 · 3차 수동역행방어, NQ=F 10분/3분 변화율(🚀 NQ_VEL_BYPASS) 및
-#           3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 동적 렌더링 (Case 13, 38, 47, 50, 67, 83, 84, 85, 86, 87, 89)
+# MODIFIED: 초과 Case 90 — 일~목 18:00~18:59 EST '( 🌐 선물 신세션 개장 · 19:00 데이장 대기 )' 헤더 분리,
+#           신세션 개장 시 전일/금요일 CANCELED_MACRO 잠금 자가 치유 및 주말 휴장 경계(금 17:00 ~ 일 17:59) 락온
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
+    wk = now_est.weekday()  # Mon=0 ... Fri=4, Sat=5, Sun=6
     t = now_est.hour * 100 + now_est.minute
-    is_day_time = (t >= 1900 or t <= 359)
-    is_whipsaw_time = (358 <= t <= 406)
-    is_pre_sniper_time = (407 <= t <= 814)
-    is_pre_cutoff_time = (815 <= t <= 929)
 
-    if is_whipsaw_time:
+    is_weekend_closed = (wk == 4 and t >= 1700) or (wk == 5) or (wk == 6 and t < 1800)
+    is_cme_open_wait = (not is_weekend_closed) and (1800 <= t <= 1859)
+    is_day_time = (not is_weekend_closed) and (t >= 1900 or t <= 359)
+    is_whipsaw_time = (not is_weekend_closed) and (358 <= t <= 406)
+    is_pre_sniper_time = (not is_weekend_closed) and (407 <= t <= 814)
+    is_pre_cutoff_time = (not is_weekend_closed) and (815 <= t <= 929)
+
+    if is_weekend_closed:
+        session_name_ui = "HOLIDAY"
+        market_header = "( <b>🌙 주말/휴장일</b> )"
+        pre_window_label = "(주말 휴장 · 일 18:00 선물 / 19:00 데이장 개장)"
+    elif is_cme_open_wait:
+        session_name_ui = "cmeOpenWait"
+        market_header = "( <b>🌐 선물 신세션 개장 · 19:00 데이장 대기</b> )"
+        pre_window_label = "(03:58 휩소1주 · 04:07 ~ 08:14 본진 대기)"
+    elif is_whipsaw_time:
         session_name_ui = "preMarket" if t >= 400 else "dayMarket"
         market_header = "( <b>🌪️ 03:58 ~ 04:07 휩소작전</b> )"
         pre_window_label = "(03:58 ~ 04:07 휩소1주 · 04:07 본진)"
@@ -322,7 +343,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         session_name_ui = "regularMarket"
         market_header = "( <b>🔥 정규장 · 신규진입 마감</b> )"
         pre_window_label = "(04:07 ~ 08:14 · 출동 마감)"
-    elif 1600 <= t <= 1859:
+    elif 1600 <= t <= 1759:
         session_name_ui = "afterMarket"
         market_header = "( <b>🛑 애프터마켓</b> )"
         pre_window_label = "(04:07 ~ 08:14 · 출동 마감)"
@@ -335,9 +356,15 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         is_open, _, sess_name, _ = await asyncio.wait_for(api_client.is_market_open(), timeout=3.0)
         if not is_open:
             if sess_name and "HOLIDAY" in sess_name:
+                session_name_ui = "HOLIDAY"
                 market_header = "( <b>🌙 주말/휴장일</b> )"
-            elif not (1600 <= t <= 1859):
-                market_header = "( <b>🌙 시스템 대기</b> )"
+            elif sess_name and "STANDBY" in sess_name:
+                if is_cme_open_wait:
+                    session_name_ui = "cmeOpenWait"
+                    market_header = "( <b>🌐 선물 신세션 개장 · 19:00 데이장 대기</b> )"
+                    pre_window_label = "(03:58 휩소1주 · 04:07 ~ 08:14 본진 대기)"
+                elif 1700 <= t <= 1759:
+                    market_header = "( <b>🧹 17:00 정산 · 18:00 선물 개장 대기</b> )"
     except Exception:
         pass
 
@@ -346,7 +373,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
     nq_curr_amp = (max(0.0, ((nq_c - nq_l) / nq_l * 100.0)) if (nq_l > 0.0 and nq_c > 0.0) else 0.0)
 
-    # NEW: 초과 Case 89 — NQ=F 10분/3분 단기 변화율(±0.20%) 급등락 상태 및 HA음봉 바이패스 작동 방향 표출
+    # 초과 Case 89 — NQ=F 10분/3분 단기 변화율(±0.20%) 급등락 상태 및 HA음봉 바이패스 작동 방향 표출
     vel_th = AssassinLedger.NQ_VELOCITY_SURGE_PCT
     if min(nq_vel_10m, nq_vel_3m) <= -vel_th:
         nq_vel_badge = f"🚀🐻SOXS 유리급락(≤-{vel_th:.2f}% · HA음봉 바이패스)"
@@ -375,7 +402,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         "pre_h": 0.0, "pre_l": 0.0, "pre_amp": 0.0, "pre_vwap": 0.0, "pre_body": 0.0,
         "reg_h": 0.0, "reg_l": 0.0, "reg_amp": 0.0, "reg_vwap": 0.0, "reg_body": 0.0,
     }
-    if session_name_ui == "dayMarket":
+    if session_name_ui in ("dayMarket", "cmeOpenWait", "HOLIDAY"):
         sess_s = dict(empty_sess)
         sess_l = dict(empty_sess)
     else:
@@ -402,6 +429,30 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         AssassinLedger.get_buy_order_id("SOXS"),
         AssassinLedger.get_buy_order_id("SOXL"),
     )
+
+    # NEW: 초과 Case 90 — 18:00 EST 선물 신세션 또는 데이장(18:00~03:57 EST) 중 미보유·무주문·비과열(nq_amp < 2.0%) 상태에서
+    #      전일/금요일에 남아 있던 CANCELED_MACRO 잠금 잔재 감지 시 즉시 자가 치유(Self-Healing) 클리어
+    if (
+        (is_cme_open_wait or is_day_time)
+        and nq_amp < 2.0
+        and qty_s <= 0.0
+        and qty_l <= 0.0
+        and not buy_id_s
+        and not buy_id_l
+        and (state_s[8] == "CANCELED_MACRO" or state_l[8] == "CANCELED_MACRO")
+    ):
+        for heal_sym in ("SOXS", "SOXL"):
+            await AssassinLedger.save_state(
+                heal_sym,
+                is_session_done=False,
+                entry_session="",
+                whipsaw_target_price=0.0,
+            )
+        state_s, state_l = await asyncio.gather(
+            AssassinLedger.get_state("SOXS"),
+            AssassinLedger.get_state("SOXL"),
+        )
+
     is_comp_s = await AssassinLedger.get_is_compound("SOXS")
     budget_s = float(state_s[1] or 100.0)
     comp_label_str = "통합복리" if is_comp_s else "단리"
@@ -571,11 +622,17 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
 async def build_sync_board(api_client) -> str:
     now_est = datetime.now(EST_TZ)
+    wk = now_est.weekday()
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
     dst_str = "🌞 서머타임" if is_dst else "❄️ 서머타임 OFF"
     t = now_est.hour * 100 + now_est.minute
+    is_weekend_closed = (wk == 4 and t >= 1700) or (wk == 5) or (wk == 6 and t < 1800)
 
-    if 358 <= t <= 406:
+    if is_weekend_closed:
+        market_state = "🌙 주말/휴장일 (일 18:00 선물 / 19:00 데이장 개장)"
+    elif 1800 <= t <= 1859:
+        market_state = "🌐 선물 신세션 개장 · 19:00 데이장 대기"
+    elif 358 <= t <= 406:
         market_state = "🌪️ 03:58~04:07 듀얼 휩소 1주 작전"
     elif 407 <= t <= 814:
         market_state = "🔫 프리장 양방향 대칭 & 최저점반등 스나이퍼 가동"
@@ -583,7 +640,7 @@ async def build_sync_board(api_client) -> str:
         market_state = "🔒 프리장 후반 (08:15 지표방어 마감)"
     elif 930 <= t <= 1559:
         market_state = "🔥 정규장 (신규매수 마감)"
-    elif 1600 <= t <= 1859:
+    elif 1600 <= t <= 1759:
         market_state = "🛑 애프터마켓 (신규매수 마감)"
     else:
         market_state = "🌙 데이마켓 (🔔[모의] 대칭 2단계 추격)"
@@ -692,7 +749,11 @@ async def build_sync_board(api_client) -> str:
             lp_b = float(bt_st.get("post_stop_low", 0.0))
             rp_b = float(bt_st.get("rebound_trig_price", 0.0))
             flag_str = f"🪤 [STAGE3_STOP_TRACK: 손절 ${sp_b:.2f} ➔ 최저 ${lp_b:.2f} / +0.30% 반등 ${rp_b:.2f} 대기]"
-        elif 815 <= t <= 1859:
+        elif is_weekend_closed:
+            flag_str = "🌙 주말 휴장 (일 18:00 선물 / 19:00 데이장 개장 대기)"
+        elif 1800 <= t <= 1859:
+            flag_str = "⏳ 데이장 개장 대기 (19:00 개장 · 🌐선물 신세션 가동중)"
+        elif 815 <= t <= 1759:
             flag_str = "🔒 금일 신규진입 마감 (관망 · 🔥HA트레일링)"
         else:
             flag_str = f"⏳ 대기 ({sym}≤30 &amp; {opp_sym}≥79.9 · 🔥HA트레일링 &amp; 🚀NQ급변바이패스)"
@@ -718,10 +779,13 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: 전술 제어반(/settlement)에서 수동 보유(active_pos_sym), 🚀 NQ_VEL_BYPASS 및 3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 상태 표출 (Case 50, 57, 77, 85, 87, 89)
+# MODIFIED: 전술 제어반(/settlement)에서 일~목 18:00~18:59 EST 선물 신세션 대기, 주말 휴장,
+#           수동 보유(active_pos_sym), 🚀 NQ_VEL_BYPASS 및 3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 상태 표출 (Case 50, 57, 77, 85, 87, 89, 90)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
+    wk = now_est.weekday()
     t = now_est.hour * 100 + now_est.minute
+    is_weekend_closed = (wk == 4 and t >= 1700) or (wk == 5) or (wk == 6 and t < 1800)
 
     state_s, state_l = await asyncio.gather(
         AssassinLedger.get_state("SOXS"),
@@ -751,7 +815,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
 
     if not act_s:
         strike_status_str = "⏸️ 가동 OFF (수동 대기)"
-    elif 1559 <= t <= 1601:
+    elif 1559 <= t <= 1601 and not is_weekend_closed:
         strike_status_str = "🛑 제로-오버나이트 청산중"
     elif active_pos_sym:
         st_a = state_s if active_pos_sym == "SOXS" else state_l
@@ -783,7 +847,11 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
         else:
             m_lbl = f"수동·{active_pos_sym}" if is_man_a else active_pos_sym
             strike_status_str = f"🎯 [{m_lbl}] 보유중 (안전캡 장전중)"
-    elif state_s[8] == "CANCELED_MACRO" or state_l[8] == "CANCELED_MACRO":
+    elif is_weekend_closed:
+        strike_status_str = "🌙 주말 휴장 (일 18:00 선물 / 19:00 데이장 개장)"
+    elif 1800 <= t <= 1859:
+        strike_status_str = "🌐 선물 신세션 개장 · 19:00 데이장 대기중"
+    elif (state_s[8] == "CANCELED_MACRO" or state_l[8] == "CANCELED_MACRO") and (400 <= t <= 1759):
         strike_status_str = "🛑 매크로 과열방어 (자동출동 마감 · 수동개입시 3차가동)"
     elif 358 <= t <= 406:
         strike_status_str = "🌪️ 휩소 노출 작전중 (03:58 ~ 04:07)"

@@ -1,7 +1,7 @@
 # =====================================================================
 # FILE: quant_engine.py
 # 목적: 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 통합 시드 원장,
-#       NQ=F 당일 진폭 + 최근 10분/3분 단기 변화율(Velocity) 15초 캐싱 및
+#       NQ=F 18:00 EST 신세션 하드 컷오프 기반 당일 진폭 + 최근 10분/3분 단기 변화율(Velocity) 15초 캐싱 및
 #       Wilder's RSI(14) + 하이킨 아시(Heikin-Ashi) 1분봉 벡터/틱 합성 엔진
 # =====================================================================
 # MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
@@ -9,7 +9,8 @@
 # NEW: 200봉 전체 100% 벡터화 하이킨 아시(Heikin-Ashi, ewm alpha=0.5) 기저 추출 및 O(1) 실시간 틱 하이킨 아시 양봉 판별식(compute_realtime_tick_heikin_ashi) 탑재 (Case 85)
 # MODIFIED: 기존 +0.64% / +1.00% 선택 모드를 전면 폐기하고 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 상수로 100% 단일화 (Case 85)
 # NEW: 초과 Case 61 & Case 89 — MacroDataCache 갱신 주기를 15.0초로 가속하고 NQ=F 최근 10분 변화율(nq_vel_10m) 및 3분 변화율(nq_vel_3m) 벡터 산출 탑재 (🚀 NQ_VEL_BYPASS 지원)
-# MODIFIED: NQ=F 45분 세션 갭(Gap) 기준 당일 세션 분리 및 타격 시 강제 갱신 파이프라인 결속 (Case 61, 62)
+# NEW: 초과 Case 62 & Case 90 — CME 나스닥 100 선물(NQ=F) 18:00 EST 신세션 경계 하드 컷오프(get_cme_session_window_est) 및 fast_info 결합으로
+#      일요일 18:00 EST(월요일 오전 07:00 KST) 신세션 개장 시 금요일 과열 진폭(3.27% 등)이 이월되는 현상 원천 소각
 # MODIFIED: 듀얼 스나이퍼 화이트리스트 ALLOWED_SYMBOLS = ("SOXS", "SOXL") 확장 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76)
 # MODIFIED: lock_all_symbols_macro 호출 시 수동 보유 종목(MANUAL) 표식 보존 및 과열장(NQ>=2.0%) 수동 청산 후 자동 매매 오작동 해금 차단 (Case 50, 66, 82)
@@ -22,11 +23,50 @@ import asyncio
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from toss_api import GlobalThrottle
 
 EST_TZ = ZoneInfo("America/New_York")
+
+
+def get_cme_session_window_est(now_est: datetime = None) -> tuple[bool, datetime]:
+    """
+    현재 미국 동부 시각(now_est) 기준으로 CME 나스닥 100 선물(NQ=F) 시장 개장 여부(is_cme_open)와
+    현재 활성 선물 세션의 시작 시각(nq_session_start_est, 18:00:00 EST)을 반환합니다 (초과 Case 62, 90).
+    - 개장 구간: 일요일 18:00 EST ~ 금요일 16:59 EST (단, 월~목 17:00 ~ 17:59 EST 일일 점검 휴장 제외)
+    - 주말 휴장: 금요일 17:00 EST ~ 일요일 17:59 EST
+    """
+    if now_est is None:
+        now_est = datetime.now(EST_TZ)
+    wk = now_est.weekday()  # Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+    est_hm = now_est.hour * 100 + now_est.minute
+
+    # 1) 주말 휴장: 금요일 17:00 이후, 토요일 종일, 일요일 18:00 이전
+    if (wk == 4 and est_hm >= 1700) or (wk == 5) or (wk == 6 and est_hm < 1800):
+        days_back = (wk - 3) if wk >= 4 else (wk + 4)
+        last_start = (now_est - timedelta(days=days_back)).replace(
+            hour=18, minute=0, second=0, microsecond=0
+        )
+        return False, last_start
+
+    # 2) 평일(월~목) 17:00 ~ 17:59 EST 일일 점검 휴장 (1시간)
+    if wk in (0, 1, 2, 3) and (1700 <= est_hm < 1800):
+        last_start = (now_est - timedelta(days=1)).replace(
+            hour=18, minute=0, second=0, microsecond=0
+        )
+        return False, last_start
+
+    # 3) 일~목 18:00 ~ 23:59 EST: 당일 18:00:00 EST에 개장한 신세션 활성 중
+    if est_hm >= 1800:
+        cur_start = now_est.replace(hour=18, minute=0, second=0, microsecond=0)
+        return True, cur_start
+
+    # 4) 월~금 00:00 ~ 16:59 EST: 전일 18:00:00 EST에 개장한 현세션 활성 중
+    cur_start = (now_est - timedelta(days=1)).replace(
+        hour=18, minute=0, second=0, microsecond=0
+    )
+    return True, cur_start
 
 
 def calculate_rsi_1m(
@@ -231,10 +271,11 @@ def compute_realtime_tick_heikin_ashi(
 
 
 class MacroDataCache:
-    # MODIFIED: 초과 Case 61 & Case 89 — 당일 진폭(curr, high, low)에 더해 최근 10분 변화율(vel_10m) 및 3분 변화율(vel_3m)을
-    #           15.0초 주기로 캐싱하여 고점 트레일링 중 하이킨 아시 음봉 바이패스(🚀 NQ_VEL_BYPASS)를 실시간 지원
+    # MODIFIED: 초과 Case 61, 62, 89, 90 — CME 18:00 EST 신세션 하드 컷오프(_nq_session_id)를 적용하여
+    #           금요일/전일 진폭 이월을 원천 차단하고, 당일 진폭 및 최근 10분/3분 변화율을 15.0초 주기로 캐싱
     # 튜플 구조: (curr_val, high_val, low_val, updated_ts, nq_vel_10m, nq_vel_3m)
     _nq_cache_data = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    _nq_session_id = ""
     _nq_cache_lock = asyncio.Lock()
 
     @classmethod
@@ -247,14 +288,44 @@ class MacroDataCache:
     async def _refresh_cache_if_needed(cls, force_refresh: bool = False):
         async with cls._nq_cache_lock:
             now = time.time()
-            need_refresh = force_refresh or cls._is_refresh_needed(now, cls._nq_cache_data[3])
+            now_est = datetime.now(EST_TZ)
+            is_cme_open, nq_session_start_est = get_cme_session_window_est(now_est)
+            cur_sess_id = nq_session_start_est.strftime("%Y-%m-%d_%H%M")
+
+            # NEW: 초과 Case 90 — 18:00 EST CME 선물 신세션 롤오버 감지 시 이전 세션(금요일/전일) 캐시 즉시 0점 소각
+            session_rolled = (cls._nq_session_id != cur_sess_id)
+            if session_rolled:
+                cls._nq_session_id = cur_sess_id
+                cls._nq_cache_data = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+            need_refresh = force_refresh or session_rolled or cls._is_refresh_needed(now, cls._nq_cache_data[3])
             if not need_refresh:
                 return
 
             def _fetch():
                 tkr = yf.Ticker("NQ=F")
-                df = tkr.history(period="5d", interval="1m")
+                fast_last_p = 0.0
+                try:
+                    fi = getattr(tkr, "fast_info", None)
+                    if fi is not None:
+                        raw_lp = fi.get("lastPrice") if hasattr(fi, "get") else getattr(fi, "last_price", 0.0)
+                        if raw_lp is not None and float(raw_lp) > 0.0:
+                            fast_last_p = float(raw_lp)
+                except Exception:
+                    fast_last_p = 0.0
+
+                df = None
+                try:
+                    df = tkr.history(period="2d", interval="1m", prepost=True)
+                except Exception:
+                    df = None
+
                 if df is None or df.empty:
+                    df = tkr.history(period="5d", interval="1m", prepost=True)
+
+                if df is None or df.empty:
+                    if fast_last_p > 0.0:
+                        return fast_last_p, fast_last_p, fast_last_p, 0.0, 0.0
                     return 0.0, 0.0, 0.0, 0.0, 0.0
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
@@ -267,6 +338,8 @@ class MacroDataCache:
 
                 df = df[df["Close"] > 0.0].copy()
                 if df.empty:
+                    if fast_last_p > 0.0:
+                        return fast_last_p, fast_last_p, fast_last_p, 0.0, 0.0
                     return 0.0, 0.0, 0.0, 0.0, 0.0
 
                 if "Open" in df.columns:
@@ -274,23 +347,49 @@ class MacroDataCache:
                 else:
                     df["Open"] = df["Close"]
 
-                # Case 62: 45분 이상 휴장 갭(Gap) 기준 당일 세션 분리로 자정 롤오버 진폭 왜곡 방어
-                time_diffs = df.index.to_series().diff()
-                gaps = time_diffs[time_diffs >= pd.Timedelta(minutes=45)]
-                if not gaps.empty:
-                    last_gap_time = gaps.index[-1]
-                    df_session = df[df.index >= last_gap_time].copy()
-                else:
-                    df_session = df.copy()
+                # NEW: 초과 Case 62 & Case 90 — 현재 활성 CME 선물 세션 시작 시각(18:00:00 EST) 이전의
+                #      전일/금요일 캔들을 100% 강제 절삭!
+                df_session = df[df.index >= nq_session_start_est].copy()
+
+                if df_session.empty:
+                    if is_cme_open:
+                        # 일~목 18:00 ~ 18:15 EST 신세션 개장 직후 야후 1분봉 10분 지연으로 인해
+                        # 신세션 1분봉이 아직 도착하지 않은 경우, 금요일 진폭(3.27% 등) 이월을 원천 차단하고
+                        # 최신가 단일 기준(진폭 0.00%)으로 새 세션을 깨끗하게 초기화!
+                        seed_p = fast_last_p if fast_last_p > 0.0 else float(df["Close"].iloc[-1])
+                        return seed_p, seed_p, seed_p, 0.0, 0.0
+                    else:
+                        # 주말 또는 17:00~17:59 휴장 중일 때는 직전 마지막 세션(45분 갭 기준) 표시
+                        time_diffs = df.index.to_series().diff()
+                        gaps = time_diffs[time_diffs >= pd.Timedelta(minutes=45)]
+                        if not gaps.empty:
+                            df_session = df[df.index >= gaps.index[-1]].copy()
+                        else:
+                            df_session = df.copy()
 
                 if df_session.empty:
                     return 0.0, 0.0, 0.0, 0.0, 0.0
+
+                # 세션 내부에 45분 이상 추가 휴장 갭이 존재하는 경우 최신 구간만 분리 (Case 62)
+                time_diffs_inner = df_session.index.to_series().diff()
+                gaps_inner = time_diffs_inner[time_diffs_inner >= pd.Timedelta(minutes=45)]
+                if not gaps_inner.empty:
+                    df_session = df_session[df_session.index >= gaps_inner.index[-1]].copy()
 
                 curr_val = float(df_session["Close"].iloc[-1])
                 high_val = float(df_session["High"].max())
                 low_val = float(df_session["Low"].min())
 
-                # NEW: 초과 Case 89 — 최근 10분 변화율(nq_vel_10m) 및 3분 단기 변화율(nq_vel_3m) 벡터 산출
+                # CME 개장 중 fast_info 최신 시세가 유효하면 1분봉 지연분을 실시간 보정
+                if is_cme_open and fast_last_p > 0.0 and curr_val > 0.0:
+                    if abs(fast_last_p - curr_val) / curr_val < 0.05:
+                        curr_val = fast_last_p
+                        if fast_last_p > high_val:
+                            high_val = fast_last_p
+                        if low_val <= 0.0 or fast_last_p < low_val:
+                            low_val = fast_last_p
+
+                # 초과 Case 89 — 최근 10분 변화율(nq_vel_10m) 및 3분 단기 변화율(nq_vel_3m) 벡터 산출
                 first_open = float(df_session["Open"].iloc[0]) or float(df_session["Close"].iloc[0])
                 ref_10m = float(df_session["Close"].iloc[-11]) if len(df_session) >= 11 else first_open
                 ref_3m = float(df_session["Close"].iloc[-4]) if len(df_session) >= 4 else first_open
@@ -361,7 +460,7 @@ class AssassinLedger:
     TRAIL_FLOOR_LOCK_RATE = 1.00          # 트레일링 점화 즉시 최소 +1.00% 익절 보존선 하드 락온
     TRAIL_DROP_CALLBACK_PCT = 0.30        # 최고가(Peak) 대비 -0.30% 콜백 발생 시 즉시 익절 스윕
     TRAIL_SAFETY_CAP_RATE = 5.00          # 매수 체결 직후 거래소에 선장전하는 상단 안전 캡 (+5.00% LIMIT)
-    NQ_VELOCITY_SURGE_PCT = 0.20          # NEW: NQ=F 10분/3분 변화율 ±0.20% 이상 급등락 시 HA음봉 바이패스 임계치 (Case 89)
+    NQ_VELOCITY_SURGE_PCT = 0.20          # NQ=F 10분/3분 변화율 ±0.20% 이상 급등락 시 HA음봉 바이패스 임계치 (Case 89)
     ROUND_TRIP_COMM_PCT = 0.14
     ONE_WAY_COMM_RATE = 0.0007
     MIN_BUDGET_FLOOR = 10.0
