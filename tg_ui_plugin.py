@@ -2,13 +2,13 @@
 # FILE: tg_ui_plugin.py
 # 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
 #       양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL), 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)',
-#       3차 손절 후 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL), 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 및
-#       일~목 18:00 ~ 18:59 EST CME 선물 신세션 개장 대기 텔레그램 UI 렌더링 모듈
+#       3차 손절 후 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL), 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫,
+#       일~목 18:00 ~ 18:59 EST CME 선물 신세션 개장 대기 및 토스 QQQ 0.0초 실시간 변화율 텔레그램 UI 렌더링 모듈
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 +0.64% / +1.00% 익절률 선택 버튼 및 데드코드 영구 소각
 # NEW: 단일 '🔥 하이킨 아시 + 고점 트레일링 (점화 +1.00% · 보존 +1.00% · 고점 -0.30% 콜백)' 상태 및 실시간 HA(🕯️양봉/🌑음봉) 표출 반영 (Case 85)
-# NEW: 초과 Case 89 — 관제탑(/avwap)·지시서(/sync)·제어반(/settlement)에 NQ=F 최근 10분/3분 단기 변화율(Velocity) 및
-#      고점 추적 중 하이킨 아시 음봉 바이패스(🚀HA음봉바이패스) 작동 상태 실시간 표출 결속 (Case 13, 57, 89)
+# NEW: 초과 Case 89 & Case 91 — 관제탑(/avwap)·지시서(/sync)·제어반(/settlement)에 토스 Open API QQQ 0.0초 실시간(폴백 NQ선물)
+#      최근 10분/3분 단기 변화율(Velocity) 소스 배지 및 고점 추적 중 하이킨 아시 음봉 바이패스(🚀HA음봉바이패스) 작동 상태 실시간 표출 결속 (Case 13, 57, 89, 91)
 # NEW: 수동 진입(MANUAL) 보유 시 '2차 과열방어 패스 · 3차 역행방어 가동' 상태 및 진입 기준 지수 표출 동기화 (Case 50, 66, 67, 86)
 # NEW: 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 안전망 손절 후 최저점 역트레일링 추적(손절가/최저점/+0.30% 반등목표가) 상태 표출 반영 (Case 13, 57, 87)
 # NEW: RSI >= 79.0 프리-클라이맥스 0.4초 고주파 부스터 및 RSI >= 79.9 (80.0 클라이맥스 인지) 상태 표출 반영 (Case 28, 81, 83)
@@ -16,8 +16,8 @@
 # MODIFIED: 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫(현재가 > 데이장VWAP 종목 1% 역산) 및 04:07 EST 타임쉴드 렌더링 (Case 79, 80)
 # MODIFIED: 프리장 본진 골든타임을 04:07 ~ 08:14 EST로 하드 락온하고 08:15 EST 거시지표 선제 컷오프 상태를 전 화면(/start, /avwap, /sync, /settlement)에 동기화 (Case 53, 57, 84)
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 및 한글 치환 (Case 17)
-# NEW: 초과 Case 57 & Case 90 — 금요일 17:00 EST ~ 일요일 17:59 EST 주말 휴장 확정 및
-#      일~목요일 18:00 ~ 18:59 EST 구간을 '( 🌐 선물 신세션 개장 · 19:00 데이장 대기 )' 및 '⏳ 데이장 대기(19:00 개장 · 선물 가동중)'으로 명확히 분리 표출
+# MODIFIED: 초과 Case 57 & Case 90 — 금요일 17:00 EST ~ 일요일 17:59 EST 주말 휴장 확정 및
+#           일~목요일 18:00 ~ 18:59 EST 구간을 '( 🌐 선물 신세션 개장 · 19:00 데이장 대기 )' 및 '⏳ 데이장 대기(19:00 개장 · 선물 가동중)'으로 명확히 분리 표출
 
 import asyncio
 from datetime import datetime, timedelta
@@ -38,7 +38,7 @@ NQ_DYNAMIC_FLOOR_UI = 0.8
 
 
 # 메인 메뉴(/start 및 메인 복귀) 화면에 18:00 선물 신세션 개장, 단일 하이킨 아시 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS) 및
-# 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL) 스케줄 반영 (Case 38, 84, 85, 87, 89, 90)
+# 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL) 스케줄 반영 (Case 38, 84, 85, 87, 89, 90, 91)
 async def get_main_menu_text() -> str:
     now_est = datetime.now(EST_TZ)
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
@@ -49,7 +49,7 @@ async def get_main_menu_text() -> str:
 
     return (
         f"🕒 <b>[ 듀얼 스나이퍼 &amp; 하이킨 아시 트레일링 스케줄 ({dst_status_text}) ]</b>\n"
-        f"▫️ 익절·복구: <b>🔥 +1.00% 점화 HA·트레일링(🚀NQ급변 바이패스) &amp; 🪤 3차손절 후 최저점 반등 ({comp_mode_str})</b>\n"
+        f"▫️ 익절·복구: <b>🔥 +1.00% 점화 HA·트레일링(🚀QQQ실시간 급변 바이패스) &amp; 🪤 3차손절 후 최저점 반등 ({comp_mode_str})</b>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
         "🔹 18:00 ~ 18:59: 🌐 <b>선물 신세션 개장 (19:00 데이장 대기)</b>\n"
         "🔹 19:00 ~ 03:57: 🌙 <b>[모의] 데이장</b>\n"
@@ -190,7 +190,7 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 83, 84, 85, 86, 87, 89, 90 —
+# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 83, 84, 85, 86, 87, 89, 90, 91 —
 #           일~목 18:00~18:59 EST '⏳ 데이장 대기(19:00 개장 · 선물 가동중)' 및 주말 '🌙 휴장(관망)' 분리 표출
 def build_compact_status(
     symbol: str,
@@ -264,7 +264,7 @@ def build_compact_status(
     elif current_session == "HOLIDAY":
         state_text = "🌙 휴장(관망)"
     elif current_session == "cmeOpenWait" or (1800 <= est_time_int <= 1859 and current_session != "HOLIDAY"):
-        # NEW: 초과 Case 90 — 일~목 18:00 ~ 18:59 EST CME 선물 신세션 개장 및 19:00 데이장 대기 상태 표출
+        # 초과 Case 90 — 일~목 18:00 ~ 18:59 EST CME 선물 신세션 개장 및 19:00 데이장 대기 상태 표출
         state_text = "⏳ 데이장 대기(19:00 개장 · 선물 가동중)"
     elif entry_session == "CANCELED_MACRO" and (400 <= est_time_int <= 1759):
         state_text = "🛑 매크로방어(자동마감)"
@@ -305,8 +305,8 @@ def build_compact_status(
     return f"{sym_icon} <b>{symbol}</b> <code>[{state_flag}]</code> {state_text}"
 
 
-# MODIFIED: 초과 Case 90 — 일~목 18:00~18:59 EST '( 🌐 선물 신세션 개장 · 19:00 데이장 대기 )' 헤더 분리,
-#           신세션 개장 시 전일/금요일 CANCELED_MACRO 잠금 자가 치유 및 주말 휴장 경계(금 17:00 ~ 일 17:59) 락온
+# MODIFIED: 초과 Case 90 & Case 91 — 일~목 18:00~18:59 EST '( 🌐 선물 신세션 개장 · 19:00 데이장 대기 )' 헤더 분리,
+#           fast_info 당일 실제 고/저가 병합 진폭 및 토스 QQQ 0.0초 실시간 변화율 소스 배지(QQQ실시간/NQ선물) 표출
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     wk = now_est.weekday()  # Mon=0 ... Fri=4, Sat=5, Sun=6
@@ -370,10 +370,11 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     nq_c, nq_h, nq_l = await MacroDataCache.get_cached_nq_data()
     nq_vel_10m, nq_vel_3m = await MacroDataCache.get_cached_nq_velocity()
+    nq_vel_src = MacroDataCache.get_cached_nq_velocity_source()
     nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
     nq_curr_amp = (max(0.0, ((nq_c - nq_l) / nq_l * 100.0)) if (nq_l > 0.0 and nq_c > 0.0) else 0.0)
 
-    # 초과 Case 89 — NQ=F 10분/3분 단기 변화율(±0.20%) 급등락 상태 및 HA음봉 바이패스 작동 방향 표출
+    # 초과 Case 89 & Case 91 — 토스 QQQ 0.0초 실시간(폴백 NQ선물) 10분/3분 단기 변화율(±0.20%) 급등락 상태 및 HA음봉 바이패스 작동 방향 표출
     vel_th = AssassinLedger.NQ_VELOCITY_SURGE_PCT
     if min(nq_vel_10m, nq_vel_3m) <= -vel_th:
         nq_vel_badge = f"🚀🐻SOXS 유리급락(≤-{vel_th:.2f}% · HA음봉 바이패스)"
@@ -430,8 +431,8 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         AssassinLedger.get_buy_order_id("SOXL"),
     )
 
-    # NEW: 초과 Case 90 — 18:00 EST 선물 신세션 또는 데이장(18:00~03:57 EST) 중 미보유·무주문·비과열(nq_amp < 2.0%) 상태에서
-    #      전일/금요일에 남아 있던 CANCELED_MACRO 잠금 잔재 감지 시 즉시 자가 치유(Self-Healing) 클리어
+    # 초과 Case 90 — 18:00 EST 선물 신세션 또는 데이장(18:00~03:57 EST) 중 미보유·무주문·비과열(nq_amp < 2.0%) 상태에서
+    # 전일/금요일에 남아 있던 CANCELED_MACRO 잠금 잔재 감지 시 즉시 자가 치유(Self-Healing) 클리어
     if (
         (is_cme_open_wait or is_day_time)
         and nq_amp < 2.0
@@ -576,11 +577,11 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     text = f"""📡 <b>[듀얼 스나이퍼 레이더]</b> {market_header}
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
-🌐 <b>나스닥 100 선물 (3단 매크로 방어 &amp; NQ급변 바이패스)</b>
+🌐 <b>나스닥 100 선물 (3단 매크로 방어 &amp; QQQ실시간 급변 바이패스)</b>
 ▫️ 고가: <code>{nq_h:.2f}</code> | 저가: <code>{nq_l:.2f}</code>
 ▫️ 현재: <code>{nq_c:.2f}</code> | 총 진폭: <code>{nq_amp:.2f}%</code>
 ▫️ 저가기준 진폭: <code>{nq_curr_amp:.2f}%</code>
-▫️ 단기 변화율: <code>10분 {nq_vel_10m:+.2f}% / 3분 {nq_vel_3m:+.2f}%</code>
+▫️ 단기 변화율({nq_vel_src}): <code>10분 {nq_vel_10m:+.2f}% / 3분 {nq_vel_3m:+.2f}%</code>
 ▫️ HA음봉 바이패스: <code>{nq_vel_badge}</code>
 ▫️ 1·2차 방어: <code>{macro_1st_str}</code>{macro_3rd_line}
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
@@ -606,7 +607,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
 {status_s}
 {status_l}
-💰 <b>{comp_label_str} 시드:</b> <code>${budget_s:,.2f}</code> (<code>🔥 HA·트레일링 &amp; 🚀 NQ급변바이패스</code>)
+💰 <b>{comp_label_str} 시드:</b> <code>${budget_s:,.2f}</code> (<code>🔥 HA·트레일링 &amp; 🚀 QQQ실시간바이패스</code>)
 
 ⏱️ 갱신: <code>{scan_time} EST</code>"""
 
@@ -756,7 +757,7 @@ async def build_sync_board(api_client) -> str:
         elif 815 <= t <= 1759:
             flag_str = "🔒 금일 신규진입 마감 (관망 · 🔥HA트레일링)"
         else:
-            flag_str = f"⏳ 대기 ({sym}≤30 &amp; {opp_sym}≥79.9 · 🔥HA트레일링 &amp; 🚀NQ급변바이패스)"
+            flag_str = f"⏳ 대기 ({sym}≤30 &amp; {opp_sym}≥79.9 · 🔥HA트레일링 &amp; 🚀QQQ실시간바이패스)"
         return (
             f"{icon} <b>[{sym}] 양방향 대칭 클라이맥스 지시서</b>\n"
             f"{comp_label}: <code>${d['budget']:,.2f}</code> | {flag_str}\n"
@@ -780,7 +781,7 @@ async def build_sync_board(api_client) -> str:
 
 
 # MODIFIED: 전술 제어반(/settlement)에서 일~목 18:00~18:59 EST 선물 신세션 대기, 주말 휴장,
-#           수동 보유(active_pos_sym), 🚀 NQ_VEL_BYPASS 및 3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 상태 표출 (Case 50, 57, 77, 85, 87, 89, 90)
+#           수동 보유(active_pos_sym), 🚀 NQ_VEL_BYPASS(QQQ실시간) 및 3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 상태 표출 (Case 50, 57, 77, 85, 87, 89, 90, 91)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     wk = now_est.weekday()
@@ -811,7 +812,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
 
     act_s_str = "🟢 ON" if act_s else "🔴 OFF"
     comp_s_str = "📈 통합 복리" if is_comp_s else "💵 단리 고정"
-    rate_mode_desc = "🔥 +1.00% 점화 HA·트레일링(🚀NQ급변 바이패스) & 🪤 최저점 반등"
+    rate_mode_desc = "🔥 +1.00% 점화 HA·트레일링(🚀QQQ실시간 급변 바이패스) & 🪤 최저점 반등"
 
     if not act_s:
         strike_status_str = "⏸️ 가동 OFF (수동 대기)"

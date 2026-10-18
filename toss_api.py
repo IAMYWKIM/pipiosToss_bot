@@ -1,8 +1,8 @@
 # =====================================================================
 # FILE: toss_api.py
 # 목적: 토스증권 Open API 비동기 통신 통제소 (GlobalThrottle, AccountSeq 락온,
-#       다건 배치 현재가 조회, 제3종목 원천 차단, HTTP 415/422 방어 및
-#       일요일 18:00 EST 논리적 거래일 롤오버 기반 미국 시장 캘린더 판정)
+#       다건 배치 현재가 조회, 제3종목 주문 원천 차단, HTTP 415/422 방어,
+#       일요일 18:00 EST 논리적 거래일 롤오버 및 QQQ 0.0초 실시간 변화율 스냅샷 브릿지)
 # =====================================================================
 # MODIFIED: 제1헌법 및 Case 20, 30 의거 GlobalThrottle API(0.15초) 및 파일 비동기 Lock 중앙 통제
 # MODIFIED: 제2헌법 의거 /api/v1/accounts 조회 후 BROKERAGE accountSeq 인메모리 락온 및 헤더 원자적 주입
@@ -10,8 +10,10 @@
 # MODIFIED: 초과 Case 69 — 미국 주식 주문 정정(modify_order) 시 quantity 파라미터 원천 적출 (400 에러 방어)
 # MODIFIED: 초과 Case 75 — POST/PUT/PATCH 호출 및 cancel_order 시 빈 JSON(json_data={}) 자동 주입으로 HTTP 415 소각
 # MODIFIED: 초과 Case 83 — get_current_prices_batch 다건 시세 동시 조회로 SOXS·SOXL 틱 합성 시차 0.0ms 달성
-# NEW: Case 01, 초과 Case 36, 57, 90 — 금요일 17:00 EST ~ 일요일 17:59 EST 주말 휴장 확정 및
-#      일~목 18:00 EST 이후 익일(월~금) 논리적 거래일 롤오버로 월요일 아침(일요일 18:00~23:59 EST) 주말 오판 버그 영구 소각
+# MODIFIED: Case 01, 초과 Case 36, 57, 90 — 금요일 17:00 EST ~ 일요일 17:59 EST 주말 휴장 확정 및
+#           일~목 18:00 EST 이후 익일(월~금) 논리적 거래일 롤오버로 월요일 아침 주말 오판 버그 영구 소각
+# NEW: 초과 Case 91 — GlobalThrottle.active_client 자동 바인딩 및 읽기 전용 get_qqq_realtime_snapshot 탑재로
+#      롱/숏(SOXL/SOXS) 자체 노이즈에 영향받지 않는 나스닥 100(QQQ) 0.0초 실시간 단기 변화율 산출 지원
 
 import os
 import time
@@ -107,10 +109,14 @@ def get_nyse_holiday_name(target_date: date) -> str:
 
 
 class GlobalThrottle:
-    """제1헌법 및 Case 20, 30: API Rate Limit 방어(0.15초 간격) 및 파일별 비동기 뮤텍스 중앙 통제소."""
+    """
+    제1헌법 및 Case 20, 30, 91: API Rate Limit 방어(0.15초 간격), 파일별 비동기 뮤텍스 중앙 통제소
+    및 MacroDataCache 전용 토스 클라이언트 브릿지(active_client).
+    """
     _api_locks: dict[str, asyncio.Lock] = {}
     _last_call_times: dict[str, float] = {}
     _file_locks: dict[str, asyncio.Lock] = {}
+    active_client = None
 
     @classmethod
     async def wait_api_sync(cls, group: str = "DEFAULT", min_interval: float = 0.15):
@@ -168,6 +174,8 @@ class TossApiClient:
         self.account_seq: int = 0
         self._auth_lock = asyncio.Lock()
         self._session: aiohttp.ClientSession | None = None
+        # NEW: 초과 Case 91 — MacroDataCache에서 토스 Open API QQQ 실시간 시세/1분봉을 조회할 수 있도록 자동 바인딩
+        GlobalThrottle.active_client = self
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -425,6 +433,22 @@ class TossApiClient:
     async def get_1m_candles(self, symbol: str, count: int = 200) -> list:
         res = await self.get_1m_candles_pagination(symbol=symbol, count=count, before=None)
         return res.get("candles", [])
+
+    async def get_qqq_realtime_snapshot(self, count: int = 25) -> tuple[float, list]:
+        """
+        NEW: 초과 Case 91 [해법 2 방법 A] — SOXL/SOXS 롱·숏 자체 노이즈에 절대 영향받지 않고
+        야후 파이낸스 선물 피드의 10분 지연을 0.0초로 제거하기 위해,
+        토스 Open API 조회 전용 엔드포인트로 나스닥 100 현물 ETF(QQQ)의 실시간 현재가와 1분봉을 조회합니다.
+        """
+        try:
+            q_price, q_candles = await asyncio.gather(
+                self.get_current_price("QQQ"),
+                self.get_1m_candles("QQQ", count=max(15, min(60, int(count or 25)))),
+            )
+            return float(q_price or 0.0), (q_candles if isinstance(q_candles, list) else [])
+        except Exception as e:
+            print(f"🚨 [QQQ 실시간 스냅샷 조회 방어] {e}", flush=True)
+            return 0.0, []
 
     async def get_symbol_holdings_detail(self, symbol: str) -> dict:
         """Case 03 & 초과 Case 29: 보유 주식 상세 조회 및 null 방어 0.0 형변환."""
