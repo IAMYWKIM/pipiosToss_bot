@@ -5,20 +5,25 @@
 #       [1] 04:07 ~ 08:14 EST 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지]) 상시 타격 +
 #       [2] 04:07 EST 이후 첫 RSI>=79.9 달성 상승 추세 종목(FIRST_799 · leader_sym) 자동 각인 후
 #           07:00 ~ 08:14 EST 후반 황금 구간에 해당 상승 종목이 RSI<=35.0 도달 시 추세추종 저가 매수
-#       무한 출동 듀얼 스나이퍼(SOXS/SOXL), 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)' 무제한 익절 추적,
-#       3차 손절 후 최저점 역트레일링 +0.30% 반등 재진입(RE_BOT_TRAIL) 및 03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 오케스트레이터
+#       무한 출동 듀얼 스나이퍼(SOXS/SOXL),
+#       진입 성격별 '이원화 매도 믹스(기술적 반등 ⚡ OLD_IMM_CB × 진성 상승종목 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020 × 🚀 NQ_VEL_BYPASS)',
+#       3차 손절 후 최저점 역트레일링 +0.30% 반등 재진입(RE_BOT_TRAIL),
+#       15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 물량 당일 정규장 VWAP 도달 즉시 덤핑 탈출(🛟 VWAP_ESCAPE) 및
+#       03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 오케스트레이터
 # 구조: sniper_plugin.py / defense_plugin.py / whipsaw_plugin.py 3대 전술 플러그인과 SniperPluginContext로 결속된 아키텍처
 # =====================================================================
 # MODIFIED: 제3헌법 및 초과 Case 88 의거 defense_plugin.py 분리 모듈을 포함한 9대 코어 모듈 프리플라이트 컴파일 검증 결속 (Case 11, 88)
 # MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30 ~ 17:00 EST로 전면 확장 (Case 07)
 # MODIFIED: SOXS 및 SOXL 양방향 대칭 클라이맥스 및 추세추종 눌림목 듀얼 감시 루프(TRADE_SYMBOLS = ("SOXS", "SOXL")) 가동 (Case 09, 54, 71, 81, 97)
-# MODIFIED: 03:55 ~ 08:14 EST 구간 및 포지션 보유(수동 포함)/트레일링 점화/최저점 추적 중 5.0초 듀얼 캔들 스캔 가속으로 EWM·HA 기저 및 VWAP 실시간 동기화 (Case 73, 84, 85, 87)
-# MODIFIED: 5대 0.4초 고주파 부스터(1차 매수덫 대기 · RSI>=79.0 프리-클라이맥스 · 07:00~08:14 상승종목 RSI<=38.0 근접 · HA트레일링 점화/근접 · 3차 손절 후 최저점 역트레일링 추적) 자동 가속 (Case 28, 83, 85, 87, 97)
+# MODIFIED: 03:55 ~ 08:14 EST 구간 및 포지션 보유(수동 포함)/트레일링 점화/최저점 추적 중 5.0초 듀얼 캔들 스캔 가속 및
+#           정규장 후반(14:55 ~ 15:58 EST) 보유 중 2페이지(최대 400분봉) 페이지네이션 스캔으로 09:30 EST 개장 첫 봉부터 누락 없는 정규장 누적 VWAP 산출 (Case 73, 84, 85, 87, 98)
+# MODIFIED: 6대 0.4초 고주파 부스터(1차 매수덫 대기 · RSI>=79.0 프리-클라이맥스 · 07:00~08:14 상승종목 RSI<=38.0 근접 · HA트레일링 점화/근접 · 3차 손절 후 최저점 추적 · 15:00~15:58 미익절 VWAP 탈출 감시) 자동 가속 (Case 28, 83, 85, 87, 97, 98)
 # NEW: 수동 진입(MANUAL) 첫 틱 감지 시 execute_macro_defense_plugin과 로컬 상태를 즉시 동기화하여 NQ>=2.0% 구간에서도 2차 방어 패스 후 3차 안전망 & HA트레일링 직결 (Case 50, 66, 67, 86)
 # NEW: 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 역행 손절 후 최저점 역트레일링 +0.30% 양봉 반등 재진입(execute_post_stop_bottom_rebound_plugin) 결속 (Case 87)
 # NEW: 초과 Case 97 — 04:07 ~ 08:14 EST 첫 RSI>=79.9 상승 추세 종목(leader_sym) 실시간 틱 각인·복원 및 07:00 ~ 08:14 EST RSI<=35.0 추세추종 타격 게이트 결속
+# NEW: 초과 Case 98 & Case 99 — 15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 보유 물량 당일 정규장 VWAP 도달 즉시 덤핑 탈출(execute_late_regular_vwap_escape_plugin) 및 이원화 매도 믹스 연동
 # MODIFIED: 프리장 본진 신규 진입·무한 재출동·자가 치유(Self-Healing) 허용 구간을 04:07 ~ 08:14 EST로 락온 및 08:15 EST 거시지표 선제 컷오프 결속 (Case 48, 52, 53, 71, 84)
-# MODIFIED: 수동 매매·1주 휩소 작전·본진 하이킨 아시 트레일링 청산 시 실제 보유 수량(last_known_qty) 추적 및 통합 복리 정산 연동 (Case 76)
+# MODIFIED: 수동 매매·1주 휩소 작전·장마감 1시간 전 VWAP 탈출·본진 하이킨 아시 트레일링 청산 시 실제 보유 수량(last_known_qty) 추적 및 통합 복리 정산 연동 (Case 76)
 # MODIFIED: 시스템 기동 완료 텔레그램 메시지를 "정상작동 중입니다." 단일 라인으로 슬림화 유지 (Case 38, 88)
 
 import sys
@@ -62,6 +67,7 @@ from sniper_plugin import (
     execute_daymarket_rsi_alert_plugin,
     execute_whipsaw_vwap_exposure_plugin,
     enforce_0407_whipsaw_cutoff_plugin,
+    execute_late_regular_vwap_escape_plugin,
     execute_moc_zero_overnight_plugin,
     execute_macro_defense_plugin,
     enforce_0930_regular_cutoff_plugin,
@@ -227,11 +233,31 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
     while True:
         try:
             now_est = datetime.now(EST_TZ)
+            est_hm = now_est.hour * 100 + now_est.minute
             is_open, _, sess_name, _ = await ctx.client.is_market_open()
 
             if is_open and sess_name != "CLOSED":
                 data = await ctx.client.get_1m_candles_pagination(symbol, count=200)
-                candles = data.get("candles", [])
+                candles = list(data.get("candles") or [])
+                next_before = data.get("nextBefore")
+
+                # NEW: 초과 Case 98 — 정규장 후반(14:55 ~ 15:58 EST, 정규장 총 390분)에 보유 포지션이 존재할 때는
+                #      2페이지(최대 400분봉)까지 페이지네이션 조회하여 09:30 EST 개장 첫 봉부터 누락 없는 정규장 누적 VWAP을 산출!
+                if (
+                    candles
+                    and next_before
+                    and (1250 <= est_hm <= 1559)
+                    and int(ctx.shared_holdings.get(symbol, 0)) > 0
+                ):
+                    try:
+                        data_p2 = await ctx.client.get_1m_candles_pagination(
+                            symbol, count=200, before=next_before
+                        )
+                        candles_p2 = data_p2.get("candles") or []
+                        if candles_p2:
+                            candles.extend(candles_p2)
+                    except Exception:
+                        pass
 
                 if candles:
                     if now_est.hour >= 19:
@@ -257,8 +283,9 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
         except Exception as e:
             print(f"🚨 [RSI 레이더망 {symbol}] 붕괴 방어: {e}", flush=True)
 
-        # Case 73 & Case 84 & Case 85 & Case 87 — 03:55 ~ 08:14 EST 구간이거나 포지션 보유(수동 포함)/트레일링 점화/최저점 추적 중에는
-        # 5.0초 고속 스캔을 유지하여 Wilder's RSI 및 하이킨 아시(Heikin-Ashi) 1분봉 기저 상태를 오차 없이 동기화
+        # Case 73 & Case 84 & Case 85 & Case 87 & Case 98 — 03:55 ~ 08:14 EST 구간이거나
+        # 포지션 보유(수동 및 15:00~15:58 VWAP 탈출 감시 포함)/트레일링 점화/최저점 추적 중에는
+        # 5.0초 고속 스캔을 유지하여 Wilder's RSI, 하이킨 아시 1분봉 기저 및 정규장 VWAP을 오차 없이 동기화
         now_est_chk = datetime.now(EST_TZ)
         est_hm_chk = now_est_chk.hour * 100 + now_est_chk.minute
         is_holding_or_trailing = (
@@ -281,6 +308,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     runtime_state = {
         "last_moc_tick": 0.0,
         "moc_dump_active": False,
+        "last_vwap_escape_tick": 0.0,
+        "vwap_escape_alert_sent": False,
         "last_heartbeat_hour": -1,
         "last_logged_session": "",
         "prev_is_active": None,
@@ -292,7 +321,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
     }
 
     while True:
-        # Case 28 & Case 83 & Case 85 & Case 87 & Case 97: 평시 1.5초 대기, 5대 부스터 조건 충족 시 0.4초 고주파 대기로 자동 가속
+        # Case 28, 83, 85, 87, 97 & Case 98: 평시 1.5초 대기, 6대 부스터 조건 충족 시 0.4초 고주파 대기로 자동 가속
         wait_sec = 0.4 if runtime_state.get("fast_shield_mode", False) else 1.5
         try:
             await asyncio.wait_for(ctx.wakeup_event.wait(), timeout=wait_sec)
@@ -357,9 +386,10 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             cached_opp_rsi = float(opp_rsi_dict.get("value", 0.0))
 
             is_whipsaw_window = (358 <= est_time_int <= 406)
-            # 초과 Case 53, 84, 97 — 프리장 본진 스나이퍼 허용 구간(04:07 ~ 08:14 EST) 및 후반 추세눌림목 구간(07:00 ~ 08:14 EST)
+            # 초과 Case 53, 84, 97, 98 — 프리장 본진 스나이퍼 허용 구간(04:07 ~ 08:14 EST), 후반 추세눌림목(07:00 ~ 08:14 EST) 및 정규장 마감 1시간 전 VWAP 탈출 구간(15:00 ~ 15:58 EST)
             is_premarket_sniper_window = (407 <= est_time_int <= 814)
             is_premarket_0700_window = (700 <= est_time_int <= 814)
+            is_late_reg_vwap_window = (1500 <= est_time_int <= 1558)
             is_daymarket_window = (est_time_int >= 1900 or est_time_int <= 359)
             is_daymarket_active_window = (est_time_int >= 1900 or est_time_int <= 357)
 
@@ -380,7 +410,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             cur_leader_sym = str(pre_leader_st.get("leader_sym") or "")
             is_pb_rearm_ready = bool(pre_leader_st.get("pb_rearm_ready", True))
 
-            # Case 28, 83, 85, 87 & Case 97: 5대 고주파 부스터 조건 판정
+            # Case 28, 83, 85, 87, 97 & Case 98: 6대 고주파 부스터 조건 판정
             is_trap_waiting = bool(
                 is_active
                 and is_premarket_sniper_window
@@ -413,12 +443,19 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     or (0.0 < cached_opp_rsi <= PRE_SNIPER_RSI_THRESHOLD and cached_my_rsi >= 78.0)
                 )
             )
+            is_vwap_escape_booster = bool(
+                is_active
+                and is_late_reg_vwap_window
+                and holdings_qty > 0
+                and not is_trail_armed_now
+            )
             runtime_state["fast_shield_mode"] = bool(
                 is_trap_waiting
                 or is_trend_pullback_booster
                 or is_pre_climax_booster
                 or is_trail_armed_now
                 or is_bottom_track_now
+                or is_vwap_escape_booster
             )
 
             if runtime_state["prev_is_active"] is None:
@@ -437,6 +474,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
 
                 runtime_state["last_moc_tick"] = 0.0
                 runtime_state["moc_dump_active"] = False
+                runtime_state["last_vwap_escape_tick"] = 0.0
+                runtime_state["vwap_escape_alert_sent"] = False
                 runtime_state["fast_shield_mode"] = False
                 runtime_state["last_known_qty"] = 0
                 _reset_bottom_track_state(symbol)
@@ -516,7 +555,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
             if now_est.hour != runtime_state["last_heartbeat_hour"]:
                 print(
                     f"💓 [맥박 {symbol}] {now_est.strftime('%Y-%m-%d %H:%M:%S')} EST | "
-                    f"세션: {hardcoded_session} | 활성: {is_active} | 잔고: {holdings_qty}주 | 모드: HYB_35_1ST & HA트레일링",
+                    f"세션: {hardcoded_session} | 활성: {is_active} | 잔고: {holdings_qty}주 | 모드: HYB_35_1ST & 이원화트레일링 & VWAP탈출",
                     flush=True,
                 )
                 runtime_state["last_heartbeat_hour"] = now_est.hour
@@ -552,11 +591,19 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
 
             avg_price_dump = float(holdings_detail.get("avg_price", 0.0)) or last_buy_price
 
-            # 목표 5 & Case 50, 66, 67, 82, 86, 87, 97 — 방향성 인지 NQ=F 매크로 3단 방어망 호출
+            # 목표 5 & Case 50, 66, 67, 82, 86, 87, 97, 98, 99 — 방향성 인지 NQ=F 매크로 3단 방어망 호출
             was_unregistered_manual = bool(
                 holdings_qty > 0
                 and not buy_order_id
-                and entry_session not in ("PRE_SNIPER", "PRE_PULLBACK", "PRE_SNIPER_REARM", "WHIPSAW_1SH", "MANUAL")
+                and entry_session not in (
+                    "PRE_SNIPER",
+                    "PRE_PULLBACK",
+                    "PRE_SNIPER_REARM",
+                    "PRE_PULLBACK_REARM",
+                    "WHIPSAW_1SH",
+                    "VWAP_ESCAPE",
+                    "MANUAL",
+                )
             )
             macro_dumped = await execute_macro_defense_plugin(
                 ctx=ctx,
@@ -585,6 +632,28 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 nq_entry_price = st_sync[10]
                 nq_entry_amp = st_sync[11]
 
+            # NEW: 초과 Case 98 — 정규장 장마감 1시간 전(15:00 ~ 15:58 EST)까지 +1.00% 익절하지 못한
+            #      미익절 표류 물량이 당일 정규장 누적 VWAP 가격에 도달하면 즉시 덤핑 탈출 스윕!
+            if is_active and is_late_reg_vwap_window and holdings_qty > 0:
+                vwap_escaped = await execute_late_regular_vwap_escape_plugin(
+                    ctx=ctx,
+                    symbol=symbol,
+                    now_est=now_est,
+                    is_active=is_active,
+                    holdings_qty=holdings_qty,
+                    holdings_detail=holdings_detail,
+                    avg_price_dump=avg_price_dump,
+                    last_buy_price=last_buy_price,
+                    buy_order_id=buy_order_id,
+                    sell_order_id=sell_order_id,
+                    entry_session=entry_session,
+                    runtime_state=runtime_state,
+                    current_price=current_price,
+                    vwap_val=float(sym_rsi_dict.get("vwap", 0.0)),
+                )
+                if vwap_escaped:
+                    continue
+
             if not is_open or current_price <= 0.0:
                 continue
 
@@ -598,7 +667,9 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     "PRE_SNIPER",
                     "PRE_PULLBACK",
                     "PRE_SNIPER_REARM",
+                    "PRE_PULLBACK_REARM",
                     "STAGE3_STOP_TRACK",
+                    "VWAP_ESCAPE",
                 )
                 is_same_day_transition = (
                     bool(last_session_id)
@@ -631,6 +702,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     if can_reset:
                         _reset_trailing_runtime_state(symbol)
                         _reset_bottom_track_state(symbol)
+                        runtime_state["vwap_escape_alert_sent"] = False
                         await AssassinLedger.save_state(
                             symbol,
                             price=0.0,
@@ -763,7 +835,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 except Exception:
                     pass
 
-            # NEW: 초과 Case 97 — 04:07 ~ 08:14 EST 구간 동안 당일 첫 RSI >= 79.9 달성 상승 추세 종목(leader_sym) 실시간 각인 및 회복 감시
+            # 초과 Case 97 — 04:07 ~ 08:14 EST 구간 동안 당일 첫 RSI >= 79.9 달성 상승 추세 종목(leader_sym) 실시간 각인 및 회복 감시
             if is_premarket_sniper_window:
                 pre_leader_st = update_premarket_trend_leader(
                     symbol=symbol,
@@ -810,13 +882,20 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 and is_pb_rearm_ready
                 and (0.0 < live_rsi_val <= PRE_TREND_BOOSTER_RSI)
             )
+            is_vwap_escape_booster_now = bool(
+                is_active
+                and is_late_reg_vwap_window
+                and holdings_qty > 0
+                and not bool(get_trailing_runtime_status(symbol).get("armed", False))
+            )
 
-            # 차기 루프 대기 시간(0.4초 부스터)을 최신 합성 RSI, 추세눌림목, 트레일링, 최저점 추적 상태 기준으로 즉시 업데이트 (Case 28, 83, 85, 87, 97)
+            # 차기 루프 대기 시간(0.4초 부스터)을 최신 합성 RSI, 추세눌림목, 트레일링, 최저점 추적, VWAP 탈출 감시 기준으로 즉시 업데이트 (Case 28, 83, 85, 87, 97, 98)
             runtime_state["fast_shield_mode"] = bool(
                 is_trap_waiting
                 or is_pb_0700_booster_now
                 or is_trailing_booster
                 or is_bottom_track_booster
+                or is_vwap_escape_booster_now
                 or (
                     is_active
                     and (is_premarket_sniper_window or is_daymarket_active_window)
@@ -854,7 +933,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     rsi_val=live_rsi_val,
                 )
 
-            # 목표 3·4 & 초과 Case 46, 49, 51, 52, 76, 84, 87, 97: 잔고 0주 복귀 시 통합 실수익 복리 정산 및 08:14 EST까지 재출동 릴리스
+            # 목표 3·4 & 초과 Case 46, 49, 51, 52, 76, 84, 87, 97, 98: 잔고 0주 복귀 시 통합 실수익 복리 정산 및 08:14 EST까지 재출동 릴리스
             if holdings_qty == 0 and (
                 target_sell_price > 0.0 or buy_order_id or sell_order_id or last_buy_price > 0.0
             ):
@@ -869,6 +948,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 )
                 if cleared:
                     runtime_state["last_known_qty"] = 0
+                    runtime_state["vwap_escape_alert_sent"] = False
                     continue
 
             # 데이장 (19:00 ~ 03:59 EST) 프리장 동일 조건(대칭 클라이맥스 + 선행 상승종목 추세눌림목) 2단계 모의 관측 알림 가동 (03:58~03:59 묵음 내장)
@@ -976,8 +1056,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     opp_rsi_val=opp_live_rsi_val,
                 )
 
-            # 목표 4 & 초과 Case 50, 58, 64, 85, 97: 매수 전량 체결(본진 및 수동 진입 공통) 확인 즉시 상단 안전 캡(+5.00%) 선장전 및
-            # +1.00% 도달 시 하이킨 아시(Heikin-Ashi) + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS) 0.1초 즉시 정정 스윕 가동
+            # 목표 4 & 초과 Case 50, 58, 64, 85, 97, 99: 매수 전량 체결(본진 및 수동 진입 공통) 확인 즉시 상단 안전 캡(+5.00%) 선장전 및
+            # +1.00% 도달 시 진입 성격별 이원화 하이킨 아시 트레일링(기술적 반등 ⚡ OLD_IMM_CB × 진성 상승종목 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020) 0.1초 즉시 정정 스윕 가동
             await manage_mechanical_profit_trap_plugin(
                 ctx=ctx,
                 symbol=symbol,
@@ -1052,7 +1132,7 @@ async def main():
         asyncio.create_task(record_candles_loop(api_client, sym))
         asyncio.create_task(rsi_radar_loop(plugin_ctx, sym))
 
-    print("시스템 코어: 04:07~08:14 골든타임(👑HYB_35_1ST) & HA트레일링(HA_HYB_1.0) & 최저점 반등 재진입(RE_BOT_TRAIL) 9대 모듈 결속 완료...", flush=True)
+    print("시스템 코어: 04:07~08:14 골든타임(👑HYB_35_1ST) & 이원화트레일링(🚀PEAK_LCK_130) & 15:00 VWAP탈출(🛟VWAP_ESCAPE) 9대 모듈 결속 완료...", flush=True)
 
     # 기동 완료 시 단일 상태 메시지만 전송 (Case 38)
     try:
