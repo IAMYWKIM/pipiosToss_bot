@@ -2,7 +2,8 @@
 # FILE: sniper_plugin.py
 # 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
 #       양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지])
-#       무한 출동 듀얼 스나이퍼(SOXS/SOXL), 3차 손절 후 최저점 역트레일링 +0.30% 반등 재진입(RE_BOT_TRAIL),
+#       무한 출동 듀얼 스나이퍼(SOXS/SOXL), 선물 진폭(NQ>=0.80%) 역산 하락가 버퍼 & 최저점 역트레일링 요격(🛡️ AMP_BUF_TRAIL),
+#       3차 손절 후 최저점 역트레일링 +0.30% 반등 재진입(🪤 RE_BOT_TRAIL),
 #       단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)' 무제한 익절 추적 및 통합 실수익 복리 정산 코어
 # =====================================================================
 # MODIFIED: 제3헌법 및 초과 Case 88 의거 매크로 3단 방어·08:15 선제 컷오프·15:59 MOC 청산 모듈을 defense_plugin.py로 분리 및 리익스포트 결속
@@ -10,8 +11,10 @@
 # MODIFIED: 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)' 무제한 익절 추적 및 0.1초 즉시 정정 스윕 가동 (Case 58, 85)
 # MODIFIED: 초과 Case 89 & Case 91 — 트레일링 점화(+1.00%) 후 고점 추적 중 토스 Open API QQQ 0.0초 실시간(폴백 NQ=F)
 #           10분/3분 단기 변화율이 유리 방향으로 ±0.20% 이상 급등·급락 지속 시 실시간 1분봉 하이킨 아시 음봉 전환을 바이패스하는 🚀 NQ_VEL_BYPASS 탑재
-# NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.8%)은 나스닥 100 선물지수(NQ=F) 진폭(nq_entry_amp)을 기준으로 산출하고,
-#      해당 임계치를 적용할 진입 기준가(nq_entry_price)는 토스 Open API QQQ 0.0초 실시간 현재가로 락온 및 체결 확증 순간 재동기화
+# MODIFIED: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.8%)은 나스닥 100 선물지수(NQ=F) 진폭(nq_entry_amp)을 기준으로 산출하고,
+#           해당 임계치를 적용할 진입 기준가(nq_entry_price)는 토스 Open API QQQ 0.0초 실시간 현재가로 락온 및 체결 확증 순간 재동기화
+# NEW: 초과 Case 93 — 프리장 본진(04:07 ~ 08:14 EST) 대칭 클라이맥스 포착 시 당일 NQ=F 진폭이 0.80% 이상 벌어져 있으면
+#      고가 진입을 보류하고 3배 레버리지 역산 예상 하락가 버퍼(_AMP_BUFFER_CACHE)를 점화하여 최저점 대비 +0.30% 양봉 반등 시 최저가로 실전 요격!
 # MODIFIED: 04:07 ~ 08:14 EST 중 NQ=F < 2.0% 내 3차 역행 손절 후 최저점 역트레일링 +0.30% 양봉 반등 재진입(RE_BOT_TRAIL) 가동 (Case 87)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 기반 실제 발생 순수익금((실제매도가-실제매수가)*체결수량 - 수수료 0.14%) 복리 정산 동기화 (Case 76)
 
@@ -28,6 +31,10 @@ from toss_api import TossApiClient
 from quant_engine import (
     AssassinLedger,
     MacroDataCache,
+    AMP_BUFFER_ACTIVATE_NQ_PCT,
+    AMP_BUFFER_LEVERAGE_MULT,
+    AMP_BUFFER_REBOUND_PCT,
+    compute_amp_buffer_target_price,
     compute_realtime_tick_rsi,
     compute_realtime_tick_heikin_ashi,
 )
@@ -56,8 +63,12 @@ from defense_plugin import (
     _STRIKE_ALERT_CACHE,
     _TRAIL_RUNTIME_CACHE,
     _BOTTOM_TRACK_CACHE,
+    _AMP_BUFFER_CACHE,
     _reset_trailing_runtime_state,
     get_trailing_runtime_status,
+    _reset_amp_buffer_state,
+    _activate_amp_buffer_state,
+    get_amp_buffer_status,
     _reset_bottom_track_state,
     _activate_bottom_track_state,
     get_bottom_track_status,
@@ -107,10 +118,11 @@ async def execute_rsi_monitoring_plugin(
     now_est = datetime.now(EST_TZ)
     est_hm = now_est.hour * 100 + now_est.minute
 
-    # 트레일링 점화 상태이거나 3차 손절 후 최저점 역트레일링 추적 중일 때도 캔들 갱신 즉시 메인 루프 기상 (Case 25, 85, 87)
+    # 트레일링 점화 상태이거나 3차 손절 후 최저점 역트레일링 / 진폭 역산 버퍼 역트레일링 추적 중일 때도 캔들 갱신 즉시 메인 루프 기상 (Case 25, 85, 87, 93)
     if (
         _TRAIL_RUNTIME_CACHE.get(symbol, {}).get("armed", False)
         or (_BOTTOM_TRACK_CACHE.get("active", False) and _BOTTOM_TRACK_CACHE.get("symbol") == symbol)
+        or (_AMP_BUFFER_CACHE.get("active", False) and _AMP_BUFFER_CACHE.get("symbol") == symbol)
     ):
         ctx.wakeup_event.set()
 
@@ -136,7 +148,7 @@ async def execute_rsi_monitoring_plugin(
 
 # 하이킨 아시 트레일링 익절(+1.00% ~ +5.00%+), 3차 손절 후 최저점 역트레일링 전환(STAGE3_STOP_TRACK) 및 모든 청산 시
 # 실제 발생 순수익금((실제매도가 - 실제매수가) * 체결수량 - 왕복수수료 0.14%) 복리 정산 및
-# 프리장 골든타임(04:00 ~ 08:14 EST) 내 조건 충족 시 양쪽 장부 동시 재출동 락 해제 (Case 52, 76, 80, 84, 87)
+# 프리장 골든타임(04:00 ~ 08:14 EST) 내 조건 충족 시 양쪽 장부 동시 재출동 락 해제 (Case 52, 76, 80, 84, 87, 93)
 async def reconcile_zero_holdings_exit_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -355,6 +367,7 @@ async def reconcile_zero_holdings_exit_plugin(
                 _reset_bottom_track_state()
 
         _reset_trailing_runtime_state(symbol)
+        _reset_amp_buffer_state(symbol)
 
         await AssassinLedger.save_state(
             symbol,
@@ -437,9 +450,10 @@ async def reconcile_zero_holdings_exit_plugin(
         ctx.in_memory_ordering_lock[symbol] = False
 
 
-# 초과 Case 87 & Case 92 — 04:07 ~ 08:14 EST 골든타임 내 3차 안전망 손절 후
-# '손절가 하회 최저점(post_stop_low) 역트레일링 +0.30% 양봉 반등 즉시 재진입 (🪤 RE_BOT_TRAIL)' 엔진
-# (NQ=F 진폭 기준 3차 임계치 산출 + 토스 QQQ 0.0초 실시간 현재가 기준점 락온)
+# MODIFIED: 초과 Case 87, Case 92 & Case 93 — 04:07 ~ 08:14 EST 골든타임 내
+#           ① 선물 진폭(NQ=F >= 0.80%) 역산 하락가 버퍼 역트레일링 바닥 요격 (🛡️ AMP_BUF_TRAIL) 및
+#           ② 3차 안전망 손절 후 '손절가 하회 최저점 역트레일링 +0.30% 양봉 반등 재진입 (🪤 RE_BOT_TRAIL)' 통합 엔진
+#           (NQ=F 진폭 기준 3차 임계치 산출 + 토스 QQQ 0.0초 실시간 현재가 기준점 락온)
 async def execute_post_stop_bottom_rebound_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -454,94 +468,186 @@ async def execute_post_stop_bottom_rebound_plugin(
     rsi_val: float,
     opp_rsi_val: float = 0.0,
 ) -> bool:
-    if not _BOTTOM_TRACK_CACHE.get("active", False):
+    is_stage3_mode = bool(
+        _BOTTOM_TRACK_CACHE.get("active", False) and _BOTTOM_TRACK_CACHE.get("symbol") == symbol
+    )
+    is_amp_buf_mode = bool(
+        not is_stage3_mode
+        and _AMP_BUFFER_CACHE.get("active", False)
+        and _AMP_BUFFER_CACHE.get("symbol") == symbol
+    )
+
+    if not is_stage3_mode and not is_amp_buf_mode:
         return False
 
-    tracked_sym = str(_BOTTOM_TRACK_CACHE.get("symbol", ""))
-    if symbol != tracked_sym or symbol not in ("SOXS", "SOXL"):
+    if symbol not in ("SOXS", "SOXL"):
         return False
 
     est_hm = now_est.hour * 100 + now_est.minute
     today_str = now_est.strftime("%Y-%m-%d")
 
+    active_cache = _BOTTOM_TRACK_CACHE if is_stage3_mode else _AMP_BUFFER_CACHE
+
     if (
         not is_active
         or not (407 <= est_hm <= 814)
-        or _BOTTOM_TRACK_CACHE.get("date") != today_str
+        or active_cache.get("date") != today_str
         or holdings_qty > 0
         or bool(buy_order_id)
         or ctx.in_memory_ordering_lock.get(symbol, False)
     ):
-        if not (407 <= est_hm <= 814) or _BOTTOM_TRACK_CACHE.get("date") != today_str:
-            _reset_bottom_track_state()
+        if not (407 <= est_hm <= 814) or active_cache.get("date") != today_str:
+            if is_stage3_mode:
+                _reset_bottom_track_state()
+            else:
+                _reset_amp_buffer_state()
         return False
 
     if current_price <= 0.0:
         return False
 
     cur_p_fl = math.floor(current_price * 100.0) / 100.0
-    last_stop_p = float(_BOTTOM_TRACK_CACHE.get("last_stop_price", 0.0))
-    if last_stop_p <= 0.0 or cur_p_fl <= 0.0:
-        _reset_bottom_track_state()
-        return False
-
-    # 주가가 반등 체결 없이 손절가 대비 +1.5% 이상 이미 날아가 버렸거나 RSI가 50.0 이상으로 중립화되면 최저점 추적 자동 해제
-    if cur_p_fl > last_stop_p * 1.015 or rsi_val >= 50.0:
-        _reset_bottom_track_state()
-        st_cur = await AssassinLedger.get_state(symbol)
-        if st_cur[8] == "STAGE3_STOP_TRACK":
-            await AssassinLedger.save_state(symbol, entry_session="")
+    if cur_p_fl <= 0.0:
         return False
 
     sym_rsi_dict = (ctx.shared_rsi_state or {}).get(symbol, {})
     ewm_st = sym_rsi_dict.get("ewm_state", {}) if isinstance(sym_rsi_dict, dict) else {}
     cur_bar_open = float(ewm_st.get("cur_bar_open", 0.0))
     cur_bar_low = float(ewm_st.get("cur_bar_low", 0.0))
-
-    prev_low = float(_BOTTOM_TRACK_CACHE.get("post_stop_low", last_stop_p))
     cand_low = min(cur_p_fl, math.floor(cur_bar_low * 100.0) / 100.0) if cur_bar_low > 0.0 else cur_p_fl
 
-    if (0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD) and (opp_rsi_val >= OPP_CLIMAX_RSI_THRESHOLD):
-        _BOTTOM_TRACK_CACHE["climax_seen"] = True
+    # =====================================================================
+    # [분기 A] 선물 진폭(NQ=F >= 0.80%) 역산 하락가 버퍼 역트레일링 (🛡️ AMP_BUF_TRAIL, 초과 Case 93)
+    # =====================================================================
+    if is_amp_buf_mode:
+        spot_p = float(_AMP_BUFFER_CACHE.get("spot_price", 0.0))
+        anchor_h = float(_AMP_BUFFER_CACHE.get("anchor_high", spot_p))
+        target_drop_p = float(_AMP_BUFFER_CACHE.get("target_drop_price", 0.0))
+        partial_drop_p = float(_AMP_BUFFER_CACHE.get("partial_drop_price", target_drop_p))
 
-    # 1단계 (칼날 회피): 신저가를 경신 중이면 절대 매수하지 않고 최저점(post_stop_low)과 반등 목표가(+0.30%)만 갱신!
-    made_new_low_tick = False
-    if cand_low < prev_low:
-        _BOTTOM_TRACK_CACHE["post_stop_low"] = cand_low
-        _BOTTOM_TRACK_CACHE["rebound_trig_price"] = (
-            math.ceil(cand_low * (1.0 + BOTTOM_REBOUND_PCT / 100.0) * 100.0) / 100.0
-        )
-        _BOTTOM_TRACK_CACHE["last_new_low_ts"] = time.time()
-        if cand_low < last_stop_p:
+        if spot_p <= 0.0 or target_drop_p <= 0.0:
+            _reset_amp_buffer_state()
+            return False
+
+        # 주가가 반등 체결 없이 포착가 대비 +1.5% 이상 이미 날아가 버렸거나 RSI >= 50.0 중립화 시 역산 버퍼 해제
+        if cur_p_fl > spot_p * 1.015 or rsi_val >= 50.0:
+            _reset_amp_buffer_state()
+            return False
+
+        # 추적 도중 선물 진폭(nq_amp_chk)이 추가로 더 확대된 경우 역산 하락가 버퍼를 실시간으로 더 낮춰서 2차 하락 방어!
+        _, nq_h_chk, nq_l_chk = await MacroDataCache.get_cached_nq_data()
+        nq_amp_chk = (((nq_h_chk - nq_l_chk) / nq_l_chk * 100.0) if nq_l_chk > 0.0 else 0.0)
+        if nq_amp_chk >= 2.0:
+            _reset_amp_buffer_state()
+            return False
+        if nq_amp_chk > float(_AMP_BUFFER_CACHE.get("nq_amp_at_arm", 0.0)):
+            new_td_p, new_pd_p, new_exp_pct, _ = compute_amp_buffer_target_price(
+                anchor_h, spot_p, nq_amp_chk, AMP_BUFFER_LEVERAGE_MULT
+            )
+            if new_td_p > 0.0 and new_td_p < target_drop_p:
+                target_drop_p = new_td_p
+                partial_drop_p = min(partial_drop_p, new_pd_p)
+                _AMP_BUFFER_CACHE["target_drop_price"] = target_drop_p
+                _AMP_BUFFER_CACHE["partial_drop_price"] = partial_drop_p
+                _AMP_BUFFER_CACHE["expected_drop_pct"] = new_exp_pct
+                _AMP_BUFFER_CACHE["nq_amp_at_arm"] = round(nq_amp_chk, 2)
+
+        prev_low = float(_AMP_BUFFER_CACHE.get("post_shock_low", spot_p))
+        made_new_low_tick = False
+        if cand_low < prev_low:
+            _AMP_BUFFER_CACHE["post_shock_low"] = cand_low
+            _AMP_BUFFER_CACHE["rebound_trig_price"] = (
+                math.ceil(cand_low * (1.0 + AMP_BUFFER_REBOUND_PCT / 100.0) * 100.0) / 100.0
+            )
+            _AMP_BUFFER_CACHE["last_new_low_ts"] = time.time()
+            if cur_p_fl <= cand_low:
+                made_new_low_tick = True
+
+        post_low = float(_AMP_BUFFER_CACHE.get("post_shock_low", prev_low))
+        rebound_trig_p = float(_AMP_BUFFER_CACHE.get("rebound_trig_price", 0.0))
+        if rebound_trig_p <= 0.0 and post_low > 0.0:
+            rebound_trig_p = math.ceil(post_low * (1.0 + AMP_BUFFER_REBOUND_PCT / 100.0) * 100.0) / 100.0
+            _AMP_BUFFER_CACHE["rebound_trig_price"] = rebound_trig_p
+
+        if (target_drop_p > 0.0 and post_low <= target_drop_p) or (partial_drop_p > 0.0 and post_low <= partial_drop_p):
+            _AMP_BUFFER_CACHE["buffer_reached"] = True
+
+        if made_new_low_tick or not bool(_AMP_BUFFER_CACHE.get("buffer_reached", False)) or is_session_done:
+            return False
+
+        is_ha_bull, _, _ = compute_realtime_tick_heikin_ashi(cur_p_fl, ewm_st)
+        is_bull_rebound = bool(is_ha_bull or (cur_bar_open > 0.0 and cur_p_fl > cur_bar_open))
+
+        if not (
+            cur_p_fl >= rebound_trig_p
+            and cur_p_fl <= spot_p
+            and is_bull_rebound
+            and (0.0 < rsi_val <= BOTTOM_MAX_RSI_CAP)
+        ):
+            return False
+
+        ref_ceil_price = spot_p
+    # =====================================================================
+    # [분기 B] 3차 안전망 손절 후 최저점 역트레일링 반등 재진입 (🪤 RE_BOT_TRAIL, 초과 Case 87)
+    # =====================================================================
+    else:
+        last_stop_p = float(_BOTTOM_TRACK_CACHE.get("last_stop_price", 0.0))
+        if last_stop_p <= 0.0:
+            _reset_bottom_track_state()
+            return False
+
+        # 주가가 반등 체결 없이 손절가 대비 +1.5% 이상 이미 날아가 버렸거나 RSI가 50.0 이상으로 중립화되면 최저점 추적 자동 해제
+        if cur_p_fl > last_stop_p * 1.015 or rsi_val >= 50.0:
+            _reset_bottom_track_state()
+            st_cur = await AssassinLedger.get_state(symbol)
+            if st_cur[8] == "STAGE3_STOP_TRACK":
+                await AssassinLedger.save_state(symbol, entry_session="")
+            return False
+
+        prev_low = float(_BOTTOM_TRACK_CACHE.get("post_stop_low", last_stop_p))
+        if (0.0 < rsi_val <= PRE_SNIPER_RSI_THRESHOLD) and (opp_rsi_val >= OPP_CLIMAX_RSI_THRESHOLD):
+            _BOTTOM_TRACK_CACHE["climax_seen"] = True
+
+        # 1단계 (칼날 회피): 신저가를 경신 중이면 절대 매수하지 않고 최저점(post_stop_low)과 반등 목표가(+0.30%)만 갱신!
+        made_new_low_tick = False
+        if cand_low < prev_low:
+            _BOTTOM_TRACK_CACHE["post_stop_low"] = cand_low
+            _BOTTOM_TRACK_CACHE["rebound_trig_price"] = (
+                math.ceil(cand_low * (1.0 + BOTTOM_REBOUND_PCT / 100.0) * 100.0) / 100.0
+            )
+            _BOTTOM_TRACK_CACHE["last_new_low_ts"] = time.time()
+            if cand_low < last_stop_p:
+                _BOTTOM_TRACK_CACHE["dipped_below_stop"] = True
+            if cur_p_fl <= cand_low:
+                made_new_low_tick = True
+
+        post_low = float(_BOTTOM_TRACK_CACHE.get("post_stop_low", prev_low))
+        if post_low < last_stop_p:
             _BOTTOM_TRACK_CACHE["dipped_below_stop"] = True
-        if cur_p_fl <= cand_low:
-            made_new_low_tick = True
 
-    post_low = float(_BOTTOM_TRACK_CACHE.get("post_stop_low", prev_low))
-    if post_low < last_stop_p:
-        _BOTTOM_TRACK_CACHE["dipped_below_stop"] = True
+        dipped_below_stop = bool(_BOTTOM_TRACK_CACHE.get("dipped_below_stop", False))
+        rebound_trig_p = float(_BOTTOM_TRACK_CACHE.get("rebound_trig_price", 0.0))
+        if rebound_trig_p <= 0.0 and post_low > 0.0:
+            rebound_trig_p = math.ceil(post_low * (1.0 + BOTTOM_REBOUND_PCT / 100.0) * 100.0) / 100.0
+            _BOTTOM_TRACK_CACHE["rebound_trig_price"] = rebound_trig_p
 
-    dipped_below_stop = bool(_BOTTOM_TRACK_CACHE.get("dipped_below_stop", False))
-    rebound_trig_p = float(_BOTTOM_TRACK_CACHE.get("rebound_trig_price", 0.0))
-    if rebound_trig_p <= 0.0 and post_low > 0.0:
-        rebound_trig_p = math.ceil(post_low * (1.0 + BOTTOM_REBOUND_PCT / 100.0) * 100.0) / 100.0
-        _BOTTOM_TRACK_CACHE["rebound_trig_price"] = rebound_trig_p
+        if made_new_low_tick or not dipped_below_stop or is_session_done:
+            return False
 
-    if made_new_low_tick or not dipped_below_stop or is_session_done:
-        return False
+        is_ha_bull, _, _ = compute_realtime_tick_heikin_ashi(cur_p_fl, ewm_st)
+        is_bull_rebound = bool(is_ha_bull or (cur_bar_open > 0.0 and cur_p_fl > cur_bar_open))
 
-    is_ha_bull, _, _ = compute_realtime_tick_heikin_ashi(cur_p_fl, ewm_st)
-    is_bull_rebound = bool(is_ha_bull or (cur_bar_open > 0.0 and cur_p_fl > cur_bar_open))
+        # 2단계: 손절가 아래 최저점(post_low < last_stop_p)을 찍고 신저가 멈춤 + 최저점 대비 +0.30% 이상 양봉 반등 + RSI<=38.0 확인!
+        if not (
+            bool(_BOTTOM_TRACK_CACHE.get("climax_seen", True))
+            and cur_p_fl >= rebound_trig_p
+            and cur_p_fl <= last_stop_p
+            and is_bull_rebound
+            and (0.0 < rsi_val <= BOTTOM_MAX_RSI_CAP)
+        ):
+            return False
 
-    # 2단계: 손절가 아래 최저점(post_low < last_stop_p)을 찍고 신저가 멈춤 + 최저점 대비 +0.30% 이상 양봉 반등 + RSI<=38.0 확인!
-    if not (
-        bool(_BOTTOM_TRACK_CACHE.get("climax_seen", True))
-        and cur_p_fl >= rebound_trig_p
-        and cur_p_fl <= last_stop_p
-        and is_bull_rebound
-        and (0.0 < rsi_val <= BOTTOM_MAX_RSI_CAP)
-    ):
-        return False
+        ref_ceil_price = last_stop_p
 
     opp_sym = "SOXL" if symbol == "SOXS" else "SOXS"
     sym_icon = "🐻" if symbol == "SOXS" else "🐂"
@@ -577,14 +683,14 @@ async def execute_post_stop_bottom_rebound_plugin(
                 await AssassinLedger.lock_all_symbols_macro(last_session_id=current_session_id)
                 _STRIKE_ALERT_CACHE["last_macro1_date"] = today_str
                 await ctx.notify_tg(
-                    "🛑 <b>[프리장 듀얼 스나이퍼] 최저점 반등 감시 중 대세장 과열 감지 (자동 진입 차단)</b>\n"
+                    "🛑 <b>[프리장 듀얼 스나이퍼] 역트레일링 감시 중 대세장 과열 감지 (자동 진입 차단)</b>\n"
                     f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp_global:.2f}%</code> (2.0% 이상)\n"
-                    "▫️ 조치: 최저점 역트레일링 캐시 파기 및 금일 자동 매수 권한 영구 소각"
+                    "▫️ 조치: 역트레일링 캐시 파기 및 금일 자동 매수 권한 영구 소각"
                 )
                 return False
 
-            # NEW: 초과 Case 92 — NQ=F 진폭 기반 임계치 max(nq_entry_amp * 0.5, 0.8%)를 실시간 적용할
-            #      3차 역행 안전망 진입 기준가(ref_entry_p)는 토스 Open API QQQ 0.0초 실시간 현재가로 락온!
+            # 초과 Case 92 — NQ=F 진폭 기반 임계치 max(nq_entry_amp * 0.5, 0.8%)를 실시간 적용할
+            # 3차 역행 안전망 진입 기준가(ref_entry_p)는 토스 Open API QQQ 0.0초 실시간 현재가로 락온!
             ref_entry_p, ref_src = await MacroDataCache.get_stage3_reference_price(
                 force_refresh=True, realtime_probing=True
             )
@@ -595,7 +701,7 @@ async def execute_post_stop_bottom_rebound_plugin(
             if latest_p <= 0.0:
                 latest_p = cur_p_fl
             exec_buy_p = math.floor(latest_p * 100.0) / 100.0
-            if exec_buy_p < rebound_trig_p or exec_buy_p > last_stop_p:
+            if exec_buy_p < rebound_trig_p or exec_buy_p > ref_ceil_price:
                 return False
 
             for chk_sym in ("SOXS", "SOXL"):
@@ -618,7 +724,8 @@ async def execute_post_stop_bottom_rebound_plugin(
                 return False
 
             trend_str = "SHORT" if symbol == "SOXS" else "LONG"
-            idem_key = f"RBOT_{symbol}_{now_est.strftime('%H%M%S')}"[:36]
+            idem_prefix = "ABUF" if is_amp_buf_mode else "RBOT"
+            idem_key = f"{idem_prefix}_{symbol}_{now_est.strftime('%H%M%S')}"[:36]
             res = await ctx.client.create_order(
                 symbol=symbol,
                 side="BUY",
@@ -630,6 +737,7 @@ async def execute_post_stop_bottom_rebound_plugin(
 
             if res and isinstance(res, dict) and res.get("result", {}).get("orderId"):
                 new_buy_id = str(res["result"]["orderId"])
+                buf_snap = get_amp_buffer_status(symbol) if is_amp_buf_mode else {}
                 _reset_trailing_runtime_state(symbol)
                 _reset_bottom_track_state()
                 await AssassinLedger.save_state(
@@ -651,19 +759,32 @@ async def execute_post_stop_bottom_rebound_plugin(
                 )
                 ctx.wakeup_event.set()
                 rebound_actual_pct = ((exec_buy_p / post_low - 1.0) * 100.0) if post_low > 0.0 else BOTTOM_REBOUND_PCT
-                disc_from_stop = last_stop_p - exec_buy_p
+                disc_from_ceil = ref_ceil_price - exec_buy_p
                 ref_unit = "$" if ref_src == "QQQ실시간" else ""
                 dyn_th_init = max(nq_amp_global * 0.5, float(ctx.nq_dynamic_floor or 0.8))
-                await ctx.notify_tg(
-                    f"🪤 <b>[3차 손절 후 최저점 역트레일링 재출격] {sym_icon}{symbol} 바닥 확인 반등 요격 발사!</b>\n"
-                    f"▫️ 바닥 궤적: 직전 손절가 <code>${last_stop_p:.2f}</code> ➡️ 경유 최저점 <code>${post_low:.2f}</code> 찍고 <code>+{rebound_actual_pct:.2f}%</code> 양봉 반등 돌파!\n"
-                    f"▫️ 요격 단가(LIMIT): <code>${exec_buy_p:.2f}</code> (손절가 대비 <code>-${disc_from_stop:.2f}</code> 저가 재진입 · <code>{target_qty}주</code> · 현재 RSI <code>{rsi_val:.1f}</code>)\n"
-                    f"▫️ 3차 방어 기준({ref_src}): <code>{ref_unit}{ref_entry_p:.2f}</code> (NQ=F 진폭 <code>{nq_amp_global:.2f}%</code> 기반 3차 한도 <code>+{dyn_th_init:.2f}%</code>)\n"
-                    "▫️ 후속 조치: <code>전량 체결 즉시 상단 안전 캡(+5.00%) &amp; 하이킨 아시 트레일링(+1.00% 점화 · QQQ실시간 급변 바이패스) 자동 결속</code>"
-                )
+
+                if is_amp_buf_mode:
+                    td_p_s = float(buf_snap.get("target_drop_price", 0.0))
+                    ah_p_s = float(buf_snap.get("anchor_high", ref_ceil_price))
+                    await ctx.notify_tg(
+                        f"🛡️ <b>[진폭 역산 버퍼 최저점 역트레일링 요격] {sym_icon}{symbol} 바닥 확인 반등 매수 발사!</b>\n"
+                        f"▫️ 휩소 방어: 기준고가 <code>${ah_p_s:.2f}</code> · 최초 포착가 <code>${ref_ceil_price:.2f}</code> 진입 보류 ➡️ 역산 하락가 <code>${td_p_s:.2f}</code> 도달!\n"
+                        f"▫️ 바닥 궤적: 경유 최저점 <code>${post_low:.2f}</code> 찍고 <code>+{rebound_actual_pct:.2f}%</code> 양봉 반등 돌파!\n"
+                        f"▫️ 요격 단가(LIMIT): <code>${exec_buy_p:.2f}</code> (최초 포착가 대비 <code>-${disc_from_ceil:.2f}</code> 저가 진입 · <code>{target_qty}주</code> · 현재 RSI <code>{rsi_val:.1f}</code>)\n"
+                        f"▫️ 3차 방어 기준({ref_src}): <code>{ref_unit}{ref_entry_p:.2f}</code> (NQ=F 진폭 <code>{nq_amp_global:.2f}%</code> 기반 3차 한도 <code>+{dyn_th_init:.2f}%</code>)\n"
+                        "▫️ 후속 조치: <code>전량 체결 즉시 상단 안전 캡(+5.00%) &amp; 하이킨 아시 트레일링(+1.00% 점화 · QQQ실시간 급변 바이패스) 자동 결속</code>"
+                    )
+                else:
+                    await ctx.notify_tg(
+                        f"🪤 <b>[3차 손절 후 최저점 역트레일링 재출격] {sym_icon}{symbol} 바닥 확인 반등 요격 발사!</b>\n"
+                        f"▫️ 바닥 궤적: 직전 손절가 <code>${ref_ceil_price:.2f}</code> ➡️ 경유 최저점 <code>${post_low:.2f}</code> 찍고 <code>+{rebound_actual_pct:.2f}%</code> 양봉 반등 돌파!\n"
+                        f"▫️ 요격 단가(LIMIT): <code>${exec_buy_p:.2f}</code> (손절가 대비 <code>-${disc_from_ceil:.2f}</code> 저가 재진입 · <code>{target_qty}주</code> · 현재 RSI <code>{rsi_val:.1f}</code>)\n"
+                        f"▫️ 3차 방어 기준({ref_src}): <code>{ref_unit}{ref_entry_p:.2f}</code> (NQ=F 진폭 <code>{nq_amp_global:.2f}%</code> 기반 3차 한도 <code>+{dyn_th_init:.2f}%</code>)\n"
+                        "▫️ 후속 조치: <code>전량 체결 즉시 상단 안전 캡(+5.00%) &amp; 하이킨 아시 트레일링(+1.00% 점화 · QQQ실시간 급변 바이패스) 자동 결속</code>"
+                    )
                 return True
         except Exception as e:
-            print(f"🚨 [최저점 역트레일링 반등 재진입 방어 {symbol}] {e}", flush=True)
+            print(f"🚨 [최저점 역트레일링 반등 진입 방어 {symbol}] {e}", flush=True)
         finally:
             ctx.in_memory_ordering_lock[symbol] = False
     return False
@@ -671,7 +792,8 @@ async def execute_post_stop_bottom_rebound_plugin(
 
 # 프리장 초중반 골든타임 (04:07 ~ 08:14 EST) 양방향 대칭 클라이맥스 단일화 타격
 # — (SOXS RSI <= 30.0 AND SOXL RSI >= 79.9) 또는 (SOXL RSI <= 30.0 AND SOXS RSI >= 79.9) 포착 시
-#   1차 슬리피지(-0.18%) 지정가 매수 덫 선(先) 투하 (Case 54, 59, 71, 81, 83, 84, 87, 92)
+#   1) NQ=F 진폭 >= 0.80% 선행 충격 장세이고 현재가 > 역산 하락가이면 고가 진입 보류 & 역산 버퍼 역트레일링(🛡️ AMP_BUF_TRAIL) 점화! (Case 93)
+#   2) 평시(NQ=F < 0.80%) 또는 이미 역산 하락가 이하 도달 시 1차 슬리피지(-0.18%) 지정가 매수 덫 선(先) 투하 (Case 54, 59, 71, 81, 83, 84, 87, 92, 93)
 async def execute_premarket_rsi_sniper_strike_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -686,9 +808,12 @@ async def execute_premarket_rsi_sniper_strike_plugin(
     if symbol not in ("SOXS", "SOXL") or ctx.in_memory_ordering_lock.get(symbol, False):
         return
 
-    # Case 87: 해당 종목이 3차 안전망 손절 후 최저점 역트레일링 추적(RE_BOT_TRAIL) 중이면
-    #          신저가 경신 중 떨어지는 칼날에 일반 대칭 클라이맥스로 성급히 재진입하지 않도록 차단!
-    if _BOTTOM_TRACK_CACHE.get("active", False) and _BOTTOM_TRACK_CACHE.get("symbol") == symbol:
+    # Case 87 & Case 93: 해당 종목이 3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 또는
+    #                    선물 진폭 역산 하락가 버퍼 역트레일링(AMP_BUF_TRAIL) 추적 중이면 중복 포착 차단!
+    if (
+        (_BOTTOM_TRACK_CACHE.get("active", False) and _BOTTOM_TRACK_CACHE.get("symbol") == symbol)
+        or (_AMP_BUFFER_CACHE.get("active", False) and _AMP_BUFFER_CACHE.get("symbol") == symbol)
+    ):
         return
 
     est_hm = now_est.hour * 100 + now_est.minute
@@ -740,8 +865,8 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                 )
                 return
 
-            # NEW: 초과 Case 92 — NQ=F 진폭 기반 임계치 max(nq_entry_amp * 0.5, 0.8%)를 실시간 적용할
-            #      3차 역행 안전망 진입 기준가(ref_entry_p)는 토스 Open API QQQ 0.0초 실시간 현재가로 락온!
+            # 초과 Case 92 — NQ=F 진폭 기반 임계치 max(nq_entry_amp * 0.5, 0.8%)를 실시간 적용할
+            # 3차 역행 안전망 진입 기준가(ref_entry_p)는 토스 Open API QQQ 0.0초 실시간 현재가로 락온!
             ref_entry_p, ref_src = await MacroDataCache.get_stage3_reference_price(
                 force_refresh=True, realtime_probing=True
             )
@@ -779,6 +904,44 @@ async def execute_premarket_rsi_sniper_strike_plugin(
 
             cur_p_floored = math.floor(latest_price * 100.0) / 100.0
             if cur_p_floored <= 0.0:
+                return
+
+            # NEW: 초과 Case 93 — 선물 시장이 이미 급등·급락(nq_amp_global >= 0.80%)한 상태에서 대칭 클라이맥스가 포착되면,
+            #      직전 기준 고가(anchor_high) 대비 3배 레버리지 역산 예상 하락가(target_drop_p)를 산출하고
+            #      현재가가 역산 예상 하락가보다 높으면(cur_p_floored > target_drop_p) 고가 진입을 보류한 뒤
+            #      _AMP_BUFFER_CACHE 역트레일링(최저점 대비 +0.30% 양봉 반등 시 실전 요격)을 점화!
+            my_ewm = ((ctx.shared_rsi_state or {}).get(symbol) or {}).get("ewm_state") or {}
+            anchor_high = max(
+                float(my_ewm.get("session_anchor_high", 0.0)),
+                float(my_ewm.get("prev_close", 0.0)),
+                cur_p_floored,
+            )
+            target_drop_p, partial_drop_p, exp_drop_pct, eff_anchor = compute_amp_buffer_target_price(
+                anchor_high, cur_p_floored, nq_amp_global, AMP_BUFFER_LEVERAGE_MULT
+            )
+
+            if nq_amp_global >= AMP_BUFFER_ACTIVATE_NQ_PCT and target_drop_p > 0.0 and cur_p_floored > target_drop_p:
+                _activate_amp_buffer_state(
+                    symbol=symbol,
+                    spot_price=cur_p_floored,
+                    anchor_high=eff_anchor,
+                    target_drop_price=target_drop_p,
+                    partial_drop_price=partial_drop_p,
+                    expected_drop_pct=exp_drop_pct,
+                    nq_amp=nq_amp_global,
+                    buy_rsi=rsi_val,
+                    opp_rsi=opp_rsi_recheck,
+                    logical_date=now_est.strftime("%Y-%m-%d"),
+                )
+                ctx.wakeup_event.set()
+                init_trig_p = float(_AMP_BUFFER_CACHE.get("rebound_trig_price", 0.0))
+                await ctx.notify_tg(
+                    f"🛡️ <b>[프리장 듀얼 스나이퍼 · 진폭 역산 버퍼 가동] {sym_icon}{symbol} 고가 진입 보류 ➡️ 최저점 역트레일링 개시</b>\n"
+                    f"▫️ 대칭 클라이맥스: {sym_icon}{symbol} RSI <code>{rsi_val:.1f}</code> (≤30.0) &amp; {opp_icon}{opp_sym} RSI <code>{opp_rsi_recheck:.1f}</code> (≥79.9)\n"
+                    f"▫️ 선물 선행 충격: NQ=F 당일 진폭 <code>{nq_amp_global:.2f}%</code> (≥0.80%) ➡️ 3배 역산 기대하락폭 <code>-{exp_drop_pct:.2f}%</code>\n"
+                    f"▫️ 역산 하락가 버퍼: 기준고가 <code>${eff_anchor:.2f}</code> ➡️ 예상 하락가 <code>${target_drop_p:.2f}</code> (유효흡수 <code>${partial_drop_p:.2f}</code> · 현재 포착가 <code>${cur_p_floored:.2f}</code> 주문 보류!)\n"
+                    f"▫️ 0.4초 역트레일링: <code>신저가 경신 중 매수 보류(칼날 회피) · 역산 하락가 버퍼 도달 후 최저점 대비 +{AMP_BUFFER_REBOUND_PCT:.2f}% 양봉 반등(초기 ${init_trig_p:.2f}) 시 즉시 최저가 LIMIT 매수 발사</code>"
+                )
                 return
 
             slip_disc = max(
@@ -1063,7 +1226,7 @@ async def rearm_premarket_buy_trap_after_30s_plugin(
 
 
 # MODIFIED: 단일 '하이킨 아시 + 고점 트레일링 (🔥 HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)' 전용 매도 안전 캡 장전,
-#           체결 확증 시점 실시간 QQQ 3차 방어 기준가 동기화 및 0.1초 즉시 정정 스윕 엔진 (Case 85, 89, 91, 92)
+#           체결 확증 시점 실시간 QQQ 3차 방어 기준가 동기화 및 0.1초 즉시 정정 스윕 엔진 (Case 85, 89, 91, 92, 93)
 async def manage_mechanical_profit_trap_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
     is_active: bool, just_turned_off: bool, holdings_qty: int, holdings_detail: dict,
@@ -1077,6 +1240,8 @@ async def manage_mechanical_profit_trap_plugin(
         runtime_state["last_known_qty"] = holdings_qty
         if _BOTTOM_TRACK_CACHE.get("active", False) and _BOTTOM_TRACK_CACHE.get("symbol") == symbol:
             _reset_bottom_track_state(symbol)
+        if _AMP_BUFFER_CACHE.get("active", False) and _AMP_BUFFER_CACHE.get("symbol") == symbol:
+            _reset_amp_buffer_state(symbol)
 
     open_orders = await ctx.client.get_orders(status="OPEN", symbol=symbol)
     has_open_sell = any(o.get("side") == "SELL" for o in open_orders)
@@ -1435,9 +1600,9 @@ async def manage_mechanical_profit_trap_plugin(
                     new_sell_id = str(res["result"]["orderId"])
 
                 if not is_rearm:
-                    # NEW: 초과 Case 92 —
-                    #      1) 3차 동적 임계치 산출용 진폭(nq_amp_now)은 나스닥 100 선물(NQ=F)에서 조회!
-                    #      2) 해당 임계치를 적용할 3차 진입 기준가(ref_p_now)는 토스 Open API QQQ 0.0초 실시간 현재가로 동기화!
+                    # 초과 Case 92 —
+                    # 1) 3차 동적 임계치 산출용 진폭(nq_amp_now)은 나스닥 100 선물(NQ=F)에서 조회!
+                    # 2) 해당 임계치를 적용할 3차 진입 기준가(ref_p_now)는 토스 Open API QQQ 0.0초 실시간 현재가로 동기화!
                     nq_c_now, nq_h_now, nq_l_now = await MacroDataCache.get_cached_nq_data()
                     nq_amp_now = (((nq_h_now - nq_l_now) / nq_l_now * 100.0) if nq_l_now > 0.0 else 0.0)
                     ref_p_now, ref_src_now = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)

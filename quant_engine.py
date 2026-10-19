@@ -2,6 +2,7 @@
 # FILE: quant_engine.py
 # 목적: 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 통합 시드 원장,
 #       NQ=F 18:00 EST 신세션 하드 컷오프 + fast_info 당일 실제 고/저가 강제 병합(해법 1 · 1/2차 방어 및 3차 임계치 max(진폭*0.5, 0.8%) 산출 기준),
+#       NQ=F >= 0.80% 선행 급등락 시 진폭×3.0배 역산 하락가 버퍼 산출 엔진(초과 Case 93 · 🛡️ AMP_BUF_TRAIL),
 #       토스 Open API QQQ 0.0초 실시간 3차 역행 비교 기준가(1.5초 프로빙) + 10분/3분 단기 변화율 산출(해법 2 방법 A) 및
 #       Wilder's RSI(14) + 하이킨 아시(Heikin-Ashi) 1분봉 벡터/틱 합성 엔진
 # =====================================================================
@@ -15,6 +16,8 @@
 # NEW: 초과 Case 91 [해법 2 방법 A] — 토스 Open API QQQ 실시간 현재가·1분봉으로 최근 10분/3분 변화율(±0.20% 동일 임계치)을 최우선 산출
 # NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.8%)은 NQ=F 선물 진폭(nq_entry_amp)을 기준으로 산출하고,
 #      해당 임계치를 적용하는 진입 기준가 및 실시간 역행 비교가는 토스 Open API QQQ 0.0초 실시간 현재가(get_stage3_reference_price, 보유중 1.5초 프로빙)로 전면 대체
+# NEW: 초과 Case 93 — 선물 진폭(NQ=F >= 0.80%) 선행 폭등·폭락 시 충격 전 기준 고가(session_anchor_high) 벡터 추출 및
+#      3배 레버리지 역산 예상 하락가 버퍼 산출 함수(compute_amp_buffer_target_price) 탑재 (🛡️ AMP_BUF_TRAIL 지원)
 # MODIFIED: 듀얼 스나이퍼 화이트리스트 ALLOWED_SYMBOLS = ("SOXS", "SOXL") 확장 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76)
 # MODIFIED: lock_all_symbols_macro 호출 시 수동 보유 종목(MANUAL) 표식 보존 및 과열장(NQ>=2.0%) 수동 청산 후 자동 매매 오작동 해금 차단 (Case 50, 66, 82)
@@ -32,6 +35,57 @@ from zoneinfo import ZoneInfo
 from toss_api import GlobalThrottle
 
 EST_TZ = ZoneInfo("America/New_York")
+
+# NEW: 초과 Case 93 — 선물 선행 폭등·폭락 시 진폭 역산 하락가 버퍼(🛡️ AMP_BUF_TRAIL) 전역 상수
+AMP_BUFFER_ACTIVATE_NQ_PCT = 0.80      # NQ=F 당일 진폭이 0.80% 이상일 때 진폭 역산 하락가 버퍼 가동
+AMP_BUFFER_LEVERAGE_MULT = 3.0         # NQ=F 진폭 대비 3배 레버리지 ETF 기대 하락폭 역산 배수 (3.0x)
+AMP_BUFFER_PARTIAL_MULT = 2.1          # 최소 부분 흡수 인정 배수 (2.1x, 포착가 대비 최소 -1.00% 추가 하락 병행)
+AMP_BUFFER_REBOUND_PCT = 0.30          # 역산 하락가 도달 후 최저점(post_shock_low) 대비 +0.30% 양봉 반등 시 진입
+
+
+def compute_amp_buffer_target_price(
+    anchor_high_price: float,
+    spot_price: float,
+    nq_amp: float,
+    leverage_mult: float = AMP_BUFFER_LEVERAGE_MULT,
+) -> tuple[float, float, float, float]:
+    """
+    NEW: 초과 Case 93 — 나스닥 100 선물(NQ=F)이 이미 급등·급락(nq_amp >= 0.80%)한 상태에서
+    오프닝 휩소 고가(예: $48.30)에 성급히 진입하지 않도록, 충격 전 기준 고가(anchor_high_price, 예: $49.03)에서
+    3배 레버리지 기대 하락률(expected_drop_pct = min(15.0, nq_amp * 3.0), 예: 4.23%)을 역산하여
+    예상 하락가 버퍼(target_drop_p, 예: $46.95)와 유효 흡수 하한선(partial_drop_p)을 산출합니다.
+    반환값: (target_drop_price, partial_drop_price, expected_drop_pct, effective_anchor_high)
+    """
+    sp_fl = math.floor(float(spot_price or 0.0) * 100.0) / 100.0
+    ah_fl = math.floor(float(anchor_high_price or 0.0) * 100.0) / 100.0
+    nq_a = max(0.0, float(nq_amp or 0.0))
+
+    if sp_fl <= 0.0 or nq_a <= 0.0:
+        return 0.0, 0.0, 0.0, max(ah_fl, sp_fl)
+
+    eff_anchor = max(ah_fl, sp_fl)
+    expected_drop_pct = min(15.0, nq_a * float(leverage_mult or AMP_BUFFER_LEVERAGE_MULT))
+
+    # 기준 고가(eff_anchor)가 현재 포착가(sp_fl)보다 유의미하게 높은 경우 정식 역산 공식 적용
+    if eff_anchor > sp_fl * 1.003:
+        target_drop_p = math.floor(eff_anchor * (1.0 - expected_drop_pct / 100.0) * 100.0) / 100.0
+    else:
+        # 개장 첫 틱 등으로 이전 고가 캔들이 아직 분리되지 않은 경우 포착가 대비 잔여 충격(1.5배, 최소 1.0%) 역산 방어
+        rem_drop_pct = min(8.0, max(1.00, nq_a * 1.5))
+        target_drop_p = math.floor(sp_fl * (1.0 - rem_drop_pct / 100.0) * 100.0) / 100.0
+        eff_anchor = round(sp_fl / max(0.85, 1.0 - (expected_drop_pct - rem_drop_pct) / 100.0), 2)
+
+    partial_drop_pct = min(12.0, nq_a * AMP_BUFFER_PARTIAL_MULT)
+    partial_from_anchor = math.floor(eff_anchor * (1.0 - partial_drop_pct / 100.0) * 100.0) / 100.0
+    partial_from_spot = math.floor(sp_fl * 0.9900 * 100.0) / 100.0
+    partial_drop_p = max(0.01, min(partial_from_anchor, partial_from_spot))
+
+    return (
+        max(0.01, target_drop_p),
+        partial_drop_p,
+        round(expected_drop_pct, 2),
+        round(eff_anchor, 2),
+    )
 
 
 def get_cme_session_window_est(now_est: datetime = None) -> tuple[bool, datetime]:
@@ -77,7 +131,7 @@ def _compute_qqq_realtime_velocity_sync(
     q_price: float, q_candles: list, now_est: datetime
 ) -> tuple[bool, float, float, float]:
     """
-    NEW: 초과 Case 91 & Case 92 [해법 2 방법 A] — 토스 Open API에서 조회한 나스닥 100 현물 ETF(QQQ)의
+    초과 Case 91 & Case 92 [해법 2 방법 A] — 토스 Open API에서 조회한 나스닥 100 현물 ETF(QQQ)의
     0.0초 실시간 현재가(q_price)와 당일 세션 1분봉(q_candles)을 결합하여,
     롱(SOXL)·숏(SOXS) 자체 노이즈에 전혀 영향받지 않고 지연 0.0초로
     최근 10분 변화율(q_vel_10m), 최근 3분 변화율(q_vel_3m) 및 유효 실시간 QQQ 가격(curr_q)을 벡터 산출합니다.
@@ -159,9 +213,8 @@ def calculate_rsi_1m(
 ) -> tuple[float, float]:
     """
     Pandas 기반 백그라운드 벡터 연산.
-    VWAP, Wilder's RSI(14), 하이킨 아시(Heikin-Ashi) 1분봉을 1개의 데이터프레임에서 동시 산출하여
-    CPU 블로킹 및 API 중복 호출을 원천 차단합니다.
-    current_price 실시간 종가 보정 및 직전 확정 분봉(iloc[-2])의 Wilder's EWM + Heikin-Ashi 기저 상태를 ewm_state_out에 기록합니다.
+    VWAP, Wilder's RSI(14), 하이킨 아시(Heikin-Ashi) 1분봉 및 충격 전 기준 고가(session_anchor_high)를
+    1개의 데이터프레임에서 동시 산출하여 CPU 블로킹 및 API 중복 호출을 원천 차단합니다.
     """
     if not candles_json:
         return 0.0, 0.0
@@ -217,7 +270,24 @@ def calculate_rsi_1m(
     ha_seed.iloc[0] = (float(df["openPrice"].iloc[0]) + float(ha_close.iloc[0])) / 2.0
     ha_open = ha_seed.ewm(alpha=0.5, adjust=False).mean()
 
-    # 메인 루프에서 O(1) 실시간 틱 RSI 및 실시간 틱 하이킨 아시를 합성할 수 있도록 직전 확정 분봉(iloc[-2]) 기저 추출 (Case 73, 85)
+    # VWAP 및 당일 세션/직전 세션 기준 고가 분리
+    session_df = df[df.index >= session_start_est].copy()
+    pre_session_df = df[df.index < session_start_est]
+
+    # NEW: 초과 Case 93 — 선물 선행 폭등·폭락 시 역산 하락가 산출의 기준이 되는 충격 전 고가(session_anchor_high) 추출
+    recent_60_high = float(df["highPrice"].tail(60).max()) if not df.empty else 0.0
+    sess_high = float(session_df["highPrice"].max()) if not session_df.empty else 0.0
+    prev_sess_ref = (
+        max(
+            float(pre_session_df["highPrice"].tail(15).max()),
+            float(pre_session_df["closePrice"].iloc[-1]),
+        )
+        if not pre_session_df.empty
+        else 0.0
+    )
+    anchor_high_val = max(recent_60_high, sess_high, prev_sess_ref)
+
+    # 메인 루프에서 O(1) 실시간 틱 RSI 및 실시간 틱 하이킨 아시를 합성할 수 있도록 직전 확정 분봉(iloc[-2]) 기저 추출 (Case 73, 85, 93)
     if isinstance(ewm_state_out, dict):
         cur_o = float(df["openPrice"].iloc[-1])
         cur_h = float(df["highPrice"].iloc[-1])
@@ -244,6 +314,8 @@ def calculate_rsi_1m(
         ewm_state_out["ha_open"] = last_ha_o
         ewm_state_out["ha_close"] = last_ha_c
         ewm_state_out["ha_bull"] = bool(last_ha_c > last_ha_o)
+        ewm_state_out["session_anchor_high"] = float(anchor_high_val)
+        ewm_state_out["recent_60m_high"] = float(recent_60_high)
         ewm_state_out["ready"] = True
 
     rs = avg_gain / avg_loss
@@ -258,8 +330,6 @@ def calculate_rsi_1m(
     raw_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 0.0
     rsi_val = max(0.01, min(100.0, raw_rsi)) if not rsi_series.empty else 0.0
 
-    # VWAP 산출 시에만 논리적 거래일 기준(session_df)으로 분리
-    session_df = df[df.index >= session_start_est].copy()
     vwap_val = 0.0
     if not session_df.empty:
         tp = (session_df["highPrice"] + session_df["lowPrice"] + session_df["closePrice"]) / 3.0
@@ -340,6 +410,8 @@ def compute_realtime_tick_heikin_ashi(
 
     ewm_state["cur_bar_high"] = cur_h
     ewm_state["cur_bar_low"] = cur_l
+    if p_float > float(ewm_state.get("session_anchor_high", 0.0)):
+        ewm_state["session_anchor_high"] = p_float
 
     live_ha_open = (prev_ha_o + prev_ha_c) / 2.0 if (prev_ha_o > 0.0 and prev_ha_c > 0.0) else cur_o
     live_ha_close = (cur_o + cur_h + cur_l + p_float) / 4.0
@@ -584,7 +656,7 @@ class MacroDataCache:
         cls, force_refresh: bool = False, realtime_probing: bool = False
     ) -> tuple[float, str]:
         """
-        NEW: 초과 Case 92 — 나스닥 100 선물(NQ=F) 진폭으로 산출된 3차 진입 임계치 max(nq_entry_amp * 0.5, 0.8%)를
+        초과 Case 92 — 나스닥 100 선물(NQ=F) 진폭으로 산출된 3차 진입 임계치 max(nq_entry_amp * 0.5, 0.8%)를
         10분 지연 없이 시차 0.0초로 적용하기 위한 토스 Open API QQQ 실시간 현재가 반환 헬퍼.
         - 포지션 보유 중(realtime_probing=True)에는 1.5초 주기로 토스 QQQ 실시간 현재가를 직접 프로빙합니다.
         - 평시 대기 중(realtime_probing=False)에는 15.0초 캐시를 사용하며, QQQ 미수신 시간대(18:00~18:59 EST 등)에만 NQ=F로 폴백합니다.
@@ -668,6 +740,9 @@ class AssassinLedger:
     TRAIL_DROP_CALLBACK_PCT = 0.30        # 최고가(Peak) 대비 -0.30% 콜백 발생 시 즉시 익절 스윕
     TRAIL_SAFETY_CAP_RATE = 5.00          # 매수 체결 직후 거래소에 선장전하는 상단 안전 캡 (+5.00% LIMIT)
     NQ_VELOCITY_SURGE_PCT = 0.20          # QQQ/NQ 10분/3분 변화율 ±0.20% 이상 급등락 시 HA음봉 바이패스 임계치 (Case 89, 91)
+    AMP_BUFFER_ACTIVATE_NQ_PCT = AMP_BUFFER_ACTIVATE_NQ_PCT  # NQ=F 진폭 0.80% 이상 시 역산 하락가 버퍼 가동 (Case 93)
+    AMP_BUFFER_LEVERAGE_MULT = AMP_BUFFER_LEVERAGE_MULT      # 진폭 × 3.0배 레버리지 기대 하락폭 역산 배수 (Case 93)
+    AMP_BUFFER_REBOUND_PCT = AMP_BUFFER_REBOUND_PCT          # 최저점 대비 +0.30% 양봉 반등 시 진입 (Case 93)
     ROUND_TRIP_COMM_PCT = 0.14
     ONE_WAY_COMM_RATE = 0.0007
     MIN_BUDGET_FLOOR = 10.0
