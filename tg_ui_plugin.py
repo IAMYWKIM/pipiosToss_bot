@@ -5,12 +5,15 @@
 #       진입 성격별 '이원화 매도 믹스(기술적 반등 ⚡ OLD_IMM_CB × 진성 상승종목 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020 × 🚀 NQ_VEL_BYPASS)',
 #       3차 실시간 QQQ 최소 0.80% 역행 방어 및 최저점 반등 재진입(🪤 RE_BOT_TRAIL),
 #       15:00 ~ 15:58 EST 정규장 장마감 1시간 전 미익절 물량 당일 정규장 VWAP 도달 탈출(🛟 VWAP_ESCAPE),
+#       17:00 ~ 17:59 EST (06:00 ~ 06:59 KST) 선물 일일 마감 휴장 중 직전 마감 세션 시세·저가 보존 표출,
 #       19:00 ~ 03:57 EST 데이장 100% [모의] 관측(개시 1분 09:00 KST 한정 역산버퍼 포함),
 #       03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 및 초슬림 텔레그램 UI 렌더링 모듈
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 +0.64% / +1.00% 익절률 선택 버튼 및 데드코드 영구 소각
 # MODIFIED: 초과 Case 13, 38, 77 — 메인 메뉴(/start), 듀얼 지시서(/sync), 관제탑(/avwap), 제어반(/settlement)에서
 #           불필요한 부연 설명을 전면 삭제하여 모든 항목이 모바일 화면에서 2줄을 넘어가지 않도록 초슬림화
+# MODIFIED: 초과 Case 90 & Case 91 — 17:00 ~ 17:59 EST(06:00 ~ 06:59 KST) 선물 일일 마감 휴장 및 주말 휴장 구간에서
+#           직전 마감된 선물 세션 기준일과 '(마감 시세 · 18:00 신세션 대기)' 라벨 및 마감가를 명확히 표출
 # MODIFIED: 초과 Case 93 — 프리장 본진 UI에서 선행 역산버퍼(AMP_BUFFER) 표시를 전면 제거
 # MODIFIED: 초과 Case 92 & Case 94 — 최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80) 반영 및
 #           SOXS·SOXL 동시 수동 보유 시 /avwap 3차 방어 라인과 /settlement 출동 상태에서 양쪽 종목을 모두 독립 표출
@@ -31,6 +34,7 @@ from quant_engine import (
     AssassinLedger,
     MacroDataCache,
     MIN_STAGE3_QQQ_ADVERSE_PCT,
+    get_cme_session_window_est,
 )
 from sniper_plugin import (
     get_daymarket_sim_status,
@@ -343,7 +347,8 @@ def build_compact_status(
 
 
 # MODIFIED: 초과 Case 38, 90, 91, 92, 93, 94, 97, 98, 99 —
-#           관제탑(/avwap)에서 불필요한 설명 줄을 모두 제거하여 2줄 초과 줄바꿈을 원천 차단하고 선택지 B·이원화 매도·15:00 VWAP 탈출 상태 표출
+#           관제탑(/avwap)에서 17:00~17:59 EST(06:00~06:59 KST) 선물 마감 휴장 시 직전 세션 마감 시세·기준일을 명확히 표시하고
+#           선택지 B·이원화 매도·15:00 VWAP 탈출 상태 표출
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     wk = now_est.weekday()  # Mon=0 ... Fri=4, Sat=5, Sun=6
@@ -351,6 +356,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     is_weekend_closed = (wk == 4 and t >= 1700) or (wk == 5) or (wk == 6 and t < 1800)
     is_cme_open_wait = (not is_weekend_closed) and (1800 <= t <= 1859)
+    is_cme_daily_break = (not is_weekend_closed) and (1700 <= t <= 1759)
     is_day_time = (not is_weekend_closed) and (t >= 1900 or t <= 359)
     is_whipsaw_time = (not is_weekend_closed) and (358 <= t <= 406)
     is_pre_sniper_time = (not is_weekend_closed) and (407 <= t <= 814)
@@ -363,6 +369,9 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     elif is_cme_open_wait:
         session_name_ui = "cmeOpenWait"
         market_header = "( <b>🌐 선물 신세션 개장 · 19:00 데이장 대기</b> )"
+    elif is_cme_daily_break:
+        session_name_ui = "afterMarket"
+        market_header = "( <b>🧹 17:00 정산 · 선물 마감휴장</b> )"
     elif is_whipsaw_time:
         session_name_ui = "preMarket" if t >= 400 else "dayMarket"
         market_header = "( <b>🌪️ 03:58 ~ 04:07 휩소작전</b> )"
@@ -378,7 +387,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     elif 930 <= t <= 1559:
         session_name_ui = "regularMarket"
         market_header = "( <b>🔥 정규장 · 신규진입 마감</b> )"
-    elif 1600 <= t <= 1759:
+    elif 1600 <= t <= 1659:
         session_name_ui = "afterMarket"
         market_header = "( <b>🛑 애프터마켓</b> )"
     else:
@@ -395,10 +404,20 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
                 if is_cme_open_wait:
                     session_name_ui = "cmeOpenWait"
                     market_header = "( <b>🌐 선물 신세션 개장 · 19:00 데이장 대기</b> )"
-                elif 1700 <= t <= 1759:
-                    market_header = "( <b>🧹 17:00 정산 대기</b> )"
+                elif is_cme_daily_break:
+                    market_header = "( <b>🧹 17:00 정산 · 선물 마감휴장</b> )"
     except Exception:
         pass
+
+    # 초과 Case 90 & Case 91 — CME 선물 활성 여부 및 세션 기준일(예: 10-19) 확인
+    is_cme_open_nq, nq_sess_start = get_cme_session_window_est(now_est)
+    nq_sess_date_str = (nq_sess_start + timedelta(hours=6)).strftime("%m-%d")
+    if is_cme_open_nq:
+        nq_header_suffix = ""
+        nq_curr_label = "현재"
+    else:
+        nq_header_suffix = f" <code>({nq_sess_date_str} 마감 시세 · 18:00 신세션 대기)</code>"
+        nq_curr_label = "마감"
 
     nq_c, nq_h, nq_l = await MacroDataCache.get_cached_nq_data()
     nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0
@@ -651,9 +670,9 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     text = f"""📡 <b>[듀얼 스나이퍼 레이더]</b> {market_header}
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
-🌐 <b>나스닥 100 선물</b>
+🌐 <b>나스닥 100 선물</b>{nq_header_suffix}
 ▫️ 고가: <code>{nq_h:.2f}</code> | 저가: <code>{nq_l:.2f}</code>
-▫️ 현재: <code>{nq_c:.2f}</code> | 총 진폭: <code>{nq_amp:.2f}%</code>
+▫️ {nq_curr_label}: <code>{nq_c:.2f}</code> | 총 진폭: <code>{nq_amp:.2f}%</code>
 ▫️ 저가기준 진폭: <code>{nq_curr_amp:.2f}%</code>
 ▫️ 1·2차 방어: <code>{macro_1st_str}</code>{macro_3rd_line}
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
