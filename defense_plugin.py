@@ -1,11 +1,10 @@
 # =====================================================================
 # FILE: defense_plugin.py
-# 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망
+# 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망 (옵션 A 원형 복원)
 #       — 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(진폭*0.5, 0.80%)의 기준은 나스닥 100 선물(NQ=F),
 #         해당 3차 임계치(최소 0.80% QQQ 역행 하한 강제)를 적용하는 진입 기준가 및 실시간 역행 비교는
 #         토스 Open API QQQ 0.0초 실시간 현재가(1.5초 프로빙 · 포지션 자체 손실률 기반 즉시 손절 절대 금지),
 #       수동 진입(MANUAL) 시 2차 과열 방어 100% 패스 및 스나이퍼 재가동(OFF->ON)/미결속 시 현재 QQQ 0.00% 영점 재락온,
-#       선물 진폭(NQ=F >= 0.80%) 선행 폭등·폭락 시 역산 하락가 버퍼 역트레일링(_AMP_BUFFER_CACHE) 관리,
 #       04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 손절 시 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL) 캐시 점화,
 #       08:15 EST 거시지표 발표 15분 전 선제 컷오프 및 15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산 코어
 # =====================================================================
@@ -15,8 +14,7 @@
 # NEW: 초과 Case 87 — 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 역행 손절 시 당일 퇴근 대신 최저점 역트레일링(_BOTTOM_TRACK_CACHE) 점화
 # NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 max(nq_entry_amp * 0.5, 0.80%)는 나스닥 100 선물지수(NQ=F) 진폭을 기준으로 산출하고,
 #      해당 임계치를 적용하는 진입 기준가(nq_entry_price) 및 실시간 역행 비교가(ref_curr)는 토스 Open API QQQ 0.0초 실시간 현재가로 전면 대체
-# NEW: 초과 Case 93 — 선물 진폭(NQ=F >= 0.80%) 선행 급등락 시 고가 진입을 보류하고 역산 하락가 버퍼를 기준으로 최저점 역트레일링을 수행하는
-#      _AMP_BUFFER_CACHE 상태 머신 및 main.py 0.4초 고주파 부스터/시그니처 100% 호환 브릿지 탑재
+# MODIFIED: 제3헌법 및 초과 Case 93 — 프리장 선행 역산 버퍼(_AMP_BUFFER_CACHE) 잔재를 실전 코어에서 100% 영구 소각하고 옵션 A 원형으로 복원
 # NEW: 초과 Case 94 — 포지션 자체 손실률(-0.80% 초과 평가손실 등) 기반 즉시 손절 절대 금지, 최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT) 강제,
 #      스나이퍼 OFF->ON 재가동 또는 지난주 만료 주문(CANCELED) 감지 시 현재 실시간 QQQ 가격으로 0.00% 영점 재락온(_MANUAL_STAGE3_ANCHOR_CACHE) 및 양방향 수동 보유 보호
 
@@ -30,10 +28,7 @@ from zoneinfo import ZoneInfo
 from quant_engine import (
     AssassinLedger,
     MacroDataCache,
-    AMP_BUFFER_ACTIVATE_NQ_PCT,
-    AMP_BUFFER_LEVERAGE_MULT,
-    AMP_BUFFER_PARTIAL_MULT,
-    AMP_BUFFER_REBOUND_PCT,
+    MIN_STAGE3_QQQ_ADVERSE_PCT,
 )
 
 EST_TZ = ZoneInfo("America/New_York")
@@ -45,11 +40,8 @@ TRAIL_DROP_CALLBACK_PCT = AssassinLedger.TRAIL_DROP_CALLBACK_PCT      # 최고�
 TRAIL_SAFETY_CAP_RATE = AssassinLedger.TRAIL_SAFETY_CAP_RATE          # 체결 직후 거래소 선장전 안전 캡 (+5.00% LIMIT)
 NQ_VELOCITY_SURGE_PCT = AssassinLedger.NQ_VELOCITY_SURGE_PCT          # QQQ/NQ 10분/3분 변화율 ±0.20% HA음봉 바이패스 임계치
 
-# NEW: 초과 Case 94 — 3차 안전망 최소 실시간 QQQ 역행 하한선 (0.80% 하드 락온)
-MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80
-
-# 초과 Case 87 & Case 93 — 3차 안전망 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 및 진폭 역산 버퍼 역트레일링(AMP_BUF_TRAIL) 상수
-BOTTOM_REBOUND_PCT = 0.30          # 최저점(post_stop_low / post_shock_low) 대비 +0.30% 이상 양봉 반등 시 요격
+# 초과 Case 87 — 3차 안전망 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 상수
+BOTTOM_REBOUND_PCT = 0.30          # 최저점(post_stop_low) 대비 +0.30% 이상 양봉 반등 시 재진입 요격
 BOTTOM_MAX_RSI_CAP = 38.0          # 최저점 반등 진입 허용 최대 RSI 상한선 (과매도 반등권 확인)
 
 # 스나이퍼 무음 불발 및 매크로 1차 과열 차단 알림 쿨다운 캐시 (Case 74)
@@ -88,8 +80,8 @@ _TRAIL_RUNTIME_CACHE = {
     "SOXL": _make_empty_trail_slot(),
 }
 
-# NEW: 초과 Case 94 — 수동 보유(MANUAL) 물량의 스나이퍼 OFF->ON 재가동 및 지난주 만료 주문 감지 시
-#      현재 실시간 QQQ 가격으로 0.00% 영점 재락온을 보장하기 위한 인메모리 앵커 검증 캐시
+# 초과 Case 94 — 수동 보유(MANUAL) 물량의 스나이퍼 OFF->ON 재가동 및 지난주 만료 주문 감지 시
+# 현재 실시간 QQQ 가격으로 0.00% 영점 재락온을 보장하기 위한 인메모리 앵커 검증 캐시
 _MANUAL_STAGE3_ANCHOR_CACHE = {
     "SOXS": {"anchored": False, "verified_sell_id": ""},
     "SOXL": {"anchored": False, "verified_sell_id": ""},
@@ -106,27 +98,6 @@ _BOTTOM_TRACK_CACHE = {
     "rebound_trig_price": 0.0,
     "dipped_below_stop": False,
     "climax_seen": True,
-    "activated_ts": 0.0,
-    "last_new_low_ts": 0.0,
-}
-
-# 초과 Case 93 — 선물 진폭(NQ=F >= 0.80%) 선행 폭등·폭락 시 '진폭 역산 하락가 버퍼 & 최저점 역트레일링(🛡️ AMP_BUF_TRAIL)' 캐시
-_AMP_BUFFER_CACHE = {
-    "active": False,
-    "mode": "AMP_BUFFER",
-    "symbol": "",
-    "date": "",
-    "spot_price": 0.0,
-    "anchor_high": 0.0,
-    "target_drop_price": 0.0,
-    "partial_drop_price": 0.0,
-    "expected_drop_pct": 0.0,
-    "post_shock_low": 0.0,
-    "rebound_trig_price": 0.0,
-    "nq_amp_at_arm": 0.0,
-    "buy_rsi_at_arm": 0.0,
-    "opp_rsi_at_arm": 0.0,
-    "buffer_reached": False,
     "activated_ts": 0.0,
     "last_new_low_ts": 0.0,
 }
@@ -166,98 +137,10 @@ def get_trailing_runtime_status(symbol: str) -> dict:
     return dict(slot)
 
 
-def _reset_amp_buffer_state(symbol: str = None):
-    """선물 진폭 역산 하락가 버퍼 역트레일링 캐시를 원자적으로 초기화합니다 (Case 02, 22, 93)."""
-    if symbol and _AMP_BUFFER_CACHE.get("symbol") not in ("", symbol):
-        return
-    _AMP_BUFFER_CACHE["active"] = False
-    _AMP_BUFFER_CACHE["mode"] = "AMP_BUFFER"
-    _AMP_BUFFER_CACHE["symbol"] = ""
-    _AMP_BUFFER_CACHE["date"] = ""
-    _AMP_BUFFER_CACHE["spot_price"] = 0.0
-    _AMP_BUFFER_CACHE["anchor_high"] = 0.0
-    _AMP_BUFFER_CACHE["target_drop_price"] = 0.0
-    _AMP_BUFFER_CACHE["partial_drop_price"] = 0.0
-    _AMP_BUFFER_CACHE["expected_drop_pct"] = 0.0
-    _AMP_BUFFER_CACHE["post_shock_low"] = 0.0
-    _AMP_BUFFER_CACHE["rebound_trig_price"] = 0.0
-    _AMP_BUFFER_CACHE["nq_amp_at_arm"] = 0.0
-    _AMP_BUFFER_CACHE["buy_rsi_at_arm"] = 0.0
-    _AMP_BUFFER_CACHE["opp_rsi_at_arm"] = 0.0
-    _AMP_BUFFER_CACHE["buffer_reached"] = False
-    _AMP_BUFFER_CACHE["activated_ts"] = 0.0
-    _AMP_BUFFER_CACHE["last_new_low_ts"] = 0.0
-
-
-def _activate_amp_buffer_state(
-    symbol: str,
-    spot_price: float,
-    anchor_high: float,
-    target_drop_price: float,
-    partial_drop_price: float,
-    expected_drop_pct: float,
-    nq_amp: float,
-    buy_rsi: float = 0.0,
-    opp_rsi: float = 0.0,
-    logical_date: str = "",
-):
-    """
-    초과 Case 93 — 프리장 골든타임(04:07 ~ 08:14 EST) 중 NQ=F 진폭이 0.80% 이상 벌어져 있을 때
-    대칭 클라이맥스 포착 시 고가 진입을 보류하고 역산 하락가 버퍼 역트레일링(_AMP_BUFFER_CACHE)을 점화합니다.
-    """
-    if symbol not in ("SOXS", "SOXL") or spot_price <= 0.0 or target_drop_price <= 0.0:
-        return
-    sp_fl = math.floor(float(spot_price) * 100.0) / 100.0
-    td_fl = math.floor(float(target_drop_price) * 100.0) / 100.0
-    pd_fl = math.floor(float(partial_drop_price or td_fl) * 100.0) / 100.0
-    trig_p = math.ceil(sp_fl * (1.0 + AMP_BUFFER_REBOUND_PCT / 100.0) * 100.0) / 100.0
-    today_s = logical_date or datetime.now(EST_TZ).strftime("%Y-%m-%d")
-
-    _AMP_BUFFER_CACHE["active"] = True
-    _AMP_BUFFER_CACHE["mode"] = "AMP_BUFFER"
-    _AMP_BUFFER_CACHE["symbol"] = symbol
-    _AMP_BUFFER_CACHE["date"] = today_s
-    _AMP_BUFFER_CACHE["spot_price"] = sp_fl
-    _AMP_BUFFER_CACHE["anchor_high"] = round(float(anchor_high or sp_fl), 2)
-    _AMP_BUFFER_CACHE["target_drop_price"] = td_fl
-    _AMP_BUFFER_CACHE["partial_drop_price"] = pd_fl
-    _AMP_BUFFER_CACHE["expected_drop_pct"] = round(float(expected_drop_pct or 0.0), 2)
-    _AMP_BUFFER_CACHE["post_shock_low"] = sp_fl
-    _AMP_BUFFER_CACHE["rebound_trig_price"] = trig_p
-    _AMP_BUFFER_CACHE["nq_amp_at_arm"] = round(float(nq_amp or 0.0), 2)
-    _AMP_BUFFER_CACHE["buy_rsi_at_arm"] = round(float(buy_rsi or 0.0), 1)
-    _AMP_BUFFER_CACHE["opp_rsi_at_arm"] = round(float(opp_rsi or 0.0), 1)
-    _AMP_BUFFER_CACHE["buffer_reached"] = bool(sp_fl <= td_fl)
-    _AMP_BUFFER_CACHE["activated_ts"] = time.time()
-    _AMP_BUFFER_CACHE["last_new_low_ts"] = time.time()
-
-
-def get_amp_buffer_status(symbol: str = None) -> dict:
-    """UI 관제탑(/avwap, /sync, /settlement) 및 스나이퍼 코어에서 진폭 역산 버퍼 상태를 조회합니다 (초과 Case 93)."""
-    if symbol and _AMP_BUFFER_CACHE.get("symbol") != symbol:
-        return {
-            "active": False,
-            "mode": "AMP_BUFFER",
-            "symbol": symbol,
-            "date": "",
-            "spot_price": 0.0,
-            "anchor_high": 0.0,
-            "target_drop_price": 0.0,
-            "partial_drop_price": 0.0,
-            "expected_drop_pct": 0.0,
-            "post_shock_low": 0.0,
-            "rebound_trig_price": 0.0,
-            "buffer_reached": False,
-        }
-    return dict(_AMP_BUFFER_CACHE)
-
-
 def _reset_bottom_track_state(symbol: str = None):
     """
-    3차 손절 후 최저점 역트레일링 캐시(_BOTTOM_TRACK_CACHE) 및
-    선물 진폭 역산 버퍼 캐시(_AMP_BUFFER_CACHE)를 원자적으로 초기화합니다 (Case 02, 22, 87, 93).
+    3차 손절 후 최저점 역트레일링 캐시(_BOTTOM_TRACK_CACHE)를 원자적으로 초기화합니다 (Case 02, 22, 87).
     """
-    _reset_amp_buffer_state(symbol)
     if symbol and _BOTTOM_TRACK_CACHE.get("symbol") not in ("", symbol):
         return
     _BOTTOM_TRACK_CACHE["active"] = False
@@ -285,7 +168,6 @@ def _activate_bottom_track_state(
     """
     if symbol not in ("SOXS", "SOXL") or stop_price <= 0.0:
         return
-    _reset_amp_buffer_state()
     sp_fl = math.floor(float(stop_price) * 100.0) / 100.0
     cp_fl = math.floor(float(current_price) * 100.0) / 100.0 if current_price > 0.0 else sp_fl
     init_low = min(sp_fl, cp_fl) if cp_fl > 0.0 else sp_fl
@@ -308,34 +190,13 @@ def _activate_bottom_track_state(
 def get_bottom_track_status(symbol: str = None) -> dict:
     """
     UI 관제탑(/avwap, /sync, /settlement) 및 main.py 0.4초 부스터 루프에서
-    3차 손절 후 최저점 추적(STAGE3_STOP) 또는 선물 진폭 역산 버퍼 역트레일링(AMP_BUFFER) 상태를 통합 조회합니다 (초과 Case 87, 93).
+    3차 손절 후 최저점 역트레일링 추적(STAGE3_STOP) 상태를 조회합니다 (초과 Case 87, 93).
     """
     if _BOTTOM_TRACK_CACHE.get("active", False):
         if not symbol or _BOTTOM_TRACK_CACHE.get("symbol") == symbol:
             res = dict(_BOTTOM_TRACK_CACHE)
             res["mode"] = "STAGE3_STOP"
             return res
-
-    if _AMP_BUFFER_CACHE.get("active", False):
-        if not symbol or _AMP_BUFFER_CACHE.get("symbol") == symbol:
-            return {
-                "active": True,
-                "mode": "AMP_BUFFER",
-                "symbol": str(_AMP_BUFFER_CACHE.get("symbol", "")),
-                "date": str(_AMP_BUFFER_CACHE.get("date", "")),
-                "last_stop_price": float(_AMP_BUFFER_CACHE.get("target_drop_price", 0.0)),
-                "spot_price": float(_AMP_BUFFER_CACHE.get("spot_price", 0.0)),
-                "anchor_high": float(_AMP_BUFFER_CACHE.get("anchor_high", 0.0)),
-                "target_drop_price": float(_AMP_BUFFER_CACHE.get("target_drop_price", 0.0)),
-                "partial_drop_price": float(_AMP_BUFFER_CACHE.get("partial_drop_price", 0.0)),
-                "expected_drop_pct": float(_AMP_BUFFER_CACHE.get("expected_drop_pct", 0.0)),
-                "post_stop_low": float(_AMP_BUFFER_CACHE.get("post_shock_low", 0.0)),
-                "post_shock_low": float(_AMP_BUFFER_CACHE.get("post_shock_low", 0.0)),
-                "rebound_trig_price": float(_AMP_BUFFER_CACHE.get("rebound_trig_price", 0.0)),
-                "dipped_below_stop": bool(_AMP_BUFFER_CACHE.get("buffer_reached", False)),
-                "buffer_reached": bool(_AMP_BUFFER_CACHE.get("buffer_reached", False)),
-                "nq_amp_at_arm": float(_AMP_BUFFER_CACHE.get("nq_amp_at_arm", 0.0)),
-            }
 
     return {
         "active": False,
@@ -599,14 +460,13 @@ async def execute_macro_defense_plugin(
         and entry_session not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
     )
     if is_untagged_manual_hold:
-        _reset_amp_buffer_state()
         ref_curr_man, ref_src_man = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
         anchor_slot = _MANUAL_STAGE3_ANCHOR_CACHE.setdefault(
             symbol, {"anchored": False, "verified_sell_id": ""}
         )
 
-        # NEW: 초과 Case 94 — 장부에 지난주/전세션의 만료된 sell_order_id가 남아있는 경우 실제 유효 여부를 1회 검증하여
-        #      CANCELED / REJECTED / 404 이면 즉시 폐기하고 현재 실시간 QQQ 가격으로 0.00% 영점 재조준!
+        # 초과 Case 94 — 장부에 지난주/전세션의 만료된 sell_order_id가 남아있는 경우 실제 유효 여부를 1회 검증하여
+        # CANCELED / REJECTED / 404 이면 즉시 폐기하고 현재 실시간 QQQ 가격으로 0.00% 영점 재조준!
         effective_sell_id = str(sell_order_id or "")
         if effective_sell_id and anchor_slot.get("verified_sell_id") != effective_sell_id:
             try:
@@ -673,10 +533,10 @@ async def execute_macro_defense_plugin(
             await AssassinLedger.save_state(symbol, **save_kwargs)
 
     # =====================================================================
-    # [1차 방어선] NQ=F 당일 진폭 >= 2.0% 대세 과열 시 미체결 자동 매수/역산버퍼 즉시 파기 및 신규 진입 잠금 (Case 66, 82, 93)
+    # [1차 방어선] NQ=F 당일 진폭 >= 2.0% 대세 과열 시 미체결 자동 매수 즉시 파기 및 신규 진입 잠금 (Case 66, 82)
     # =====================================================================
     if nq_amp >= 2.0:
-        if _BOTTOM_TRACK_CACHE.get("active", False) or _AMP_BUFFER_CACHE.get("active", False):
+        if _BOTTOM_TRACK_CACHE.get("active", False):
             _reset_bottom_track_state()
 
         if buy_order_id and not ctx.in_memory_ordering_lock.get(symbol, False):
@@ -894,8 +754,8 @@ async def execute_macro_defense_plugin(
                 )
             else:
                 _reset_bottom_track_state()
-                # MODIFIED: 초과 Case 94 ③ — force_all=False를 전달하여 반대편 종목이 수동 보유(MANUAL) 중일 때
-                #           반대편 종목의 MANUAL 표식과 QQQ 기준가가 소각되지 않도록 100% 보호!
+                # 초과 Case 94 ③ — force_all=False를 전달하여 반대편 종목이 수동 보유(MANUAL) 중일 때
+                # 반대편 종목의 MANUAL 표식과 QQQ 기준가가 소각되지 않도록 100% 보호!
                 await AssassinLedger.lock_all_symbols_macro(
                     last_session_id=current_session_id, force_all=False
                 )
@@ -931,8 +791,8 @@ async def execute_macro_defense_plugin(
     return False
 
 
-# 초과 Case 48 & Case 84 & Case 93: 08:15:00 EST 거시지표 발표 15분 전 선제 컷오프
-# (08:15 ~ 15:58 EST 전 구간 신규 매수 봉쇄, 진폭 역산 버퍼·최저점 추적 캐시 파기 및 미체결 매수 즉시 선취소)
+# 초과 Case 48 & Case 84: 08:15:00 EST 거시지표 발표 15분 전 선제 컷오프
+# (08:15 ~ 15:58 EST 전 구간 신규 매수 봉쇄, 최저점 추적 캐시 파기 및 미체결 매수 즉시 선취소)
 async def enforce_0930_regular_cutoff_plugin(
     ctx,
     symbol: str,
@@ -953,8 +813,8 @@ async def enforce_0930_regular_cutoff_plugin(
     if not is_active or not (815 <= est_hm <= 1559):
         return is_session_done, buy_order_id
 
-    # 08:15 EST 진입 즉시 진폭 역산 버퍼 캐시 및 최저점 역트레일링 추적 캐시 파기 (Case 48, 84, 93)
-    if _BOTTOM_TRACK_CACHE.get("active", False) or _AMP_BUFFER_CACHE.get("active", False):
+    # 08:15 EST 진입 즉시 최저점 역트레일링 추적 캐시 파기 (Case 48, 84)
+    if _BOTTOM_TRACK_CACHE.get("active", False):
         _reset_bottom_track_state()
 
     if buy_order_id and not ctx.in_memory_ordering_lock.get(symbol, False):
