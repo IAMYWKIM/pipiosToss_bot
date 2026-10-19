@@ -1,8 +1,8 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL) 통합 시드 원장,
+# 목적: 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL · 옵션 A) 통합 시드 원장,
 #       NQ=F 18:00 EST 신세션 하드 컷오프 + fast_info 당일 실제 고/저가 강제 병합(해법 1 · 1/2차 방어 및 3차 임계치 max(진폭*0.5, 0.80%) 산출 기준),
-#       NQ=F >= 0.80% 선행 급등락 시 진폭×3.0배 역산 하락가 버퍼 산출 엔진(초과 Case 93 · 🛡️ AMP_BUF_TRAIL),
+#       데이장 개시 1분(09:00:00~09:00:59 KST) [모의] 전용 진폭×3.0배 역산 하락가 버퍼 산출 엔진(초과 Case 93 · 🛡️ BUFFER_WAIT),
 #       토스 Open API QQQ 0.0초 실시간 3차 역행 비교 기준가(1.5초 프로빙 · 최소 0.80% 역행 하한 강제) + 10분/3분 단기 변화율 산출(해법 2 방법 A) 및
 #       Wilder's RSI(14) + 하이킨 아시(Heikin-Ashi) 1분봉 벡터/틱 합성 엔진
 # =====================================================================
@@ -16,10 +16,11 @@
 # NEW: 초과 Case 91 [해법 2 방법 A] — 토스 Open API QQQ 실시간 현재가·1분봉으로 최근 10분/3분 변화율(±0.20% 동일 임계치)을 최우선 산출
 # NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)은 NQ=F 선물 진폭(nq_entry_amp)을 기준으로 산출하고,
 #      해당 임계치를 적용하는 진입 기준가 및 실시간 역행 비교가는 토스 Open API QQQ 0.0초 실시간 현재가(get_stage3_reference_price, 보유중 1.5초 프로빙)로 전면 대체
-# NEW: 초과 Case 93 — 선물 진폭(NQ=F >= 0.80%) 선행 폭등·폭락 시 충격 전 기준 고가(session_anchor_high) 벡터 추출 및
-#      3배 레버리지 역산 예상 하락가 버퍼 산출 함수(compute_amp_buffer_target_price) 탑재 (🛡️ AMP_BUF_TRAIL 지원)
-# NEW: 초과 Case 94 — 포지션 자체 손실률 기반 즉시 손절 절대 금지 및 실시간 QQQ 최소 0.80% 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80) 강제,
-#      lock_all_symbols_macro 호출 시 force_all 여부와 무관하게 수동 보유 종목(MANUAL) 표식 및 기준가 100% 보존
+# MODIFIED: 초과 Case 93 — 데이장 개시 1분(09:00:00~09:00:59 KST) [모의] 전용 충격 전 기준 고가(session_anchor_high) 벡터 추출 및
+#           3배 레버리지 역산 예상 하락가 버퍼 산출 함수(compute_amp_buffer_target_price) 유지 (프리장 본진은 순수 옵션 A 원복)
+# NEW: 초과 Case 94 — 포지션 자체 손실률 기반 즉시 손절 절대 금지 및 실시간 QQQ 최소 0.80% 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80) 강제
+# NEW: 초과 Case 95 — lock_all_symbols_macro 호출 시 수동 보유 종목(MANUAL)뿐만 아니라 03:58 ~ 04:06 EST 진행 중인
+#      1주 휩소 노출 작전(WHIPSAW_1SH)의 표식 및 목표가를 덮어쓰지 않도록 보호하고, 04:07 정리 후 과열일 본진 차단(CANCELED_MACRO) 자동 복원 결속
 # MODIFIED: 듀얼 스나이퍼 화이트리스트 ALLOWED_SYMBOLS = ("SOXS", "SOXL") 확장 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76)
 
@@ -37,13 +38,13 @@ from toss_api import GlobalThrottle
 
 EST_TZ = ZoneInfo("America/New_York")
 
-# 초과 Case 93 — 선물 선행 폭등·폭락 시 진폭 역산 하락가 버퍼(🛡️ AMP_BUF_TRAIL) 전역 상수
-AMP_BUFFER_ACTIVATE_NQ_PCT = 0.80      # NQ=F 당일 진폭이 0.80% 이상일 때 진폭 역산 하락가 버퍼 가동
+# 초과 Case 93 — 데이장 개시 1분(09:00:00 ~ 09:00:59 KST) [모의] 스나이퍼 전용 진폭 역산 하락가 버퍼(BUFFER_WAIT) 전역 상수
+AMP_BUFFER_ACTIVATE_NQ_PCT = 0.80      # 데이장 개시 1분 중 NQ=F 당일 진폭이 0.80% 이상일 때 [모의] 역산 버퍼 가동
 AMP_BUFFER_LEVERAGE_MULT = 3.0         # NQ=F 진폭 대비 3배 레버리지 ETF 기대 하락폭 역산 배수 (3.0x)
 AMP_BUFFER_PARTIAL_MULT = 2.1          # 최소 부분 흡수 인정 배수 (2.1x, 포착가 대비 최소 -1.00% 추가 하락 병행)
-AMP_BUFFER_REBOUND_PCT = 0.30          # 역산 하락가 도달 후 최저점(post_shock_low) 대비 +0.30% 양봉 반등 시 진입
+AMP_BUFFER_REBOUND_PCT = 0.30          # 역산 하락가 도달 후 최저점 대비 +0.30% 양봉 반등 시 모의 가상 체결
 
-# NEW: 초과 Case 94 — 3차 안전망 최소 실시간 QQQ 역행 하한선 (0.80% 하드 락온)
+# 초과 Case 94 — 3차 안전망 최소 실시간 QQQ 역행 하한선 (0.80% 하드 락온)
 MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80
 
 
@@ -54,10 +55,11 @@ def compute_amp_buffer_target_price(
     leverage_mult: float = AMP_BUFFER_LEVERAGE_MULT,
 ) -> tuple[float, float, float, float]:
     """
-    초과 Case 93 — 나스닥 100 선물(NQ=F)이 이미 급등·급락(nq_amp >= 0.80%)한 상태에서
-    오프닝 휩소 고가(예: $48.30)에 성급히 진입하지 않도록, 충격 전 기준 고가(anchor_high_price, 예: $49.03)에서
-    3배 레버리지 기대 하락률(expected_drop_pct = min(15.0, nq_amp * 3.0), 예: 4.23%)을 역산하여
-    예상 하락가 버퍼(target_drop_p, 예: $46.95)와 유효 흡수 하한선(partial_drop_p)을 산출합니다.
+    초과 Case 93 — 데이장 개시 시각(09:00:00 ~ 09:00:59 KST / 19:00:00 ~ 19:00:59 EST) 1분간
+    나스닥 100 선물(NQ=F)이 이미 급등·급락(nq_amp >= 0.80%)한 상태에서 [모의] 스나이퍼가
+    오프닝 휩소 고가에 즉시 모의 체결하지 않도록, 충격 전 기준 고가(anchor_high_price)에서
+    3배 레버리지 기대 하락률(expected_drop_pct = min(15.0, nq_amp * 3.0))을 역산하여
+    예상 하락가 버퍼(target_drop_p)와 유효 흡수 하한선(partial_drop_p)을 산출합니다.
     반환값: (target_drop_price, partial_drop_price, expected_drop_pct, effective_anchor_high)
     """
     sp_fl = math.floor(float(spot_price or 0.0) * 100.0) / 100.0
@@ -70,11 +72,9 @@ def compute_amp_buffer_target_price(
     eff_anchor = max(ah_fl, sp_fl)
     expected_drop_pct = min(15.0, nq_a * float(leverage_mult or AMP_BUFFER_LEVERAGE_MULT))
 
-    # 기준 고가(eff_anchor)가 현재 포착가(sp_fl)보다 유의미하게 높은 경우 정식 역산 공식 적용
     if eff_anchor > sp_fl * 1.003:
         target_drop_p = math.floor(eff_anchor * (1.0 - expected_drop_pct / 100.0) * 100.0) / 100.0
     else:
-        # 개장 첫 틱 등으로 이전 고가 캔들이 아직 분리되지 않은 경우 포착가 대비 잔여 충격(1.5배, 최소 1.0%) 역산 방어
         rem_drop_pct = min(8.0, max(1.00, nq_a * 1.5))
         target_drop_p = math.floor(sp_fl * (1.0 - rem_drop_pct / 100.0) * 100.0) / 100.0
         eff_anchor = round(sp_fl / max(0.85, 1.0 - (expected_drop_pct - rem_drop_pct) / 100.0), 2)
@@ -217,7 +217,7 @@ def calculate_rsi_1m(
 ) -> tuple[float, float]:
     """
     Pandas 기반 백그라운드 벡터 연산.
-    VWAP, Wilder's RSI(14), 하이킨 아시(Heikin-Ashi) 1분봉 및 충격 전 기준 고가(session_anchor_high)를
+    VWAP, Wilder's RSI(14), 하이킨 아시(Heikin-Ashi) 1분봉 및 데이장 개시 1분 [모의] 버퍼용 기준 고가(session_anchor_high)를
     1개의 데이터프레임에서 동시 산출하여 CPU 블로킹 및 API 중복 호출을 원천 차단합니다.
     """
     if not candles_json:
@@ -278,7 +278,7 @@ def calculate_rsi_1m(
     session_df = df[df.index >= session_start_est].copy()
     pre_session_df = df[df.index < session_start_est]
 
-    # 초과 Case 93 — 선물 선행 폭등·폭락 시 역산 하락가 산출의 기준이 되는 충격 전 고가(session_anchor_high) 추출
+    # 초과 Case 93 — 데이장 개시 1분(09:00 KST) [모의] 역산 버퍼용 충격 전 기준 고가(session_anchor_high) 추출
     recent_60_high = float(df["highPrice"].tail(60).max()) if not df.empty else 0.0
     sess_high = float(session_df["highPrice"].max()) if not session_df.empty else 0.0
     prev_sess_ref = (
@@ -745,9 +745,9 @@ class AssassinLedger:
     TRAIL_SAFETY_CAP_RATE = 5.00          # 매수 체결 직후 거래소에 선장전하는 상단 안전 캡 (+5.00% LIMIT)
     NQ_VELOCITY_SURGE_PCT = 0.20          # QQQ/NQ 10분/3분 변화율 ±0.20% 이상 급등락 시 HA음봉 바이패스 임계치 (Case 89, 91)
     MIN_STAGE3_QQQ_ADVERSE_PCT = MIN_STAGE3_QQQ_ADVERSE_PCT  # 3차 안전망 최소 실시간 QQQ 역행 하한선 0.80% (Case 94)
-    AMP_BUFFER_ACTIVATE_NQ_PCT = AMP_BUFFER_ACTIVATE_NQ_PCT  # NQ=F 진폭 0.80% 이상 시 역산 하락가 버퍼 가동 (Case 93)
+    AMP_BUFFER_ACTIVATE_NQ_PCT = AMP_BUFFER_ACTIVATE_NQ_PCT  # 데이장 09:00 KST 1분 한정 역산 버퍼 가동 기준 (Case 93)
     AMP_BUFFER_LEVERAGE_MULT = AMP_BUFFER_LEVERAGE_MULT      # 진폭 × 3.0배 레버리지 기대 하락폭 역산 배수 (Case 93)
-    AMP_BUFFER_REBOUND_PCT = AMP_BUFFER_REBOUND_PCT          # 최저점 대비 +0.30% 양봉 반등 시 진입 (Case 93)
+    AMP_BUFFER_REBOUND_PCT = AMP_BUFFER_REBOUND_PCT          # 최저점 대비 +0.30% 양봉 반등 시 모의 진입 (Case 93)
     ROUND_TRIP_COMM_PCT = 0.14
     ONE_WAY_COMM_RATE = 0.0007
     MIN_BUDGET_FLOOR = 10.0
@@ -1031,28 +1031,56 @@ class AssassinLedger:
             )
 
     # MODIFIED: 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 잠금하되,
-    #           현재 수동 보유 중(entry_session == "MANUAL" 이고 활성 보유/매도주문 존재)인 종목은
-    #           force_all 여부와 무관하게 MANUAL 표식과 QQQ 기준가를 절대 덮어쓰지 않고 100% 보존 (Case 50, 82, 94)
+    #           현재 수동 보유 중(entry_session == "MANUAL")인 종목과
+    #           03:58 ~ 04:06 EST 진행 중인 1주 휩소 작전(entry_session == "WHIPSAW_1SH") 종목은
+    #           표식과 목표가(whipsaw_target_price), 미체결 buy_order_id를 절대 덮어쓰지 않고 100% 보존 (Case 50, 82, 94, 95)
     @classmethod
     async def lock_all_symbols_macro(cls, last_session_id: str = None, force_all: bool = False):
+        now_est = datetime.now(EST_TZ)
+        est_hm = now_est.hour * 100 + now_est.minute
         for sym in cls.ALLOWED_SYMBOLS:
             st = await cls.get_state(sym)
+            buy_id = await cls.get_buy_order_id(sym)
+            cur_es = str(st[8] or "")
+
             is_active_manual_hold = (
-                str(st[8] or "") == "MANUAL"
+                cur_es == "MANUAL"
                 and (float(st[0] or 0.0) > 0.0 or float(st[6] or 0.0) > 0.0 or bool(st[7]))
             )
-            kwargs = {
-                "buy_order_id": "",
-                "is_session_done": True,
-                "entry_session": "MANUAL" if is_active_manual_hold else "CANCELED_MACRO",
-                "whipsaw_target_price": 0.0,
-            }
+            is_active_whipsaw_1sh = (
+                cur_es == "WHIPSAW_1SH"
+                and (
+                    (358 <= est_hm <= 406)
+                    or bool(buy_id)
+                    or float(st[0] or 0.0) > 0.0
+                    or float(st[6] or 0.0) > 0.0
+                    or bool(st[7])
+                )
+            )
+
+            if is_active_whipsaw_1sh:
+                kwargs = {"is_session_done": True}
+            elif is_active_manual_hold:
+                kwargs = {
+                    "buy_order_id": "",
+                    "is_session_done": True,
+                    "entry_session": "MANUAL",
+                    "whipsaw_target_price": 0.0,
+                }
+            else:
+                kwargs = {
+                    "buy_order_id": "",
+                    "is_session_done": True,
+                    "entry_session": "CANCELED_MACRO",
+                    "whipsaw_target_price": 0.0,
+                }
+
             if last_session_id is not None:
                 kwargs["last_session_id"] = last_session_id
             await cls.save_state(sym, **kwargs)
 
     # 프리장 골든타임 내 익절 완료 또는 04:07 휩소 정리 완료 시 양쪽 장부 동시 무한 재출동 락 해제하되,
-    # 당일 NQ=F 진폭이 이미 2.0% 이상인 과열 장세라면 자동 스나이퍼 재해금을 차단하고 CANCELED_MACRO 유지 (Case 52, 66, 80, 84)
+    # 당일 NQ=F 진폭이 이미 2.0% 이상인 과열 장세라면 자동 스나이퍼 재해금을 차단하고 CANCELED_MACRO 복원 (Case 52, 66, 80, 84, 95)
     @classmethod
     async def unlock_all_symbols_for_reentry(cls):
         nq_h = float(MacroDataCache._nq_cache_data[1] or 0.0)

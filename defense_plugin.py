@@ -1,10 +1,11 @@
 # =====================================================================
 # FILE: defense_plugin.py
-# 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망 (옵션 A 원형 복원)
+# 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망 (옵션 A 원형 & 초과 Case 95 완결)
 #       — 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(진폭*0.5, 0.80%)의 기준은 나스닥 100 선물(NQ=F),
 #         해당 3차 임계치(최소 0.80% QQQ 역행 하한 강제)를 적용하는 진입 기준가 및 실시간 역행 비교는
 #         토스 Open API QQQ 0.0초 실시간 현재가(1.5초 프로빙 · 포지션 자체 손실률 기반 즉시 손절 절대 금지),
-#       수동 진입(MANUAL) 시 2차 과열 방어 100% 패스 및 스나이퍼 재가동(OFF->ON)/미결속 시 현재 QQQ 0.00% 영점 재락온,
+#       수동 진입(MANUAL) 및 03:58~04:06 EST 1주 휩소 작전(WHIPSAW_1SH) 시 1·2차 과열 방어 100% 패스,
+#       스나이퍼 재가동(OFF->ON)/미결속 시 현재 QQQ 0.00% 영점 재락온,
 #       04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 손절 시 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL) 캐시 점화,
 #       08:15 EST 거시지표 발표 15분 전 선제 컷오프 및 15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산 코어
 # =====================================================================
@@ -17,6 +18,8 @@
 # MODIFIED: 제3헌법 및 초과 Case 93 — 프리장 선행 역산 버퍼(_AMP_BUFFER_CACHE) 잔재를 실전 코어에서 100% 영구 소각하고 옵션 A 원형으로 복원
 # NEW: 초과 Case 94 — 포지션 자체 손실률(-0.80% 초과 평가손실 등) 기반 즉시 손절 절대 금지, 최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT) 강제,
 #      스나이퍼 OFF->ON 재가동 또는 지난주 만료 주문(CANCELED) 감지 시 현재 실시간 QQQ 가격으로 0.00% 영점 재락온(_MANUAL_STAGE3_ANCHOR_CACHE) 및 양방향 수동 보유 보호
+# NEW: 초과 Case 95 — 03:58 ~ 04:06 EST 중 가동되는 1주 휩소 노출 작전(WHIPSAW_1SH)의 미체결 1주 매수덫 및 1주 보유 물량에 대해
+#      1·2차 과열 방어선(NQ>=2.0% 주문 파기 및 손실권 즉시 덤핑)을 100% 바이패스하고 3차 실시간 QQQ 역행 방어와 04:07 정각 정리만 적용
 
 import math
 import time
@@ -407,13 +410,13 @@ async def execute_moc_zero_overnight_plugin(
     return True
 
 
-# MODIFIED: 초과 Case 66, 67, 82, 86, 87, 92, 93, 94 —
+# MODIFIED: 초과 Case 66, 67, 82, 86, 87, 92, 93, 94, 95 —
 #           1) 포지션 자체의 현재 평가손실률(예: 지난주 보유분 -3% ~ -10% 손실 등)을 3차 임계치에 바로 적용하여 즉시 손절하는 것을 100% 금지!
 #           2) 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)의 기준은 나스닥 100 선물(NQ=F)이되,
 #              최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80)을 하드 락온!
 #           3) 스나이퍼 OFF->ON 재가동 시 또는 수동 물량 미결속(not sell_order_id 또는 만료된 구버전 sell_order_id) 감지 첫 틱에
 #              과거 nq_entry_price를 폐기하고 현재 실시간 QQQ 가격(ref_curr_man)으로 0.00% 영점 재조준!
-#           4) 양방향 동시 수동 보유 중 한쪽 3차 손절 시 반대편 수동 보유 종목의 MANUAL 표식 및 QQQ 기준가 100% 보호
+#           4) 03:58 ~ 04:06 EST 1주 휩소 작전(WHIPSAW_1SH)은 1·2차 과열 방어선(주문 취소 및 손실권 즉시 덤핑)을 100% 바이패스!
 async def execute_macro_defense_plugin(
     ctx,
     symbol: str,
@@ -449,6 +452,12 @@ async def execute_macro_defense_plugin(
     # 1. 1·2차 과열 방어선(>=2.0%) 및 3차 동적 임계치 산출 기준인 나스닥 100 선물지수(NQ=F) 조회
     nq_curr, nq_high, nq_low = await MacroDataCache.get_cached_nq_data()
     nq_amp = ((nq_high - nq_low) / nq_low * 100.0) if nq_low > 0.0 else 0.0
+
+    # NEW: 초과 Case 95 — 03:58 ~ 04:06 EST 진행 중인 1주 휩소 노출 작전(WHIPSAW_1SH) 여부 판별
+    is_whipsaw_1sh_active = (
+        entry_session == "WHIPSAW_1SH"
+        and (358 <= est_hm <= 406)
+    )
 
     # =====================================================================
     # [선행 처리] 수동 진입(MANUAL) 포지션 첫 감지 틱 및 재가동(OFF->ON) 시
@@ -533,13 +542,14 @@ async def execute_macro_defense_plugin(
             await AssassinLedger.save_state(symbol, **save_kwargs)
 
     # =====================================================================
-    # [1차 방어선] NQ=F 당일 진폭 >= 2.0% 대세 과열 시 미체결 자동 매수 즉시 파기 및 신규 진입 잠금 (Case 66, 82)
+    # [1차 방어선] NQ=F 당일 진폭 >= 2.0% 대세 과열 시 본진 미체결 매수 즉시 파기 및 본진 신규 진입 잠금
+    #             (단, 초과 Case 95 의거 03:58~04:06 EST 1주 휩소 작전 WHIPSAW_1SH 매수덫은 절대 파기하지 않음!)
     # =====================================================================
     if nq_amp >= 2.0:
         if _BOTTOM_TRACK_CACHE.get("active", False):
             _reset_bottom_track_state()
 
-        if buy_order_id and not ctx.in_memory_ordering_lock.get(symbol, False):
+        if buy_order_id and not is_whipsaw_1sh_active and not ctx.in_memory_ordering_lock.get(symbol, False):
             ctx.in_memory_ordering_lock[symbol] = True
             try:
                 try:
@@ -555,28 +565,28 @@ async def execute_macro_defense_plugin(
                 await ctx.notify_tg(
                     f"🛑 <b>[매크로 1차 방어선 발동] {sym_icon}{symbol} 미체결 매수 주문 즉시 파기</b>\n"
                     f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp:.2f}%</code> (2.0% 대세 과열 돌파)\n"
-                    "▫️ 조치: 미체결 매수 취소 완료 및 금일 양 종목 자동 매수 권한 영구 소각"
+                    "▫️ 조치: 미체결 매수 취소 완료 및 금일 양 종목 본진 자동 매수 권한 영구 소각"
                 )
                 return True
             finally:
                 ctx.in_memory_ordering_lock[symbol] = False
 
         if holdings_qty <= 0 and not buy_order_id:
-            if entry_session != "CANCELED_MACRO":
+            if entry_session not in ("CANCELED_MACRO", "WHIPSAW_1SH"):
                 await AssassinLedger.lock_all_symbols_macro(
                     last_session_id=current_session_id, force_all=False
                 )
-            if (400 <= est_hm <= 814) and _STRIKE_ALERT_CACHE.get("last_macro1_date") != today_str:
+            if (407 <= est_hm <= 814) and _STRIKE_ALERT_CACHE.get("last_macro1_date") != today_str:
                 _STRIKE_ALERT_CACHE["last_macro1_date"] = today_str
                 await ctx.notify_tg(
                     "🛑 <b>[매크로 1차 방어선 작동] 나스닥 100 선물(NQ=F) 대세 과열 감지</b>\n"
                     f"▫️ 현재 NQ=F 진폭: <code>{nq_amp:.2f}%</code> (기준 ≥ 2.00%)\n"
-                    "▫️ 조치: 금일 SOXS·SOXL 자동 신규 진입 잠금 (수동 진입 시 2차 과열방어 패스 · 3차 QQQ 실시간 최소 0.80% 역행방어 가동)"
+                    "▫️ 조치: 금일 SOXS·SOXL 본진 자동 신규 진입 잠금 (수동 진입 시 2차 과열방어 패스 · 3차 QQQ 실시간 최소 0.80% 역행방어 가동)"
                 )
             return False
 
     # =====================================================================
-    # [2차 & 3차 방어선] 보유 포지션(holdings_qty > 0) 손실 구간 방어 프로빙 (초과 Case 66, 67, 86, 87, 92, 94)
+    # [2차 & 3차 방어선] 보유 포지션(holdings_qty > 0) 손실 구간 방어 프로빙 (초과 Case 66, 67, 86, 87, 92, 94, 95)
     # =====================================================================
     if holdings_qty <= 0 or ctx.in_memory_ordering_lock.get(symbol, False):
         return False
@@ -639,14 +649,19 @@ async def execute_macro_defense_plugin(
         nq_adverse_pct = 0.0
         adverse_dir_str = "역행"
 
-    # 초과 Case 86 & Case 94: 수동 진입(MANUAL) 포지션은 2차 과열 방어선(NQ=F >= 2.0%)을 100% 패스(Bypass)하며,
+    # 초과 Case 86, 94 & Case 95: 수동 진입(MANUAL) 포지션과 03:58~04:06 EST 1주 휩소 작전(WHIPSAW_1SH) 포지션은
+    # 2차 과열 방어선(NQ=F >= 2.0%)을 100% 패스(Bypass)하며,
     # 오직 진입/락온 시점 QQQ 기준가 대비 실시간 QQQ가 최소 0.80%(dynamic_threshold) 이상 역행했을 때만 3차 손절 격발!
     is_manual_pos = (
         entry_session == "MANUAL"
         or is_untagged_manual_hold
-        or (nq_entry_amp >= 2.0)
+        or (nq_entry_amp >= 2.0 and entry_session != "WHIPSAW_1SH")
     )
-    effective_stage2_breach = (nq_amp >= 2.0) and (not is_manual_pos)
+    effective_stage2_breach = (
+        (nq_amp >= 2.0)
+        and (not is_manual_pos)
+        and (entry_session != "WHIPSAW_1SH")
+    )
     is_stage3_breach = (
         nq_entry_price > 0.0
         and ref_curr > 0.0
@@ -765,6 +780,7 @@ async def execute_macro_defense_plugin(
                     target_sell_price=bid_price,
                     is_session_done=True,
                     entry_session="CANCELED_MACRO",
+                    whipsaw_target_price=0.0,
                 )
                 ctx.wakeup_event.set()
                 if effective_stage2_breach:

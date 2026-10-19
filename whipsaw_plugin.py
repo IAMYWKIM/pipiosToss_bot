@@ -6,7 +6,7 @@
 #       그 외 데이장 전 구간은 프리장 본진(옵션 A)과 동일하게 즉시 1차 슬리피지(-0.18%) 매수덫 + 30초 타임쉴드 +
 #       하이킨 아시 트레일링(🚀 NQ_VEL_BYPASS) + QQQ 실시간 최소 0.80% 3차 역행 방어를 [모의] 추격하며,
 #       03:58~03:59 EST 마감 휩소 묵음 바이패스 및
-#       03:58~04:07 EST (9분간) 데이장 VWAP 상단 종목 1% 역산 듀얼 1주 휩소 매수 덫을 수행하는 전용 플러그인
+#       03:58~04:07 EST (9분간) NQ>=2.0% 과열차단일에도 별개 독립 가동되는 데이장 VWAP 상단 종목 1% 역산 듀얼 1주 휩소 매수 덫 플러그인
 # =====================================================================
 # MODIFIED: 제3헌법 의거 모듈 분리 및 구버전 +0.64% 참고 타점 데드코드 영구 소각
 # MODIFIED: 데이장(19:00~03:57 EST)은 100% [모의] 전용이며 어떠한 경우에도 실거래 매수 주문(create_order)을 발사하지 않도록 물리적 차단 (Case 53, 78, 93)
@@ -17,9 +17,8 @@
 # MODIFIED: 초과 Case 92 & Case 94 — 데이장 [모의] 및 03:58 휩소 1주 작전에서 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)은
 #           나스닥 100 선물지수(NQ=F) 진폭(nq_entry_amp)을 기준으로 산출하되 최소 0.80% QQQ 역행 하한을 강제하고,
 #           해당 임계치를 적용하는 진입 기준가 및 실시간 역행 비교가는 토스 Open API QQQ 0.0초 실시간 현재가(get_stage3_reference_price)로 전면 대체
-# NEW: PRE_CLIMAX_BOOSTER_RSI = 79.0 (1.5초 -> 0.4초 고주파 부스터 가속) 및 OPP_CLIMAX_RSI_THRESHOLD = 79.9 (79.9를 80.0 클라이맥스로 즉시 인지) 탑재 (Case 28, 83)
-# NEW: 03:58 ~ 03:59 EST 데이장 마감 직전 휩소 알림 100% 묵음 바이패스(Silent Bypass) 및 04:00 EST 프리장 전환 자동 클리어 탑재 (Case 78)
-# MODIFIED: 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전 — 선취 매수 폐기 및 현재가 > 데이장 VWAP 종목 기준 1% 역산 지정가 매수 덫 전용화 (Case 79, 80)
+# NEW: 초과 Case 95 — 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전(WHIPSAW_1SH)은 당일 NQ=F >= 2.0% 과열차단(CANCELED_MACRO)일에도
+#      차단되지 않고 본진과 별개로 1주 진입하여 +1.00% VWAP 익절을 추구하며, 04:07:00 EST 정리 직후 과열차단(CANCELED_MACRO)을 복원하여 본진 시드를 보호
 
 import math
 import time
@@ -224,10 +223,10 @@ async def settle_daymarket_sim_before_premarket(
             )
 
 
-# MODIFIED: 데이장 (19:00 ~ 03:57 EST) 100% [모의] 전용 (실거래 매수 절대 차단!)
-#           — 유일하게 데이장 개시 시각(한국시간 09:00:00 ~ 09:00:59 KST / 19:00:00 ~ 19:00:59 EST) 1분간만
-#             선물 진폭 NQ=F >= 0.80% 선행 폭등·폭락 시 0단계 BUFFER_WAIT(역산 하락가 버퍼 대기 후 최저점 +0.30% 양봉 반등 가상 체결) 적용!
-#           — 그 외 모든 데이장 시간대는 즉시 1단계 TRAP_WAIT(30초 타임쉴드) ➔ 2단계 HOLDING(하이킨 아시 트레일링 & QQQ실시간 바이패스 & QQQ실시간 최소 0.80% 3차 역행 손절) (Case 78, 81, 83, 89, 91, 92, 93, 94)
+# 데이장 (19:00 ~ 03:57 EST) 100% [모의] 전용 (실거래 매수 절대 차단!)
+# — 유일하게 데이장 개시 시각(한국시간 09:00:00 ~ 09:00:59 KST / 19:00:00 ~ 19:00:59 EST) 1분간만
+#   선물 진폭 NQ=F >= 0.80% 선행 폭등·폭락 시 0단계 BUFFER_WAIT(역산 하락가 버퍼 대기 후 최저점 +0.30% 양봉 반등 가상 체결) 적용!
+# — 그 외 모든 데이장 시간대는 즉시 1단계 TRAP_WAIT(30초 타임쉴드) ➔ 2단계 HOLDING(하이킨 아시 트레일링 & QQQ실시간 바이패스 & QQQ실시간 최소 0.80% 3차 역행 손절) (Case 78, 81, 83, 89, 91, 92, 93, 94)
 async def execute_daymarket_rsi_alert_plugin(
     ctx,
     symbol: str,
@@ -647,7 +646,7 @@ async def execute_daymarket_rsi_alert_plugin(
             ((nq_h_global - nq_l_global) / nq_l_global * 100.0) if nq_l_global > 0.0 else 0.0
         )
 
-        # 매크로 1차 방어선: 당일 NQ=F 진폭이 이미 2.0% 이상이면 과열 장세이므로 모의 진입 차단
+        # 매크로 1차 방어선: 당일 NQ=F 진폭이 이미 2.0% 이상이면 과열 장세이므로 데이장 모의 진입 차단
         if nq_amp_global >= 2.0:
             return
 
@@ -704,7 +703,7 @@ async def execute_daymarket_rsi_alert_plugin(
             MIN_STAGE3_QQQ_ADVERSE_PCT,
         )
 
-        # MODIFIED: 초과 Case 93 — 선물 시장(18:00 EST 개장)이 먼저 열리고 나서 발생한 진폭을
+        # 초과 Case 93 — 선물 시장(18:00 EST 개장)이 먼저 열리고 나서 발생한 진폭을
         # 데이장 개시 시각에 고스란히 고점으로 받지 않도록 하기 위해,
         # 역산 하락가 버퍼(BUFFER_WAIT)는 유일하게 데이장이 개시되는 첫 1분
         # (한국시간 09:00:00 ~ 09:00:59 KST / 미국시간 19:00:00 ~ 19:00:59 EST)에만 작동!
@@ -812,8 +811,9 @@ async def execute_daymarket_rsi_alert_plugin(
         )
 
 
-# 03:58 ~ 04:06:59 EST (9분간) 듀얼(SOXS/SOXL) 데이장 누적 VWAP 비교 및
-# 현재가 > 데이장 VWAP 종목 기준 하단 1% 역산 1주 지정가 매수 덫 전용 플러그인 (Case 79, 92)
+# MODIFIED: 초과 Case 79, 92, 95 — 03:58 ~ 04:06:59 EST (9분간) 듀얼(SOXS/SOXL) 데이장 누적 VWAP 비교 및
+#           현재가 > 데이장 VWAP 종목 기준 하단 1% 역산 1주 지정가 매수 덫 전용 플러그인
+#           (당일 NQ=F >= 2.0% 과열차단[CANCELED_MACRO] 발동일에도 차단하지 않고 본진과 별개로 1주 진입하여 +1.00% VWAP 익절 추구!)
 async def execute_whipsaw_vwap_exposure_plugin(
     ctx,
     symbol: str,
@@ -912,21 +912,19 @@ async def execute_whipsaw_vwap_exposure_plugin(
         if target_buy_p <= 0.0 or target_sell_p <= 0.0:
             return
 
-        # 2단계: 매크로 1차 과열 방어선(NQ=F 진폭 < 2.0%) 및 양쪽 종목 무포지션 교차 검증 후 1주 매수 덫 발사
+        # 2단계: 초과 Case 95 — 마스터 전원(is_active) 및 양쪽 종목 무포지션 교차 검증 후
+        #        당일 NQ=F >= 2.0% 과열차단(CANCELED_MACRO) 여부와 무관하게 별개로 1주 매수 덫 발사!
         async with ctx.dual_strike_mutex:
             if ctx.in_memory_ordering_lock.get(target_sym, False):
                 return
             ctx.in_memory_ordering_lock[target_sym] = True
             try:
                 state_chk = await AssassinLedger.get_state(target_sym)
-                if not bool(state_chk[5]) or state_chk[8] == "CANCELED_MACRO":
+                if not bool(state_chk[5]):
                     return
 
                 nq_c_now, nq_h_now, nq_l_now = await MacroDataCache.get_cached_nq_data()
                 nq_amp_now = (((nq_h_now - nq_l_now) / nq_l_now * 100.0) if nq_l_now > 0.0 else 0.0)
-                if nq_amp_now >= 2.0:
-                    _WHIPSAW_SIM_CACHE["whipsaw_order_fired"] = True
-                    return
 
                 # 초과 Case 92 — 휩소 1주 작전에서도 3차 방어 임계치 산출용 진폭은 NQ=F(nq_amp_now)를 기록하고,
                 # 3차 방어 기준가는 토스 QQQ 0.0초 실시간 현재가(ref_p_now)로 락온
@@ -997,13 +995,18 @@ async def execute_whipsaw_vwap_exposure_plugin(
                     ctx.wakeup_event.set()
                     exp_gross_pct = ((target_sell_p / target_buy_p - 1.0) * 100.0) if target_buy_p > 0.0 else 1.00
                     sym_icon = "🐻" if target_sym == "SOXS" else "🐂"
+                    macro_indep_note = (
+                        f" (NQ진폭 {nq_amp_now:.2f}% 과열차단 별개 1주 독립 가동 · 04:07 정리 후 본진 차단 복원)"
+                        if nq_amp_now >= 2.0
+                        else ""
+                    )
                     await ctx.notify_tg(
                         f"🌪️ <b>[듀얼 휩소 노출 작전 개시] {sym_icon}{target_sym} VWAP 1% 역산 1주 매수 덫 투하</b>\n"
-                        f"▫️ 작전 시간: <code>03:58 ~ 04:07 EST (9분간 유지 · 본진 듀얼 스나이퍼 04:07 타임쉴드)</code>\n"
+                        f"▫️ 작전 시간: <code>03:58 ~ 04:07 EST (9분간 유지{macro_indep_note})</code>\n"
                         f"▫️ 선정 종목: <b>{sym_icon}{target_sym}</b> | 데이장 누적 VWAP: <code>${locked_vwap:.2f}</code>\n"
                         f"▫️ 타점 판정: <code>{mode_desc_str}</code>\n"
                         f"▫️ 주문 내역: <b>1주 고정(LIMIT)</b> 하단 매수덫 <code>${target_buy_p:.2f}</code> ➡️ 체결 시 목표 매도덫 <code>${target_sell_p:.2f}</code> (기대 <code>+{exp_gross_pct:.2f}%</code>)\n"
-                        "▫️ 무비용 방어: <code>04:07 EST까지 덫 미체결 시 비용 $0 자동 취소 / 체결 후 미매도 시 현재가 즉시 매도 후 본진 인계</code>"
+                        "▫️ 무비용 방어: <code>04:07 EST까지 덫 미체결 시 비용 $0 자동 취소 / 체결 후 미매도 시 현재가 즉시 매도</code>"
                     )
             except Exception as e:
                 err_str = str(e)
@@ -1019,7 +1022,8 @@ async def execute_whipsaw_vwap_exposure_plugin(
                 ctx.in_memory_ordering_lock[target_sym] = False
 
 
-# Case 80: 04:07:00 EST 정각 듀얼 휩소 노출 작전 9분 타임쉴드 만료 정리 플러그인
+# MODIFIED: Case 80 & 초과 Case 95 — 04:07:00 EST 정각 듀얼 휩소 노출 작전 9분 타임쉴드 만료 정리 플러그인
+#           (미체결 취소 시 당일 NQ >= 2.0% 과열일이면 즉시 CANCELED_MACRO 잠금을 복원하여 본진 자동 진입을 차단!)
 async def enforce_0407_whipsaw_cutoff_plugin(
     ctx,
     symbol: str,
@@ -1044,7 +1048,7 @@ async def enforce_0407_whipsaw_cutoff_plugin(
 
     sym_icon = "🐻" if symbol == "SOXS" else "🐂"
 
-    # [분기 1] 04:07 EST 도달 시점에 1주 매수 덫이 미체결(holdings_qty == 0)인 경우 -> 비용 $0 즉시 취소 후 본진 인계
+    # [분기 1] 04:07 EST 도달 시점에 1주 매수 덫이 미체결(holdings_qty == 0)인 경우 -> 비용 $0 즉시 취소 후 본진 인계/과열차단 복원
     if holdings_qty == 0 and buy_order_id:
         ctx.in_memory_ordering_lock[symbol] = True
         try:
@@ -1072,14 +1076,18 @@ async def enforce_0407_whipsaw_cutoff_plugin(
             except Exception:
                 pass
 
+            _, nq_h_cut, nq_l_cut = await MacroDataCache.get_cached_nq_data()
+            nq_amp_cut = (((nq_h_cut - nq_l_cut) / nq_l_cut * 100.0) if nq_l_cut > 0.0 else 0.0)
+            is_macro_overheated = (nq_amp_cut >= 2.0)
+
             await AssassinLedger.save_state(
                 symbol,
                 price=0.0,
                 target_sell_price=0.0,
-                is_session_done=False,
+                is_session_done=True if is_macro_overheated else False,
                 buy_order_id="",
                 sell_order_id="",
-                entry_session="",
+                entry_session="CANCELED_MACRO" if is_macro_overheated else "",
                 entry_time=0.0,
                 nq_entry_price=0.0,
                 nq_entry_amp=0.0,
@@ -1091,12 +1099,22 @@ async def enforce_0407_whipsaw_cutoff_plugin(
             ctx.wakeup_event.set()
 
             if canceled_any:
+                if is_macro_overheated:
+                    next_action_desc = (
+                        f"미체결 1주 매수 덫 무비용 파기 ➡️ 당일 NQ=F 진폭(<code>{nq_amp_cut:.2f}%</code>) 과열로 "
+                        "<b>본진 자동 진입 차단(🛑 CANCELED_MACRO) 복원 완료</b>"
+                    )
+                else:
+                    next_action_desc = (
+                        "미체결 1주 매수 덫 무비용 파기 ➡️ "
+                        "<b>04:07 ~ 08:14 EST 본진 양방향 대칭 듀얼 스나이퍼 정식 가동 개시</b>"
+                    )
                 await ctx.notify_tg(
                     f"⏱️ <b>[04:07 타임쉴드 해제 {sym_icon}{symbol}] 휩소 1주 매수 덫 미체결 취소 완료 (비용 $0)</b>\n"
                     "▫️ 사유: 03:58 ~ 04:07 EST (9분간) 듀얼 휩소 노출 작전 시간 만료\n"
-                    "▫️ 조치: 미체결 1주 매수 덫 무비용 파기 ➡️ <b>04:07 ~ 08:14 EST 본진 양방향 대칭 듀얼 스나이퍼 정식 가동 개시</b>"
+                    f"▫️ 조치: {next_action_desc}"
                 )
-            return "", "", True
+            return "", ("CANCELED_MACRO" if is_macro_overheated else ""), True
         finally:
             ctx.in_memory_ordering_lock[symbol] = False
 
@@ -1184,7 +1202,7 @@ async def enforce_0407_whipsaw_cutoff_plugin(
                     f"⏱️ <b>[04:07 타임쉴드 정리 {sym_icon}{symbol}] 휩소 노출 작전 1주 현재가 즉시 매도 집행</b>\n"
                     f"▫️ 사유: 04:07 EST 휩소 노출 작전 종료 시각 도달 (보유 <code>{holdings_qty}주</code> 정리)\n"
                     f"▫️ 처분 단가(LIMIT): <code>${exec_sell_price:.2f}</code> (현재가/매수1호가 즉시 체결 유도)\n"
-                    "▫️ 후속 조치: <code>1주 체결 완료 즉시 실수익 복리 정산 후 본진 양방향 대칭 듀얼 스나이퍼 감시로 전환됩니다.</code>"
+                    "▫️ 후속 조치: <code>1주 체결 완료 즉시 실수익 복리 정산 후 본진(과열 시 과열차단 복원) 상태로 전환됩니다.</code>"
                 )
             return buy_order_id, entry_session, True
         except Exception as e:

@@ -17,6 +17,8 @@
 # NEW: 초과 Case 94 — 스나이퍼 가동 OFF 전환 시 nq_entry_price=0.0, nq_entry_amp=0.0 원자적 초기화 및
 #      수동 보유 물량 안전캡(+5.00% LIMIT) 결속 시 현재 실시간 QQQ 기준가(0.00% 역행 출발) 강제 동기화·마킹(mark_manual_stage3_anchored)으로
 #      포지션 자체 손실률(-0.80% 초과 등)이나 과거 기준가로 인한 즉시 손절을 100% 원천 차단
+# NEW: 초과 Case 95 — 03:58 ~ 04:07 EST 1주 휩소 작전(WHIPSAW_1SH)이 과열차단(NQ>=2.0%)일에 별개 가동된 후 청산 완료되면,
+#      즉시 양쪽 장부를 CANCELED_MACRO(is_session_done=True)로 복원하여 04:07 ~ 08:14 EST 본진 자동 진입을 100% 차단!
 # MODIFIED: 04:07 ~ 08:14 EST 중 NQ=F < 2.0% 내 3차 역행 손절 후 최저점 역트레일링 +0.30% 양봉 반등 재진입(RE_BOT_TRAIL) 가동 (Case 87)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 기반 실제 발생 순수익금((실제매도가-실제매수가)*체결수량 - 수수료 0.14%) 복리 정산 동기화 (Case 76)
 
@@ -145,7 +147,7 @@ async def execute_rsi_monitoring_plugin(
 
 # 하이킨 아시 트레일링 익절(+1.00% ~ +5.00%+), 3차 손절 후 최저점 역트레일링 전환(STAGE3_STOP_TRACK) 및 모든 청산 시
 # 실제 발생 순수익금((실제매도가 - 실제매수가) * 체결수량 - 왕복수수료 0.14%) 복리 정산 및
-# 프리장 골든타임(04:00 ~ 08:14 EST) 내 조건 충족 시 양쪽 장부 동시 재출동 락 해제 (Case 52, 76, 80, 84, 87, 94)
+# 프리장 골든타임(04:00 ~ 08:14 EST) 내 조건 충족 시 양쪽 장부 동시 재출동 락 해제 (Case 52, 76, 80, 84, 87, 94, 95)
 async def reconcile_zero_holdings_exit_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -336,8 +338,9 @@ async def reconcile_zero_holdings_exit_plugin(
         opp_sym = "SOXL" if symbol == "SOXS" else "SOXS"
         opp_holding_now = int(ctx.shared_holdings.get(opp_sym, 0)) > 0
 
-        # 초과 Case 52, 80, 84, 87, 94 — 프리장 골든타임 (04:00 ~ 08:14 EST) 내 익절 완료, 매수 취소, 1주 휩소 작전 정리,
+        # MODIFIED: 초과 Case 52, 80, 84, 87, 94, 95 — 프리장 골든타임 (04:00 ~ 08:14 EST) 내 익절 완료, 매수 취소, 1주 휩소 작전 정리,
         # 또는 NQ=F < 2.0% 내 3차 안전망 손절(STAGE3_STOP_TRACK) 완료 시(단, 반대편 종목을 수동 보유 중이 아닐 때) 양쪽 장부 모두 is_session_done=False로 복원!
+        # 반면 당일 NQ=F >= 2.0% 과열일 상태에서 1주 휩소 작전(WHIPSAW_1SH)이 청산된 경우에는 즉시 CANCELED_MACRO(과열차단)로 복원하여 본진 자동 진입을 차단!
         if (
             is_premarket_now
             and nq_amp_chk < 2.0
@@ -363,8 +366,12 @@ async def reconcile_zero_holdings_exit_plugin(
                 )
         else:
             next_is_session_done = True
-            next_entry_session = "CANCELED_MACRO" if prev_entry_session == "CANCELED_MACRO" else ""
-            if is_stage3_stop_track_exit or prev_entry_session == "CANCELED_MACRO":
+            next_entry_session = (
+                "CANCELED_MACRO"
+                if (prev_entry_session == "CANCELED_MACRO" or nq_amp_chk >= 2.0)
+                else ""
+            )
+            if is_stage3_stop_track_exit or prev_entry_session == "CANCELED_MACRO" or nq_amp_chk >= 2.0:
                 _reset_bottom_track_state()
 
         _reset_trailing_runtime_state(symbol)
@@ -390,6 +397,8 @@ async def reconcile_zero_holdings_exit_plugin(
 
         if not next_is_session_done and not opp_holding_now:
             await AssassinLedger.unlock_all_symbols_for_reentry()
+        elif nq_amp_chk >= 2.0 and prev_entry_session == "WHIPSAW_1SH":
+            await AssassinLedger.lock_all_symbols_macro(force_all=False)
 
         if not is_active:
             print(f"🧹 [Silent Reset {symbol}] 가동 OFF 상태 청산 확인. 타전 억제 및 장부 초기화 완료.", flush=True)
@@ -403,17 +412,25 @@ async def reconcile_zero_holdings_exit_plugin(
                 f"▫️ 잔고 0주 (제로-오버나이트 락온){pnl_str}{compound_str}"
             )
         elif prev_entry_session == "WHIPSAW_1SH":
+            if nq_amp_chk >= 2.0:
+                whip_next_note = (
+                    f"당일 NQ=F 진폭(<code>{nq_amp_chk:.2f}%</code> ≥ 2.00%) 과열로 "
+                    "<b>본진 자동 진입 차단(🛑 CANCELED_MACRO) 복원 완료</b>"
+                )
+            else:
+                whip_next_note = "04:07 ~ 08:14 EST 본진 양방향 대칭 클라이맥스 듀얼 스나이퍼 무한 출동 감시 개시"
+
             if is_whipsaw_0407_exit:
                 await ctx.notify_tg(
-                    f"⏱️ <b>[듀얼 휩소 작전 04:07 정산 완료 {sym_icon}{symbol}] 1주 현재가 매도 체결 ➡️ 본진 듀얼 스나이퍼 인계</b>\n"
+                    f"⏱️ <b>[듀얼 휩소 작전 04:07 정산 완료 {sym_icon}{symbol}] 1주 현재가 매도 체결</b>\n"
                     f"▫️ 잔고 0주 (04:07 타임쉴드 해제 완료){pnl_str}{compound_str}\n"
-                    "▫️ 후속 조치: 04:07 ~ 08:14 EST 본진 양방향 대칭 클라이맥스 듀얼 스나이퍼 무한 출동 감시 개시"
+                    f"▫️ 후속 조치: {whip_next_note}"
                 )
             else:
                 await ctx.notify_tg(
-                    f"🎉 <b>[듀얼 휩소 작전 1주 익절 성공 {sym_icon}{symbol}] 데이장 VWAP 타점 달성 ➡️ 본진 대기</b>\n"
+                    f"🎉 <b>[듀얼 휩소 작전 1주 익절 성공 {sym_icon}{symbol}] 데이장 VWAP 타점 달성</b>\n"
                     f"▫️ 잔고 0주 (1주 지정가 매도 덫 체결 확인){pnl_str}{compound_str}\n"
-                    "▫️ 후속 조치: 04:07 ~ 08:14 EST 본진 양방향 대칭 클라이맥스 듀얼 스나이퍼 무한 출동 감시 대기"
+                    f"▫️ 후속 조치: {whip_next_note}"
                 )
         elif is_stage3_stop_track_exit and not next_is_session_done:
             st_bot = get_bottom_track_status(symbol)
@@ -435,7 +452,7 @@ async def reconcile_zero_holdings_exit_plugin(
                 )
             else:
                 await ctx.notify_tg(
-                    f"🎉 <b>[듀얼 스나이퍼 {sym_icon}{symbol}] 하이킨 아시 트레일링 익절 성공 (08:15 컷오프 이후 당일 퇴근)</b>\n"
+                    f"🎉 <b>[듀얼 스나이퍼 {sym_icon}{symbol}] 하이킨 아시 트레일링 익절 성공 (08:15 컷오프/과열 마감)</b>\n"
                     f"▫️ 잔고 0주 (트레일링 익절 매도 체결 확인){pnl_str}{compound_str}\n"
                     "▫️ 당일 신규 진입 권한 영구 소각"
                 )
@@ -450,9 +467,9 @@ async def reconcile_zero_holdings_exit_plugin(
         ctx.in_memory_ordering_lock[symbol] = False
 
 
-# MODIFIED: 초과 Case 87, Case 92, Case 93, Case 94 — 04:07 ~ 08:14 EST 골든타임 내
-#           순수 3차 안전망 손절 후 '손절가 하회 최저점 역트레일링 +0.30% 양봉 반등 재진입 (🪤 RE_BOT_TRAIL)' 전용 엔진
-#           (선행 역산 버퍼 분기 소각 · NQ=F 진폭 기준 3차 임계치[최소 0.80%] 산출 + 토스 QQQ 0.0초 실시간 현재가 기준점 락온)
+# 초과 Case 87, Case 92, Case 93, Case 94 — 04:07 ~ 08:14 EST 골든타임 내
+# 순수 3차 안전망 손절 후 '손절가 하회 최저점 역트레일링 +0.30% 양봉 반등 재진입 (🪤 RE_BOT_TRAIL)' 전용 엔진
+# (선행 역산 버퍼 분기 소각 · NQ=F 진폭 기준 3차 임계치[최소 0.80%] 산출 + 토스 QQQ 0.0초 실시간 현재가 기준점 락온)
 async def execute_post_stop_bottom_rebound_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -1085,8 +1102,8 @@ async def rearm_premarket_buy_trap_after_30s_plugin(
         ctx.in_memory_ordering_lock[symbol] = False
 
 
-# MODIFIED: 단일 '하이킨 아시 + 고점 트레일링 (🔥 HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)' 전용 매도 안전 캡 장전,
-#           스나이퍼 OFF 전환 시 구버전 QQQ 기준가 소각 및 체결/수동재결속 시점 실시간 QQQ 3차 방어 기준가 동기화 (Case 85, 89, 91, 92, 93, 94)
+# 단일 '하이킨 아시 + 고점 트레일링 (🔥 HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)' 전용 매도 안전 캡 장전,
+# 스나이퍼 OFF 전환 시 구버전 QQQ 기준가 소각 및 체결/수동재결속 시점 실시간 QQQ 3차 방어 기준가 동기화 (Case 85, 89, 91, 92, 93, 94)
 async def manage_mechanical_profit_trap_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
     is_active: bool, just_turned_off: bool, holdings_qty: int, holdings_detail: dict,
