@@ -2,14 +2,16 @@
 # FILE: tg_ui_plugin.py
 # 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
 #       양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL), 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)',
-#       3차 손절 후 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL), 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫,
-#       일~목 18:00 ~ 18:59 EST CME 선물 신세션 개장 대기 및 토스 QQQ 0.0초 실시간 변화율 텔레그램 UI 렌더링 모듈
+#       3차 실시간 QQQ 역행 방어(임계치 기준: NQ=F 진폭 × 역행 비교: 토스 QQQ 0.0초 실시간) 및 최저점 반등 재진입(RE_BOT_TRAIL),
+#       03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수 덫 및 일~목 18:00 ~ 18:59 EST CME 선물 신세션 대기 텔레그램 UI 렌더링 모듈
 # =====================================================================
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 +0.64% / +1.00% 익절률 선택 버튼 및 데드코드 영구 소각
 # NEW: 단일 '🔥 하이킨 아시 + 고점 트레일링 (점화 +1.00% · 보존 +1.00% · 고점 -0.30% 콜백)' 상태 및 실시간 HA(🕯️양봉/🌑음봉) 표출 반영 (Case 85)
 # NEW: 초과 Case 89 & Case 91 — 관제탑(/avwap)·지시서(/sync)·제어반(/settlement)에 토스 Open API QQQ 0.0초 실시간(폴백 NQ선물)
 #      최근 10분/3분 단기 변화율(Velocity) 소스 배지 및 고점 추적 중 하이킨 아시 음봉 바이패스(🚀HA음봉바이패스) 작동 상태 실시간 표출 결속 (Case 13, 57, 89, 91)
-# NEW: 수동 진입(MANUAL) 보유 시 '2차 과열방어 패스 · 3차 역행방어 가동' 상태 및 진입 기준 지수 표출 동기화 (Case 50, 66, 67, 86)
+# NEW: 초과 Case 92 — 관제탑(/avwap) 3차 역행방어 라인에서 동적 임계치 max(nq_entry_amp * 0.5, 0.8%)는 나스닥 100 선물(NQ=F) 진폭을 기준으로 산출하고,
+#      진입 기준가 및 실시간 역행률은 토스 Open API QQQ 0.0초 실시간 현재가(get_stage3_reference_price)로 표출 및 스케일 불일치 자가 치유 결속
+# NEW: 수동 진입(MANUAL) 보유 시 '2차 과열방어 패스 · 3차 QQQ실시간 역행방어 가동' 상태 및 진입 기준가 표출 동기화 (Case 50, 66, 67, 86, 92)
 # NEW: 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 안전망 손절 후 최저점 역트레일링 추적(손절가/최저점/+0.30% 반등목표가) 상태 표출 반영 (Case 13, 57, 87)
 # NEW: RSI >= 79.0 프리-클라이맥스 0.4초 고주파 부스터 및 RSI >= 79.9 (80.0 클라이맥스 인지) 상태 표출 반영 (Case 28, 81, 83)
 # MODIFIED: 데이장(19:00 ~ 03:57 EST) 프리장 동일 대칭 조건 [모의] 듀얼 2단계 추격 및 03:58 ~ 03:59 EST 묵음 바이패스 상태 표출 (Case 78)
@@ -37,8 +39,8 @@ EST_TZ = ZoneInfo("America/New_York")
 NQ_DYNAMIC_FLOOR_UI = 0.8
 
 
-# 메인 메뉴(/start 및 메인 복귀) 화면에 18:00 선물 신세션 개장, 단일 하이킨 아시 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS) 및
-# 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL) 스케줄 반영 (Case 38, 84, 85, 87, 89, 90, 91)
+# 메인 메뉴(/start 및 메인 복귀) 화면에 18:00 선물 신세션 개장, 단일 하이킨 아시 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS),
+# QQQ 실시간 3차 역행 방어 및 최저점 반등 재진입(RE_BOT_TRAIL) 스케줄 반영 (Case 38, 84, 85, 87, 89, 90, 91, 92)
 async def get_main_menu_text() -> str:
     now_est = datetime.now(EST_TZ)
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
@@ -49,7 +51,7 @@ async def get_main_menu_text() -> str:
 
     return (
         f"🕒 <b>[ 듀얼 스나이퍼 &amp; 하이킨 아시 트레일링 스케줄 ({dst_status_text}) ]</b>\n"
-        f"▫️ 익절·복구: <b>🔥 +1.00% 점화 HA·트레일링(🚀QQQ실시간 급변 바이패스) &amp; 🪤 3차손절 후 최저점 반등 ({comp_mode_str})</b>\n"
+        f"▫️ 익절·복구: <b>🔥 +1.00% 점화 HA·트레일링(🚀QQQ실시간 바이패스) &amp; 🛡️QQQ실시간 3차방어·🪤최저점 반등 ({comp_mode_str})</b>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
         "🔹 18:00 ~ 18:59: 🌐 <b>선물 신세션 개장 (19:00 데이장 대기)</b>\n"
         "🔹 19:00 ~ 03:57: 🌙 <b>[모의] 데이장</b>\n"
@@ -190,7 +192,7 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 83, 84, 85, 86, 87, 89, 90, 91 —
+# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 83, 84, 85, 86, 87, 89, 90, 91, 92 —
 #           일~목 18:00~18:59 EST '⏳ 데이장 대기(19:00 개장 · 선물 가동중)' 및 주말 '🌙 휴장(관망)' 분리 표출
 def build_compact_status(
     symbol: str,
@@ -245,7 +247,7 @@ def build_compact_status(
             state_text = f"{prefix_tag}({int(qty)}주 · 고점 ${pk_p:.2f} / 스탑 ${st_p:.2f} · {ha_badge})"
         elif target_sell_price > 0.0:
             if is_manual_hold:
-                state_text = f"🎯 수동보유({int(qty)}주 · +1.00% 점화 ${target_sell_price:.2f} · 2차패스/3차가동 · {ha_badge})"
+                state_text = f"🎯 수동보유({int(qty)}주 · +1.00% 점화 ${target_sell_price:.2f} · 2차패스/3차QQQ가동 · {ha_badge})"
             else:
                 state_text = f"🎯 보유({int(qty)}주 · +1.00% 점화 ${target_sell_price:.2f} · {ha_badge})"
         else:
@@ -305,8 +307,9 @@ def build_compact_status(
     return f"{sym_icon} <b>{symbol}</b> <code>[{state_flag}]</code> {state_text}"
 
 
-# MODIFIED: 초과 Case 90 & Case 91 — 일~목 18:00~18:59 EST '( 🌐 선물 신세션 개장 · 19:00 데이장 대기 )' 헤더 분리,
-#           fast_info 당일 실제 고/저가 병합 진폭 및 토스 QQQ 0.0초 실시간 변화율 소스 배지(QQQ실시간/NQ선물) 표출
+# MODIFIED: 초과 Case 90, 91, 92 —
+#           1) 1·2차 과열 방어(>=2.0%) 및 3차 동적 임계치 max(nq_entry_amp * 0.5, 0.8%)는 NQ=F 선물 진폭 기준으로 산출
+#           2) 3차 역행방어 비교 기준가·현재가·역행률은 토스 QQQ 0.0초 실시간 현재가(get_stage3_reference_price)로 렌더링 및 스케일 자가 치유 결속
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     wk = now_est.weekday()  # Mon=0 ... Fri=4, Sat=5, Sun=6
@@ -491,25 +494,38 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     else:
         macro_1st_str = "🛑 과열차단(≥2.0%)" if nq_amp >= 2.0 else "🟢 진입허용(2.0%미만)"
 
+    # NEW: 초과 Case 92 —
+    #      1) 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_a * 0.5, 0.8%)은 나스닥 100 선물(NQ=F) 진폭을 기준으로 산출
+    #      2) 해당 임계치를 적용하는 진입 기준가 및 실시간 역행 비교가는 토스 Open API QQQ 0.0초 실시간 현재가로 표출
     if qty_s > 0.0:
-        nq_entry_p = float(state_s[10] or 0.0) or nq_c
+        ref_curr, ref_src = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
+        ref_unit = "$" if ref_src == "QQQ실시간" else ""
+        nq_entry_p = float(state_s[10] or 0.0) or ref_curr
         nq_entry_a = float(state_s[11] or 0.0) or nq_amp
+        if nq_entry_p > 0.0 and ref_curr > 0.0 and ((nq_entry_p > 3000.0) != (ref_curr > 3000.0)):
+            nq_entry_p = ref_curr
+            await AssassinLedger.save_state("SOXS", nq_entry_price=nq_entry_p)
         dyn_thresh = max(nq_entry_a * 0.5, NQ_DYNAMIC_FLOOR_UI)
-        nq_adv = ((nq_c - nq_entry_p) / nq_entry_p * 100.0) if (nq_c > 0.0 and nq_entry_p > 0.0) else 0.0
+        nq_adv = ((ref_curr - nq_entry_p) / nq_entry_p * 100.0) if (ref_curr > 0.0 and nq_entry_p > 0.0) else 0.0
         tag_3rd = "3차 수동역행방어" if is_manual_s else "3차 역행방어"
         macro_3rd_line = (
-            f"\n▫️ {tag_3rd}(🐻SOXS): <code>{nq_adv:+.2f}%</code> 상승역행 "
-            f"(기준 <code>{nq_entry_p:.2f}</code> / 한도 <code>+{dyn_thresh:.2f}%</code>)"
+            f"\n▫️ {tag_3rd}(🐻SOXS·{ref_src}): <code>{nq_adv:+.2f}%</code> 상승역행 "
+            f"(기준 <code>{ref_unit}{nq_entry_p:.2f}</code> ➔ 현재 <code>{ref_unit}{ref_curr:.2f}</code> / NQ진폭 <code>{nq_entry_a:.2f}%</code> 한도 <code>+{dyn_thresh:.2f}%</code>)"
         )
     elif qty_l > 0.0:
-        nq_entry_p = float(state_l[10] or 0.0) or nq_c
+        ref_curr, ref_src = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
+        ref_unit = "$" if ref_src == "QQQ실시간" else ""
+        nq_entry_p = float(state_l[10] or 0.0) or ref_curr
         nq_entry_a = float(state_l[11] or 0.0) or nq_amp
+        if nq_entry_p > 0.0 and ref_curr > 0.0 and ((nq_entry_p > 3000.0) != (ref_curr > 3000.0)):
+            nq_entry_p = ref_curr
+            await AssassinLedger.save_state("SOXL", nq_entry_price=nq_entry_p)
         dyn_thresh = max(nq_entry_a * 0.5, NQ_DYNAMIC_FLOOR_UI)
-        nq_adv = ((nq_entry_p - nq_c) / nq_entry_p * 100.0) if (nq_c > 0.0 and nq_entry_p > 0.0) else 0.0
+        nq_adv = ((nq_entry_p - ref_curr) / nq_entry_p * 100.0) if (ref_curr > 0.0 and nq_entry_p > 0.0) else 0.0
         tag_3rd = "3차 수동역행방어" if is_manual_l else "3차 역행방어"
         macro_3rd_line = (
-            f"\n▫️ {tag_3rd}(🐂SOXL): <code>{nq_adv:+.2f}%</code> 하락역행 "
-            f"(기준 <code>{nq_entry_p:.2f}</code> / 한도 <code>+{dyn_thresh:.2f}%</code>)"
+            f"\n▫️ {tag_3rd}(🐂SOXL·{ref_src}): <code>{nq_adv:+.2f}%</code> 하락역행 "
+            f"(기준 <code>{ref_unit}{nq_entry_p:.2f}</code> ➔ 현재 <code>{ref_unit}{ref_curr:.2f}</code> / NQ진폭 <code>{nq_entry_a:.2f}%</code> 한도 <code>+{dyn_thresh:.2f}%</code>)"
         )
     else:
         macro_3rd_line = ""
@@ -577,7 +593,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     text = f"""📡 <b>[듀얼 스나이퍼 레이더]</b> {market_header}
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
-🌐 <b>나스닥 100 선물 (3단 매크로 방어 &amp; QQQ실시간 급변 바이패스)</b>
+🌐 <b>나스닥 100 선물 (1·2차 NQ진폭 방어 &amp; 3차·바이패스 QQQ실시간)</b>
 ▫️ 고가: <code>{nq_h:.2f}</code> | 저가: <code>{nq_l:.2f}</code>
 ▫️ 현재: <code>{nq_c:.2f}</code> | 총 진폭: <code>{nq_amp:.2f}%</code>
 ▫️ 저가기준 진폭: <code>{nq_curr_amp:.2f}%</code>
@@ -607,7 +623,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 ➖➖➖➖➖➖➖➖➖➖➖➖➖➖
 {status_s}
 {status_l}
-💰 <b>{comp_label_str} 시드:</b> <code>${budget_s:,.2f}</code> (<code>🔥 HA·트레일링 &amp; 🚀 QQQ실시간바이패스</code>)
+💰 <b>{comp_label_str} 시드:</b> <code>${budget_s:,.2f}</code> (<code>🔥 HA·트레일링 &amp; 🛡️ QQQ실시간 3차방어</code>)
 
 ⏱️ 갱신: <code>{scan_time} EST</code>"""
 
@@ -739,12 +755,12 @@ async def build_sync_board(api_client) -> str:
                 pk_p = float(tr_st.get("peak_price", 0.0))
                 st_p = float(tr_st.get("stop_price", d["target_sell_p"]))
                 byp_s = " · 🚀HA음봉바이패스" if tr_st.get("nq_vel_bypass", False) else ""
-                m_tag = "MANUAL·HA트레일링(2차패스/3차방어)" if is_man else "HA트레일링 가동중"
+                m_tag = "MANUAL·HA트레일링(2차패스/3차QQQ방어)" if is_man else "HA트레일링 가동중"
                 flag_str = f"🔥 [{m_tag}: 고점 ${pk_p:.2f} / 스탑 ${st_p:.2f}{byp_s}]"
             elif is_man:
-                flag_str = f"🎯 [MANUAL: +1.00% 점화가 ${d['target_sell_p']:.2f} 대기 · 2차패스/3차방어]"
+                flag_str = f"🎯 [MANUAL: +1.00% 점화가 ${d['target_sell_p']:.2f} 대기 · 2차패스/3차QQQ방어]"
             else:
-                flag_str = f"🎯 [{es_str or 'HOLD'}: +1.00% 점화가 ${d['target_sell_p']:.2f} 대기]"
+                flag_str = f"🎯 [{es_str or 'HOLD'}: +1.00% 점화가 ${d['target_sell_p']:.2f} 대기 · 3차QQQ방어]"
         elif (407 <= t <= 814) and bt_st.get("active", False):
             sp_b = float(bt_st.get("last_stop_price", 0.0))
             lp_b = float(bt_st.get("post_stop_low", 0.0))
@@ -757,7 +773,7 @@ async def build_sync_board(api_client) -> str:
         elif 815 <= t <= 1759:
             flag_str = "🔒 금일 신규진입 마감 (관망 · 🔥HA트레일링)"
         else:
-            flag_str = f"⏳ 대기 ({sym}≤30 &amp; {opp_sym}≥79.9 · 🔥HA트레일링 &amp; 🚀QQQ실시간바이패스)"
+            flag_str = f"⏳ 대기 ({sym}≤30 &amp; {opp_sym}≥79.9 · 🔥HA트레일링 &amp; 🛡️QQQ실시간3차방어)"
         return (
             f"{icon} <b>[{sym}] 양방향 대칭 클라이맥스 지시서</b>\n"
             f"{comp_label}: <code>${d['budget']:,.2f}</code> | {flag_str}\n"
@@ -781,7 +797,7 @@ async def build_sync_board(api_client) -> str:
 
 
 # MODIFIED: 전술 제어반(/settlement)에서 일~목 18:00~18:59 EST 선물 신세션 대기, 주말 휴장,
-#           수동 보유(active_pos_sym), 🚀 NQ_VEL_BYPASS(QQQ실시간) 및 3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 상태 표출 (Case 50, 57, 77, 85, 87, 89, 90, 91)
+#           수동 보유(active_pos_sym), 🚀 NQ_VEL_BYPASS(QQQ실시간), 🛡️ QQQ실시간 3차방어 및 3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 상태 표출 (Case 50, 57, 77, 85, 87, 89, 90, 91, 92)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     wk = now_est.weekday()
@@ -812,7 +828,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
 
     act_s_str = "🟢 ON" if act_s else "🔴 OFF"
     comp_s_str = "📈 통합 복리" if is_comp_s else "💵 단리 고정"
-    rate_mode_desc = "🔥 +1.00% 점화 HA·트레일링(🚀QQQ실시간 급변 바이패스) & 🪤 최저점 반등"
+    rate_mode_desc = "🔥 +1.00% 점화 HA·트레일링(🚀QQQ바이패스) & 🛡️QQQ실시간 3차방어·🪤최저점 반등"
 
     if not act_s:
         strike_status_str = "⏸️ 가동 OFF (수동 대기)"
@@ -842,9 +858,9 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
             strike_status_str = f"🔥 [{m_lbl}] HA트레일링 (고점 ${pk_a:.2f} / 스탑 ${sp_a:.2f}{byp_a})"
         elif tp_a > 0.0:
             if is_man_a:
-                strike_status_str = f"🎯 [수동·{active_pos_sym}] 보유중 (점화가 ${tp_a:.2f} · 2차패스/3차가동)"
+                strike_status_str = f"🎯 [수동·{active_pos_sym}] 보유중 (점화가 ${tp_a:.2f} · 2차패스/3차QQQ가동)"
             else:
-                strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (점화가 ${tp_a:.2f} 대기)"
+                strike_status_str = f"🎯 [{active_pos_sym}] 보유중 (점화가 ${tp_a:.2f} 대기 · 3차QQQ가동)"
         else:
             m_lbl = f"수동·{active_pos_sym}" if is_man_a else active_pos_sym
             strike_status_str = f"🎯 [{m_lbl}] 보유중 (안전캡 장전중)"
@@ -853,7 +869,7 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     elif 1800 <= t <= 1859:
         strike_status_str = "🌐 선물 신세션 개장 · 19:00 데이장 대기중"
     elif (state_s[8] == "CANCELED_MACRO" or state_l[8] == "CANCELED_MACRO") and (400 <= t <= 1759):
-        strike_status_str = "🛑 매크로 과열방어 (자동출동 마감 · 수동개입시 3차가동)"
+        strike_status_str = "🛑 매크로 과열방어 (자동출동 마감 · 수동개입시 3차QQQ가동)"
     elif 358 <= t <= 406:
         strike_status_str = "🌪️ 휩소 노출 작전중 (03:58 ~ 04:07)"
     elif 407 <= t <= 814:

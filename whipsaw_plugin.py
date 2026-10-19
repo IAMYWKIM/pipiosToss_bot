@@ -1,12 +1,15 @@
 # =====================================================================
 # FILE: whipsaw_plugin.py
-# 목적: 데이장(19:00~03:57 EST) 프리장 동일 조건(양방향 대칭 클라이맥스 + 하이킨 아시 트레일링 + 🚀 NQ_VEL_BYPASS) [모의] 듀얼 2단계 추격,
+# 목적: 데이장(19:00~03:57 EST) 프리장 동일 조건(양방향 대칭 클라이맥스 + 하이킨 아시 트레일링 + 🚀 NQ_VEL_BYPASS + QQQ 실시간 3차 역행 방어) [모의] 듀얼 2단계 추격,
 #       03:58~03:59 EST 마감 휩소 묵음 바이패스 및
 #       03:58~04:07 EST (9분간) 데이장 VWAP 상단 종목 1% 역산 듀얼 1주 휩소 매수 덫 전용 플러그인
 # =====================================================================
 # MODIFIED: 제3헌법 의거 모듈 분리 및 구버전 +0.64% 참고 타점 데드코드 영구 소각
 # MODIFIED: 데이장 [모의] 스나이퍼를 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9)로 단일화 (Case 78, 81, 83)
-# MODIFIED: 데이장 [모의] 2단계 추격(HOLDING)에 본진과 동일하게 '+1.00% 점화 후 하이킨 아시 양봉 홀딩 & NQ=F ±0.20% 급등락 시 HA음봉 바이패스(🚀 NQ_VEL_BYPASS) & 고점 -0.30% 콜백/HA음봉 모의 익절' 동기화 (Case 78, 89)
+# MODIFIED: 데이장 [모의] 2단계 추격(HOLDING)에 본진과 동일하게 '+1.00% 점화 후 하이킨 아시 양봉 홀딩 & QQQ실시간 ±0.20% 급등락 시 HA음봉 바이패스(🚀 NQ_VEL_BYPASS) & 고점 -0.30% 콜백/HA음봉 모의 익절' 동기화 (Case 78, 89, 91)
+# NEW: 초과 Case 92 — 데이장 [모의] 및 03:58 휩소 1주 작전에서 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.8%)은
+#      나스닥 100 선물지수(NQ=F) 진폭(nq_entry_amp)을 기준으로 산출하고, 해당 임계치를 적용하는 진입 기준가 및 실시간 역행 비교가는
+#      토스 Open API QQQ 0.0초 실시간 현재가(get_stage3_reference_price)로 전면 대체
 # NEW: PRE_CLIMAX_BOOSTER_RSI = 79.0 (1.5초 -> 0.4초 고주파 부스터 가속) 및 OPP_CLIMAX_RSI_THRESHOLD = 79.9 (79.9를 80.0 클라이맥스로 즉시 인지) 탑재 (Case 28, 83)
 # NEW: 데이장 [모의] 포착 시 get_current_prices_batch(("SOXS", "SOXL")) 단일 배치 호출로 양쪽 현재가 동시 조회 및 0.0ms 시차 틱 RSI 합성 (Case 83)
 # NEW: 03:58 ~ 03:59 EST 데이장 마감 직전 휩소 알림 100% 묵음 바이패스(Silent Bypass) 및 04:00 EST 프리장 전환 자동 클리어 탑재 (Case 78)
@@ -35,7 +38,7 @@ PRE_CLIMAX_BOOSTER_RSI = 79.0
 # 순간 스파이크 누락 방지를 위해 반대편 대세 종목 RSI 79.9 이상을 80.0 클라이맥스로 즉시 인지 (Case 81, 83)
 OPP_CLIMAX_RSI_THRESHOLD = 79.9
 
-# 데이장 (19:00 ~ 03:57 EST) [모의] 하이킨 아시 트레일링 점화 기준 수익률 (+1.00%), 콜백 폭 (-0.30%) 및 NQ 급등락 바이패스 임계치 (±0.20%)
+# 데이장 (19:00 ~ 03:57 EST) [모의] 하이킨 아시 트레일링 점화 기준 수익률 (+1.00%), 콜백 폭 (-0.30%) 및 급등락 바이패스 임계치 (±0.20%)
 DAY_SIM_ARM_PROFIT_RATE = AssassinLedger.TRAIL_ARM_PROFIT_RATE
 DAY_SIM_TRAIL_DROP_PCT = AssassinLedger.TRAIL_DROP_CALLBACK_PCT
 DAY_SIM_NQ_VEL_SURGE_PCT = AssassinLedger.NQ_VELOCITY_SURGE_PCT
@@ -51,7 +54,7 @@ BUY_TRAP_REARM_WAIT_SEC = 30.0        # RSI <= 30.0 유지 시 1차 매수 덫 �
 WHIPSAW_FIXED_QTY = 1                 # 시드 무관 무조건 1주 고정 테스트
 WHIPSAW_PROFIT_FACTOR = 1.01          # 데이장 VWAP = 1.01 * 매수덫가격 (1% 역산 하단 매수 덫)
 
-# 데이장 [모의] 하이킨 아시 트레일링(🚀 NQ_VEL_BYPASS 포함) 및 03:58 휩소 런타임 상태 캐시
+# 데이장 [모의] 하이킨 아시 트레일링(🚀 NQ_VEL_BYPASS & QQQ 실시간 3차 방어 포함) 및 03:58 휩소 런타임 상태 캐시
 _WHIPSAW_SIM_CACHE = {
     "day_logical_date": "",
     "day_sim_active": False,
@@ -64,7 +67,7 @@ _WHIPSAW_SIM_CACHE = {
     "day_sim_arm_price": 0.0,         # +1.00% 트레일링 점화 기준가 (보존선 겸용)
     "day_sim_target_price": 0.0,      # UI 표출용 목표가 (점화 전에는 arm_price, 점화 후에는 유효 스탑가)
     "day_sim_trail_armed": False,     # +1.00% 돌파 트레일링 점화 여부
-    "day_sim_nq_vel_bypass": False,   # NEW: 트레일링 중 NQ=F ±0.20% 급등락 HA음봉 바이패스 작동 여부 (Case 89)
+    "day_sim_nq_vel_bypass": False,   # 트레일링 중 QQQ/NQ ±0.20% 급등락 HA음봉 바이패스 작동 여부 (Case 89, 91)
     "day_sim_armed_ts": 0.0,          # 트레일링 점화 시각 타임스탬프
     "day_sim_armed_hm": 0,            # 트레일링 점화 분봉 시각 (HHMM)
     "day_sim_min_price": 0.0,         # 경유 최저가 (MAE)
@@ -73,8 +76,9 @@ _WHIPSAW_SIM_CACHE = {
     "day_sim_entry_time_str": "",
     "day_sim_buy_rsi": 0.0,           # 포착 당시 매수종목 RSI (<= 30.0)
     "day_sim_opp_rsi": 0.0,           # 포착 당시 반대종목 RSI (>= 79.9)
-    "day_sim_nq_entry_price": 0.0,    # 모의 진입 시점 NQ=F 지수 (방향성 인지 매크로 3차 방어용)
-    "day_sim_nq_entry_amp": 0.0,      # 모의 진입 시점 NQ=F 당일 진폭
+    "day_sim_nq_entry_price": 0.0,    # 모의 진입 시점 3차 방어 기준가 (토스 QQQ 0.0초 실시간 현재가, 폴백 NQ=F) (Case 92)
+    "day_sim_nq_entry_amp": 0.0,      # 모의 진입 시점 NQ=F 당일 진폭 (max(진폭*0.5, 0.8%) 임계치 산출 기준!) (Case 92)
+    "day_sim_ref_src": "QQQ실시간",   # 3차 방어 기준가 소스 라벨 ("QQQ실시간" 또는 "NQ선물")
     # 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전 런타임 스냅샷
     "whipsaw_date": "",               # 당일 휩소 작전 수행 논리적 날짜 (1일 1회 제한)
     "whipsaw_target_sym": "",         # 선정된 VWAP 상단 종목 ("SOXS" 또는 "SOXL")
@@ -112,6 +116,7 @@ def _reset_day_sim_state():
     _WHIPSAW_SIM_CACHE["day_sim_opp_rsi"] = 0.0
     _WHIPSAW_SIM_CACHE["day_sim_nq_entry_price"] = 0.0
     _WHIPSAW_SIM_CACHE["day_sim_nq_entry_amp"] = 0.0
+    _WHIPSAW_SIM_CACHE["day_sim_ref_src"] = "QQQ실시간"
 
 
 def get_daymarket_sim_status() -> dict:
@@ -190,7 +195,8 @@ async def settle_daymarket_sim_before_premarket(
 
 
 # MODIFIED: 데이장 (19:00 ~ 03:57 EST) 프리장 본진과 100% 동일한 양방향 대칭 클라이맥스(매수종목<=30.0 & 반대종목>=79.9)
-#           [모의] 2단계 체결 시뮬레이션 + 하이킨 아시 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS) + 방향성 인지 매크로 손절 & 03:58~03:59 묵음 바이패스 (Case 78, 81, 83, 89)
+#           [모의] 2단계 체결 시뮬레이션 + 하이킨 아시 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS) +
+#           NQ=F 진폭 기반 임계치 산출 × 토스 QQQ 0.0초 실시간 3차 역행 손절 & 03:58~03:59 묵음 바이패스 (Case 78, 81, 83, 89, 91, 92)
 async def execute_daymarket_rsi_alert_plugin(
     ctx,
     symbol: str,
@@ -300,6 +306,13 @@ async def execute_daymarket_rsi_alert_plugin(
                     fill_type_str = f"🔄 30초 타임쉴드 만료 현재가체결(RSI {rsi_val:.1f} · 30.0초 경과)"
 
                 if filled_now and confirmed_entry > 0.0:
+                    # NEW: 초과 Case 92 — 모의 체결 확정 순간의 NQ=F 진폭(nq_amp_now)은 3차 임계치 산출 기준으로 저장하고,
+                    #      3차 역행 비교 기준가(day_sim_nq_entry_price)는 토스 Open API QQQ 0.0초 실시간 현재가로 동기화!
+                    ref_p_fill, ref_src_fill = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
+                    if ref_p_fill <= 0.0:
+                        ref_p_fill = nq_c_now
+                        ref_src_fill = "NQ선물"
+
                     new_arm_100 = math.ceil(confirmed_entry * (1.0 + DAY_SIM_ARM_PROFIT_RATE / 100.0) * 100.0) / 100.0
                     _WHIPSAW_SIM_CACHE["day_sim_phase"] = "HOLDING"
                     _WHIPSAW_SIM_CACHE["day_sim_entry_price"] = confirmed_entry
@@ -310,8 +323,9 @@ async def execute_daymarket_rsi_alert_plugin(
                     _WHIPSAW_SIM_CACHE["day_sim_nq_vel_bypass"] = False
                     _WHIPSAW_SIM_CACHE["day_sim_min_price"] = min(confirmed_entry, cur_p_fl)
                     _WHIPSAW_SIM_CACHE["day_sim_max_price"] = max(confirmed_entry, cur_p_fl)
-                    _WHIPSAW_SIM_CACHE["day_sim_nq_entry_price"] = nq_c_now
+                    _WHIPSAW_SIM_CACHE["day_sim_nq_entry_price"] = ref_p_fill
                     _WHIPSAW_SIM_CACHE["day_sim_nq_entry_amp"] = nq_amp_now
+                    _WHIPSAW_SIM_CACHE["day_sim_ref_src"] = ref_src_fill
                 return
 
             # -----------------------------------------------------------------
@@ -343,10 +357,11 @@ async def execute_daymarket_rsi_alert_plugin(
             ewm_d = sym_state_d.get("ewm_state", {}) if isinstance(sym_state_d, dict) else {}
             is_ha_bull, live_ha_o, live_ha_c = compute_realtime_tick_heikin_ashi(cur_p_fl, ewm_d)
 
-            # NEW: 초과 Case 89 — 데이장 모의 추격 중에도 NQ=F 단기 변화율(10m/3m) ±0.20% 유리 급변 시 HA음봉 바이패스 판정
+            # 초과 Case 89 & Case 91 — 데이장 모의 추격 중에도 토스 QQQ 0.0초 실시간 변화율(10m/3m) ±0.20% 유리 급변 시 HA음봉 바이패스 판정
             is_nq_favorable_surge, nq_vel_10m, _ = await MacroDataCache.is_nq_velocity_favorable_surge(
                 symbol=active_sim_sym, surge_threshold=DAY_SIM_NQ_VEL_SURGE_PCT
             )
+            vel_src_lbl = MacroDataCache.get_cached_nq_velocity_source()
             _WHIPSAW_SIM_CACHE["day_sim_nq_vel_bypass"] = bool(is_nq_favorable_surge)
 
             # 1) +1.00% 점화선 도달 확인 및 하이킨 아시 트레일링 추적
@@ -368,7 +383,7 @@ async def execute_daymarket_rsi_alert_plugin(
                 armed_hm = int(_WHIPSAW_SIM_CACHE.get("day_sim_armed_hm", est_hm))
 
                 is_cb_exit = (peak_p > arm_p or elapsed_arm >= 2.5) and (cur_p_fl <= effective_stop_p)
-                # MODIFIED: 초과 Case 89 — NQ=F가 유리 방향으로 ±0.20% 이상 급등/급락 중이면 HA음봉 모의 익절을 바이패스!
+                # 초과 Case 89 & Case 91 — QQQ실시간(폴백 NQ)이 유리 방향으로 ±0.20% 이상 급등/급락 중이면 HA음봉 모의 익절을 바이패스!
                 is_ha_exit = (
                     not is_ha_bull
                     and not is_nq_favorable_surge
@@ -386,7 +401,7 @@ async def execute_daymarket_rsi_alert_plugin(
                     exit_trig_str = (
                         f"고점(${peak_p:.2f} / +{peak_pct:.2f}%) 대비 -0.30% 콜백 스탑(${effective_stop_p:.2f})"
                         if is_cb_exit
-                        else f"하이킨 아시 1분봉 음봉 전환(HA시가 ${live_ha_o:.2f} ≥ HA종가 ${live_ha_c:.2f} · 고점 ${peak_p:.2f} · NQ 10m {nq_vel_10m:+.2f}%)"
+                        else f"하이킨 아시 1분봉 음봉 전환(HA시가 ${live_ha_o:.2f} ≥ HA종가 ${live_ha_c:.2f} · 고점 ${peak_p:.2f} · {vel_src_lbl} 10m {nq_vel_10m:+.2f}%)"
                     )
 
                     await ctx.notify_tg(
@@ -400,22 +415,34 @@ async def execute_daymarket_rsi_alert_plugin(
                     )
                 return
 
-            # 2) 트레일링 미점화 상태 + 손실권(0 < cur_p_fl < entry_p)에서 방향성 인지 NQ=F 매크로 2·3차 방어선 이탈 시 -> 모의 손절 정산 및 락 리셋 (Case 67)
+            # 2) 트레일링 미점화 상태 + 손실권(0 < cur_p_fl < entry_p)에서
+            #    2차 과열 방어선(NQ=F 진폭 >= 2.0%) 또는
+            #    3차 역행 방어선(NQ=F 진폭 기반 dyn_thresh = max(진폭*0.5, 0.8%) × 토스 QQQ 0.0초 실시간 역행) 이탈 시 모의 손절 정산 (Case 67, 92)
             if entry_p > 0.0 and 0.0 < cur_p_fl < entry_p:
                 dyn_thresh = max(nq_entry_a * 0.5, ctx.nq_dynamic_floor) if nq_entry_a > 0.0 else ctx.nq_dynamic_floor
-                if nq_entry_p > 0.0 and nq_c_now > 0.0:
+                ref_c_now, ref_src_now = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
+
+                # 스케일 불일치 자가 치유 (NQ=F > 3000.0 vs QQQ < 3000.0)
+                if nq_entry_p <= 0.0 and ref_c_now > 0.0:
+                    nq_entry_p = ref_c_now
+                    _WHIPSAW_SIM_CACHE["day_sim_nq_entry_price"] = nq_entry_p
+                elif nq_entry_p > 0.0 and ref_c_now > 0.0 and ((nq_entry_p > 3000.0) != (ref_c_now > 3000.0)):
+                    nq_entry_p = ref_c_now
+                    _WHIPSAW_SIM_CACHE["day_sim_nq_entry_price"] = nq_entry_p
+
+                if nq_entry_p > 0.0 and ref_c_now > 0.0:
                     if active_sim_sym == "SOXS":
-                        nq_adverse_pct = (nq_c_now - nq_entry_p) / nq_entry_p * 100.0
+                        nq_adverse_pct = (ref_c_now - nq_entry_p) / nq_entry_p * 100.0
                         adverse_dir_label = "상승(숏 역행)"
                     else:
-                        nq_adverse_pct = (nq_entry_p - nq_c_now) / nq_entry_p * 100.0
+                        nq_adverse_pct = (nq_entry_p - ref_c_now) / nq_entry_p * 100.0
                         adverse_dir_label = "하락(롱 역행)"
                 else:
                     nq_adverse_pct = 0.0
                     adverse_dir_label = "역행"
 
                 is_macro_2nd = (nq_amp_now >= 2.0)
-                is_macro_3rd = (nq_entry_p > 0.0 and nq_c_now > 0.0 and nq_adverse_pct >= dyn_thresh)
+                is_macro_3rd = (nq_entry_p > 0.0 and ref_c_now > 0.0 and nq_adverse_pct >= dyn_thresh)
 
                 if is_macro_2nd or is_macro_3rd:
                     _reset_day_sim_state()
@@ -428,12 +455,14 @@ async def execute_daymarket_rsi_alert_plugin(
 
                     loss_gross_pct = ((bid_1_p / entry_p - 1.0) * 100.0) if entry_p > 0.0 else 0.0
                     loss_net_pct = loss_gross_pct - 0.14
+                    ref_unit = "$" if ref_src_now == "QQQ실시간" else ""
                     if is_macro_2nd:
                         macro_reason = f"NQ=F 당일 진폭 <code>{nq_amp_now:.2f}%</code> (2.0% 이상 대세 과열 돌파)"
                     else:
                         macro_reason = (
-                            f"진입 지수(<code>{nq_entry_p:.2f}</code>) 대비 <code>+{nq_adverse_pct:.2f}%</code> {adverse_dir_label} "
-                            f"(3차 동적 한도 <code>+{dyn_thresh:.2f}%</code> 이탈)"
+                            f"3차 {ref_src_now} 기준(<code>{ref_unit}{nq_entry_p:.2f}</code> ➡️ <code>{ref_unit}{ref_c_now:.2f}</code>) "
+                            f"대비 <code>+{nq_adverse_pct:.2f}%</code> {adverse_dir_label} "
+                            f"(NQ=F 진폭 <code>{nq_entry_a:.2f}%</code> 기반 3차 한도 <code>+{dyn_thresh:.2f}%</code> 이탈)"
                         )
 
                     await ctx.notify_tg(
@@ -494,6 +523,13 @@ async def execute_daymarket_rsi_alert_plugin(
         if cur_p_fl <= 0.0:
             return
 
+        # NEW: 초과 Case 92 — 3차 역행 안전망 진입 기준가는 토스 Open API QQQ 0.0초 실시간 현재가로 락온하고,
+        #      3차 동적 임계치 산출용 진폭은 나스닥 100 선물(NQ=F) 당일 진폭(nq_amp_global)으로 락온!
+        ref_entry_p, ref_src_init = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
+        if ref_entry_p <= 0.0:
+            ref_entry_p = nq_c_global
+            ref_src_init = "NQ선물"
+
         slip_disc = max(BUY_TRAP_MIN_DISC_USD, round(cur_p_fl * (BUY_TRAP_SLIPPAGE_PCT / 100.0), 2))
         sim_trap_buy = max(0.01, math.floor((cur_p_fl - slip_disc) * 100.0) / 100.0)
         sim_arm_100 = math.ceil(cur_p_fl * (1.0 + DAY_SIM_ARM_PROFIT_RATE / 100.0) * 100.0) / 100.0
@@ -516,8 +552,9 @@ async def execute_daymarket_rsi_alert_plugin(
         _WHIPSAW_SIM_CACHE["day_sim_entry_time_str"] = now_est.strftime("%H:%M:%S")
         _WHIPSAW_SIM_CACHE["day_sim_buy_rsi"] = rsi_val
         _WHIPSAW_SIM_CACHE["day_sim_opp_rsi"] = opp_live_rsi
-        _WHIPSAW_SIM_CACHE["day_sim_nq_entry_price"] = nq_c_global
+        _WHIPSAW_SIM_CACHE["day_sim_nq_entry_price"] = ref_entry_p
         _WHIPSAW_SIM_CACHE["day_sim_nq_entry_amp"] = nq_amp_global
+        _WHIPSAW_SIM_CACHE["day_sim_ref_src"] = ref_src_init
 
         if vwap_val <= 0.0 and ctx.shared_rsi_state and symbol in ctx.shared_rsi_state:
             vwap_val = float(ctx.shared_rsi_state[symbol].get("vwap", 0.0))
@@ -525,6 +562,8 @@ async def execute_daymarket_rsi_alert_plugin(
         vwap_str = f"${vwap_val:.2f}" if vwap_val > 0.0 else "집계중"
         sym_icon = "🐻" if symbol == "SOXS" else "🐂"
         opp_icon = "🐂" if opp_sym == "SOXL" else "🐻"
+        ref_unit = "$" if ref_src_init == "QQQ실시간" else ""
+        dyn_th_init = max(nq_amp_global * 0.5, float(ctx.nq_dynamic_floor or 0.8))
 
         await ctx.notify_tg(
             f"🔔 <b>[데이장 모의 관측] {sym_icon}{symbol} 양방향 대칭 클라이맥스 포착 ➡️ 2단계 타임쉴드 &amp; 🔥HA·트레일링 추격 개시 (매수차단)</b>\n"
@@ -532,14 +571,14 @@ async def execute_daymarket_rsi_alert_plugin(
             f"▫️ 대칭 클라이맥스: {sym_icon}{symbol} RSI <code>{rsi_val:.1f}</code> (기준 ≤ 30.0) &amp; {opp_icon}{opp_sym} RSI <code>{opp_live_rsi:.1f}</code> (기준 ≥ 79.9[80인지])\n"
             f"▫️ 포착 현재가: <code>${cur_p_fl:.2f}</code> | 🪤 1차 슬리피지 덫: <code>${sim_trap_buy:.2f}</code> (-0.18%) | VWAP: <code>{vwap_str}</code>\n"
             f"▫️ 30초 타임쉴드: <code>30초 내 ${sim_trap_buy:.2f} 도달 시 저가체결(점화가 ${trap_arm_100:.2f}) / RSI 30초과 반등 또는 30초 만료 시 현재가체결</code>\n"
-            f"▫️ NQ=F 당일 진폭: <code>{nq_amp_global:.2f}%</code> (현재지수 <code>{nq_c_global:.2f}</code>)\n"
-            f"▫️ 트레일링 점화가(+1.00%): <code>${sim_arm_100:.2f}</code> (점화 후 HA 1분봉 양봉 홀딩 · NQ ±{DAY_SIM_NQ_VEL_SURGE_PCT:.2f}% 급변 시 HA음봉 바이패스 · 고점 -0.30% 콜백/HA음봉 시 모의 익절)\n"
+            f"▫️ 매크로 기준: 3차 방어({ref_src_init}) <code>{ref_unit}{ref_entry_p:.2f}</code> | NQ=F 진폭 <code>{nq_amp_global:.2f}%</code> (3차 한도 <code>+{dyn_th_init:.2f}%</code>)\n"
+            f"▫️ 트레일링 점화가(+1.00%): <code>${sim_arm_100:.2f}</code> (점화 후 HA 1분봉 양봉 홀딩 · QQQ실시간 ±{DAY_SIM_NQ_VEL_SURGE_PCT:.2f}% 급변 시 HA음봉 바이패스 · 고점 -0.30% 콜백/HA음봉 시 모의 익절)\n"
             f"▫️ 다중알림 잠금: <code>모의 트레일링 익절 또는 매크로 손절 도달 전까지 추가 알림이 100% 차단됩니다.</code>"
         )
 
 
 # 03:58 ~ 04:06:59 EST (9분간) 듀얼(SOXS/SOXL) 데이장 누적 VWAP 비교 및
-# 현재가 > 데이장 VWAP 종목 기준 하단 1% 역산 1주 지정가 매수 덫 전용 플러그인 (Case 79)
+# 현재가 > 데이장 VWAP 종목 기준 하단 1% 역산 1주 지정가 매수 덫 전용 플러그인 (Case 79, 92)
 async def execute_whipsaw_vwap_exposure_plugin(
     ctx,
     symbol: str,
@@ -654,6 +693,12 @@ async def execute_whipsaw_vwap_exposure_plugin(
                     _WHIPSAW_SIM_CACHE["whipsaw_order_fired"] = True
                     return
 
+                # NEW: 초과 Case 92 — 휩소 1주 작전에서도 3차 방어 임계치 산출용 진폭은 NQ=F(nq_amp_now)를 기록하고,
+                #      3차 방어 기준가는 토스 QQQ 0.0초 실시간 현재가(ref_p_now)로 락온
+                ref_p_now, _ = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
+                if ref_p_now <= 0.0:
+                    ref_p_now = nq_c_now
+
                 # Case 71: SOXS 및 SOXL 양쪽 모두 실잔고 및 미체결 주문 이중 프로빙
                 for chk_s in ("SOXS", "SOXL"):
                     if await AssassinLedger.get_buy_order_id(chk_s) != "":
@@ -703,7 +748,7 @@ async def execute_whipsaw_vwap_exposure_plugin(
                         entry_session="WHIPSAW_1SH",
                         entry_trend=trend_tag,
                         entry_time=time.time(),
-                        nq_entry_price=nq_c_now,
+                        nq_entry_price=ref_p_now,
                         nq_entry_amp=nq_amp_now,
                         is_session_done=True,
                         last_session_id=current_session_id,
