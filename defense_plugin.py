@@ -1,10 +1,11 @@
 # =====================================================================
 # FILE: defense_plugin.py
-# 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망 (옵션 A 원형 & 초과 Case 95 완결)
+# 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망 (옵션 A 원형 & 초과 Case 96 완결)
 #       — 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(진폭*0.5, 0.80%)의 기준은 나스닥 100 선물(NQ=F),
 #         해당 3차 임계치(최소 0.80% QQQ 역행 하한 강제)를 적용하는 진입 기준가 및 실시간 역행 비교는
 #         토스 Open API QQQ 0.0초 실시간 현재가(1.5초 프로빙 · 포지션 자체 손실률 기반 즉시 손절 절대 금지),
-#       수동 진입(MANUAL) 및 03:58~04:06 EST 1주 휩소 작전(WHIPSAW_1SH) 시 1·2차 과열 방어 100% 패스,
+#       수동 진입(MANUAL) 및 1주 휩소 작전(WHIPSAW_1SH) 시 1·2차 과열 방어 100% 패스(04:07 정각 정리는 휩소 컷오프 전담),
+#       1차 과열 미체결 매수 파기 시 buy_order_id="" 원자적 즉시 소각 및 중복 알림 영구 차단,
 #       스나이퍼 재가동(OFF->ON)/미결속 시 현재 QQQ 0.00% 영점 재락온,
 #       04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 손절 시 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL) 캐시 점화,
 #       08:15 EST 거시지표 발표 15분 전 선제 컷오프 및 15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산 코어
@@ -18,8 +19,9 @@
 # MODIFIED: 제3헌법 및 초과 Case 93 — 프리장 선행 역산 버퍼(_AMP_BUFFER_CACHE) 잔재를 실전 코어에서 100% 영구 소각하고 옵션 A 원형으로 복원
 # NEW: 초과 Case 94 — 포지션 자체 손실률(-0.80% 초과 평가손실 등) 기반 즉시 손절 절대 금지, 최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT) 강제,
 #      스나이퍼 OFF->ON 재가동 또는 지난주 만료 주문(CANCELED) 감지 시 현재 실시간 QQQ 가격으로 0.00% 영점 재락온(_MANUAL_STAGE3_ANCHOR_CACHE) 및 양방향 수동 보유 보호
-# NEW: 초과 Case 95 — 03:58 ~ 04:06 EST 중 가동되는 1주 휩소 노출 작전(WHIPSAW_1SH)의 미체결 1주 매수덫 및 1주 보유 물량에 대해
-#      1·2차 과열 방어선(NQ>=2.0% 주문 파기 및 손실권 즉시 덤핑)을 100% 바이패스하고 3차 실시간 QQQ 역행 방어와 04:07 정각 정리만 적용
+# MODIFIED: 초과 Case 95 & Case 96 — 1주 휩소 노출 작전(WHIPSAW_1SH)의 미체결 1주 매수덫 및 1주 보유 물량은 시간대와 무관하게
+#           1·2차 과열 방어선(NQ>=2.0% 주문 파기 및 손실권 즉시 덤핑)을 100% 바이패스하여 04:07 정각 정리를 enforce_0407_whipsaw_cutoff_plugin에 전담 위임하고,
+#           본진 미체결 매수 1차 파기 시 buy_order_id="" 즉시 소각 및 already-canceled 중복 텔레그램 알림 폭탄을 원천 차단
 
 import math
 import time
@@ -47,10 +49,11 @@ NQ_VELOCITY_SURGE_PCT = AssassinLedger.NQ_VELOCITY_SURGE_PCT          # QQQ/NQ 1
 BOTTOM_REBOUND_PCT = 0.30          # 최저점(post_stop_low) 대비 +0.30% 이상 양봉 반등 시 재진입 요격
 BOTTOM_MAX_RSI_CAP = 38.0          # 최저점 반등 진입 허용 최대 RSI 상한선 (과매도 반등권 확인)
 
-# 스나이퍼 무음 불발 및 매크로 1차 과열 차단 알림 쿨다운 캐시 (Case 74)
+# 스나이퍼 무음 불발 및 매크로 1차 과열 차단 알림 쿨다운 캐시 (Case 74, 96)
 _STRIKE_ALERT_CACHE = {
     "last_warn_session": "",
     "last_macro1_date": "",
+    "last_macro1_cancel_id": "",
     "last_err_msg": "",
 }
 
@@ -410,13 +413,15 @@ async def execute_moc_zero_overnight_plugin(
     return True
 
 
-# MODIFIED: 초과 Case 66, 67, 82, 86, 87, 92, 93, 94, 95 —
+# MODIFIED: 초과 Case 66, 67, 82, 86, 87, 92, 93, 94, 95, 96 —
 #           1) 포지션 자체의 현재 평가손실률(예: 지난주 보유분 -3% ~ -10% 손실 등)을 3차 임계치에 바로 적용하여 즉시 손절하는 것을 100% 금지!
 #           2) 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)의 기준은 나스닥 100 선물(NQ=F)이되,
 #              최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80)을 하드 락온!
 #           3) 스나이퍼 OFF->ON 재가동 시 또는 수동 물량 미결속(not sell_order_id 또는 만료된 구버전 sell_order_id) 감지 첫 틱에
 #              과거 nq_entry_price를 폐기하고 현재 실시간 QQQ 가격(ref_curr_man)으로 0.00% 영점 재조준!
-#           4) 03:58 ~ 04:06 EST 1주 휩소 작전(WHIPSAW_1SH)은 1·2차 과열 방어선(주문 취소 및 손실권 즉시 덤핑)을 100% 바이패스!
+#           4) 1주 휩소 노출 작전(WHIPSAW_1SH)은 시간대와 무관하게 1·2차 과열 방어선(주문 취소 및 손실권 즉시 덤핑)을 100% 바이패스하여
+#              04:07 정각 정리를 enforce_0407_whipsaw_cutoff_plugin에 전담 위임하고,
+#              본진 미체결 매수 1차 파기 시 buy_order_id="" 즉시 소각 및 already-canceled 중복 알림 폭탄을 원천 차단!
 async def execute_macro_defense_plugin(
     ctx,
     symbol: str,
@@ -453,11 +458,9 @@ async def execute_macro_defense_plugin(
     nq_curr, nq_high, nq_low = await MacroDataCache.get_cached_nq_data()
     nq_amp = ((nq_high - nq_low) / nq_low * 100.0) if nq_low > 0.0 else 0.0
 
-    # NEW: 초과 Case 95 — 03:58 ~ 04:06 EST 진행 중인 1주 휩소 노출 작전(WHIPSAW_1SH) 여부 판별
-    is_whipsaw_1sh_active = (
-        entry_session == "WHIPSAW_1SH"
-        and (358 <= est_hm <= 406)
-    )
+    # MODIFIED: 초과 Case 95 & Case 96 — 1주 휩소 노출 작전(WHIPSAW_1SH)은 시간대(03:58~04:06 및 04:07+ 정리 시점 포함)와 무관하게
+    # execute_macro_defense_plugin의 1·2차 과열 방어선을 100% 패스하고 04:07 정각 정리는 enforce_0407_whipsaw_cutoff_plugin이 전담!
+    is_whipsaw_1sh_active = (entry_session == "WHIPSAW_1SH")
 
     # =====================================================================
     # [선행 처리] 수동 진입(MANUAL) 포지션 첫 감지 틱 및 재가동(OFF->ON) 시
@@ -543,7 +546,8 @@ async def execute_macro_defense_plugin(
 
     # =====================================================================
     # [1차 방어선] NQ=F 당일 진폭 >= 2.0% 대세 과열 시 본진 미체결 매수 즉시 파기 및 본진 신규 진입 잠금
-    #             (단, 초과 Case 95 의거 03:58~04:06 EST 1주 휩소 작전 WHIPSAW_1SH 매수덫은 절대 파기하지 않음!)
+    #             (단, 초과 Case 95 & 96 의거 1주 휩소 작전 WHIPSAW_1SH 매수덫은 절대 파기하지 않고 04:07 컷오프에 위임하며,
+    #              본진 미체결 주문 파기 시에는 buy_order_id=""를 원자적으로 즉시 소각하고 중복 알림을 차단!)
     # =====================================================================
     if nq_amp >= 2.0:
         if _BOTTOM_TRACK_CACHE.get("active", False):
@@ -552,21 +556,36 @@ async def execute_macro_defense_plugin(
         if buy_order_id and not is_whipsaw_1sh_active and not ctx.in_memory_ordering_lock.get(symbol, False):
             ctx.in_memory_ordering_lock[symbol] = True
             try:
+                already_canceled = False
                 try:
                     await ctx.client.cancel_order(buy_order_id)
                 except Exception as cancel_e:
-                    if "already-filled" in str(cancel_e):
+                    err_low = str(cancel_e).lower()
+                    if "already-filled" in err_low:
                         return False
+                    if "already-canceled" in err_low or "404" in err_low or "order-not-found" in err_low:
+                        already_canceled = True
+
+                await AssassinLedger.save_state(
+                    symbol,
+                    buy_order_id="",
+                    is_session_done=True,
+                    entry_session="CANCELED_MACRO",
+                    whipsaw_target_price=0.0,
+                )
                 await AssassinLedger.lock_all_symbols_macro(
                     last_session_id=current_session_id, force_all=False
                 )
                 _STRIKE_ALERT_CACHE["last_macro1_date"] = today_str
                 ctx.wakeup_event.set()
-                await ctx.notify_tg(
-                    f"🛑 <b>[매크로 1차 방어선 발동] {sym_icon}{symbol} 미체결 매수 주문 즉시 파기</b>\n"
-                    f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp:.2f}%</code> (2.0% 대세 과열 돌파)\n"
-                    "▫️ 조치: 미체결 매수 취소 완료 및 금일 양 종목 본진 자동 매수 권한 영구 소각"
-                )
+
+                if not already_canceled and _STRIKE_ALERT_CACHE.get("last_macro1_cancel_id") != buy_order_id:
+                    _STRIKE_ALERT_CACHE["last_macro1_cancel_id"] = buy_order_id
+                    await ctx.notify_tg(
+                        f"🛑 <b>[매크로 1차 방어선 발동] {sym_icon}{symbol} 미체결 매수 주문 즉시 파기</b>\n"
+                        f"▫️ 사유: NQ=F 당일 진폭 <code>{nq_amp:.2f}%</code> (2.0% 대세 과열 돌파)\n"
+                        "▫️ 조치: 미체결 매수 취소 완료 및 금일 양 종목 본진 자동 매수 권한 영구 소각"
+                    )
                 return True
             finally:
                 ctx.in_memory_ordering_lock[symbol] = False
@@ -586,7 +605,7 @@ async def execute_macro_defense_plugin(
             return False
 
     # =====================================================================
-    # [2차 & 3차 방어선] 보유 포지션(holdings_qty > 0) 손실 구간 방어 프로빙 (초과 Case 66, 67, 86, 87, 92, 94, 95)
+    # [2차 & 3차 방어선] 보유 포지션(holdings_qty > 0) 손실 구간 방어 프로빙 (초과 Case 66, 67, 86, 87, 92, 94, 95, 96)
     # =====================================================================
     if holdings_qty <= 0 or ctx.in_memory_ordering_lock.get(symbol, False):
         return False
@@ -649,7 +668,7 @@ async def execute_macro_defense_plugin(
         nq_adverse_pct = 0.0
         adverse_dir_str = "역행"
 
-    # 초과 Case 86, 94 & Case 95: 수동 진입(MANUAL) 포지션과 03:58~04:06 EST 1주 휩소 작전(WHIPSAW_1SH) 포지션은
+    # 초과 Case 86, 94, 95 & 96: 수동 진입(MANUAL) 포지션과 1주 휩소 작전(WHIPSAW_1SH) 포지션은
     # 2차 과열 방어선(NQ=F >= 2.0%)을 100% 패스(Bypass)하며,
     # 오직 진입/락온 시점 QQQ 기준가 대비 실시간 QQQ가 최소 0.80%(dynamic_threshold) 이상 역행했을 때만 3차 손절 격발!
     is_manual_pos = (

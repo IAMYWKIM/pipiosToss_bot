@@ -19,8 +19,8 @@
 # MODIFIED: 초과 Case 93 — 데이장 개시 1분(09:00:00~09:00:59 KST) [모의] 전용 충격 전 기준 고가(session_anchor_high) 벡터 추출 및
 #           3배 레버리지 역산 예상 하락가 버퍼 산출 함수(compute_amp_buffer_target_price) 유지 (프리장 본진은 순수 옵션 A 원복)
 # NEW: 초과 Case 94 — 포지션 자체 손실률 기반 즉시 손절 절대 금지 및 실시간 QQQ 최소 0.80% 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80) 강제
-# NEW: 초과 Case 95 — lock_all_symbols_macro 호출 시 수동 보유 종목(MANUAL)뿐만 아니라 03:58 ~ 04:06 EST 진행 중인
-#      1주 휩소 노출 작전(WHIPSAW_1SH)의 표식 및 목표가를 덮어쓰지 않도록 보호하고, 04:07 정리 후 과열일 본진 차단(CANCELED_MACRO) 자동 복원 결속
+# MODIFIED: 초과 Case 82, 95 & 96 — lock_all_symbols_macro 호출 시 수동 보유 종목(MANUAL)과 03:58 ~ 04:06 EST 진행 중인
+#           1주 휩소 노출 작전(WHIPSAW_1SH)을 보호하되, 04:07 EST 이후 미체결 buy_order_id 잔재는 즉시 ""로 소각하여 장부 고착 무한 루프를 원천 차단
 # MODIFIED: 듀얼 스나이퍼 화이트리스트 ALLOWED_SYMBOLS = ("SOXS", "SOXL") 확장 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76)
 
@@ -843,7 +843,7 @@ class AssassinLedger:
                     return ""
             return await asyncio.to_thread(_read)
 
-    # 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전 전용 목표 매도가(VWAP) 조회
+    # 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전 전용 목표 매도가 조회
     @classmethod
     async def get_whipsaw_target_price(cls, symbol: str) -> float:
         filepath = cls._get_file_path(symbol)
@@ -1033,7 +1033,8 @@ class AssassinLedger:
     # MODIFIED: 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 잠금하되,
     #           현재 수동 보유 중(entry_session == "MANUAL")인 종목과
     #           03:58 ~ 04:06 EST 진행 중인 1주 휩소 작전(entry_session == "WHIPSAW_1SH") 종목은
-    #           표식과 목표가(whipsaw_target_price), 미체결 buy_order_id를 절대 덮어쓰지 않고 100% 보존 (Case 50, 82, 94, 95)
+    #           표식과 목표가(whipsaw_target_price), 미체결 buy_order_id를 보존하며,
+    #           04:07 EST 이후에는 미체결 buy_order_id 잔재를 즉시 ""로 소각하여 무한 루프를 원천 차단 (Case 50, 82, 94, 95, 96)
     @classmethod
     async def lock_all_symbols_macro(cls, last_session_id: str = None, force_all: bool = False):
         now_est = datetime.now(EST_TZ)
@@ -1047,19 +1048,23 @@ class AssassinLedger:
                 cur_es == "MANUAL"
                 and (float(st[0] or 0.0) > 0.0 or float(st[6] or 0.0) > 0.0 or bool(st[7]))
             )
+            is_whipsaw_holding = (
+                float(st[0] or 0.0) > 0.0
+                or float(st[6] or 0.0) > 0.0
+                or bool(st[7])
+            )
             is_active_whipsaw_1sh = (
                 cur_es == "WHIPSAW_1SH"
                 and (
                     (358 <= est_hm <= 406)
-                    or bool(buy_id)
-                    or float(st[0] or 0.0) > 0.0
-                    or float(st[6] or 0.0) > 0.0
-                    or bool(st[7])
+                    or is_whipsaw_holding
                 )
             )
 
             if is_active_whipsaw_1sh:
                 kwargs = {"is_session_done": True}
+                if not (358 <= est_hm <= 406) and buy_id:
+                    kwargs["buy_order_id"] = ""
             elif is_active_manual_hold:
                 kwargs = {
                     "buy_order_id": "",

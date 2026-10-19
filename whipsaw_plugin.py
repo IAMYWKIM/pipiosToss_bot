@@ -6,7 +6,7 @@
 #       그 외 데이장 전 구간은 프리장 본진(옵션 A)과 동일하게 즉시 1차 슬리피지(-0.18%) 매수덫 + 30초 타임쉴드 +
 #       하이킨 아시 트레일링(🚀 NQ_VEL_BYPASS) + QQQ 실시간 최소 0.80% 3차 역행 방어를 [모의] 추격하며,
 #       03:58~03:59 EST 마감 휩소 묵음 바이패스 및
-#       03:58~04:07 EST (9분간) NQ>=2.0% 과열차단일에도 별개 독립 가동되는 데이장 VWAP 상단 종목 1% 역산 듀얼 1주 휩소 매수 덫 플러그인
+#       03:58~04:07 EST (9분간) NQ>=2.0% 과열차단일에도 별개 독립 가동되는 데이장 VWAP 상단 종목 0.5% 역산 매수 ➔ +1.00% 익절 매도 듀얼 1주 휩소 매수 덫 플러그인
 # =====================================================================
 # MODIFIED: 제3헌법 의거 모듈 분리 및 구버전 +0.64% 참고 타점 데드코드 영구 소각
 # MODIFIED: 데이장(19:00~03:57 EST)은 100% [모의] 전용이며 어떠한 경우에도 실거래 매수 주문(create_order)을 발사하지 않도록 물리적 차단 (Case 53, 78, 93)
@@ -17,8 +17,9 @@
 # MODIFIED: 초과 Case 92 & Case 94 — 데이장 [모의] 및 03:58 휩소 1주 작전에서 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)은
 #           나스닥 100 선물지수(NQ=F) 진폭(nq_entry_amp)을 기준으로 산출하되 최소 0.80% QQQ 역행 하한을 강제하고,
 #           해당 임계치를 적용하는 진입 기준가 및 실시간 역행 비교가는 토스 Open API QQQ 0.0초 실시간 현재가(get_stage3_reference_price)로 전면 대체
-# NEW: 초과 Case 95 — 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전(WHIPSAW_1SH)은 당일 NQ=F >= 2.0% 과열차단(CANCELED_MACRO)일에도
-#      차단되지 않고 본진과 별개로 1주 진입하여 +1.00% VWAP 익절을 추구하며, 04:07:00 EST 정리 직후 과열차단(CANCELED_MACRO)을 복원하여 본진 시드를 보호
+# MODIFIED: 초과 Case 79, 80, 95 & 96 — 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전(WHIPSAW_1SH)은 당일 NQ=F >= 2.0% 과열차단(CANCELED_MACRO)일에도
+#           차단되지 않고 본진과 별개로 데이장 VWAP 0.5% 역산 가격(VWAP / 1.005)에 1주 진입하여 매수 체결가 대비 +1.00%(avg_price * 1.01) 익절을 추구하며,
+#           04:07:00 EST 정리 직후 buy_order_id="" 원자적 소각 및 과열차단(CANCELED_MACRO)을 복원하여 본진 시드를 보호
 
 import math
 import time
@@ -61,9 +62,12 @@ BUY_TRAP_SLIPPAGE_PCT = 0.18          # 1차 매수 덫 슬리피지 할인율 (
 BUY_TRAP_MIN_DISC_USD = 0.02          # 1차 매수 덫 최소 할인 폭 (-$0.02 보장)
 BUY_TRAP_REARM_WAIT_SEC = 30.0        # RSI <= 30.0 유지 시 1차 매수 덫 최대 타임쉴드 대기 시간 (30.0초)
 
-# 03:58 ~ 04:07 EST (9분간) 실전 듀얼 1주 고정 '휩소 노출 작전' 상수
-WHIPSAW_FIXED_QTY = 1                 # 시드 무관 무조건 1주 고정 테스트
-WHIPSAW_PROFIT_FACTOR = 1.01          # 데이장 VWAP = 1.01 * 매수덫가격 (1% 역산 하단 매수 덫)
+# MODIFIED: 초과 Case 79 & Case 95 — 03:58 ~ 04:07 EST (9분간) 실전 듀얼 1주 고정 '휩소 노출 작전' 상수
+#           (데이장 VWAP 0.5% 역산 매수 덫 투하 ➔ 매수 체결 후 +1.00% 익절 매도 덫 장전)
+WHIPSAW_FIXED_QTY = 1                      # 시드 무관 무조건 1주 고정 테스트
+WHIPSAW_BUY_REVERSE_FACTOR = 1.005         # 데이장 VWAP = 1.005 * 매수덫가격 (VWAP 대비 0.5% 역산 하단 매수 덫)
+WHIPSAW_SELL_PROFIT_FACTOR = 1.01          # 목표 매도덫가격 = ceil(매수체결가 * 1.01) (+1.00% 익절 매도 덫)
+WHIPSAW_PROFIT_FACTOR = WHIPSAW_SELL_PROFIT_FACTOR
 
 # 데이장 100% [모의] (개시 1분 한정 BUFFER_WAIT / 평시 TRAP_WAIT / HOLDING) 및 03:58 휩소 런타임 상태 캐시
 _WHIPSAW_SIM_CACHE = {
@@ -101,8 +105,8 @@ _WHIPSAW_SIM_CACHE = {
     "whipsaw_target_sym": "",         # 선정된 VWAP 상단 종목 ("SOXS" 또는 "SOXL")
     "whipsaw_spot_price": 0.0,        # 선정 당시 해당 종목 현재가 (> day_vwap)
     "whipsaw_locked_vwap": 0.0,       # 선정된 종목의 데이장 누적 VWAP
-    "whipsaw_buy_price": 0.0,         # 산출된 하단 1% 역산 1주 매수 덫 가격 (VWAP / 1.01)
-    "whipsaw_sell_target": 0.0,       # 산출된 1주 목표 매도 덫 가격 (VWAP)
+    "whipsaw_buy_price": 0.0,         # 산출된 하단 0.5% 역산 1주 매수 덫 가격 (VWAP / 1.005)
+    "whipsaw_sell_target": 0.0,       # 산출된 1주 목표 매도 덫 가격 (매수가 * 1.01, +1.00% 익절가)
     "whipsaw_mode_desc": "",          # 타점 선정 설명
     "whipsaw_order_fired": False,     # 실제 토스 주문 접수 완료 여부
     "whipsaw_cutoff_done": False,     # 04:07 EST 컷오프 정리 완료 여부
@@ -811,9 +815,9 @@ async def execute_daymarket_rsi_alert_plugin(
         )
 
 
-# MODIFIED: 초과 Case 79, 92, 95 — 03:58 ~ 04:06:59 EST (9분간) 듀얼(SOXS/SOXL) 데이장 누적 VWAP 비교 및
-#           현재가 > 데이장 VWAP 종목 기준 하단 1% 역산 1주 지정가 매수 덫 전용 플러그인
-#           (당일 NQ=F >= 2.0% 과열차단[CANCELED_MACRO] 발동일에도 차단하지 않고 본진과 별개로 1주 진입하여 +1.00% VWAP 익절 추구!)
+# MODIFIED: 초과 Case 79, 92, 95 & 96 — 03:58 ~ 04:06:59 EST (9분간) 듀얼(SOXS/SOXL) 데이장 누적 VWAP 비교 및
+#           현재가 > 데이장 VWAP 종목 기준 하단 0.5% 역산(VWAP / 1.005) 1주 지정가 매수 덫 ➔ 체결 시 매수가 대비 +1.00%(avg_price * 1.01) 익절 매도 덫 전용 플러그인
+#           (당일 NQ=F >= 2.0% 과열차단[CANCELED_MACRO] 발동일에도 차단하지 않고 본진과 별개로 1주 진입하여 +1.00% 익절 추구!)
 async def execute_whipsaw_vwap_exposure_plugin(
     ctx,
     symbol: str,
@@ -881,12 +885,14 @@ async def execute_whipsaw_vwap_exposure_plugin(
             candidates.sort(key=lambda x: x[0], reverse=True)
             best_prem, chosen_sym, chosen_spot, chosen_vwap = candidates[0]
 
-            # 공식: 데이장 VWAP = 1.01 * 매수덫가격 -> 매수덫가격 = floor((VWAP / 1.01) * 100) / 100
-            calc_buy_p = max(0.01, math.floor((chosen_vwap / WHIPSAW_PROFIT_FACTOR) * 100.0) / 100.0)
-            calc_sell_tp = math.ceil(chosen_vwap * 100.0) / 100.0
+            # MODIFIED: 초과 Case 79 & Case 95 —
+            # 1) 1주 매수 덫: 데이장 VWAP에서 0.5% 역산 (floor((VWAP / 1.005) * 100) / 100)
+            # 2) 1주 목표 매도 덫: 매수 체결가 대비 +1.00% 익절가 (ceil(매수가 * 1.01 * 100) / 100)
+            calc_buy_p = max(0.01, math.floor((chosen_vwap / WHIPSAW_BUY_REVERSE_FACTOR) * 100.0) / 100.0)
+            calc_sell_tp = math.ceil(calc_buy_p * WHIPSAW_SELL_PROFIT_FACTOR * 100.0) / 100.0
             mode_desc = (
                 f"{chosen_sym} 현재가(${chosen_spot:.2f})가 데이장VWAP(${chosen_vwap:.2f}, +{best_prem:.2f}%) 상단 위치 "
-                f"➡️ 1% 역산 하단 매수덫(${calc_buy_p:.2f}) · 체결 시 목표 VWAP(${calc_sell_tp:.2f})"
+                f"➡️ VWAP 0.5% 역산 하단 매수덫(${calc_buy_p:.2f}) · 체결 시 +1.00% 익절 매도덫(${calc_sell_tp:.2f})"
             )
 
             _WHIPSAW_SIM_CACHE["whipsaw_target_sym"] = chosen_sym
@@ -1001,11 +1007,11 @@ async def execute_whipsaw_vwap_exposure_plugin(
                         else ""
                     )
                     await ctx.notify_tg(
-                        f"🌪️ <b>[듀얼 휩소 노출 작전 개시] {sym_icon}{target_sym} VWAP 1% 역산 1주 매수 덫 투하</b>\n"
+                        f"🌪️ <b>[듀얼 휩소 노출 작전 개시] {sym_icon}{target_sym} VWAP 0.5% 역산 1주 매수 덫 투하</b>\n"
                         f"▫️ 작전 시간: <code>03:58 ~ 04:07 EST (9분간 유지{macro_indep_note})</code>\n"
                         f"▫️ 선정 종목: <b>{sym_icon}{target_sym}</b> | 데이장 누적 VWAP: <code>${locked_vwap:.2f}</code>\n"
                         f"▫️ 타점 판정: <code>{mode_desc_str}</code>\n"
-                        f"▫️ 주문 내역: <b>1주 고정(LIMIT)</b> 하단 매수덫 <code>${target_buy_p:.2f}</code> ➡️ 체결 시 목표 매도덫 <code>${target_sell_p:.2f}</code> (기대 <code>+{exp_gross_pct:.2f}%</code>)\n"
+                        f"▫️ 주문 내역: <b>1주 고정(LIMIT)</b> 하단 매수덫 <code>${target_buy_p:.2f}</code> ➡️ 체결 시 +1.00% 목표 매도덫 <code>${target_sell_p:.2f}</code> (기대 <code>+{exp_gross_pct:.2f}%</code>)\n"
                         "▫️ 무비용 방어: <code>04:07 EST까지 덫 미체결 시 비용 $0 자동 취소 / 체결 후 미매도 시 현재가 즉시 매도</code>"
                     )
             except Exception as e:
@@ -1022,8 +1028,9 @@ async def execute_whipsaw_vwap_exposure_plugin(
                 ctx.in_memory_ordering_lock[target_sym] = False
 
 
-# MODIFIED: Case 80 & 초과 Case 95 — 04:07:00 EST 정각 듀얼 휩소 노출 작전 9분 타임쉴드 만료 정리 플러그인
-#           (미체결 취소 시 당일 NQ >= 2.0% 과열일이면 즉시 CANCELED_MACRO 잠금을 복원하여 본진 자동 진입을 차단!)
+# MODIFIED: Case 80, 초과 Case 95 & Case 96 — 04:07:00 EST 정각 듀얼 휩소 노출 작전 9분 타임쉴드 만료 정리 플러그인
+#           (미체결 취소 시 already-canceled/404 여부와 무관하게 buy_order_id="" 원자적 즉시 소각 및
+#            당일 NQ >= 2.0% 과열일이면 즉시 CANCELED_MACRO 잠금을 복원하여 본진 자동 진입을 차단!)
 async def enforce_0407_whipsaw_cutoff_plugin(
     ctx,
     symbol: str,
@@ -1049,18 +1056,22 @@ async def enforce_0407_whipsaw_cutoff_plugin(
     sym_icon = "🐻" if symbol == "SOXS" else "🐂"
 
     # [분기 1] 04:07 EST 도달 시점에 1주 매수 덫이 미체결(holdings_qty == 0)인 경우 -> 비용 $0 즉시 취소 후 본진 인계/과열차단 복원
-    if holdings_qty == 0 and buy_order_id:
+    if holdings_qty == 0:
         ctx.in_memory_ordering_lock[symbol] = True
         try:
             canceled_any = False
             canceled_ids = set()
-            try:
-                await ctx.client.cancel_order(buy_order_id)
-                canceled_ids.add(buy_order_id)
-                canceled_any = True
-            except Exception as ce:
-                if "already-filled" in str(ce):
-                    return buy_order_id, entry_session, True
+            if buy_order_id:
+                try:
+                    await ctx.client.cancel_order(buy_order_id)
+                    canceled_ids.add(buy_order_id)
+                    canceled_any = True
+                except Exception as ce:
+                    err_low = str(ce).lower()
+                    if "already-filled" in err_low:
+                        return buy_order_id, entry_session, True
+                    if "already-canceled" in err_low or "404" in err_low or "order-not-found" in err_low:
+                        canceled_ids.add(buy_order_id)
 
             try:
                 open_orders = await ctx.client.get_orders(status="OPEN", symbol=symbol)
@@ -1095,10 +1106,11 @@ async def enforce_0407_whipsaw_cutoff_plugin(
                 whipsaw_target_price=0.0,
             )
             await AssassinLedger.unlock_all_symbols_for_reentry()
+            should_notify = not _WHIPSAW_SIM_CACHE.get("whipsaw_cutoff_done", False)
             _WHIPSAW_SIM_CACHE["whipsaw_cutoff_done"] = True
             ctx.wakeup_event.set()
 
-            if canceled_any:
+            if (canceled_any or bool(buy_order_id)) and should_notify:
                 if is_macro_overheated:
                     next_action_desc = (
                         f"미체결 1주 매수 덫 무비용 파기 ➡️ 당일 NQ=F 진폭(<code>{nq_amp_cut:.2f}%</code>) 과열로 "

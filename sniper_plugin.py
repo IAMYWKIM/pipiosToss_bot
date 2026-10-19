@@ -17,8 +17,9 @@
 # NEW: 초과 Case 94 — 스나이퍼 가동 OFF 전환 시 nq_entry_price=0.0, nq_entry_amp=0.0 원자적 초기화 및
 #      수동 보유 물량 안전캡(+5.00% LIMIT) 결속 시 현재 실시간 QQQ 기준가(0.00% 역행 출발) 강제 동기화·마킹(mark_manual_stage3_anchored)으로
 #      포지션 자체 손실률(-0.80% 초과 등)이나 과거 기준가로 인한 즉시 손절을 100% 원천 차단
-# NEW: 초과 Case 95 — 03:58 ~ 04:07 EST 1주 휩소 작전(WHIPSAW_1SH)이 과열차단(NQ>=2.0%)일에 별개 가동된 후 청산 완료되면,
-#      즉시 양쪽 장부를 CANCELED_MACRO(is_session_done=True)로 복원하여 04:07 ~ 08:14 EST 본진 자동 진입을 100% 차단!
+# MODIFIED: 초과 Case 58, 79, 95 & 96 — 03:58 ~ 04:07 EST 1주 휩소 작전(WHIPSAW_1SH)이 데이장 VWAP 0.5% 역산 가격에 체결되면
+#           즉시 실제 매수 체결 평단가(avg_price) 대비 +1.00% 익절가(math.ceil(avg_price * 1.01 * 100) / 100.0)에 1주 지정가 매도 덫을 장전하며,
+#           과열차단(NQ>=2.0%)일에 청산 완료 시 즉시 양쪽 장부를 CANCELED_MACRO(is_session_done=True)로 복원하여 본진 자동 진입을 100% 차단!
 # MODIFIED: 04:07 ~ 08:14 EST 중 NQ=F < 2.0% 내 3차 역행 손절 후 최저점 역트레일링 +0.30% 양봉 반등 재진입(RE_BOT_TRAIL) 가동 (Case 87)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 기반 실제 발생 순수익금((실제매도가-실제매수가)*체결수량 - 수수료 0.14%) 복리 정산 동기화 (Case 76)
 
@@ -46,6 +47,8 @@ from whipsaw_plugin import (
     BUY_TRAP_SLIPPAGE_PCT,
     BUY_TRAP_MIN_DISC_USD,
     BUY_TRAP_REARM_WAIT_SEC,
+    WHIPSAW_BUY_REVERSE_FACTOR,
+    WHIPSAW_SELL_PROFIT_FACTOR,
     get_daymarket_sim_status,
     get_whipsaw_runtime_status,
     settle_daymarket_sim_before_premarket,
@@ -428,7 +431,7 @@ async def reconcile_zero_holdings_exit_plugin(
                 )
             else:
                 await ctx.notify_tg(
-                    f"🎉 <b>[듀얼 휩소 작전 1주 익절 성공 {sym_icon}{symbol}] 데이장 VWAP 타점 달성</b>\n"
+                    f"🎉 <b>[듀얼 휩소 작전 1주 익절 성공 {sym_icon}{symbol}] +1.00% 익절 타점 달성</b>\n"
                     f"▫️ 잔고 0주 (1주 지정가 매도 덫 체결 확인){pnl_str}{compound_str}\n"
                     f"▫️ 후속 조치: {whip_next_note}"
                 )
@@ -705,7 +708,7 @@ async def execute_post_stop_bottom_rebound_plugin(
 
 
 # 프리장 초중반 골든타임 (04:07 ~ 08:14 EST) 양방향 대칭 클라이맥스 단일화 타격 (옵션 A 원형 : 🪤 DUAL80_TRAP)
-# — (SOXS RSI <= 30.0 AND SOXL RSI >= 79.9) 또는 (SOXL RSI <= 30.0 AND SOXS RSI >= 79.9) 포착 시
+# — (SOXS RSI <= 30.0 AND SOXL RSI >= 79.9) 또는 (SOXL RSI <= 30.0 AND SOXS >= 79.9) 포착 시
 #   선행 역산 버퍼 보류 없이 즉시 1차 슬리피지(-0.18%) 지정가 매수 덫 선(先) 투하 (Case 54, 59, 71, 81, 83, 84, 87, 92, 93, 94)
 async def execute_premarket_rsi_sniper_strike_plugin(
     ctx: SniperPluginContext,
@@ -1103,7 +1106,8 @@ async def rearm_premarket_buy_trap_after_30s_plugin(
 
 
 # 단일 '하이킨 아시 + 고점 트레일링 (🔥 HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)' 전용 매도 안전 캡 장전,
-# 스나이퍼 OFF 전환 시 구버전 QQQ 기준가 소각 및 체결/수동재결속 시점 실시간 QQQ 3차 방어 기준가 동기화 (Case 85, 89, 91, 92, 93, 94)
+# 1주 휩소 작전(WHIPSAW_1SH) 체결 시 실체결 평단가 기준 +1.00% 매도 덫 장전,
+# 스나이퍼 OFF 전환 시 구버전 QQQ 기준가 소각 및 체결/수동재결속 시점 실시간 QQQ 3차 방어 기준가 동기화 (Case 58, 79, 85, 89, 91, 92, 93, 94, 95)
 async def manage_mechanical_profit_trap_plugin(
     ctx: SniperPluginContext, symbol: str, now_est: datetime, current_session_id: str,
     is_active: bool, just_turned_off: bool, holdings_qty: int, holdings_detail: dict,
@@ -1396,7 +1400,7 @@ async def manage_mechanical_profit_trap_plugin(
 
     # =====================================================================
     # 3. 최초 매수 전량 체결(또는 스나이퍼 재가동/세션 전환) 확인 즉시
-    #    거래소 매도 주문(상단 안전 캡 +5.00% 또는 휩소 VWAP) 장전 및 실시간 QQQ 기준가 동기화
+    #    거래소 매도 주문(상단 안전 캡 +5.00% 또는 휩소 1주 +1.00% 익절가) 장전 및 실시간 QQQ 기준가 동기화
     # =====================================================================
     if (
         holdings_qty > 0
@@ -1440,14 +1444,12 @@ async def manage_mechanical_profit_trap_plugin(
 
         if avg_price > 0.0:
             if entry_session == "WHIPSAW_1SH":
-                whipsaw_tp = await AssassinLedger.get_whipsaw_target_price(symbol)
-                if whipsaw_tp > 0.0:
-                    order_limit_price = math.ceil(whipsaw_tp * 100.0) / 100.0
-                else:
-                    order_limit_price = math.ceil(avg_price * 1.01 * 100.0) / 100.0
+                # MODIFIED: 초과 Case 58, 79 & Case 95 — 03:58 ~ 04:07 EST 1주 휩소 작전 체결 시
+                # 실제 매수 체결 평단가(avg_price) 대비 +1.00% 익절가(math.ceil(avg_price * 1.01 * 100) / 100.0)로 매도 주문 장전!
+                order_limit_price = math.ceil(avg_price * WHIPSAW_SELL_PROFIT_FACTOR * 100.0) / 100.0
                 ledger_target_price = order_limit_price
                 exp_w_rate = ((order_limit_price / avg_price - 1.0) * 100.0) if avg_price > 0.0 else 1.00
-                trap_tag = f"듀얼 휩소 작전 1주 체결(목표 VWAP +{exp_w_rate:.2f}%)"
+                trap_tag = f"듀얼 휩소 작전 1주 체결(목표 +{exp_w_rate:.2f}% 익절)"
             else:
                 arm_p = math.ceil(avg_price * (1.0 + TRAIL_ARM_PROFIT_RATE / 100.0) * 100.0) / 100.0
                 safety_cap_p = math.ceil(avg_price * (1.0 + TRAIL_SAFETY_CAP_RATE / 100.0) * 100.0) / 100.0
@@ -1522,7 +1524,9 @@ async def manage_mechanical_profit_trap_plugin(
                         "nq_entry_price": eff_nq_p, "nq_entry_amp": eff_nq_a,
                     }
 
-                    if is_manual_trap:
+                    if entry_session == "WHIPSAW_1SH":
+                        kwargs["whipsaw_target_price"] = order_limit_price
+                    elif is_manual_trap:
                         kwargs.update({
                             "entry_session": "MANUAL", "entry_trend": trend_str,
                         })
@@ -1541,7 +1545,7 @@ async def manage_mechanical_profit_trap_plugin(
                         await ctx.notify_tg(
                             f"🟢 <b>[듀얼 스나이퍼 {sym_icon}{symbol}] {trap_tag} 지정가 매도 덫 장전 완료</b>\n"
                             f"▫️ 팩트 평단가: <code>${avg_price:.2f}</code> (전량 <code>{trap_qty}주</code>)\n"
-                            f"▫️ 목표 익절가: <code>${order_limit_price:.2f}</code> (+{gross_tp_pct:.2f}% 지정가 · 예상 실순수익 <code>+${est_net_usd:,.2f}</code>)"
+                            f"▫️ 목표 익절가(+1.00%): <code>${order_limit_price:.2f}</code> (+{gross_tp_pct:.2f}% 지정가 · 예상 실순수익 <code>+${est_net_usd:,.2f}</code>)"
                         )
                     else:
                         min_net_usd = round(
