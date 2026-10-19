@@ -1,9 +1,10 @@
 # =====================================================================
 # FILE: defense_plugin.py
 # 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망
-#       — 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(진폭*0.5, 0.8%)의 기준은 나스닥 100 선물(NQ=F),
-#         해당 3차 임계치를 적용하는 진입 기준가 및 실시간 역행 비교는 토스 Open API QQQ 0.0초 실시간 현재가(1.5초 프로빙),
-#       수동 진입(MANUAL) 시 2차 과열 방어 100% 패스 및 3차 실시간 QQQ 역행 방어 전용 가동,
+#       — 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(진폭*0.5, 0.80%)의 기준은 나스닥 100 선물(NQ=F),
+#         해당 3차 임계치(최소 0.80% QQQ 역행 하한 강제)를 적용하는 진입 기준가 및 실시간 역행 비교는
+#         토스 Open API QQQ 0.0초 실시간 현재가(1.5초 프로빙 · 포지션 자체 손실률 기반 즉시 손절 절대 금지),
+#       수동 진입(MANUAL) 시 2차 과열 방어 100% 패스 및 스나이퍼 재가동(OFF->ON)/미결속 시 현재 QQQ 0.00% 영점 재락온,
 #       선물 진폭(NQ=F >= 0.80%) 선행 폭등·폭락 시 역산 하락가 버퍼 역트레일링(_AMP_BUFFER_CACHE) 관리,
 #       04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 손절 시 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL) 캐시 점화,
 #       08:15 EST 거시지표 발표 15분 전 선제 컷오프 및 15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산 코어
@@ -12,10 +13,12 @@
 # NEW: 초과 Case 85 & Case 89 — 하이킨 아시 트레일링 런타임 캐시(_TRAIL_RUNTIME_CACHE) 및 NQ_VELOCITY_SURGE_PCT(0.20%) 슬롯 관리
 # NEW: 초과 Case 86 — 수동 진입(MANUAL) 시 첫 틱 기준점 선행 락온 및 2차 과열 방어선(NQ>=2.0%) 100% 패스
 # NEW: 초과 Case 87 — 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 역행 손절 시 당일 퇴근 대신 최저점 역트레일링(_BOTTOM_TRACK_CACHE) 점화
-# NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 max(nq_entry_amp * 0.5, 0.8%)는 나스닥 100 선물지수(NQ=F) 진폭을 기준으로 산출하고,
+# NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 max(nq_entry_amp * 0.5, 0.80%)는 나스닥 100 선물지수(NQ=F) 진폭을 기준으로 산출하고,
 #      해당 임계치를 적용하는 진입 기준가(nq_entry_price) 및 실시간 역행 비교가(ref_curr)는 토스 Open API QQQ 0.0초 실시간 현재가로 전면 대체
 # NEW: 초과 Case 93 — 선물 진폭(NQ=F >= 0.80%) 선행 급등락 시 고가 진입을 보류하고 역산 하락가 버퍼를 기준으로 최저점 역트레일링을 수행하는
 #      _AMP_BUFFER_CACHE 상태 머신 및 main.py 0.4초 고주파 부스터/시그니처 100% 호환 브릿지 탑재
+# NEW: 초과 Case 94 — 포지션 자체 손실률(-0.80% 초과 평가손실 등) 기반 즉시 손절 절대 금지, 최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT) 강제,
+#      스나이퍼 OFF->ON 재가동 또는 지난주 만료 주문(CANCELED) 감지 시 현재 실시간 QQQ 가격으로 0.00% 영점 재락온(_MANUAL_STAGE3_ANCHOR_CACHE) 및 양방향 수동 보유 보호
 
 import math
 import time
@@ -41,6 +44,9 @@ TRAIL_FLOOR_LOCK_RATE = AssassinLedger.TRAIL_FLOOR_LOCK_RATE          # 최소 +
 TRAIL_DROP_CALLBACK_PCT = AssassinLedger.TRAIL_DROP_CALLBACK_PCT      # 최고가 대비 -0.30% 콜백 스탑
 TRAIL_SAFETY_CAP_RATE = AssassinLedger.TRAIL_SAFETY_CAP_RATE          # 체결 직후 거래소 선장전 안전 캡 (+5.00% LIMIT)
 NQ_VELOCITY_SURGE_PCT = AssassinLedger.NQ_VELOCITY_SURGE_PCT          # QQQ/NQ 10분/3분 변화율 ±0.20% HA음봉 바이패스 임계치
+
+# NEW: 초과 Case 94 — 3차 안전망 최소 실시간 QQQ 역행 하한선 (0.80% 하드 락온)
+MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80
 
 # 초과 Case 87 & Case 93 — 3차 안전망 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 및 진폭 역산 버퍼 역트레일링(AMP_BUF_TRAIL) 상수
 BOTTOM_REBOUND_PCT = 0.30          # 최저점(post_stop_low / post_shock_low) 대비 +0.30% 이상 양봉 반등 시 요격
@@ -82,6 +88,13 @@ _TRAIL_RUNTIME_CACHE = {
     "SOXL": _make_empty_trail_slot(),
 }
 
+# NEW: 초과 Case 94 — 수동 보유(MANUAL) 물량의 스나이퍼 OFF->ON 재가동 및 지난주 만료 주문 감지 시
+#      현재 실시간 QQQ 가격으로 0.00% 영점 재락온을 보장하기 위한 인메모리 앵커 검증 캐시
+_MANUAL_STAGE3_ANCHOR_CACHE = {
+    "SOXS": {"anchored": False, "verified_sell_id": ""},
+    "SOXL": {"anchored": False, "verified_sell_id": ""},
+}
+
 # 인메모리 3차 손절 후 최저점 역트레일링(RE_BOT_TRAIL) 추적 캐시 (Case 02, 87)
 _BOTTOM_TRACK_CACHE = {
     "active": False,
@@ -97,7 +110,7 @@ _BOTTOM_TRACK_CACHE = {
     "last_new_low_ts": 0.0,
 }
 
-# NEW: 초과 Case 93 — 선물 진폭(NQ=F >= 0.80%) 선행 폭등·폭락 시 '진폭 역산 하락가 버퍼 & 최저점 역트레일링(🛡️ AMP_BUF_TRAIL)' 캐시
+# 초과 Case 93 — 선물 진폭(NQ=F >= 0.80%) 선행 폭등·폭락 시 '진폭 역산 하락가 버퍼 & 최저점 역트레일링(🛡️ AMP_BUF_TRAIL)' 캐시
 _AMP_BUFFER_CACHE = {
     "active": False,
     "mode": "AMP_BUFFER",
@@ -119,8 +132,27 @@ _AMP_BUFFER_CACHE = {
 }
 
 
+def _reset_manual_stage3_anchor(symbol: str = None):
+    """수동 포지션 3차 방어 QQQ 기준가 영점 앵커 캐시를 초기화합니다 (초과 Case 94)."""
+    if symbol and symbol in _MANUAL_STAGE3_ANCHOR_CACHE:
+        _MANUAL_STAGE3_ANCHOR_CACHE[symbol] = {"anchored": False, "verified_sell_id": ""}
+    else:
+        for sym in ("SOXS", "SOXL"):
+            _MANUAL_STAGE3_ANCHOR_CACHE[sym] = {"anchored": False, "verified_sell_id": ""}
+
+
+def mark_manual_stage3_anchored(symbol: str, sell_order_id: str = ""):
+    """수동 포지션의 상단 안전 캡(+5.00% LIMIT) 장전 및 실시간 QQQ 기준가 락온 완료를 기록합니다 (초과 Case 94)."""
+    if symbol in _MANUAL_STAGE3_ANCHOR_CACHE:
+        _MANUAL_STAGE3_ANCHOR_CACHE[symbol] = {
+            "anchored": True,
+            "verified_sell_id": str(sell_order_id or ""),
+        }
+
+
 def _reset_trailing_runtime_state(symbol: str = None):
-    """하이킨 아시 트레일링 인메모리 캐시를 원자적으로 초기화합니다 (Case 02, 22, 85)."""
+    """하이킨 아시 트레일링 인메모리 캐시 및 수동 3차 방어 앵커 캐시를 원자적으로 초기화합니다 (Case 02, 22, 85, 94)."""
+    _reset_manual_stage3_anchor(symbol)
     if symbol and symbol in _TRAIL_RUNTIME_CACHE:
         _TRAIL_RUNTIME_CACHE[symbol] = _make_empty_trail_slot()
     else:
@@ -170,7 +202,7 @@ def _activate_amp_buffer_state(
     logical_date: str = "",
 ):
     """
-    NEW: 초과 Case 93 — 프리장 골든타임(04:07 ~ 08:14 EST) 중 NQ=F 진폭이 0.80% 이상 벌어져 있을 때
+    초과 Case 93 — 프리장 골든타임(04:07 ~ 08:14 EST) 중 NQ=F 진폭이 0.80% 이상 벌어져 있을 때
     대칭 클라이맥스 포착 시 고가 진입을 보류하고 역산 하락가 버퍼 역트레일링(_AMP_BUFFER_CACHE)을 점화합니다.
     """
     if symbol not in ("SOXS", "SOXL") or spot_price <= 0.0 or target_drop_price <= 0.0:
@@ -514,11 +546,13 @@ async def execute_moc_zero_overnight_plugin(
     return True
 
 
-# MODIFIED: 초과 Case 66, 67, 82, 86, 87, 92, 93 —
-#           1) 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(nq_entry_amp * 0.5, 0.8%)의 기준은 나스닥 100 선물(NQ=F)
-#           2) 해당 3차 임계치를 적용하는 진입 기준가(nq_entry_price) 및 실시간 역행 비교가(ref_curr)는 토스 Open API QQQ 0.0초 실시간 현재가로 전면 대체 (보유중 1.5초 프로빙)
-#           3) 수동 진입(MANUAL) 시 2차 과열 방어 100% 패스 및 04:07~08:14 EST 내 NQ<2.0% 3차 손절 시 최저점 역트레일링(STAGE3_STOP_TRACK) 점화
-#           4) main.py 호출 시그니처(avg_price_dump, is_session_done 등) 및 bool 반환값 100% 호환
+# MODIFIED: 초과 Case 66, 67, 82, 86, 87, 92, 93, 94 —
+#           1) 포지션 자체의 현재 평가손실률(예: 지난주 보유분 -3% ~ -10% 손실 등)을 3차 임계치에 바로 적용하여 즉시 손절하는 것을 100% 금지!
+#           2) 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)의 기준은 나스닥 100 선물(NQ=F)이되,
+#              최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80)을 하드 락온!
+#           3) 스나이퍼 OFF->ON 재가동 시 또는 수동 물량 미결속(not sell_order_id 또는 만료된 구버전 sell_order_id) 감지 첫 틱에
+#              과거 nq_entry_price를 폐기하고 현재 실시간 QQQ 가격(ref_curr_man)으로 0.00% 영점 재조준!
+#           4) 양방향 동시 수동 보유 중 한쪽 3차 손절 시 반대편 수동 보유 종목의 MANUAL 표식 및 QQQ 기준가 100% 보호
 async def execute_macro_defense_plugin(
     ctx,
     symbol: str,
@@ -539,8 +573,13 @@ async def execute_macro_defense_plugin(
     current_price: float = 0.0,
     **kwargs,
 ) -> bool:
-    if not is_active or symbol not in ("SOXS", "SOXL"):
+    if symbol not in ("SOXS", "SOXL"):
         return False
+
+    if holdings_qty <= 0 or not is_active:
+        _reset_manual_stage3_anchor(symbol)
+        if not is_active:
+            return False
 
     est_hm = now_est.hour * 100 + now_est.minute
     today_str = now_est.strftime("%Y-%m-%d")
@@ -551,7 +590,8 @@ async def execute_macro_defense_plugin(
     nq_amp = ((nq_high - nq_low) / nq_low * 100.0) if nq_low > 0.0 else 0.0
 
     # =====================================================================
-    # [선행 처리] 수동 진입(MANUAL) 포지션 첫 감지 틱 즉시 실시간 QQQ 기준가 및 NQ=F 진폭 락온 (초과 Case 50, 86, 92)
+    # [선행 처리] 수동 진입(MANUAL) 포지션 첫 감지 틱 및 재가동(OFF->ON) 시
+    #            실시간 QQQ 기준가 0.00% 영점 재락온 및 NQ=F 진폭 동기화 (초과 Case 50, 86, 92, 94)
     # =====================================================================
     is_untagged_manual_hold = (
         holdings_qty > 0
@@ -560,9 +600,48 @@ async def execute_macro_defense_plugin(
     )
     if is_untagged_manual_hold:
         _reset_amp_buffer_state()
-        ref_curr_man, _ = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
+        ref_curr_man, ref_src_man = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
+        anchor_slot = _MANUAL_STAGE3_ANCHOR_CACHE.setdefault(
+            symbol, {"anchored": False, "verified_sell_id": ""}
+        )
+
+        # NEW: 초과 Case 94 — 장부에 지난주/전세션의 만료된 sell_order_id가 남아있는 경우 실제 유효 여부를 1회 검증하여
+        #      CANCELED / REJECTED / 404 이면 즉시 폐기하고 현재 실시간 QQQ 가격으로 0.00% 영점 재조준!
+        effective_sell_id = str(sell_order_id or "")
+        if effective_sell_id and anchor_slot.get("verified_sell_id") != effective_sell_id:
+            try:
+                od_chk = await ctx.client.get_order_detail(effective_sell_id)
+                st_chk = str(od_chk.get("status") or "")
+                if st_chk in ("CANCELED", "REJECTED"):
+                    effective_sell_id = ""
+                else:
+                    anchor_slot["verified_sell_id"] = effective_sell_id
+                    anchor_slot["anchored"] = True
+            except Exception as e_chk:
+                if "404" in str(e_chk).lower() or "not-found" in str(e_chk).lower():
+                    effective_sell_id = ""
+
+        # 안전 캡 매도 주문(effective_sell_id)이 아직 장전되지 않았거나(신규 수동 매수 / 스나이퍼 OFF->ON 직후 / 지난주 주문 만료),
+        # 기준가가 없거나 스케일이 불일치하면 무조건 현재 실시간 QQQ 가격(ref_curr_man)으로 0.00% 영점 재락온!
+        need_fresh_reanchor = bool(
+            not effective_sell_id
+            or not anchor_slot.get("anchored", False)
+            or nq_entry_price <= 0.0
+            or (
+                nq_entry_price > 0.0
+                and ref_curr_man > 0.0
+                and ((nq_entry_price > 3000.0) != (ref_curr_man > 3000.0))
+            )
+        )
+
         need_man_save = False
         save_kwargs = {}
+
+        if effective_sell_id != sell_order_id:
+            sell_order_id = ""
+            save_kwargs["sell_order_id"] = ""
+            save_kwargs["target_sell_price"] = 0.0
+            need_man_save = True
 
         if entry_session != "MANUAL":
             entry_session = "MANUAL"
@@ -571,17 +650,21 @@ async def execute_macro_defense_plugin(
             save_kwargs["is_session_done"] = True
             need_man_save = True
 
-        if nq_entry_price <= 0.0 and ref_curr_man > 0.0:
+        if need_fresh_reanchor and ref_curr_man > 0.0:
             nq_entry_price = ref_curr_man
             save_kwargs["nq_entry_price"] = nq_entry_price
             need_man_save = True
-        elif nq_entry_price > 0.0 and ref_curr_man > 0.0 and ((nq_entry_price > 3000.0) != (ref_curr_man > 3000.0)):
-            # 기존 장부에 NQ=F 스케일(>3000)이 남아 있는 경우 실시간 QQQ 스케일(<3000)로 즉시 자동 치유 (초과 Case 92)
-            nq_entry_price = ref_curr_man
-            save_kwargs["nq_entry_price"] = nq_entry_price
-            need_man_save = True
-
-        if nq_entry_amp <= 0.0 and nq_amp > 0.0:
+            if nq_amp > 0.0:
+                nq_entry_amp = nq_amp
+                save_kwargs["nq_entry_amp"] = nq_entry_amp
+            anchor_slot["anchored"] = True
+            anchor_slot["verified_sell_id"] = effective_sell_id
+            print(
+                f"🛡️ [수동 보유 3차 안전망 0.00% 영점 락온 {symbol}] 기준({ref_src_man}): {nq_entry_price:.2f} "
+                f"| NQ진폭: {nq_entry_amp:.2f}% | 최소 역행 한도: +{max(nq_entry_amp * 0.5, MIN_STAGE3_QQQ_ADVERSE_PCT):.2f}%",
+                flush=True,
+            )
+        elif nq_entry_amp <= 0.0 and nq_amp > 0.0:
             nq_entry_amp = nq_amp
             save_kwargs["nq_entry_amp"] = nq_entry_amp
             need_man_save = True
@@ -628,12 +711,12 @@ async def execute_macro_defense_plugin(
                 await ctx.notify_tg(
                     "🛑 <b>[매크로 1차 방어선 작동] 나스닥 100 선물(NQ=F) 대세 과열 감지</b>\n"
                     f"▫️ 현재 NQ=F 진폭: <code>{nq_amp:.2f}%</code> (기준 ≥ 2.00%)\n"
-                    "▫️ 조치: 금일 SOXS·SOXL 자동 신규 진입 잠금 (수동 진입 시 2차 과열방어 패스 · 3차 QQQ 실시간 역행방어 가동)"
+                    "▫️ 조치: 금일 SOXS·SOXL 자동 신규 진입 잠금 (수동 진입 시 2차 과열방어 패스 · 3차 QQQ 실시간 최소 0.80% 역행방어 가동)"
                 )
             return False
 
     # =====================================================================
-    # [2차 & 3차 방어선] 보유 포지션(holdings_qty > 0) 손실 구간 방어 프로빙 (초과 Case 66, 67, 86, 87, 92)
+    # [2차 & 3차 방어선] 보유 포지션(holdings_qty > 0) 손실 구간 방어 프로빙 (초과 Case 66, 67, 86, 87, 92, 94)
     # =====================================================================
     if holdings_qty <= 0 or ctx.in_memory_ordering_lock.get(symbol, False):
         return False
@@ -654,13 +737,14 @@ async def execute_macro_defense_plugin(
             live_p = 0.0
 
     # 수익권(live_p >= avg_p)이거나 이미 하이킨 아시 트레일링이 점화(armed)된 상태에서는 익절 트레일링 엔진이 전담
+    # 주의(초과 Case 94): live_p < avg_p 는 단지 손실 구간 전제 조건일 뿐, 포지션 자체 손실률((avg_p - live_p)/avg_p)로 손절하지 않는다!
     if live_p <= 0.0 or live_p >= avg_p:
         return False
     if _TRAIL_RUNTIME_CACHE.get(symbol, {}).get("armed", False):
         return False
 
-    # 초과 Case 92 —
-    # 1) 동적 임계치 max(eff_entry_amp * 0.5, 0.8%)는 나스닥 100 선물(NQ=F) 진폭을 기준으로 산출!
+    # 초과 Case 92 & Case 94 —
+    # 1) 동적 임계치 max(eff_entry_amp * 0.5, 0.80%)는 나스닥 100 선물(NQ=F) 진폭을 기준으로 산출하되 최소 0.80% 하한 강제!
     # 2) 산출된 임계치를 적용할 진입 기준가(nq_entry_price) 및 실시간 비교가(ref_curr)는
     #    토스 Open API QQQ 0.0초 실시간 현재가(1.5초 주기 실시간 프로빙)로 비교!
     ref_curr, ref_src = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
@@ -678,7 +762,11 @@ async def execute_macro_defense_plugin(
         await AssassinLedger.save_state(symbol, nq_entry_price=nq_entry_price)
 
     eff_entry_amp = nq_entry_amp if nq_entry_amp > 0.0 else nq_amp
-    dynamic_threshold = max(eff_entry_amp * 0.5, float(ctx.nq_dynamic_floor or 0.8))
+    dynamic_threshold = max(
+        eff_entry_amp * 0.5,
+        float(ctx.nq_dynamic_floor or MIN_STAGE3_QQQ_ADVERSE_PCT),
+        MIN_STAGE3_QQQ_ADVERSE_PCT,
+    )
 
     if nq_entry_price > 0.0 and ref_curr > 0.0:
         if symbol == "SOXS":
@@ -691,7 +779,8 @@ async def execute_macro_defense_plugin(
         nq_adverse_pct = 0.0
         adverse_dir_str = "역행"
 
-    # 초과 Case 86: 수동 진입(MANUAL) 포지션은 2차 과열 방어선(NQ=F >= 2.0%)을 100% 패스(Bypass)!
+    # 초과 Case 86 & Case 94: 수동 진입(MANUAL) 포지션은 2차 과열 방어선(NQ=F >= 2.0%)을 100% 패스(Bypass)하며,
+    # 오직 진입/락온 시점 QQQ 기준가 대비 실시간 QQQ가 최소 0.80%(dynamic_threshold) 이상 역행했을 때만 3차 손절 격발!
     is_manual_pos = (
         entry_session == "MANUAL"
         or is_untagged_manual_hold
@@ -702,6 +791,7 @@ async def execute_macro_defense_plugin(
         nq_entry_price > 0.0
         and ref_curr > 0.0
         and nq_adverse_pct >= dynamic_threshold
+        and nq_adverse_pct >= MIN_STAGE3_QQQ_ADVERSE_PCT
     )
 
     if not effective_stage2_breach and not is_stage3_breach:
@@ -804,8 +894,10 @@ async def execute_macro_defense_plugin(
                 )
             else:
                 _reset_bottom_track_state()
+                # MODIFIED: 초과 Case 94 ③ — force_all=False를 전달하여 반대편 종목이 수동 보유(MANUAL) 중일 때
+                #           반대편 종목의 MANUAL 표식과 QQQ 기준가가 소각되지 않도록 100% 보호!
                 await AssassinLedger.lock_all_symbols_macro(
-                    last_session_id=current_session_id, force_all=True
+                    last_session_id=current_session_id, force_all=False
                 )
                 await AssassinLedger.save_state(
                     symbol,
@@ -827,7 +919,7 @@ async def execute_macro_defense_plugin(
                     f"🛑 <b>[매크로 방어선 손절 덤핑 &amp; 당일 마감] {sym_icon}{symbol} 매수 1호가 즉시 스윕</b>\n"
                     f"▫️ 발동 사유: {reason_msg}\n"
                     f"▫️ 처분 단가(Bid 1 LIMIT): 평단 <code>${avg_p:.2f}</code> ➡️ <code>${bid_price:.2f}</code> (<code>{holdings_qty}주</code>)\n"
-                    "▫️ 후속 조치: 금일 양 종목 자동 신규 진입 권한 영구 소각 완료"
+                    "▫️ 후속 조치: 금일 자동 신규 진입 권한 영구 소각 완료"
                 )
             return True
     except Exception as e:
