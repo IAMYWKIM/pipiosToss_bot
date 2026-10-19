@@ -1,7 +1,7 @@
 # =====================================================================
 # FILE: tg_ui_plugin.py
 # 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
-#       양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL · 옵션 A 원형),
+#       선택지 B (👑 HYB_35_1ST : 양방향 대칭 클라이맥스 + 04:07~ 첫 RSI>=79.9 상승종목의 07:00~08:14 RSI<=35.0 추세눌림목) 듀얼 스나이퍼(SOXS/SOXL),
 #       단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)',
 #       3차 실시간 QQQ 최소 0.80% 역행 방어 및 최저점 반등 재진입(🪤 RE_BOT_TRAIL),
 #       19:00 ~ 03:57 EST 데이장 100% [모의] 관측(개시 1분 09:00 KST 한정 역산버퍼 포함),
@@ -10,9 +10,11 @@
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 +0.64% / +1.00% 익절률 선택 버튼 및 데드코드 영구 소각
 # MODIFIED: 초과 Case 13, 38, 77 — 메인 메뉴(/start), 듀얼 지시서(/sync), 관제탑(/avwap), 제어반(/settlement)에서
 #           불필요한 부연 설명을 전면 삭제하여 모든 항목이 모바일 화면에서 2줄을 넘어가지 않도록 초슬림화
-# MODIFIED: 초과 Case 93 — 프리장 본진 UI에서 선행 역산버퍼(AMP_BUFFER) 표시를 전면 제거하고 옵션 A 원형으로 복원
+# MODIFIED: 초과 Case 93 — 프리장 본진 UI에서 선행 역산버퍼(AMP_BUFFER) 표시를 전면 제거
 # MODIFIED: 초과 Case 92 & Case 94 — 최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80) 반영 및
 #           SOXS·SOXL 동시 수동 보유 시 /avwap 3차 방어 라인과 /settlement 출동 상태에서 양쪽 종목을 모두 독립 표출
+# NEW: 초과 Case 97 — 04:07 EST 이후 각인된 당일 첫 상승 추세 종목(👑상승주도: SOXL/SOXS) 및
+#      07:00 ~ 08:14 EST RSI <= 35.0 추세눌림목 타격/부스터 상태(PRE_PULLBACK) 초슬림 렌더링 탑재
 # MODIFIED: 텔레그램 HTML 파서 크래시(Unsupported start tag) 방어를 위해 코드 블록 내 원시 부등호(<, >) 전면 소각 (Case 17)
 
 import asyncio
@@ -31,13 +33,14 @@ from sniper_plugin import (
     get_whipsaw_runtime_status,
     get_trailing_runtime_status,
     get_bottom_track_status,
+    get_pre_leader_status,
 )
 
 EST_TZ = ZoneInfo("America/New_York")
 NQ_DYNAMIC_FLOOR_UI = MIN_STAGE3_QQQ_ADVERSE_PCT
 
 
-# MODIFIED: 메인 메뉴(/start 및 메인 복귀) 화면 불필요 설명 삭제 및 1줄 고정 슬림화 (Case 38, 77)
+# MODIFIED: 메인 메뉴(/start 및 메인 복귀) 화면 불필요 설명 삭제 및 1줄 고정 슬림화 (Case 38, 77, 97)
 async def get_main_menu_text() -> str:
     now_est = datetime.now(EST_TZ)
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
@@ -54,7 +57,7 @@ async def get_main_menu_text() -> str:
         "🔹 19:00 ~ 03:57: 🌙 <b>[모의] 데이장</b>\n"
         "🔹 03:58 ~ 03:59: 🔇 <b>휩소 묵음</b>\n"
         "🔹 03:58 ~ 04:07: 🌪️ <b>'휩소 노출 작전'</b>\n"
-        "🔹 04:07 ~ 08:14: 🔫 <b>프리장 본진</b>\n"
+        "🔹 04:07 ~ 08:14: 🔫 <b>프리장 본진 (👑HYB_35_1ST)</b>\n"
         "🔹 08:15 ~ 15:58: 🔒 <b>정규장 본장</b>\n"
         "🔹 15:59 ~ 16:01: 🛑 <b>제로-오버나이트</b>\n"
         "🔹 17:00: 🧹 <b>가비지 컬렉션(GC)</b>\n\n"
@@ -189,8 +192,8 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 83, 84, 85, 86, 87, 89, 90, 91, 92, 93, 94 —
-#           하단 종목 상태가 2줄을 넘어가지 않도록 간결화 및 옵션 A 원형 복원
+# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 83, 84, 85, 86, 87, 89, 90, 91, 92, 93, 94, 97 —
+#           하단 종목 상태가 2줄을 넘어가지 않도록 간결화 및 선택지 B (👑 HYB_35_1ST) 상승 주도주·추세눌림목 표시 반영
 def build_compact_status(
     symbol: str,
     state_tuple: tuple,
@@ -214,6 +217,7 @@ def build_compact_status(
     whip_st = get_whipsaw_runtime_status()
     trail_st = get_trailing_runtime_status(symbol)
     bot_st = get_bottom_track_status(symbol)
+    pre_ld = get_pre_leader_status()
     nq_bypass_on = bool(trail_st.get("nq_vel_bypass", False))
 
     if ha_bull:
@@ -226,7 +230,7 @@ def build_compact_status(
     is_manual_hold = (
         qty > 0
         and not buy_order_id
-        and entry_session not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
+        and entry_session not in ("PRE_SNIPER", "PRE_PULLBACK", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
     )
 
     if not is_active:
@@ -252,6 +256,8 @@ def build_compact_status(
         if entry_session == "WHIPSAW_1SH":
             w_bp = whip_st.get("buy_price", 0.0)
             state_text = f"🌪️ 휩소1주 매수덫(${w_bp:.2f})"
+        elif entry_session == "PRE_PULLBACK":
+            state_text = "🚀 추세눌림 매수덫(30초 쉴드)"
         elif entry_session == "PRE_SNIPER":
             state_text = "🪤 1차 매수덫(30초 쉴드)"
         else:
@@ -279,6 +285,8 @@ def build_compact_status(
                 state_text = f"🪤 [모의] 1차덫(${day_sim['trap_price']:.2f})"
             else:
                 state_text = f"🔔 [모의] 추격(목표 ${day_sim['target_price']:.2f})"
+        elif day_sim.get("leader_sym") == symbol:
+            state_text = "👑 [모의] 상승주도(≤35 추세·대칭감시)"
         else:
             state_text = f"🔔 [모의] 대칭감시(≤30 &amp; {opp_sym}≥79.9)"
     elif 407 <= est_time_int <= 814:
@@ -287,7 +295,13 @@ def build_compact_status(
             rp_v = float(bot_st.get("rebound_trig_price", 0.0))
             state_text = f"🪤 최저점추적(최저 ${lp_v:.2f} ➔ 반등 ${rp_v:.2f})"
         elif not is_done:
-            state_text = f"🔫 대칭감시(≤30 &amp; {opp_sym}≥79.9)"
+            if pre_ld.get("leader_sym") == symbol:
+                if (700 <= est_time_int <= 814) and bool(pre_ld.get("pb_rearm_ready", True)):
+                    state_text = "👑 상승주도(RSI≤35 추세·대칭감시)"
+                else:
+                    state_text = "👑 상승각인(07:00 눌림대기·대칭감시)"
+            else:
+                state_text = f"🔫 대칭감시(≤30 &amp; {opp_sym}≥79.9)"
         else:
             state_text = "🔒 프리장 타격잠금"
     elif 815 <= est_time_int < 930:
@@ -302,8 +316,8 @@ def build_compact_status(
     return f"{sym_icon} <b>{symbol}</b> <code>[{state_flag}]</code> {state_text}"
 
 
-# MODIFIED: 초과 Case 38, 90, 91, 92, 93, 94 —
-#           관제탑(/avwap)에서 불필요한 설명 줄을 모두 제거하여 2줄 초과 줄바꿈을 원천 차단
+# MODIFIED: 초과 Case 38, 90, 91, 92, 93, 94, 97 —
+#           관제탑(/avwap)에서 불필요한 설명 줄을 모두 제거하여 2줄 초과 줄바꿈을 원천 차단하고 선택지 B 상태 표출
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     wk = now_est.weekday()  # Mon=0 ... Fri=4, Sat=5, Sun=6
@@ -452,12 +466,12 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     is_manual_s = (
         qty_s > 0.0
         and not buy_id_s
-        and str(state_s[8] or "") not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
+        and str(state_s[8] or "") not in ("PRE_SNIPER", "PRE_PULLBACK", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
     )
     is_manual_l = (
         qty_l > 0.0
         and not buy_id_l
-        and str(state_l[8] or "") not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
+        and str(state_l[8] or "") not in ("PRE_SNIPER", "PRE_PULLBACK", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
     )
 
     if is_manual_s or is_manual_l:
@@ -503,8 +517,11 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     macro_3rd_line = "".join(macro_3rd_lines)
 
     day_sim = get_daymarket_sim_status()
+    pre_ld = get_pre_leader_status()
+    pre_leader_sym = str(pre_ld.get("leader_sym") or "")
+    pre_pb_ready = bool(pre_ld.get("pb_rearm_ready", True))
 
-    # Case 17, 38, 44, 57, 78, 81, 83, 84, 85, 87, 89, 93: 실시간 RSI + 하이킨 아시 통합 렌더링
+    # Case 17, 38, 44, 57, 78, 81, 83, 84, 85, 87, 89, 93, 97: 실시간 RSI + 하이킨 아시 + 추세눌림목 통합 렌더링
     rsi_ui_lines = []
     if shared_rsi_state:
         r_s = float((shared_rsi_state.get("SOXS") or {}).get("value", 0.0))
@@ -541,6 +558,29 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
                     warn_str = f"🪤 모의1차덫(${day_sim['trap_price']:.2f})"
                 else:
                     warn_str = f"🔒 모의추격(${day_sim['target_price']:.2f})"
+            elif (
+                is_pre_sniper_time
+                and (700 <= t <= 814)
+                and pre_leader_sym == r_sym
+                and pre_pb_ready
+                and (0.0 < r_val <= 35.0)
+            ):
+                warn_str = f"🚀 추세눌림 타격권(≤35.0 · {ha_short})"
+            elif (
+                is_pre_sniper_time
+                and (700 <= t <= 814)
+                and pre_leader_sym == r_sym
+                and pre_pb_ready
+                and (35.0 < r_val <= 38.0)
+            ):
+                warn_str = f"⚡ 추세눌림 부스터(≤38.0 · {ha_short})"
+            elif (
+                is_day_time
+                and day_sim.get("leader_sym") == r_sym
+                and day_sim.get("pb_rearm_ready", True)
+                and (0.0 < r_val <= 35.0)
+            ):
+                warn_str = f"🔔 모의추세눌림(≤35.0 · {ha_short})"
             elif 0.0 < r_val <= 30.0:
                 if opp_val >= 79.9:
                     if is_pre_sniper_time:
@@ -558,7 +598,10 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
             elif r_val >= 79.0 and (is_pre_sniper_time or is_day_time):
                 warn_str = f"⚡ 0.4초 부스터({ha_short})"
             else:
-                warn_str = f"🟢 중립({ha_short})"
+                if is_pre_sniper_time and pre_leader_sym == r_sym:
+                    warn_str = f"👑 상승주도({ha_short})"
+                else:
+                    warn_str = f"🟢 중립({ha_short})"
 
             if r_val > 0.0:
                 icon = "🐻" if r_sym == "SOXS" else "🐂"
@@ -611,7 +654,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     return text, keyboard
 
 
-# MODIFIED: 듀얼 지시서(/sync)에서 종목 대기 상태의 불필요한 부연 설명을 삭제하여 1줄 고정 (Case 38)
+# MODIFIED: 듀얼 지시서(/sync)에서 종목 대기 상태의 불필요한 부연 설명을 삭제하여 1줄 고정 및 상승 주도주 표시 (Case 38, 97)
 async def build_sync_board(api_client) -> str:
     now_est = datetime.now(EST_TZ)
     wk = now_est.weekday()
@@ -627,7 +670,7 @@ async def build_sync_board(api_client) -> str:
     elif 358 <= t <= 406:
         market_state = "🌪️ 03:58~04:07 휩소 작전"
     elif 407 <= t <= 814:
-        market_state = "🔫 프리장 본진 가동"
+        market_state = "🔫 프리장 본진 가동 (👑HYB_35_1ST)"
     elif 815 <= t <= 929:
         market_state = "🔒 프리장 마감"
     elif 930 <= t <= 1559:
@@ -635,7 +678,7 @@ async def build_sync_board(api_client) -> str:
     elif 1600 <= t <= 1759:
         market_state = "🛑 애프터마켓"
     else:
-        market_state = "🌙 데이마켓 (🔔100% [모의] 대칭·역산버퍼 추격)"
+        market_state = "🌙 데이마켓 (🔔100% [모의] 추격)"
 
     bp = await api_client.get_usd_buying_power()
     exchange_rate = 1400.0
@@ -712,6 +755,8 @@ async def build_sync_board(api_client) -> str:
         get_symbol_sync_data("SOXS"),
         get_symbol_sync_data("SOXL"),
     )
+    pre_ld = get_pre_leader_status()
+    pre_leader_sym = str(pre_ld.get("leader_sym") or "")
 
     def format_symbol(d: dict) -> str:
         sym = d["symbol"]
@@ -721,7 +766,7 @@ async def build_sync_board(api_client) -> str:
         tr_st = d["trail_st"]
         bt_st = d["bot_st"]
         es_str = str(d["entry_session"] or "")
-        is_man = es_str not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
+        is_man = es_str not in ("PRE_SNIPER", "PRE_PULLBACK", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
         if d["qty"] > 0:
             if es_str == "WHIPSAW_1SH":
                 flag_str = "🌪️ 휩소 1주 보유"
@@ -737,6 +782,8 @@ async def build_sync_board(api_client) -> str:
             lp_b = float(bt_st.get("post_stop_low", 0.0))
             rp_b = float(bt_st.get("rebound_trig_price", 0.0))
             flag_str = f"🪤 최저점추적 (${lp_b:.2f} ➔ ${rp_b:.2f})"
+        elif (407 <= t <= 814) and pre_leader_sym == sym:
+            flag_str = "👑 상승주도(RSI≤35)" if t >= 700 else "👑 상승각인(07시 대기)"
         elif is_weekend_closed:
             flag_str = "🌙 주말 휴장"
         elif 1800 <= t <= 1859:
@@ -746,7 +793,7 @@ async def build_sync_board(api_client) -> str:
         else:
             flag_str = "⏳ 대기"
         return (
-            f"{icon} <b>[{sym}] 양방향 대칭 클라이맥스 지시서</b>\n"
+            f"{icon} <b>[{sym}] 듀얼 스나이퍼 지시서 (👑HYB_35_1ST)</b>\n"
             f"{comp_label}: <code>${d['budget']:,.2f}</code> | {flag_str}\n"
             f"💰 현재 ${d['curr']:.2f} / 평단 ${d['avg_price']:.2f} ({int(d['qty'])}주)\n"
             f"📈 금일 고가: ${d['high']:.2f} ({d['high_rate']:+.2f}%)\n"
@@ -767,7 +814,7 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: 전술 제어반(/settlement) 슬림화 및 양방향 동시 보유 표출 (Case 37, 77, 94)
+# MODIFIED: 전술 제어반(/settlement) 슬림화, 양방향 동시 보유 표출 및 상승 주도주 표시 (Case 37, 77, 94, 97)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     wk = now_est.weekday()
@@ -786,6 +833,8 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     day_sim = get_daymarket_sim_status()
     whip_st = get_whipsaw_runtime_status()
     bot_all = get_bottom_track_status()
+    pre_ld = get_pre_leader_status()
+    ld_sym = str(pre_ld.get("leader_sym") or "")
 
     budget_s = float(state_s[1] or 100.0)
     act_s = bool(state_s[5])
@@ -797,16 +846,18 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
 
     act_s_str = "🟢 ON" if act_s else "🔴 OFF"
     comp_s_str = "📈 통합 복리" if is_comp_s else "💵 단리 고정"
-    rate_mode_desc = "🔥 +1.00% 점화 HA·트레일링"
+    rate_mode_desc = "🔥 +1.00% 점화 HA·트레일링 (👑HYB_35_1ST)"
 
     def _format_single_pos_status(sym_a: str, st_a: tuple, bid_a: str) -> str:
         tp_a = float(st_a[6] or 0.0)
         es_a = str(st_a[8] or "")
         tr_a = get_trailing_runtime_status(sym_a)
-        is_man_a = (not bid_a and es_a not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH"))
+        is_man_a = (not bid_a and es_a not in ("PRE_SNIPER", "PRE_PULLBACK", "PRE_SNIPER_REARM", "WHIPSAW_1SH"))
         if bid_a:
             if es_a == "WHIPSAW_1SH":
                 return f"🌪️ [{sym_a}] 휩소 1주 매수덫 (${whip_st['buy_price']:.2f})"
+            elif es_a == "PRE_PULLBACK":
+                return f"🚀 [{sym_a}] 추세눌림 매수덫 대기중"
             elif es_a == "PRE_SNIPER":
                 return f"🪤 [{sym_a}] 1차 매수덫 대기중"
             return f"⚡ [{sym_a}] 재장전 체결 대기중"
@@ -847,7 +898,10 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
             rp_b = float(bot_all.get("rebound_trig_price", 0.0))
             strike_status_str = f"🪤 [{b_sym}] 최저점추적 (${lp_b:.2f} ➔ ${rp_b:.2f})"
         elif not bool(state_s[4]) and not bool(state_l[4]):
-            strike_status_str = "🔫 프리장 본진 감시중 (04:07 ~ 08:14)"
+            if ld_sym:
+                strike_status_str = f"🔫 프리장 감시중 (👑상승주도: {ld_sym})"
+            else:
+                strike_status_str = "🔫 프리장 본진 감시중 (04:07 ~ 08:14)"
         else:
             strike_status_str = "🔒 프리장 타격 잠금"
     elif 815 <= t <= 1558:

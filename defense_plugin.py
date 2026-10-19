@@ -1,12 +1,13 @@
 # =====================================================================
 # FILE: defense_plugin.py
-# 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망 (옵션 A 원형 & 초과 Case 96 완결)
+# 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망 (선택지 B [👑 HYB_35_1ST] & 초과 Case 97 완결)
 #       — 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(진폭*0.5, 0.80%)의 기준은 나스닥 100 선물(NQ=F),
 #         해당 3차 임계치(최소 0.80% QQQ 역행 하한 강제)를 적용하는 진입 기준가 및 실시간 역행 비교는
 #         토스 Open API QQQ 0.0초 실시간 현재가(1.5초 프로빙 · 포지션 자체 손실률 기반 즉시 손절 절대 금지),
 #       수동 진입(MANUAL) 및 1주 휩소 작전(WHIPSAW_1SH) 시 1·2차 과열 방어 100% 패스(04:07 정각 정리는 휩소 컷오프 전담),
 #       1차 과열 미체결 매수 파기 시 buy_order_id="" 원자적 즉시 소각 및 중복 알림 영구 차단,
 #       스나이퍼 재가동(OFF->ON)/미결속 시 현재 QQQ 0.00% 영점 재락온,
+#       04:07 EST 이후 첫 RSI>=79.9 달성 상승 추세 종목(_PRE_LEADER_CACHE) 불변 각인 및 벡터 자가 복원,
 #       04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 손절 시 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL) 캐시 점화,
 #       08:15 EST 거시지표 발표 15분 전 선제 컷오프 및 15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산 코어
 # =====================================================================
@@ -16,12 +17,14 @@
 # NEW: 초과 Case 87 — 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 역행 손절 시 당일 퇴근 대신 최저점 역트레일링(_BOTTOM_TRACK_CACHE) 점화
 # NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 max(nq_entry_amp * 0.5, 0.80%)는 나스닥 100 선물지수(NQ=F) 진폭을 기준으로 산출하고,
 #      해당 임계치를 적용하는 진입 기준가(nq_entry_price) 및 실시간 역행 비교가(ref_curr)는 토스 Open API QQQ 0.0초 실시간 현재가로 전면 대체
-# MODIFIED: 제3헌법 및 초과 Case 93 — 프리장 선행 역산 버퍼(_AMP_BUFFER_CACHE) 잔재를 실전 코어에서 100% 영구 소각하고 옵션 A 원형으로 복원
+# MODIFIED: 제3헌법 및 초과 Case 93 — 프리장 선행 역산 버퍼(_AMP_BUFFER_CACHE) 잔재를 실전 코어에서 100% 영구 소각
 # NEW: 초과 Case 94 — 포지션 자체 손실률(-0.80% 초과 평가손실 등) 기반 즉시 손절 절대 금지, 최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT) 강제,
 #      스나이퍼 OFF->ON 재가동 또는 지난주 만료 주문(CANCELED) 감지 시 현재 실시간 QQQ 가격으로 0.00% 영점 재락온(_MANUAL_STAGE3_ANCHOR_CACHE) 및 양방향 수동 보유 보호
 # MODIFIED: 초과 Case 95 & Case 96 — 1주 휩소 노출 작전(WHIPSAW_1SH)의 미체결 1주 매수덫 및 1주 보유 물량은 시간대와 무관하게
 #           1·2차 과열 방어선(NQ>=2.0% 주문 파기 및 손실권 즉시 덤핑)을 100% 바이패스하여 04:07 정각 정리를 enforce_0407_whipsaw_cutoff_plugin에 전담 위임하고,
 #           본진 미체결 매수 1차 파기 시 buy_order_id="" 즉시 소각 및 already-canceled 중복 텔레그램 알림 폭탄을 원천 차단
+# NEW: 초과 Case 97 — 04:07 EST 이후 첫 RSI >= 79.9 달성 상승 추세 종목(_PRE_LEADER_CACHE · FIRST_799) 불변 각인·복원 및
+#      PRE_PULLBACK 진입 세션의 3단 방어망·08:15 선제 컷오프 연동
 
 import math
 import time
@@ -34,6 +37,9 @@ from quant_engine import (
     AssassinLedger,
     MacroDataCache,
     MIN_STAGE3_QQQ_ADVERSE_PCT,
+    PRE_TREND_LEADER_SELECT_RSI,
+    PRE_TREND_PULLBACK_RSI_THRESHOLD,
+    PRE_TREND_REARM_RESET_RSI,
 )
 
 EST_TZ = ZoneInfo("America/New_York")
@@ -107,6 +113,118 @@ _BOTTOM_TRACK_CACHE = {
     "activated_ts": 0.0,
     "last_new_low_ts": 0.0,
 }
+
+# NEW: 초과 Case 97 — 선택지 B (👑 HYB_35_1ST) : 04:07 EST 이후 가장 먼저 RSI >= 79.9 를 달성한
+#      당일 첫 상승 추세 종목(FIRST_799 · leader_sym) 인메모리 추세 원장 캐시
+_PRE_LEADER_CACHE = {
+    "date": "",
+    "leader_sym": "",
+    "leader_rsi": 0.0,
+    "locked_ts": 0.0,
+    "locked_time_str": "",
+    "pb_rearm_ready": True,
+}
+
+
+def _reset_pre_leader_state(logical_date: str = ""):
+    """프리장 상승 추세 주도주 캐시(_PRE_LEADER_CACHE)를 원자적으로 0점 초기화합니다 (Case 02, 22, 48, 97)."""
+    _PRE_LEADER_CACHE["date"] = str(logical_date or "")
+    _PRE_LEADER_CACHE["leader_sym"] = ""
+    _PRE_LEADER_CACHE["leader_rsi"] = 0.0
+    _PRE_LEADER_CACHE["locked_ts"] = 0.0
+    _PRE_LEADER_CACHE["locked_time_str"] = ""
+    _PRE_LEADER_CACHE["pb_rearm_ready"] = True
+
+
+def mark_pre_pullback_dispatched(symbol: str):
+    """07:00 ~ 08:14 EST 선행 상승종목 추세눌림목(RSI <= 35.0) 매수 덫 발사 시 동일 눌림목 중복 진입을 잠급니다 (초과 Case 97)."""
+    if _PRE_LEADER_CACHE.get("leader_sym") == symbol:
+        _PRE_LEADER_CACHE["pb_rearm_ready"] = False
+
+
+def get_pre_leader_status() -> dict:
+    """UI 관제탑(/avwap, /sync, /settlement) 및 메인 루프에서 당일 프리장 첫 상승 추세 종목 상태를 조회합니다 (초과 Case 97)."""
+    return dict(_PRE_LEADER_CACHE)
+
+
+def update_premarket_trend_leader(
+    symbol: str,
+    live_rsi_val: float,
+    now_est: datetime = None,
+    shared_rsi_state: dict = None,
+) -> dict:
+    """
+    NEW: 초과 Case 97 — 04:07 ~ 08:14 EST 구간에서 당일 가장 먼저 RSI >= 79.9 를 달성한 첫 번째 종목을
+    당일 프리장의 상승 추세 주도주(_PRE_LEADER_CACHE["leader_sym"])로 불변 각인하며,
+    장중 프로세스 재기동 시에도 shared_rsi_state(200봉 벡터 스캔 결과 first_0407_799_ts)를 대조하여 100% 자동 복원합니다.
+    """
+    if symbol not in ("SOXS", "SOXL"):
+        return dict(_PRE_LEADER_CACHE)
+
+    if now_est is None:
+        now_est = datetime.now(EST_TZ)
+    est_hm = now_est.hour * 100 + now_est.minute
+    today_str = now_est.strftime("%Y-%m-%d")
+
+    if 400 <= est_hm <= 814 and _PRE_LEADER_CACHE.get("date") != today_str:
+        _reset_pre_leader_state(logical_date=today_str)
+
+    if not (407 <= est_hm <= 814):
+        return dict(_PRE_LEADER_CACHE)
+
+    cur_leader = str(_PRE_LEADER_CACHE.get("leader_sym", ""))
+
+    # 1) 장중 재기동 시 200봉 1분봉 벡터 스캔 타임스탬프(first_0407_799_ts) 비교로 첫 상승 추세 종목 자동 복원
+    if not cur_leader and isinstance(shared_rsi_state, dict):
+        ewm_s = ((shared_rsi_state.get("SOXS") or {}).get("ewm_state")) or {}
+        ewm_l = ((shared_rsi_state.get("SOXL") or {}).get("ewm_state")) or {}
+        ts_s = float(ewm_s.get("first_0407_799_ts", 0.0)) if ewm_s.get("logical_date") == today_str else 0.0
+        ts_l = float(ewm_l.get("first_0407_799_ts", 0.0)) if ewm_l.get("logical_date") == today_str else 0.0
+
+        if ts_s > 0.0 and (ts_l <= 0.0 or ts_s <= ts_l):
+            _PRE_LEADER_CACHE["leader_sym"] = "SOXS"
+            _PRE_LEADER_CACHE["leader_rsi"] = float(ewm_s.get("first_0407_799_rsi", PRE_TREND_LEADER_SELECT_RSI))
+            _PRE_LEADER_CACHE["locked_ts"] = ts_s
+            _PRE_LEADER_CACHE["locked_time_str"] = str(ewm_s.get("first_0407_799_time_str", now_est.strftime("%H:%M:%S")))
+            _PRE_LEADER_CACHE["pb_rearm_ready"] = True
+            cur_leader = "SOXS"
+            print(
+                f"👑 [프리장 첫 상승추세 종목 벡터 복원 SOXS] 시각: {_PRE_LEADER_CACHE['locked_time_str']} EST | "
+                f"피크 RSI: {_PRE_LEADER_CACHE['leader_rsi']:.1f} ➡️ 07:00~08:14 RSI≤{PRE_TREND_PULLBACK_RSI_THRESHOLD:.1f} 추세눌림목 감시 대기",
+                flush=True,
+            )
+        elif ts_l > 0.0 and (ts_s <= 0.0 or ts_l < ts_s):
+            _PRE_LEADER_CACHE["leader_sym"] = "SOXL"
+            _PRE_LEADER_CACHE["leader_rsi"] = float(ewm_l.get("first_0407_799_rsi", PRE_TREND_LEADER_SELECT_RSI))
+            _PRE_LEADER_CACHE["locked_ts"] = ts_l
+            _PRE_LEADER_CACHE["locked_time_str"] = str(ewm_l.get("first_0407_799_time_str", now_est.strftime("%H:%M:%S")))
+            _PRE_LEADER_CACHE["pb_rearm_ready"] = True
+            cur_leader = "SOXL"
+            print(
+                f"👑 [프리장 첫 상승추세 종목 벡터 복원 SOXL] 시각: {_PRE_LEADER_CACHE['locked_time_str']} EST | "
+                f"피크 RSI: {_PRE_LEADER_CACHE['leader_rsi']:.1f} ➡️ 07:00~08:14 RSI≤{PRE_TREND_PULLBACK_RSI_THRESHOLD:.1f} 추세눌림목 감시 대기",
+                flush=True,
+            )
+
+    # 2) 실시간 틱 RSI >= 79.9 최초 도달 종목 불변 각인 (FIRST_799)
+    if not cur_leader and live_rsi_val >= PRE_TREND_LEADER_SELECT_RSI:
+        _PRE_LEADER_CACHE["leader_sym"] = symbol
+        _PRE_LEADER_CACHE["leader_rsi"] = float(live_rsi_val)
+        _PRE_LEADER_CACHE["locked_ts"] = time.time()
+        _PRE_LEADER_CACHE["locked_time_str"] = now_est.strftime("%H:%M:%S")
+        _PRE_LEADER_CACHE["pb_rearm_ready"] = True
+        print(
+            f"👑 [프리장 첫 상승추세 종목 각인 {symbol}] {now_est.strftime('%H:%M:%S')} EST | "
+            f"RSI {live_rsi_val:.1f} (≥{PRE_TREND_LEADER_SELECT_RSI:.1f}) ➡️ 07:00~08:14 RSI≤{PRE_TREND_PULLBACK_RSI_THRESHOLD:.1f} 추세눌림목 타겟 락온",
+            flush=True,
+        )
+    elif cur_leader == symbol:
+        if live_rsi_val > float(_PRE_LEADER_CACHE.get("leader_rsi", 0.0)):
+            _PRE_LEADER_CACHE["leader_rsi"] = float(live_rsi_val)
+        if not bool(_PRE_LEADER_CACHE.get("pb_rearm_ready", True)) and live_rsi_val > PRE_TREND_REARM_RESET_RSI:
+            _PRE_LEADER_CACHE["pb_rearm_ready"] = True
+
+    return dict(_PRE_LEADER_CACHE)
 
 
 def _reset_manual_stage3_anchor(symbol: str = None):
@@ -298,6 +416,7 @@ async def execute_moc_zero_overnight_plugin(
         return False
 
     _reset_bottom_track_state()
+    _reset_pre_leader_state()
     _reset_trailing_runtime_state(symbol)
 
     if holdings_qty is None:
@@ -413,7 +532,7 @@ async def execute_moc_zero_overnight_plugin(
     return True
 
 
-# MODIFIED: 초과 Case 66, 67, 82, 86, 87, 92, 93, 94, 95, 96 —
+# MODIFIED: 초과 Case 66, 67, 82, 86, 87, 92, 93, 94, 95, 96, 97 —
 #           1) 포지션 자체의 현재 평가손실률(예: 지난주 보유분 -3% ~ -10% 손실 등)을 3차 임계치에 바로 적용하여 즉시 손절하는 것을 100% 금지!
 #           2) 1·2차 대세 과열 방어(>=2.0%) 및 3차 동적 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)의 기준은 나스닥 100 선물(NQ=F)이되,
 #              최소 0.80% 실시간 QQQ 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80)을 하드 락온!
@@ -421,7 +540,7 @@ async def execute_moc_zero_overnight_plugin(
 #              과거 nq_entry_price를 폐기하고 현재 실시간 QQQ 가격(ref_curr_man)으로 0.00% 영점 재조준!
 #           4) 1주 휩소 노출 작전(WHIPSAW_1SH)은 시간대와 무관하게 1·2차 과열 방어선(주문 취소 및 손실권 즉시 덤핑)을 100% 바이패스하여
 #              04:07 정각 정리를 enforce_0407_whipsaw_cutoff_plugin에 전담 위임하고,
-#              본진 미체결 매수 1차 파기 시 buy_order_id="" 즉시 소각 및 already-canceled 중복 알림 폭탄을 원천 차단!
+#              본진 미체결 매수(PRE_SNIPER, PRE_PULLBACK, PRE_SNIPER_REARM) 1차 파기 시 buy_order_id="" 즉시 소각 및 중복 알림 폭탄을 원천 차단!
 async def execute_macro_defense_plugin(
     ctx,
     symbol: str,
@@ -464,12 +583,12 @@ async def execute_macro_defense_plugin(
 
     # =====================================================================
     # [선행 처리] 수동 진입(MANUAL) 포지션 첫 감지 틱 및 재가동(OFF->ON) 시
-    #            실시간 QQQ 기준가 0.00% 영점 재락온 및 NQ=F 진폭 동기화 (초과 Case 50, 86, 92, 94)
+    #            실시간 QQQ 기준가 0.00% 영점 재락온 및 NQ=F 진폭 동기화 (초과 Case 50, 86, 92, 94, 97)
     # =====================================================================
     is_untagged_manual_hold = (
         holdings_qty > 0
         and not buy_order_id
-        and entry_session not in ("PRE_SNIPER", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
+        and entry_session not in ("PRE_SNIPER", "PRE_PULLBACK", "PRE_SNIPER_REARM", "WHIPSAW_1SH")
     )
     if is_untagged_manual_hold:
         ref_curr_man, ref_src_man = await MacroDataCache.get_stage3_reference_price(realtime_probing=True)
@@ -552,6 +671,8 @@ async def execute_macro_defense_plugin(
     if nq_amp >= 2.0:
         if _BOTTOM_TRACK_CACHE.get("active", False):
             _reset_bottom_track_state()
+        if _PRE_LEADER_CACHE.get("leader_sym"):
+            _reset_pre_leader_state()
 
         if buy_order_id and not is_whipsaw_1sh_active and not ctx.in_memory_ordering_lock.get(symbol, False):
             ctx.in_memory_ordering_lock[symbol] = True
@@ -605,7 +726,7 @@ async def execute_macro_defense_plugin(
             return False
 
     # =====================================================================
-    # [2차 & 3차 방어선] 보유 포지션(holdings_qty > 0) 손실 구간 방어 프로빙 (초과 Case 66, 67, 86, 87, 92, 94, 95, 96)
+    # [2차 & 3차 방어선] 보유 포지션(holdings_qty > 0) 손실 구간 방어 프로빙 (초과 Case 66, 67, 86, 87, 92, 94, 95, 96, 97)
     # =====================================================================
     if holdings_qty <= 0 or ctx.in_memory_ordering_lock.get(symbol, False):
         return False
@@ -668,13 +789,16 @@ async def execute_macro_defense_plugin(
         nq_adverse_pct = 0.0
         adverse_dir_str = "역행"
 
-    # 초과 Case 86, 94, 95 & 96: 수동 진입(MANUAL) 포지션과 1주 휩소 작전(WHIPSAW_1SH) 포지션은
+    # 초과 Case 86, 94, 95, 96, 97: 수동 진입(MANUAL) 포지션과 1주 휩소 작전(WHIPSAW_1SH) 포지션은
     # 2차 과열 방어선(NQ=F >= 2.0%)을 100% 패스(Bypass)하며,
     # 오직 진입/락온 시점 QQQ 기준가 대비 실시간 QQQ가 최소 0.80%(dynamic_threshold) 이상 역행했을 때만 3차 손절 격발!
     is_manual_pos = (
         entry_session == "MANUAL"
         or is_untagged_manual_hold
-        or (nq_entry_amp >= 2.0 and entry_session != "WHIPSAW_1SH")
+        or (
+            nq_entry_amp >= 2.0
+            and entry_session not in ("WHIPSAW_1SH", "PRE_SNIPER", "PRE_PULLBACK", "PRE_SNIPER_REARM")
+        )
     )
     effective_stage2_breach = (
         (nq_amp >= 2.0)
@@ -788,6 +912,7 @@ async def execute_macro_defense_plugin(
                 )
             else:
                 _reset_bottom_track_state()
+                _reset_pre_leader_state()
                 # 초과 Case 94 ③ — force_all=False를 전달하여 반대편 종목이 수동 보유(MANUAL) 중일 때
                 # 반대편 종목의 MANUAL 표식과 QQQ 기준가가 소각되지 않도록 100% 보호!
                 await AssassinLedger.lock_all_symbols_macro(
@@ -826,8 +951,8 @@ async def execute_macro_defense_plugin(
     return False
 
 
-# 초과 Case 48 & Case 84: 08:15:00 EST 거시지표 발표 15분 전 선제 컷오프
-# (08:15 ~ 15:58 EST 전 구간 신규 매수 봉쇄, 최저점 추적 캐시 파기 및 미체결 매수 즉시 선취소)
+# 초과 Case 48, 84 & 97: 08:15:00 EST 거시지표 발표 15분 전 선제 컷오프
+# (08:15 ~ 15:58 EST 전 구간 신규 매수 봉쇄, 최저점 추적 캐시 및 상승 주도주 캐시 파기, 미체결 매수 즉시 선취소)
 async def enforce_0930_regular_cutoff_plugin(
     ctx,
     symbol: str,
@@ -848,9 +973,11 @@ async def enforce_0930_regular_cutoff_plugin(
     if not is_active or not (815 <= est_hm <= 1559):
         return is_session_done, buy_order_id
 
-    # 08:15 EST 진입 즉시 최저점 역트레일링 추적 캐시 파기 (Case 48, 84)
+    # 08:15 EST 진입 즉시 최저점 역트레일링 추적 캐시 및 프리장 상승 주도주 캐시 파기 (Case 48, 84, 97)
     if _BOTTOM_TRACK_CACHE.get("active", False):
         _reset_bottom_track_state()
+    if _PRE_LEADER_CACHE.get("leader_sym"):
+        _reset_pre_leader_state()
 
     if buy_order_id and not ctx.in_memory_ordering_lock.get(symbol, False):
         ctx.in_memory_ordering_lock[symbol] = True

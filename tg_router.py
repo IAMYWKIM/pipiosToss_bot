@@ -1,14 +1,15 @@
 # =====================================================================
 # FILE: tg_router.py
 # 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
-#       양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL), 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0)',
+#       선택지 B (👑 HYB_35_1ST : 양방향 대칭 클라이맥스 + 07:00~08:14 선행 상승종목 RSI<=35.0 추세눌림목) 듀얼 스나이퍼(SOXS/SOXL),
+#       단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)',
 #       3차 손절 후 최저점 역트레일링 반등 재진입(RE_BOT_TRAIL) 및 03:58 ~ 04:07 EST 듀얼 1주 무비용 휩소 매수덫 텔레그램 라우팅 컨트롤러
 # =====================================================================
 # MODIFIED: 제3헌법 및 초과 Case 88 의거 defense_plugin.py 분리 모듈을 포함한 9대 코어 모듈 프리플라이트 컴파일 검증 결속 (Case 11, 88)
 # MODIFIED: 전술 제어반(/settlement) 설정 변경(전원, 복리모드, 통합시드) 시 SOXS/SOXL 양쪽 원장 동시 동기화(sync_global_settings) (Case 37, 76)
-# MODIFIED: 통합 시드 설정 및 장부 초기화 안내 문구에 단일 '🔥 +1.00% 점화 하이킨 아시 트레일링' 및 '🪤 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL)' 반영 (Case 53, 84, 87)
+# MODIFIED: 통합 시드 설정 및 장부 초기화 안내 문구에 '👑 HYB_35_1ST(대칭+07:00~추세눌림목)', '🔥 +1.00% 점화 HA·트레일링' 및 '🪤 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL)' 반영 (Case 53, 84, 87, 97)
 # MODIFIED: 예산 입력 시 음수/0/NaN/Inf 유입으로 인한 장부 오염 방어 로직 유지 (Case 37)
-# MODIFIED: /reset 명령을 통한 SOXS 및 SOXL 듀얼 원장 + 인메모리 트레일링 캐시 + 최저점 역트레일링 캐시 원자적 0점 소각 및 wakeup_event 즉각 동기화 (Case 02, 87)
+# MODIFIED: /reset 명령을 통한 SOXS 및 SOXL 듀얼 원장 + 인메모리 트레일링 캐시 + 최저점 역트레일링 캐시 + 프리장 상승 추세 주도주 캐시(_PRE_LEADER_CACHE) 원자적 0점 소각 및 wakeup_event 즉각 동기화 (Case 02, 87, 97)
 # MODIFIED: 모든 인라인 콜백 제자리 갱신(edit_text) 및 except Exception as e 문법 무결성 사수 (Case 17, 26)
 
 import os
@@ -25,6 +26,7 @@ from quant_engine import AssassinLedger
 from sniper_plugin import (
     _reset_trailing_runtime_state,
     _reset_bottom_track_state,
+    _reset_pre_leader_state,
 )
 from tg_ui_plugin import (
     get_main_menu_text,
@@ -72,7 +74,7 @@ async def cmd_avwap(message: types.Message, state: FSMContext):
         return
     await state.clear()
     try:
-        msg = await message.answer("📡 <b>양방향 대칭 듀얼 스나이퍼 레이더 스캔 중...</b>", parse_mode="HTML")
+        msg = await message.answer("📡 <b>듀얼 스나이퍼 레이더(👑HYB_35_1ST) 스캔 중...</b>", parse_mode="HTML")
         text, keyboard = await build_avwap_radar(api_client, shared_rsi_state)
         await msg.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
@@ -217,7 +219,7 @@ async def process_toggle_compound(callback_query: types.CallbackQuery, state: FS
             pass
 
 
-# 초과 Case 37, 84, 87 — 단일 하이킨 아시 트레일링(HA_HYB_1.0) 및 최저점 반등 재진입(RE_BOT_TRAIL) 통합 시드 설정 안내문
+# 초과 Case 37, 84, 87, 97 — 선택지 B(👑HYB_35_1ST), 단일 하이킨 아시 트레일링(HA_HYB_1.0) 및 최저점 반등 재진입(RE_BOT_TRAIL) 통합 시드 설정 안내문
 @router.callback_query(F.data.startswith("set_budget_SOXS"))
 async def process_set_budget(callback_query: types.CallbackQuery, state: FSMContext):
     user = getattr(callback_query, "from_user", None)
@@ -227,13 +229,13 @@ async def process_set_budget(callback_query: types.CallbackQuery, state: FSMCont
     is_comp = await AssassinLedger.get_is_compound("SOXS")
 
     mode_desc = (
-        "📈 현재 <b>[통합 복리 모드 · 🔥 +1.00% 점화 HA·트레일링 &amp; 🪤 3차손절 후 최저점 반등 재진입]</b>이 활성화되어 있습니다. 입력하신 통합 시드를 시작점으로 SOXS/SOXL 본진 트레일링 매매·최저점 반등 재진입·수동 스나이퍼·1주 휩소 작전 등 모든 청산 시 <b>실제 발생한 순수익금(세전손익 - 왕복수수료 0.14%)</b>이 양쪽 장부 시드에 동시 가감됩니다."
+        "📈 현재 <b>[통합 복리 모드 · 👑 HYB_35_1ST &amp; 🔥 +1.00% 점화 HA·트레일링 &amp; 🪤 3차손절 후 최저점 반등 재진입]</b>이 활성화되어 있습니다. 입력하신 통합 시드를 시작점으로 SOXS/SOXL 본진(대칭 클라이맥스 및 07:00~ 추세눌림목)·최저점 반등 재진입·수동 스나이퍼·1주 휩소 작전 등 모든 청산 시 <b>실제 발생한 순수익금(세전손익 - 왕복수수료 0.14%)</b>이 양쪽 장부 시드에 동시 가감됩니다."
         if is_comp
-        else "💵 현재 <b>[단리(고정) 모드 · 🔥 +1.00% 점화 HA·트레일링 &amp; 🪤 3차손절 후 최저점 반등 재진입]</b>이 활성화되어 있습니다. 본진 듀얼 스나이퍼 및 최저점 반등 재출동 시 입력하신 고정 달러 예산만 투입됩니다."
+        else "💵 현재 <b>[단리(고정) 모드 · 👑 HYB_35_1ST &amp; 🔥 +1.00% 점화 HA·트레일링 &amp; 🪤 3차손절 후 최저점 반등 재진입]</b>이 활성화되어 있습니다. 본진 듀얼 스나이퍼 및 최저점 반등 재출동 시 입력하신 고정 달러 예산만 투입됩니다."
     )
     text = (
         "⌨️ <b>듀얼 스나이퍼(SOXS/SOXL) 통합 투입 시드 설정 (USD)</b>\n\n"
-        "▫️ 04:07 ~ 08:14 EST 프리장 초중반 골든타임 양방향 대칭 클라이맥스 본진 스나이퍼 및 3차 손절 후 최저점 반등 재진입 출동 시 투입할 통합 기준 달러 예산을 숫자로 전송하십시오.\n"
+        "▫️ 04:07 ~ 08:14 EST 프리장 골든타임 본진(동시 대칭 ≤30.0&amp;≥79.9 및 07:00~08:14 선행 상승종목 RSI≤35.0 추세눌림목) 및 3차 손절 후 최저점 반등 재진입 출동 시 투입할 통합 기준 달러 예산을 숫자로 전송하십시오.\n"
         "▫️ (참고: 03:58 ~ 04:07 EST 듀얼 휩소 노출 작전은 시드와 무관하게 무조건 1주만 역산 매수 덫을 설치합니다.)\n"
         f"▫️ {mode_desc}"
     )
@@ -286,7 +288,7 @@ async def cmd_reset(message: types.Message, state: FSMContext):
     text = (
         "⚠️ <b>[듀얼 스나이퍼(SOXS/SOXL) 장부 초기화]</b>\n\n"
         "경고: SOXS 및 SOXL 로컬 장부(평단가, 점화가, 휩소 타점, 주문 ID, 당일 진입 잠금)와 "
-        "인메모리 하이킨 아시 트레일링 캐시 및 최저점 역트레일링 캐시를 100% 영구 소각하고 0점으로 원자적 초기화를 수행합니다.\n"
+        "인메모리 하이킨 아시 트레일링 캐시, 최저점 역트레일링 캐시 및 프리장 상승 주도주 캐시를 100% 영구 소각하고 0점으로 원자적 초기화를 수행합니다.\n"
         "(설정된 통합 시드 금액 및 복리/단리 모드는 그대로 보존됩니다.)\n진행하시겠습니까?"
     )
     try:
@@ -306,6 +308,7 @@ async def process_execute_reset(callback_query: types.CallbackQuery, state: FSMC
         for sym in ("SOXS", "SOXL"):
             _reset_trailing_runtime_state(sym)
         _reset_bottom_track_state()
+        _reset_pre_leader_state()
         if wakeup_event:
             wakeup_event.set()
         await callback_query.answer("✅ 듀얼 장부 0점 소각 완료", show_alert=True)
@@ -314,7 +317,7 @@ async def process_execute_reset(callback_query: types.CallbackQuery, state: FSMC
         )
         await callback_query.message.edit_text(
             "✅ <b>[SOXS &amp; SOXL 듀얼 장부 영구 소각 완료]</b>\n"
-            "▫️ 양쪽 로컬 장부, 하이킨 아시 트레일링 캐시 및 최저점 역트레일링 캐시가 0점으로 원자적 초기화되었습니다 (04:07 ~ 08:14 EST 프리장 골든타임 내 양방향 대칭 클라이맥스 감시 즉시 복귀).",
+            "▫️ 양쪽 로컬 장부, 하이킨 아시 트레일링 캐시, 최저점 역트레일링 캐시 및 상승 주도주 캐시가 0점으로 원자적 초기화되었습니다 (04:07 ~ 08:14 EST 프리장 골든타임 내 👑HYB_35_1ST 감시 즉시 복귀).",
             reply_markup=keyboard,
             parse_mode="HTML",
         )

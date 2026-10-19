@@ -1,10 +1,10 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: 양방향 대칭 클라이맥스 듀얼 스나이퍼(SOXS/SOXL · 옵션 A) 통합 시드 원장,
+# 목적: 양방향 대칭 클라이맥스 + 07:00~08:14 선행 상승종목 추세눌림목(👑 HYB_35_1ST) 듀얼 스나이퍼(SOXS/SOXL) 통합 시드 원장,
 #       NQ=F 18:00 EST 신세션 하드 컷오프 + fast_info 당일 실제 고/저가 강제 병합(해법 1 · 1/2차 방어 및 3차 임계치 max(진폭*0.5, 0.80%) 산출 기준),
 #       데이장 개시 1분(09:00:00~09:00:59 KST) [모의] 전용 진폭×3.0배 역산 하락가 버퍼 산출 엔진(초과 Case 93 · 🛡️ BUFFER_WAIT),
 #       토스 Open API QQQ 0.0초 실시간 3차 역행 비교 기준가(1.5초 프로빙 · 최소 0.80% 역행 하한 강제) + 10분/3분 단기 변화율 산출(해법 2 방법 A) 및
-#       Wilder's RSI(14) + 하이킨 아시(Heikin-Ashi) 1분봉 벡터/틱 합성 엔진
+#       Wilder's RSI(14) + 하이킨 아시(Heikin-Ashi) 1분봉 + 04:07 EST 이후 첫 RSI>=79.9 달성 시각 벡터/틱 합성 엔진
 # =====================================================================
 # MODIFIED: RSI 연산을 세션 절단 전 전체 캔들(df)에서 선행하여 EWM 워밍업 무결성 100% 락온 (Case 72)
 # NEW: 폴링 사각지대(원인 D) 소각을 위한 Wilder's EWM 기저 상태(ewm_state_out) 추출 및 O(1) 실시간 틱 RSI 점화식(compute_realtime_tick_rsi) 탑재 (Case 73)
@@ -17,10 +17,12 @@
 # NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)은 NQ=F 선물 진폭(nq_entry_amp)을 기준으로 산출하고,
 #      해당 임계치를 적용하는 진입 기준가 및 실시간 역행 비교가는 토스 Open API QQQ 0.0초 실시간 현재가(get_stage3_reference_price, 보유중 1.5초 프로빙)로 전면 대체
 # MODIFIED: 초과 Case 93 — 데이장 개시 1분(09:00:00~09:00:59 KST) [모의] 전용 충격 전 기준 고가(session_anchor_high) 벡터 추출 및
-#           3배 레버리지 역산 예상 하락가 버퍼 산출 함수(compute_amp_buffer_target_price) 유지 (프리장 본진은 순수 옵션 A 원복)
+#           3배 레버리지 역산 예상 하락가 버퍼 산출 함수(compute_amp_buffer_target_price) 유지
 # NEW: 초과 Case 94 — 포지션 자체 손실률 기반 즉시 손절 절대 금지 및 실시간 QQQ 최소 0.80% 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80) 강제
 # MODIFIED: 초과 Case 82, 95 & 96 — lock_all_symbols_macro 호출 시 수동 보유 종목(MANUAL)과 03:58 ~ 04:06 EST 진행 중인
 #           1주 휩소 노출 작전(WHIPSAW_1SH)을 보호하되, 04:07 EST 이후 미체결 buy_order_id 잔재는 즉시 ""로 소각하여 장부 고착 무한 루프를 원천 차단
+# NEW: 초과 Case 97 — 04:07 EST 이후 첫 RSI >= 79.9 달성 상승 추세 종목(FIRST_799 · leader_sym) 자동 각인·복원용 벡터 타임스탬프 추출 및
+#      07:00 ~ 08:14 EST 해당 상승 종목 RSI <= 35.0 추세추종 눌림목 매수(👑 HYB_35_1ST) 상수 탑재
 # MODIFIED: 듀얼 스나이퍼 화이트리스트 ALLOWED_SYMBOLS = ("SOXS", "SOXL") 확장 및 임시 파일 os.replace 원자적 저장 (Case 06, 09, 30)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 및 실제 발생 순수익금((매도가-매수가)*체결수량 - 왕복수수료 0.14%) 기반 복리 정산 동기화 (Case 76)
 
@@ -46,6 +48,11 @@ AMP_BUFFER_REBOUND_PCT = 0.30          # 역산 하락가 도달 후 최저점 �
 
 # 초과 Case 94 — 3차 안전망 최소 실시간 QQQ 역행 하한선 (0.80% 하드 락온)
 MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80
+
+# NEW: 초과 Case 97 — 선택지 B (👑 HYB_35_1ST) : 04:07 EST 이후 첫 RSI >= 79.9 상승 추세 종목 각인 및 07:00 ~ 08:14 EST RSI <= 35.0 추세추종 매수 상수
+PRE_TREND_LEADER_SELECT_RSI = 79.9         # 04:07 EST 이후 당일 첫 상승 추세 종목(leader_sym) 선정 임계치 (79.9 [80.0 클라이맥스 인지])
+PRE_TREND_PULLBACK_RSI_THRESHOLD = 35.0    # 07:00 ~ 08:14 EST 선정된 상승 추세 종목의 눌림목 매수 임계치 (RSI <= 35.0)
+PRE_TREND_REARM_RESET_RSI = 40.0           # 추세눌림목 매매 익절 후 동일 눌림목 고점 재진입 방지를 위한 RSI 회복 기준 (> 40.0)
 
 
 def compute_amp_buffer_target_price(
@@ -217,7 +224,8 @@ def calculate_rsi_1m(
 ) -> tuple[float, float]:
     """
     Pandas 기반 백그라운드 벡터 연산.
-    VWAP, Wilder's RSI(14), 하이킨 아시(Heikin-Ashi) 1분봉 및 데이장 개시 1분 [모의] 버퍼용 기준 고가(session_anchor_high)를
+    VWAP, Wilder's RSI(14), 하이킨 아시(Heikin-Ashi) 1분봉, 데이장 개시 1분 [모의] 버퍼용 기준 고가(session_anchor_high) 및
+    당일 04:07 EST / 19:00 EST 이후 첫 RSI >= 79.9 달성 타임스탬프(초과 Case 97)를
     1개의 데이터프레임에서 동시 산출하여 CPU 블로킹 및 API 중복 호출을 원천 차단합니다.
     """
     if not candles_json:
@@ -268,6 +276,15 @@ def calculate_rsi_1m(
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
 
+    rs = avg_gain / avg_loss
+    rsi_series = 100.0 - (100.0 / (1.0 + rs))
+    rsi_series = np.where(
+        (avg_loss <= 0.0) & (avg_gain <= 0.0),
+        50.0,
+        np.where(avg_loss <= 0.0, 100.0, rsi_series),
+    )
+    rsi_series = pd.Series(rsi_series, index=df.index).replace([np.inf, -np.inf], 100.0).fillna(50.0)
+
     # 2. 전체 데이터(df)를 대상으로 하이킨 아시(Heikin-Ashi) 1분봉 100% 벡터 연산 (for 루프 금지)
     ha_close = (df["openPrice"] + df["highPrice"] + df["lowPrice"] + df["closePrice"]) / 4.0
     ha_seed = ha_close.shift(1)
@@ -291,7 +308,38 @@ def calculate_rsi_1m(
     )
     anchor_high_val = max(recent_60_high, sess_high, prev_sess_ref)
 
-    # 메인 루프에서 O(1) 실시간 틱 RSI 및 실시간 틱 하이킨 아시를 합성할 수 있도록 직전 확정 분봉(iloc[-2]) 기저 추출 (Case 73, 85, 93)
+    # NEW: 초과 Case 97 — 당일 04:07 ~ 08:14 EST 프리장 및 19:00 ~ 03:57 EST 데이장에서
+    #      RSI >= 79.9 를 최초로 달성한 분봉 시각 및 피크 RSI 100% 벡터 추출 (장중 봇 재기동 시 자동 복원용)
+    pre_0407_start = session_start_est + timedelta(hours=9, minutes=7)
+    pre_0814_end = session_start_est + timedelta(hours=13, minutes=14, seconds=59)
+    day_0357_end = session_start_est + timedelta(hours=8, minutes=57, seconds=59)
+
+    first_0407_799_ts = 0.0
+    first_0407_799_time_str = ""
+    first_0407_799_rsi = 0.0
+    first_day_799_ts = 0.0
+    first_day_799_time_str = ""
+    first_day_799_rsi = 0.0
+
+    if not session_df.empty:
+        rsi_sess = rsi_series.loc[session_df.index]
+        rsi_0407_win = rsi_sess[(rsi_sess.index >= pre_0407_start) & (rsi_sess.index <= pre_0814_end)]
+        climax_0407 = rsi_0407_win[rsi_0407_win >= PRE_TREND_LEADER_SELECT_RSI]
+        if not climax_0407.empty:
+            first_idx_0407 = climax_0407.index[0]
+            first_0407_799_ts = float(first_idx_0407.timestamp())
+            first_0407_799_time_str = first_idx_0407.strftime("%H:%M:%S")
+            first_0407_799_rsi = float(climax_0407.max())
+
+        rsi_day_win = rsi_sess[(rsi_sess.index >= session_start_est) & (rsi_sess.index <= day_0357_end)]
+        climax_day = rsi_day_win[rsi_day_win >= PRE_TREND_LEADER_SELECT_RSI]
+        if not climax_day.empty:
+            first_idx_day = climax_day.index[0]
+            first_day_799_ts = float(first_idx_day.timestamp())
+            first_day_799_time_str = first_idx_day.strftime("%H:%M:%S")
+            first_day_799_rsi = float(climax_day.max())
+
+    # 메인 루프에서 O(1) 실시간 틱 RSI 및 실시간 틱 하이킨 아시를 합성할 수 있도록 직전 확정 분봉(iloc[-2]) 기저 추출 (Case 73, 85, 93, 97)
     if isinstance(ewm_state_out, dict):
         cur_o = float(df["openPrice"].iloc[-1])
         cur_h = float(df["highPrice"].iloc[-1])
@@ -320,16 +368,14 @@ def calculate_rsi_1m(
         ewm_state_out["ha_bull"] = bool(last_ha_c > last_ha_o)
         ewm_state_out["session_anchor_high"] = float(anchor_high_val)
         ewm_state_out["recent_60m_high"] = float(recent_60_high)
+        ewm_state_out["logical_date"] = pre_0407_start.strftime("%Y-%m-%d")
+        ewm_state_out["first_0407_799_ts"] = first_0407_799_ts
+        ewm_state_out["first_0407_799_time_str"] = first_0407_799_time_str
+        ewm_state_out["first_0407_799_rsi"] = first_0407_799_rsi
+        ewm_state_out["first_day_799_ts"] = first_day_799_ts
+        ewm_state_out["first_day_799_time_str"] = first_day_799_time_str
+        ewm_state_out["first_day_799_rsi"] = first_day_799_rsi
         ewm_state_out["ready"] = True
-
-    rs = avg_gain / avg_loss
-    rsi_series = 100.0 - (100.0 / (1.0 + rs))
-    rsi_series = np.where(
-        (avg_loss <= 0.0) & (avg_gain <= 0.0),
-        50.0,
-        np.where(avg_loss <= 0.0, 100.0, rsi_series),
-    )
-    rsi_series = pd.Series(rsi_series, index=df.index).replace([np.inf, -np.inf], 100.0).fillna(50.0)
 
     raw_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 0.0
     rsi_val = max(0.01, min(100.0, raw_rsi)) if not rsi_series.empty else 0.0
@@ -350,7 +396,8 @@ def compute_realtime_tick_rsi(
     """
     메인 루프(assassin_loop) 전용 O(1) 무부하 실시간 틱 RSI 합성 엔진 (Case 73).
     직전 확정 분봉(t-1)의 Wilder's EWM 기저 상태에 실시간 현재가(live_price)를 대입하여
-    추가 API 호출 0회로 순간적인 대칭 클라이맥스(매수종목 RSI <= 30.0 & 반대종목 RSI >= 79.9)를 즉시 포착합니다.
+    추가 API 호출 0회로 순간적인 대칭 클라이맥스(매수종목 RSI <= 30.0 & 반대종목 RSI >= 79.9) 및
+    07:00 ~ 08:14 EST 선행 상승종목 추세눌림목(RSI <= 35.0)을 즉시 포착합니다.
     """
     if live_price is None or live_price <= 0.0 or not isinstance(ewm_state, dict):
         return float(fallback_rsi or 0.0)
@@ -730,11 +777,11 @@ class MacroDataCache:
     ) -> tuple[str, float, str, float, float, float]:
         await cls._refresh_cache_if_needed(force_refresh=force_refresh)
         c, h, l = cls._nq_cache_data[0], cls._nq_cache_data[1], cls._nq_cache_data[2]
-        return ("DUAL80", float(cls._nq_cache_data[4]), f"{c:.2f}", c, h, l)
+        return ("HYB35", float(cls._nq_cache_data[4]), f"{c:.2f}", c, h, l)
 
 
 class AssassinLedger:
-    # 양방향 대칭 클라이맥스 듀얼 스나이퍼 화이트리스트 락온 (Case 09, 54)
+    # 양방향 대칭 클라이맥스 + 추세추종 눌림목 듀얼 스나이퍼 화이트리스트 락온 (Case 09, 54, 97)
     ALLOWED_SYMBOLS = ("SOXS", "SOXL")
     # 단일 '하이킨 아시 + 고점 트레일링(HA_HYB_1.0 × 🚀 NQ_VEL_BYPASS)' 상수로 100% 단일화 (Case 68, 85, 89)
     DEFAULT_TARGET_PROFIT_RATE = 1.00
@@ -748,6 +795,9 @@ class AssassinLedger:
     AMP_BUFFER_ACTIVATE_NQ_PCT = AMP_BUFFER_ACTIVATE_NQ_PCT  # 데이장 09:00 KST 1분 한정 역산 버퍼 가동 기준 (Case 93)
     AMP_BUFFER_LEVERAGE_MULT = AMP_BUFFER_LEVERAGE_MULT      # 진폭 × 3.0배 레버리지 기대 하락폭 역산 배수 (Case 93)
     AMP_BUFFER_REBOUND_PCT = AMP_BUFFER_REBOUND_PCT          # 최저점 대비 +0.30% 양봉 반등 시 모의 진입 (Case 93)
+    PRE_TREND_LEADER_SELECT_RSI = PRE_TREND_LEADER_SELECT_RSI          # 04:07 EST 이후 첫 상승 추세 종목 각인 기준 79.9 (Case 97)
+    PRE_TREND_PULLBACK_RSI_THRESHOLD = PRE_TREND_PULLBACK_RSI_THRESHOLD# 07:00~08:14 EST 추세추종 눌림목 매수 기준 35.0 (Case 97)
+    PRE_TREND_REARM_RESET_RSI = PRE_TREND_REARM_RESET_RSI              # 추세눌림목 익절 후 재장전 회복 기준 40.0 (Case 97)
     ROUND_TRIP_COMM_PCT = 0.14
     ONE_WAY_COMM_RATE = 0.0007
     MIN_BUDGET_FLOOR = 10.0
