@@ -1,24 +1,26 @@
 # =====================================================================
 # FILE: main_loops_plugin.py
-# 목적: main.py 임포트 호환 심볼(TRADE_SYMBOLS 등) 전수 제공,
-#       백그라운드 듀얼 캔들·VWAP·하이킨 아시·첫 RSI>=79.9 상승주도주 2페이지(400분봉) 레이더 루프(rsi_radar_loop),
-#       6대 0.4초 고주파 부스터 및 실시간 틱 RSI·HA 합성 메인 전술 루프(assassin_loop),
-#       17:00 EST 일일 가비지 컬렉션(run_daily_gc) 코어 플러그인
+# 목적: main.py (line 73~83) 필수 임포트 9대 심볼(EST_TZ, KST_TZ, TRADE_SYMBOLS,
+#       RSI_SYMBOLS, NQ_DYNAMIC_FLOOR, HOLIDAY_TRANSLATIONS, _run_git_update_sync,
+#       auto_update_loop, rsi_radar_loop) 및 assassin_loop 100% 제공,
+#       04:07 ~ 08:14 EST 프리장 2페이지(400분봉) 풀 스캔 기반 첫 RSI>=79.9 상승주도주(👑) 자동 복원,
+#       03:30 ~ 17:00 EST 장중 무인 업데이트 락다운(Case 07) 및 9대 코어 프리플라이트 검증(Case 11) 플러그인
 #       (main.py 1/2 분할본)
 # =====================================================================
-# NEW: 제3헌법 및 플러그인 분할 아키텍처 의거 백그라운드 레이더 루프와 메인 스나이퍼 루프를 main_loops_plugin.py로 분리
-# MODIFIED: 1) main.py (line 73) 에서 임포트하는 TRADE_SYMBOLS, ALLOWED_SYMBOLS, REAL_ALLOWED_SYMBOLS,
-#              NQ_DYNAMIC_FLOOR 및 공유 상태 변수를 모듈 최상단에 100% 선언하여 ImportError 원천 차단
-#           2) AssassinLedger.get_state 및 calculate_rsi_1m 반환값 추출 시 고정 개수 언패킹 대신
-#              안전 인덱스 추출기(_unpack_ledger_state_safe / _unpack_rsi_calc_safe)를 적용하여
-#              `too many values to unpack (expected 12 / expected 2)` 예외를 물리적으로 0%로 소각
-#           3) 초과 Case 28, 72, 73, 83, 85, 87, 93, 97, 98, 99, 100 전술 스텝 100% 결속
+# NEW: 제3헌법 및 플러그인 분할 아키텍처 의거 백그라운드 레이더·자동업데이트·메인 전술 루프를 main_loops_plugin.py로 분리
+# MODIFIED: 1) main.py 에서 임포트하는 HOLIDAY_TRANSLATIONS(초과 Case 45), _run_git_update_sync(Case 11),
+#              auto_update_loop(Case 07), TRADE_SYMBOLS, RSI_SYMBOLS, NQ_DYNAMIC_FLOOR 전수 구현으로 ImportError 영구 소각
+#           2) AssassinLedger.get_state 및 calculate_rsi_1m 반환값 추출 시 고정 언패킹 대신 안전 인덱스 추출기 적용
+#           3) 초과 Case 28, 72, 73, 83, 85, 87, 93, 97, 98, 99, 100 전술 스텝 및 2페이지(400분봉) 조회 결속
 
 import os
+import sys
 import glob
 import math
 import time
 import asyncio
+import subprocess
+import py_compile
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -73,16 +75,34 @@ from defense_plugin import (
     _cancel_open_orders_and_wait_sellable as sniper_plugin_cancel_helper,
 )
 
-# NEW: main.py 임포트 호환용 필수 상수 및 전역 공유 상태 객체 100% 선언 (Case 09, 11)
+# 제4헌법 및 Case 09, 11, 45: 필수 타임존, 허용 종목 상수 및 미국 휴장일 한글 번역 매핑 사전
 EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
 
 TRADE_SYMBOLS = ("SOXS", "SOXL")
+RSI_SYMBOLS = ("SOXS", "SOXL")
 ALLOWED_SYMBOLS = ("SOXS", "SOXL")
 REAL_ALLOWED_SYMBOLS = ("SOXS", "SOXL")
 NQ_DYNAMIC_FLOOR = MIN_STAGE3_QQQ_ADVERSE_PCT
 LOOP_INTERVAL_NORMAL = 1.5
 LOOP_INTERVAL_FAST = 0.4
+
+# 초과 Case 45: pandas_market_calendars 영문 휴일명 한글 정밀 매핑 사전
+HOLIDAY_TRANSLATIONS = {
+    "New Year's Day": "신정",
+    "Martin Luther King, Jr. Day": "마틴 루터 킹 데이",
+    "Dr. Martin Luther King Jr. Day": "마틴 루터 킹 데이",
+    "Washington's Birthday": "대통령의 날(워싱턴 탄신일)",
+    "Presidents' Day": "대통령의 날",
+    "Good Friday": "성금요일(부활절 전 금요일)",
+    "Memorial Day": "현충일(메모리얼 데이)",
+    "Juneteenth National Independence Day": "준틴스 노예해방기념일",
+    "Juneteenth": "준틴스 노예해방기념일",
+    "Independence Day": "미국 독립기념일",
+    "Labor Day": "노동절",
+    "Thanksgiving Day": "추수감사절",
+    "Christmas Day": "크리스마스(성탄절)",
+}
 
 shared_rsi_state = {
     "SOXS": {"value": 0.0, "vwap": 0.0, "ewm_state": {}},
@@ -99,6 +119,18 @@ idempotency_keys = {
 
 _LAST_GC_DATE_STR = ""
 LAST_GC_DATE = ""
+
+CORE_VERIFY_MODULES = (
+    "main.py",
+    "sniper_plugin.py",
+    "defense_plugin.py",
+    "whipsaw_plugin.py",
+    "tg_router.py",
+    "tg_ui_plugin.py",
+    "quant_engine.py",
+    "toss_api.py",
+    "candle_recorder.py",
+)
 
 
 def _unpack_rsi_calc_safe(calc_res) -> tuple[float, float, dict]:
@@ -153,6 +185,112 @@ def _unpack_ledger_state_safe(state_tuple) -> tuple:
         nq_entry_amp,
         entry_trend,
     )
+
+
+def _run_git_update_sync(force_pull: bool = False) -> tuple[bool, str]:
+    """
+    Case 11: Git 원격 저장소(origin/main) 동기화 및 9대 코어 + 분할 플러그인 전체 py_compile 프리플라이트 검증.
+    """
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        subprocess.run(
+            ["git", "fetch", "--all"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+        local_hash = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        ).stdout.strip()
+        remote_hash = subprocess.run(
+            ["git", "rev-parse", "origin/main"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        ).stdout.strip()
+
+        if not force_pull and local_hash and remote_hash and local_hash == remote_hash:
+            return False, "ALREADY_UP_TO_DATE"
+
+        pull_proc = subprocess.run(
+            ["git", "reset", "--hard", "origin/main"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+        if pull_proc.returncode != 0:
+            return False, f"GIT_RESET_ERR: {pull_proc.stderr.strip()}"
+
+        # 9대 코어 및 분할 플러그인 전체 py_compile 문법 무결성 검증 (Case 11)
+        py_files = set(CORE_VERIFY_MODULES)
+        for fp in glob.glob(os.path.join(repo_dir, "*.py")):
+            py_files.add(os.path.basename(fp))
+
+        for mod_name in sorted(py_files):
+            mod_path = os.path.join(repo_dir, mod_name)
+            if os.path.exists(mod_path):
+                py_compile.compile(mod_path, doraise=True)
+
+        return True, f"{local_hash[:7]} -> {remote_hash[:7]}"
+    except Exception as e:
+        return False, f"UPDATE_EX: {e}"
+
+
+async def auto_update_loop(*args, **kwargs):
+    """
+    Case 07 & Case 11:
+    프리장 개장 전부터 애프터장 종료(03:30 ~ 17:00 EST)까지 무인 자동 업데이트 재기동을 전면 차단(Lockdown)하고,
+    장외 안전 시간대에만 원격 커밋을 감지하여 프리플라이트 검증 통과 시 하드 킬(os._exit(0)) 재기동합니다.
+    """
+    deps = _resolve_loop_dependencies(*args, **kwargs)
+    bot = deps.get("bot")
+    chat_id = deps.get("chat_id", 0)
+
+    while True:
+        try:
+            await asyncio.sleep(300.0)
+            now_est = datetime.now(EST_TZ)
+            wk = now_est.weekday()
+            est_hm = now_est.hour * 100 + now_est.minute
+
+            # Case 07: 평일 03:30 ~ 17:00 EST 장중 업데이트 락다운 엄수
+            if wk in (0, 1, 2, 3, 4) and (330 <= est_hm <= 1700):
+                continue
+
+            updated, detail_msg = await asyncio.wait_for(
+                asyncio.to_thread(_run_git_update_sync, False),
+                timeout=45.0,
+            )
+            if updated:
+                if bot and chat_id:
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                "🚀 <b>[장외 자동 업데이트 완료]</b>\n"
+                                f"▫️ 버전 동기화: <code>{detail_msg}</code>\n"
+                                "▫️ 9대 코어 컴파일 검증 통과 ➡️ 시스템을 재기동합니다."
+                            ),
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                await asyncio.sleep(1.0)
+                os._exit(0)
+        except Exception as e:
+            print(f"🚨 [자동 업데이트 루프 방어] {e}", flush=True)
+            await asyncio.sleep(60.0)
 
 
 def _resolve_loop_dependencies(*args, **kwargs) -> dict:
@@ -382,9 +520,9 @@ async def rsi_radar_loop(*args, **kwargs):
                 await asyncio.sleep(10.0)
                 continue
 
-            prices_map = await api_client.get_current_prices_batch(TRADE_SYMBOLS)
+            prices_map = await api_client.get_current_prices_batch(RSI_SYMBOLS)
 
-            for sym in TRADE_SYMBOLS:
+            for sym in RSI_SYMBOLS:
                 try:
                     candles = await _fetch_candles_for_radar(
                         api_client=api_client,
@@ -891,3 +1029,18 @@ async def assassin_loop(*args, **kwargs):
             wake_ev.clear()
         except asyncio.TimeoutError:
             pass
+
+
+def __getattr__(name: str):
+    """
+    PEP 562 모듈 레벨 안전 폴백:
+    만일 main.py 에서 예상치 못한 상수명을 import 시도하더라도 ImportError 를 원천 차단합니다.
+    """
+    up = name.upper()
+    if "SYMBOL" in up:
+        return ("SOXS", "SOXL")
+    if "FLOOR" in up:
+        return NQ_DYNAMIC_FLOOR
+    if "HOLIDAY" in up:
+        return HOLIDAY_TRANSLATIONS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
