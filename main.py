@@ -1,23 +1,27 @@
 # =====================================================================
 # FILE: main.py
 # 목적: 인피니트 스노우볼 듀얼 스나이퍼(SOXS & SOXL) 메인 엔트리포인트,
+#       SIGTERM/SIGINT 0.1초 고속 하드 킬 핸들러(_install_fast_shutdown_handlers — 90초 재시작 멈춤 영구 소각),
+#       tg_router.inject_dependencies(api_client, chat_id, wakeup_event, shared_rsi_state) 최우선 직결,
 #       제2헌법 종합매매(BROKERAGE) 계좌 accountSeq 실전 헤더 검증 및 강제 바인딩(ensure_account_seq_locked),
 #       O(1) 시그니처 캐싱 기반 전술 플러그인 적응형 호출기(_call_plugin_adaptive),
 #       듀얼 심볼(SOXS & SOXL) 캔들 레코더 자동 매핑 기동기(_start_candle_recorder_task) 및
 #       메인 전술 루프(assassin_loop) 통합 관제 코어
 # =====================================================================
 # MODIFIED: 제1 ~ 제6헌법 및 100대 엣지 케이스 방어망(Case 01 ~ Case 100) 100% 결속
-# NEW: 1) `_call_plugin_adaptive(fn, **kwargs)` 탑재로 `execute_macro_defense_plugin() got an unexpected
-#         keyword argument 'entry_trend'` 등 플러그인 인자 불일치 TypeError 를 물리적으로 0%로 원천 소각
-#      2) `_start_candle_recorder_task(api_client)` 에서 `record_candles_loop(api_client, symbol)` 시그니처를
-#         자동 감지하여 `SOXS`, `SOXL` 종목별 독립 태스크로 기동 (`missing 1 required positional argument: 'symbol'` 해결)
-#      3) 초과 Case 97, 98, 99, 100 — 프리장 첫 RSI>=79.9 상승주도주(👑 leader_sym) 실시간 갱신,
+# NEW: 1) `_install_fast_shutdown_handlers()` 탑재로 `systemctl restart / stop` 시 발생하는
+#         90초 타임아웃(`State 'stop-sigterm' timed out`)을 0.1초 즉시 종료(os._exit(0))로 영구 해결
+#      2) `_bind_telegram_router` 최상단에 `tg_router.inject_dependencies(api_client, chat_id, wakeup_event, shared_rsi_state)`
+#         명시적 직결로 `/start`, `/update`, `/avwap`, `/sync`, `/settlement` 무응답 현상 영구 소각
+#      3) `_call_plugin_adaptive(fn, **kwargs)` 및 `_start_candle_recorder_task` 듀얼 심볼 자동 매핑 탑재
+#      4) 초과 Case 97, 98, 99, 100 — 프리장 첫 RSI>=79.9 상승주도주(👑 leader_sym) 실시간 갱신,
 #         15:00~15:58 EST 미익절 정규장 VWAP 탈출, 이원화 매도 믹스, 30초 타임쉴드 정정 직후 실잔고 즉시 재조회 결속
 
 import os
 import sys
 import math
 import time
+import signal
 import inspect
 import asyncio
 import logging
@@ -105,7 +109,8 @@ from main_loops_plugin import (
     rsi_radar_loop,
 )
 
-logging.getLogger("aiogram").setLevel(logging.CRITICAL)
+# 텔레그램 핸들러 내부 예외가 묵음 처리되지 않도록 ERROR 레벨 유지
+logging.getLogger("aiogram").setLevel(logging.ERROR)
 logging.getLogger("aiohttp").setLevel(logging.CRITICAL)
 
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -116,12 +121,31 @@ _ACCOUNT_LOCK_MUTEX = asyncio.Lock()
 _PLUGIN_SIG_CACHE: dict = {}
 
 
+def _install_fast_shutdown_handlers():
+    """
+    NEW (Case 11): systemd 가 `systemctl restart` 또는 `stop` 시 보내는 SIGTERM / SIGINT 신호를 포착하여
+    90초 타임아웃(`State 'stop-sigterm' timed out`) 대기 없이 0.1초 만에 즉시 프로세스를 종료합니다.
+    """
+    def _fast_exit_handler(signum, frame):
+        print(f"⚡ [시그널 {signum} 수신] 0.1초 고속 하드 킬 종료 실행", flush=True)
+        os._exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _fast_exit_handler)
+        signal.signal(signal.SIGINT, _fast_exit_handler)
+    except Exception:
+        pass
+
+
 async def _call_plugin_adaptive(fn, **kwargs):
     """
     NEW: 전술 플러그인 함수의 inspect.signature 를 O(1) 캐싱하여
     대상 함수가 선언한 매개변수만 정확히 필터링 전달함으로써
-    `got an unexpected keyword argument` (예: entry_trend 등) 예외를 100% 원천 차단합니다.
+    `got an unexpected keyword argument` 예외를 100% 원천 차단합니다.
     """
+    if fn is None or not callable(fn):
+        return False
+
     sig_info = _PLUGIN_SIG_CACHE.get(fn)
     if sig_info is None:
         try:
@@ -831,9 +855,26 @@ def _bind_telegram_router(
     chat_id: int,
 ):
     """
-    tg_router.py 의 초기화 함수 시그니처(setup_telegram_router / setup_tg_router / register_handlers / router)를
-    자동 감지하여 100% 무결하게 Dispatcher에 바인딩합니다.
+    MODIFIED: 서버 tg_router.py 의 `inject_dependencies(client, admin_id, event, rsi_state)` 를
+    최우선 직결 호출하고, 기타 초기화 함수 시그니처(setup_telegram_router 등)와 router 등록까지
+    100% 무결하게 Dispatcher에 바인딩합니다.
     """
+    setup_called = False
+
+    # 1순위: 서버 tg_router.py 표준 의존성 주입 함수 `inject_dependencies` 직결
+    if hasattr(tg_router, "inject_dependencies") and callable(tg_router.inject_dependencies):
+        try:
+            tg_router.inject_dependencies(
+                api_client,
+                chat_id,
+                wakeup_event,
+                shared_rsi_state,
+            )
+            setup_called = True
+            print("✅ [텔레그램 라우터 inject_dependencies 바인딩 완료]", flush=True)
+        except Exception as e:
+            print(f"🚨 [inject_dependencies 호출 방어] {e}", flush=True)
+
     available_ctx = {
         "dp": dp,
         "dispatcher": dp,
@@ -841,9 +882,12 @@ def _bind_telegram_router(
         "api_client": api_client,
         "client": api_client,
         "chat_id": chat_id,
+        "admin_id": chat_id,
+        "event": wakeup_event,
+        "wakeup_event": wakeup_event,
+        "rsi_state": shared_rsi_state,
         "shared_rsi_state": shared_rsi_state,
         "shared_holdings": shared_holdings,
-        "wakeup_event": wakeup_event,
         "in_memory_ordering_lock": in_memory_ordering_lock,
         "dual_strike_mutex": dual_strike_mutex,
         "idempotency_keys": idempotency_keys,
@@ -851,7 +895,6 @@ def _bind_telegram_router(
         "_run_git_update_sync": _run_git_update_sync,
     }
 
-    setup_called = False
     for fn_name in (
         "setup_telegram_router",
         "setup_tg_router",
@@ -862,30 +905,33 @@ def _bind_telegram_router(
     ):
         fn = getattr(tg_router, fn_name, None)
         if callable(fn):
-            sig = inspect.signature(fn)
-            call_kwargs = {}
-            call_args = []
-            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-            for p_name, param in sig.parameters.items():
-                if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                    continue
-                if p_name in available_ctx:
-                    if param.kind == inspect.Parameter.POSITIONAL_ONLY:
-                        call_args.append(available_ctx[p_name])
-                    else:
-                        call_kwargs[p_name] = available_ctx[p_name]
-            if has_var_kw:
-                for k, v in available_ctx.items():
-                    if k not in call_kwargs:
-                        call_kwargs[k] = v
-            res = fn(*call_args, **call_kwargs)
-            setup_called = True
-            if hasattr(res, "message") and hasattr(res, "callback_query"):
-                try:
-                    dp.include_router(res)
-                except Exception:
-                    pass
-            break
+            try:
+                sig = inspect.signature(fn)
+                call_kwargs = {}
+                call_args = []
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                for p_name, param in sig.parameters.items():
+                    if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                        continue
+                    if p_name in available_ctx:
+                        if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                            call_args.append(available_ctx[p_name])
+                        else:
+                            call_kwargs[p_name] = available_ctx[p_name]
+                if has_var_kw:
+                    for k, v in available_ctx.items():
+                        if k not in call_kwargs:
+                            call_kwargs[k] = v
+                res = fn(*call_args, **call_kwargs)
+                setup_called = True
+                if hasattr(res, "message") and hasattr(res, "callback_query"):
+                    try:
+                        dp.include_router(res)
+                    except Exception:
+                        pass
+                break
+            except Exception as e:
+                print(f"⚠️ [{fn_name} 바인딩 방어] {e}", flush=True)
 
     router_obj = getattr(tg_router, "router", None)
     if router_obj is not None:
@@ -895,7 +941,7 @@ def _bind_telegram_router(
                     setattr(tg_router, attr_k, attr_v)
                 except Exception:
                     pass
-        if not setup_called or getattr(router_obj, "parent_router", None) is None:
+        if getattr(router_obj, "parent_router", None) is None:
             try:
                 dp.include_router(router_obj)
             except Exception:
@@ -904,7 +950,7 @@ def _bind_telegram_router(
 
 def _start_candle_recorder_task(api_client: TossApiClient) -> list:
     """
-    MODIFIED: candle_recorder.py 의 백그라운드 태스크 엔트리포인트 시그니처를 정밀 분석하여,
+    candle_recorder.py 의 백그라운드 태스크 엔트리포인트 시그니처를 정밀 분석하여,
     `record_candles_loop(api_client, symbol)` 처럼 `symbol` 인자를 요구하는 경우
     TRADE_SYMBOLS ("SOXS", "SOXL") 각각에 대해 독립 태스크를 기동합니다.
     """
@@ -968,6 +1014,8 @@ def _start_candle_recorder_task(api_client: TossApiClient) -> list:
 
 
 async def main():
+    _install_fast_shutdown_handlers()
+
     tg_token = (
         os.getenv("TELEGRAM_BOT_TOKEN")
         or os.getenv("TELEGRAM_TOKEN")
@@ -1042,7 +1090,7 @@ async def main():
         pass
 
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), handle_signals=False)
     finally:
         for t in bg_tasks:
             t.cancel()

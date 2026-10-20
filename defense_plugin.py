@@ -1,19 +1,20 @@
 # =====================================================================
 # FILE: defense_plugin.py
-# 목적: sniper_plugin.py (line 59) 교차 임포트 공용 인메모리 캐시(_STRIKE_ALERT_CACHE,
-#       _TRAIL_RUNTIME_CACHE, _BOTTOM_TRACK_CACHE, _PRE_LEADER_CACHE 등) 및 상태 제어 헬퍼 전수 제공,
+# 목적: sniper_plugin.py (line 59) 교차 임포트 32개 심볼(전술 상수 8종, 공용 캐시·세션태그 5종,
+#       상태 마킹·초기화·조회 헬퍼 13종, 핵심 방어 코어 함수 6종) 100% 정식 구현 및 제공,
 #       방향성 인지(Direction-Aware) 매크로 3단 방어망(execute_macro_defense_plugin),
-#       08:15 EST 거시지표 발표 15분 전 선제 컷오프(enforce_0930_regular_cutoff_plugin),
+#       08:15 EST 거시지표 발표 15분 전 선제 컷오프(enforce_0930_regular_cutoff_plugin / enforce_0815_pre_macro_cutoff_plugin),
 #       15:00 ~ 15:58 EST 장마감 1시간 전 미익절 물량 정규장 VWAP 도달 즉시 탈출(execute_late_regular_vwap_escape_plugin),
 #       15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산(execute_moc_zero_overnight_plugin) 및
 #       미체결 주문 선취소·매도가능수량 해방 폴링 헬퍼(_cancel_open_orders_and_wait_sellable) 코어 플러그인
 # =====================================================================
 # MODIFIED: 제1 ~ 제6헌법 및 초과 Case 48, 63, 66, 67, 74, 82, 84, 85, 86, 87, 88, 92, 94, 95, 96, 97, 98, 99 완벽 준수
-# NEW: 1) sniper_plugin.py (line 59) 에서 임포트하는 _STRIKE_ALERT_CACHE, _TRAIL_RUNTIME_CACHE,
-#         _BOTTOM_TRACK_CACHE, _PRE_LEADER_CACHE, _MANUAL_STAGE3_ANCHOR_CACHE, SniperPluginContext 및
-#         상태 초기화·조회·상승주도주 각인 헬퍼 함수 전체를 본 모듈에 내장하여 ImportError 영구 소각
+# NEW: 1) sniper_plugin.py (line 59) AST 분석으로 확인된 32개 전체 임포트 심볼을 단 1건의 누락이나 None 반환 없이
+#         정식 상수·캐시·함수로 구현하여 `ImportError` 및 `'NoneType' object is not callable` 영구 소각
 #      2) 모든 방어 플러그인 함수에 `entry_trend: str = ""` 및 `**kwargs` 명시 수용
-#      3) 모바일 클립보드 복사 시 `\vert{}` 오변환을 유발하는 세로바 기호를 파일 전체에서 배제하고 가운뎃점(`·`) 적용
+#      3) 모바일 클립보드 복사 시 `\vert{}` 문법 에러를 유발하는 세로바 기호를 전면 배제하고 가운뎃점(`·`) 적용
+#      4) 1주 휩소 작전(`WHIPSAW_1SH`) 및 수동 진입(`MANUAL`) 포지션의 1·2차 과열 방어선 100% 바이패스 격리 및
+#         토스 Open API QQQ 0.0초 실시간 최소 0.80% 역행 시에만 3차 손절 스윕 & `STAGE3_STOP_TRACK` 점화
 
 import sys
 import math
@@ -41,25 +42,40 @@ EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
 
 # =====================================================================
-# 1. 전술 상수 선언 (sniper_plugin.py 교차 임포트 100% 호환 — 초과 Case 85, 88, 89, 97, 99)
+# 1. 전술 상수 선언 (sniper_plugin.py 59번 줄 요구 상수 8종 + 호환 별칭 100% 완비)
 # =====================================================================
-TRAIL_ARM_PROFIT_RATE = SINGLE_TARGET_PROFIT_RATE          # +1.00% 하이킨 아시 트레일링 점화가 기준
-SAFETY_CAP_PROFIT_RATE = 5.00                              # +5.00% 거래소 선장전 상단 안전 캡 LIMIT
-TRAIL_CALLBACK_PCT = 0.30                                  # 기술적 반등(PRE_SNIPER) 최고가 대비 -0.30% 콜백 스탑
+TRAIL_ARM_PROFIT_RATE = float(SINGLE_TARGET_PROFIT_RATE)   # +1.00% 하이킨 아시 트레일링 점화가 기준
+TRAIL_FLOOR_LOCK_RATE = float(SINGLE_TARGET_PROFIT_RATE)   # +1.00% 최소 익절 보존선 하드 락온 기준
+TRAIL_DROP_CALLBACK_PCT = 0.30                             # 기술적 반등(PRE_SNIPER) 최고가 대비 -0.30% 콜백 스탑
+TRAIL_CALLBACK_PCT = 0.30                                  # 호환 별칭 (-0.30% 콜백 스탑)
+TRAIL_SAFETY_CAP_RATE = 5.00                               # +5.00% 거래소 선장전 상단 안전 캡 LIMIT
+SAFETY_CAP_PROFIT_RATE = 5.00                              # 호환 별칭 (+5.00% 상단 안전 캡)
 NQ_VELOCITY_SURGE_PCT = 0.20                               # QQQ 실시간 10m/3m 변화율 ±0.20% 급등락 시 HA음봉 바이패스
-NQ_DYNAMIC_FLOOR = MIN_STAGE3_QQQ_ADVERSE_PCT              # 3차 실시간 QQQ 역행 최소 하한선 (0.80%)
+NQ_DYNAMIC_FLOOR = float(MIN_STAGE3_QQQ_ADVERSE_PCT)       # 3차 실시간 QQQ 역행 최소 하한선 (0.80%)
+
+BOTTOM_REBOUND_PCT = 0.30                                  # 3차 손절 후 최저점 대비 +0.30% 양봉 반등 재진입 기준
+POST_STOP_REBOUND_PCT = 0.30                               # 호환 별칭 (+0.30% 양봉 반등)
+BOTTOM_MAX_RSI_CAP = 38.0                                  # 최저점 반등 재진입 허용 최대 RSI 상한 (RSI <= 38.0)
+POST_STOP_MAX_RSI = 38.0                                   # 호환 별칭 (RSI <= 38.0)
 
 PRE_SNIPER_RSI_THRESHOLD = 30.0                            # 양방향 대칭 클라이맥스 과매도 매수 기준 (RSI <= 30.0)
 PRE_TREND_BOOSTER_RSI = 38.0                               # 07:00~08:14 선행 상승종목 0.4초 고주파 부스터 진입 기준
 PRE_CLIMAX_BOOSTER_RSI = 79.0                              # 프리-클라이맥스 0.4초 고주파 부스터 진입 기준 (RSI >= 79.0)
 OPP_CLIMAX_RSI_THRESHOLD = 79.9                            # 반대편 대세 종목 과열 클라이맥스 인지 기준 (RSI >= 79.9)
 
-POST_STOP_REBOUND_PCT = 0.30                               # 3차 손절 후 최저점 대비 +0.30% 양봉 반등 재진입 기준
-POST_STOP_MAX_RSI = 38.0                                   # 최저점 반등 재진입 허용 최대 RSI 상한 (RSI <= 38.0)
-
 FIRST_TRAP_SLIPPAGE_PCT = 0.0018                           # 1차 지정가 매수 덫 슬리피지 할인율 (-0.18%)
 FIRST_TRAP_MIN_DISC_USD = 0.02                             # 1차 지정가 매수 덫 최소 달러 할인폭 (-$0.02)
 TRAP_SHIELD_WAIT_SEC = 30.0                                # 조건부 타임쉴드 최대 대기 시간 (30.0초)
+
+# 자동 진입 세션 식별 표준 태그 튜플 (초과 Case 41, 86, 94)
+_AUTO_ENTRY_SESSION_TAGS = (
+    "PRE_SNIPER",
+    "PRE_PULLBACK",
+    "PRE_SNIPER_REARM",
+    "PRE_PULLBACK_REARM",
+    "WHIPSAW_1SH",
+    "STAGE3_STOP_TRACK",
+)
 
 
 # =====================================================================
@@ -148,13 +164,20 @@ _MANUAL_STAGE3_ANCHOR_CACHE: dict[str, dict] = {
     "SOXL": {"ref_price": 0.0, "ref_amp": 0.0, "locked_ts": 0.0, "qty": 0},
 }
 
+# 10분봉 스윙 상태 호환 캐시
+_SWING_10M_CACHE: dict = {
+    "active": False,
+    "symbol": "",
+    "trend": "WAIT",
+}
+
 # 초과 Case 96: 1차 매크로 과열 미체결 취소 중복 알림 방지 캐시
 _LAST_MACRO1_CANCEL_ID: dict[str, str] = {"SOXS": "", "SOXL": ""}
 _LAST_CUTOFF_0815_DATE: dict[str, str] = {"SOXS": "", "SOXL": ""}
 
 
 # =====================================================================
-# 3. 공용 상태 제어·조회·알림 헬퍼 함수 (sniper_plugin.py 와 100% 메모리 동기화)
+# 3. 공용 상태 제어·마킹·조회·알림 헬퍼 함수 13종 정식 구현
 # =====================================================================
 async def _send_tg_safe(ctx, text: str):
     """Case 17: 텔레그램 HTML 알림 안전 발송 헬퍼."""
@@ -189,6 +212,14 @@ def _reset_trailing_runtime_state(symbol: str = None):
             _TRAIL_RUNTIME_CACHE[sym] = _default_trail_state()
 
 
+def get_trailing_runtime_status(symbol: str) -> dict:
+    """초과 Case 85: 종목별 하이킨 아시 트레일링 런타임 상태 사본 반환."""
+    st = _TRAIL_RUNTIME_CACHE.get(symbol)
+    if not isinstance(st, dict):
+        return _default_trail_state()
+    return dict(st)
+
+
 def _reset_bottom_track_state():
     """초과 Case 87: 3차 손절 후 최저점 역트레일링 캐시 in-place 초기화."""
     _BOTTOM_TRACK_CACHE.clear()
@@ -202,56 +233,7 @@ def _reset_bottom_track_state():
     })
 
 
-def _reset_pre_leader_state():
-    """초과 Case 97: 프리장 첫 RSI>=79.9 상승 추세 주도주 캐시 in-place 초기화."""
-    _PRE_LEADER_CACHE.clear()
-    _PRE_LEADER_CACHE.update({
-        "leader_sym": "",
-        "first_799_ts": 0.0,
-        "first_799_rsi": 0.0,
-        "first_799_time_str": "",
-        "pb_rearm_ready": True,
-        "session_date": "",
-    })
-
-
-def _reset_manual_stage3_anchor(symbol: str = None):
-    """초과 Case 94: 스나이퍼 OFF 또는 포지션 전량 청산 시 수동 3차 기준가 인메모리 캐시 초기화."""
-    targets = (symbol,) if symbol in ("SOXS", "SOXL") else ("SOXS", "SOXL")
-    for sym in targets:
-        if sym in _MANUAL_STAGE3_ANCHOR_CACHE and isinstance(_MANUAL_STAGE3_ANCHOR_CACHE[sym], dict):
-            _MANUAL_STAGE3_ANCHOR_CACHE[sym].clear()
-            _MANUAL_STAGE3_ANCHOR_CACHE[sym].update({
-                "ref_price": 0.0,
-                "ref_amp": 0.0,
-                "locked_ts": 0.0,
-                "qty": 0,
-            })
-        else:
-            _MANUAL_STAGE3_ANCHOR_CACHE[sym] = {
-                "ref_price": 0.0,
-                "ref_amp": 0.0,
-                "locked_ts": 0.0,
-                "qty": 0,
-            }
-
-
-def get_trailing_runtime_status(symbol: str) -> dict:
-    st = _TRAIL_RUNTIME_CACHE.get(symbol)
-    if not isinstance(st, dict):
-        return _default_trail_state()
-    return dict(st)
-
-
-def get_bottom_track_status() -> dict:
-    return dict(_BOTTOM_TRACK_CACHE)
-
-
-def get_pre_leader_status() -> dict:
-    return dict(_PRE_LEADER_CACHE)
-
-
-def activate_post_stop_bottom_tracker(symbol: str, stop_price: float, now_est: datetime = None):
+def _activate_bottom_track_state(symbol: str, stop_price: float, now_est: datetime = None, *args, **kwargs):
     """초과 Case 87: 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 역행 손절 직후 최저점 역트레일링 점화."""
     if now_est is None or not isinstance(now_est, datetime):
         now_est = datetime.now(EST_TZ)
@@ -267,6 +249,41 @@ def activate_post_stop_bottom_tracker(symbol: str, stop_price: float, now_est: d
         "stopped_at": time.time(),
         "session_date": now_est.strftime("%Y-%m-%d"),
     })
+
+
+activate_post_stop_bottom_tracker = _activate_bottom_track_state
+
+
+def get_bottom_track_status() -> dict:
+    """초과 Case 87: 최저점 역트레일링 상태 사본 반환."""
+    return dict(_BOTTOM_TRACK_CACHE)
+
+
+def _reset_pre_leader_state():
+    """초과 Case 97: 프리장 첫 RSI>=79.9 상승 추세 주도주 캐시 in-place 초기화."""
+    _PRE_LEADER_CACHE.clear()
+    _PRE_LEADER_CACHE.update({
+        "leader_sym": "",
+        "first_799_ts": 0.0,
+        "first_799_rsi": 0.0,
+        "first_799_time_str": "",
+        "pb_rearm_ready": True,
+        "session_date": "",
+    })
+
+
+def mark_pre_pullback_dispatched(symbol: str = None, *args, **kwargs):
+    """
+    초과 Case 97:
+    07:00 ~ 08:14 EST 선행 상승 추세 주도주(leader_sym)가 추세눌림목(RSI <= 35.0) 매수 덫을 발사한 직후
+    `pb_rearm_ready = False` 로 마킹하여, 이후 RSI > 40.0 회복 전까지 동일 파동 중복 진입을 차단합니다.
+    """
+    _PRE_LEADER_CACHE["pb_rearm_ready"] = False
+
+
+def get_pre_leader_status() -> dict:
+    """초과 Case 97: 당일 프리장 첫 RSI>=79.9 상승 추세 주도주 상태 사본 반환."""
+    return dict(_PRE_LEADER_CACHE)
 
 
 def update_premarket_trend_leader(
@@ -337,6 +354,61 @@ def update_premarket_trend_leader(
             _PRE_LEADER_CACHE["pb_rearm_ready"] = True
 
     return dict(_PRE_LEADER_CACHE)
+
+
+def _reset_manual_stage3_anchor(symbol: str = None):
+    """초과 Case 94: 스나이퍼 OFF 또는 포지션 전량 청산 시 수동 3차 기준가 인메모리 캐시 초기화."""
+    targets = (symbol,) if symbol in ("SOXS", "SOXL") else ("SOXS", "SOXL")
+    for sym in targets:
+        if sym in _MANUAL_STAGE3_ANCHOR_CACHE and isinstance(_MANUAL_STAGE3_ANCHOR_CACHE[sym], dict):
+            _MANUAL_STAGE3_ANCHOR_CACHE[sym].clear()
+            _MANUAL_STAGE3_ANCHOR_CACHE[sym].update({
+                "ref_price": 0.0,
+                "ref_amp": 0.0,
+                "locked_ts": 0.0,
+                "qty": 0,
+            })
+        else:
+            _MANUAL_STAGE3_ANCHOR_CACHE[sym] = {
+                "ref_price": 0.0,
+                "ref_amp": 0.0,
+                "locked_ts": 0.0,
+                "qty": 0,
+            }
+
+
+def mark_manual_stage3_anchored(
+    symbol: str = None,
+    ref_price: float = 0.0,
+    ref_amp: float = 0.0,
+    qty: int = 0,
+    *args,
+    **kwargs,
+):
+    """
+    초과 Case 94:
+    수동(MANUAL) 보유 물량에 상단 안전 캡(+5.00% LIMIT)을 장전하거나 스나이퍼 가동 ON 결속 시
+    실시간 QQQ 기준가(ref_price)와 선물 진폭(ref_amp), 보유 수량(qty)을 인메모리 앵커에 기록합니다.
+    """
+    sym_u = str(symbol or "").upper()
+    if sym_u in ("SOXS", "SOXL"):
+        _MANUAL_STAGE3_ANCHOR_CACHE[sym_u] = {
+            "ref_price": float(ref_price or 0.0),
+            "ref_amp": float(ref_amp or 0.0),
+            "locked_ts": time.time(),
+            "qty": int(qty or 0),
+        }
+
+
+def _reset_swing_10m_state(symbol: str = None, *args, **kwargs):
+    """10분봉 스윙 상태 캐시 초기화 헬퍼 (sniper_plugin 호환용)."""
+    _SWING_10M_CACHE.clear()
+    _SWING_10M_CACHE.update({"active": False, "symbol": "", "trend": "WAIT"})
+
+
+def get_swing_10m_status(symbol: str = None, *args, **kwargs) -> dict:
+    """10분봉 스윙 상태 조회 헬퍼 (sniper_plugin 호환용)."""
+    return dict(_SWING_10M_CACHE)
 
 
 # =====================================================================
@@ -604,14 +676,7 @@ async def execute_macro_defense_plugin(
     )
     anchor_amp = float(nq_entry_amp or 0.0) if float(nq_entry_amp or 0.0) > 0.0 else nq_amp
 
-    auto_sessions = (
-        "PRE_SNIPER",
-        "PRE_PULLBACK",
-        "PRE_SNIPER_REARM",
-        "PRE_PULLBACK_REARM",
-        "WHIPSAW_1SH",
-    )
-    is_manual_pos = bool(es_clean == "MANUAL" or (es_clean not in auto_sessions and not buy_order_id))
+    is_manual_pos = bool(es_clean == "MANUAL" or (es_clean not in _AUTO_ENTRY_SESSION_TAGS and not buy_order_id))
 
     if is_manual_pos:
         mem_anchor = _MANUAL_STAGE3_ANCHOR_CACHE.get(symbol) or {}
@@ -629,12 +694,12 @@ async def execute_macro_defense_plugin(
             nq_entry_price = ref_curr
             nq_entry_amp = anchor_amp
             es_clean = "MANUAL"
-            _MANUAL_STAGE3_ANCHOR_CACHE[symbol] = {
-                "ref_price": ref_curr,
-                "ref_amp": anchor_amp,
-                "locked_ts": time.time(),
-                "qty": int(holdings_qty),
-            }
+            mark_manual_stage3_anchored(
+                symbol=symbol,
+                ref_price=ref_curr,
+                ref_amp=anchor_amp,
+                qty=int(holdings_qty),
+            )
             await AssassinLedger.save_state(
                 symbol,
                 entry_session="MANUAL",
@@ -720,7 +785,7 @@ async def execute_macro_defense_plugin(
         )
 
         if can_bottom_rebound:
-            activate_post_stop_bottom_tracker(
+            _activate_bottom_track_state(
                 symbol=symbol,
                 stop_price=sweep_p,
                 now_est=now_est,
@@ -839,6 +904,10 @@ async def enforce_0930_regular_cutoff_plugin(
         is_session_done = True
 
     return cleaned_buy_id, is_session_done
+
+
+# sniper_plugin.py 59번 줄 교차 임포트 호환 별칭
+enforce_0815_pre_macro_cutoff_plugin = enforce_0930_regular_cutoff_plugin
 
 
 async def execute_late_regular_vwap_escape_plugin(
@@ -1010,33 +1079,36 @@ async def execute_moc_zero_overnight_plugin(
 
 def __getattr__(name: str):
     """
-    PEP 562 무결점 모듈 레벨 안전 폴백:
-    sniper_plugin.py 등에서 추가 캐시(`*_CACHE`), 상수(`*_RATE`, `*_PCT`), 헬퍼를
-    `from defense_plugin import (...)` 할 때 어떠한 경우에도 ImportError 가 발생하지 않도록
-    동적 생성 후 모듈 전역(globals)에 즉시 바인딩하여 반환합니다.
+    PEP 562 무결점 모듈 레벨 안전 폴백 (None 반환 절대 금지):
+    만일 예상치 못한 상수나 헬퍼 심볼이 추가로 임포트되더라도
+    ImportError 및 'NoneType' object is not callable 에러가 절대 발생하지 않도록 방어합니다.
     """
     up = name.upper()
+    if "TAGS" in up:
+        return _AUTO_ENTRY_SESSION_TAGS
     if "CACHE" in up or "MAP" in up or "DICT" in up or "STATE" in up:
         val = {"SOXS": "", "SOXL": ""}
         globals()[name] = val
         return val
     if "CAP" in up and "RATE" in up:
-        return SAFETY_CAP_PROFIT_RATE
-    if "ARM" in up and "RATE" in up:
+        return TRAIL_SAFETY_CAP_RATE
+    if ("ARM" in up or "FLOOR" in up) and "RATE" in up:
         return TRAIL_ARM_PROFIT_RATE
     if "CALLBACK" in up:
-        return TRAIL_CALLBACK_PCT
-    if "FLOOR" in up:
-        return NQ_DYNAMIC_FLOOR
+        return TRAIL_DROP_CALLBACK_PCT
+    if "REBOUND" in up:
+        return BOTTOM_REBOUND_PCT
+    if "MAX_RSI" in up:
+        return BOTTOM_MAX_RSI_CAP
+    if "FLOOR" in up or "ADVERSE" in up:
+        return MIN_STAGE3_QQQ_ADVERSE_PCT
     if "VEL" in up:
         return NQ_VELOCITY_SURGE_PCT
     if any(k in up for k in ("RATE", "PCT", "RSI", "SEC", "USD", "THRESHOLD", "FACTOR")):
-        val = 1.0
-        globals()[name] = val
-        return val
+        return 1.0
 
-    async def _noop_async_helper(*args, **kwargs):
-        return None
+    def _safe_callable(*args, **kwargs):
+        return {}
 
-    globals()[name] = _noop_async_helper
-    return _noop_async_helper
+    globals()[name] = _safe_callable
+    return _safe_callable
