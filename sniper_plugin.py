@@ -6,9 +6,10 @@
 #           07:00 ~ 08:14 EST 해당 상승종목 RSI<=35.0 추세추종 눌림목 매수(🚀 PB_0700_35),
 #       3차 실시간 QQQ 역행 손절 후 손절가 하회 최저점 역트레일링 +0.30% 양봉 반등 재진입(🪤 RE_BOT_TRAIL),
 #       1차 슬리피지(-0.18%) 매수 덫 + 조건부 30초 타임쉴드(RSI>30.0 / RSI>35.0 반등 또는 30초 만료 정정),
-#       진입 성격별 이원화 하이킨 아시 트레일링(기술적 반등[PRE_SNIPER] ⚡ OLD_IMM_CB [-0.30%] vs
-#       진성 상승종목[PRE_PULLBACK 및 모든 수동 매수 MANUAL] 🚀 PEAK_LCK_130 × 📊 BAR_BEAR_020 [초입 양봉 홀딩 후 -0.20%]
-#       × 🚀 NQ_VEL_BYPASS), 409 already-modified 자동 추적 정정 및 REPLACED 안전 캡($47.98)/수량(1주➔4주) 왜곡 차단 코어
+#       진입 성격별 이원화 하이킨 아시 트레일링(🕯️HA양봉 중 밑꼬리 콜백 유예 & 🌑HA음봉 전환 + 콜백 도달 시 스윕:
+#       기술적 반등[PRE_SNIPER] ⚡ OLD_IMM_CB [-0.30%] vs 진성 상승종목[PRE_PULLBACK 및 모든 수동 매수 MANUAL]
+#       🚀 PEAK_LCK_130 × 📊 BAR_BEAR_020 [-0.20%] × 🚀 NQ_VEL_BYPASS),
+#       409 already-modified 자동 추적 정정 및 REPLACED 안전 캡($47.98)/수량(1주➔4주) 왜곡 차단 코어
 # =====================================================================
 # MODIFIED: 제1 ~ 제6헌법 및 100대 엣지 케이스 방어망(Case 01 ~ Case 100) 완벽 준수
 # NEW: 1) `whipsaw_plugin` 동적 안전 바인딩(`import whipsaw_plugin as _whipsaw_mod` + 다중 별칭 `getattr`):
@@ -19,6 +20,9 @@
 #         새로 발급된 최신 `orderId` 로 정정을 완수하고, 2단계 취소 폴백 시 `holdings_qty` 를 명시 전달
 #      4) 수동 매수(`MANUAL`) 포지션을 `leader_sym` 여부나 시간대와 무관하게 100% `🚀 진성상승 추세추종(TREND_PULLBACK)` 고정
 #      5) `_EXIT_SNAPSHOT_CACHE` 를 통해 `REPLACED` 원주문 안전 캡($47.98) 오인 및 `1주 ➔ 4주` 수량 왜곡 영구 소각
+#      6) 이원화 트레일링 스윕 수식 교정: 매 0.4초 틱마다 실시간 하이킨 아시(`compute_realtime_tick_heikin_ashi`)를 직접 합성하고,
+#         🕯️HA양봉 유지 중에는 단순 호가 밑꼬리(-0.30%/-0.20%) 스탑을 유예하며,
+#         🌑HA음봉 전환 + 최고가 대비 콜백(-0.30%/-0.20%) 동시 도달 시에만 정밀 익절 스윕 격발 (+1.00%~+1.29% 여유폭 0% 함정 제거)
 
 import math
 import time
@@ -40,6 +44,7 @@ from quant_engine import (
     TREND_PB_LAUNCH_RATCHET_PCT,
     TREND_PB_CUSHION_FLOOR_RATE,
     calc_compound_next_budget,
+    compute_realtime_tick_heikin_ashi,
 )
 from defense_plugin import (
     SniperPluginContext,
@@ -385,6 +390,11 @@ async def execute_post_stop_bottom_rebound_plugin(
 
     # 실시간 양봉 전환 확인 (일반 1분봉 양봉 또는 하이킨 아시 양봉)
     ewm_st = ((ctx.shared_rsi_state or {}).get(symbol) or {}).get("ewm_state") or {}
+    if live_p > 0.0 and isinstance(ewm_st, dict) and ewm_st:
+        try:
+            compute_realtime_tick_heikin_ashi(live_p, ewm_st)
+        except Exception:
+            pass
     cur_o = float(ewm_st.get("cur_bar_open", 0.0) or 0.0)
     is_ha_bull = bool(ewm_st.get("live_ha_bull", ewm_st.get("ha_bull", False)))
     is_bar_bull = bool(cur_o > 0.0 and live_p > cur_o)
@@ -855,7 +865,7 @@ async def rearm_premarket_buy_trap_after_30s_plugin(
 
 # =====================================================================
 # 4. 상단 안전 캡(+5.00% LIMIT) 선장전 & 이원화 하이킨 아시 트레일링 스윕 엔진
-#    (기술적 반등 ⚡ OLD_IMM_CB [-0.30%] vs 진성 상승종목/수동매수 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020 [-0.20%])
+#    (🕯️HA양봉 홀딩 & 🌑HA음봉 + 콜백 도달 스윕: 기술적 반등 ⚡ OLD_IMM_CB [-0.30%] vs 진성 상승종목/수동매수 🚀 PEAK_LCK_130 [-0.20%])
 # =====================================================================
 async def manage_mechanical_profit_trap_plugin(
     ctx: SniperPluginContext,
@@ -875,15 +885,20 @@ async def manage_mechanical_profit_trap_plugin(
     **kwargs,
 ) -> bool:
     """
-    초과 Case 50, 58, 64, 69, 85, 89, 94, 99 & 수동 매수(MANUAL) 100% 진성상승 추세추종 레짐 고정:
+    초과 Case 50, 58, 64, 69, 85, 89, 94, 99 & 🌑HA음봉 + 콜백(-0.30%/-0.20%) 도달 스윕 옵션:
     1) 보유 중 매 틱마다 `_EXIT_SNAPSHOT_CACHE[symbol]` 에 실보유 수량(holdings_qty), 평단가(avg_price),
        경유 최고가(peak_price)를 상시 기록하여 청산 직후 `1주 ➔ 4주` 수량 왜곡을 원천 봉쇄합니다.
     2) 진입 성격 판별(`is_trend_pb_regime`):
        - `PRE_PULLBACK`, `PRE_PULLBACK_REARM` 및 **모든 수동 매수(`MANUAL`)** 포지션은 `leader_sym` 여부나
          시간대와 무관하게 **100% 무조건 `🚀 진성상승 추세추종 매도(TREND_PULLBACK / PEAK_LCK_130)`** 로 고정합니다!
-       - 오직 양방향 대칭 클라이맥스 자동 진입(`PRE_SNIPER`, `PRE_SNIPER_REARM`)만 `⚡ 기술적반등 매도(TECH_BOUNCE / OLD_IMM_CB)` 로 작동합니다.
-    3) 스윕 정정(`modify_order`) 시 `[409 already-modified]` 에러가 반환되면 즉시 거래소의 살아있는 `OPEN` 매도 주문을
-       스캔하여 최신 `orderId` 로 정정을 완수하고, 2단계 취소 폴백 시 `holdings_qty` 를 명시 전달합니다.
+       - 양방향 대칭 클라이맥스 자동 진입(`PRE_SNIPER`, `PRE_SNIPER_REARM`)은 `⚡ 기술적반등 매도(TECH_BOUNCE / OLD_IMM_CB)` 로 작동합니다.
+    3) 🕯️HA양봉 홀딩 & 🌑HA음봉 + 콜백(-0.30%/-0.20%) 도달 결합 스윕:
+       - 매 0.4초 틱마다 `compute_realtime_tick_heikin_ashi(live_p, ewm_st)` 를 직접 호출하여 0.0ms 시차 없는
+         실시간 하이킨 아시 양/음봉(`is_ha_bull` / `is_ha_bear`)을 산출합니다.
+       - 하이킨 아시가 양봉(`🕯️HA양봉` 또는 `🚀 NQ_VEL_BYPASS` 급등락 진행 중)인 동안에는 단순 호가 밑꼬리(-0.20%/-0.30%)나
+         일반 1분봉 시가 노이즈에 조기 매도하지 않고 상승 파동을 끝까지 홀딩합니다!
+       - 하이킨 아시가 음봉(`🌑HA음봉`, `effective_ha_bear == True`)으로 전환되면서 동시에 최고가 대비 콜백 스탑선
+         (기술적 반등 `-0.30%`, 진성 상승종목 `-0.20%`) 이하로 하락(`live_p <= effective_stop_p`)했을 때 0.1초 정정 스윕을 격발합니다.
     """
     _ensure_ctx_notify_callable(ctx)
     if not is_active or int(holdings_qty) <= 0 or float(avg_price or 0.0) <= 0.0:
@@ -902,6 +917,7 @@ async def manage_mechanical_profit_trap_plugin(
     is_trend_pb_regime = bool(eff_sess in ("PRE_PULLBACK", "PRE_PULLBACK_REARM", "MANUAL"))
     regime_code = "TREND_PULLBACK" if is_trend_pb_regime else "TECH_BOUNCE"
     ui_exit_regime = "PEAK_LCK_130" if is_trend_pb_regime else "OLD_IMM_CB"
+    active_cb_pct = float(TREND_PB_CALLBACK_PCT if is_trend_pb_regime else TRAIL_DROP_CALLBACK_PCT)
 
     # 1) 보유 중 매 틱 불변 정산 스냅샷(_EXIT_SNAPSHOT_CACHE) 및 트레일링 런타임 상태 갱신
     snap = _EXIT_SNAPSHOT_CACHE.get(symbol)
@@ -924,7 +940,7 @@ async def manage_mechanical_profit_trap_plugin(
     tr_state["last_known_qty"] = int(holdings_qty)
     tr_state["regime"] = regime_code
     tr_state["exit_regime"] = ui_exit_regime
-    tr_state["callback_pct"] = (TREND_PB_CALLBACK_PCT if is_trend_pb_regime else TRAIL_DROP_CALLBACK_PCT)
+    tr_state["callback_pct"] = active_cb_pct
 
     # 초과 Case 64: 아직 미체결 매수 주문(분할 체결 중)이 살아 있는지 점검
     if buy_order_id:
@@ -940,6 +956,7 @@ async def manage_mechanical_profit_trap_plugin(
             pass
 
     arm_price = math.ceil(float(avg_price) * (1.0 + TRAIL_ARM_PROFIT_RATE / 100.0) * 100.0) / 100.0
+    cushion_floor = math.ceil(float(avg_price) * (1.0 + TREND_PB_CUSHION_FLOOR_RATE / 100.0) * 100.0) / 100.0
     safety_cap_price = (
         arm_price
         if is_whipsaw_1sh
@@ -1040,12 +1057,13 @@ async def manage_mechanical_profit_trap_plugin(
                     mode_tag = "🖐️ 수동 스나이퍼 개입" if eff_sess == "MANUAL" else f"🔫 본진 체결({eff_sess})"
                     if is_trend_pb_regime:
                         regime_desc = (
-                            "🚀 진성상승 추세추종 (+1.30% 전 양봉홀딩[쿠션+0.75%] · "
-                            "음봉/+1.30% 시 +1.00% 잠금 & 고점 대비 -0.20% 타이트 스윕)"
+                            "🚀 진성상승 추세추종 (🕯️HA양봉 중 콜백 유예 & 홀딩 · "
+                            "🌑HA음봉 전환 + 고점 대비 -0.20% 도달 시 스윕)"
                         )
                     else:
                         regime_desc = (
-                            "⚡ 기술적반등 매도 (+1.00% 보존 고정 & 고점 대비 -0.30% 콜백/HA음봉 즉시 스윕)"
+                            "⚡ 기술적반등 매도 (🕯️HA양봉 중 콜백 유예 & 홀딩 · "
+                            "🌑HA음봉 전환 + 고점 대비 -0.30% 도달 시 스윕)"
                         )
                     dyn_th = max(eff_nq_amp * 0.5, MIN_STAGE3_QQQ_ADVERSE_PCT)
                     await _send_tg_safe(
@@ -1069,7 +1087,7 @@ async def manage_mechanical_profit_trap_plugin(
         return False
 
     # =================================================================
-    # [단계 2] +1.00% 트레일링 점화 판정 및 진입 성격별 레짐(Regime) 작동 (초과 Case 85, 99)
+    # [단계 2] +1.00% 트레일링 점화 판정 및 초입 여유폭 0% 함정 원천 제거 (초과 Case 85, 99)
     # =================================================================
     armed = bool(tr_state.get("armed", False))
     cur_hm = now_est.hour * 100 + now_est.minute
@@ -1080,8 +1098,8 @@ async def manage_mechanical_profit_trap_plugin(
 
         armed = True
         peak_price = max(live_p, arm_price)
-        cushion_floor = math.ceil(float(avg_price) * (1.0 + TREND_PB_CUSHION_FLOOR_RATE / 100.0) * 100.0) / 100.0
-        init_floor = cushion_floor if is_trend_pb_regime else arm_price
+        raw_init_cb = math.floor(peak_price * (1.0 - active_cb_pct / 100.0) * 100.0) / 100.0
+        init_stop = max(cushion_floor, raw_init_cb)
 
         tr_state.update({
             "armed": True,
@@ -1089,14 +1107,15 @@ async def manage_mechanical_profit_trap_plugin(
             "peak_price": peak_price,
             "max_price": peak_price,
             "arm_price": arm_price,
-            "floor_price": init_floor,
-            "stop_price": init_floor,
-            "callback_pct": (TREND_PB_CALLBACK_PCT if is_trend_pb_regime else TRAIL_DROP_CALLBACK_PCT),
+            "floor_price": cushion_floor,
+            "stop_price": init_stop,
+            "callback_pct": active_cb_pct,
             "armed_at": time.time(),
             "armed_hm": cur_hm,
             "last_mod_price": 0.0,
             "last_known_qty": int(holdings_qty),
             "bear_candle_seen": False,
+            "ratchet_130_locked": False,
             "regime": regime_code,
             "exit_regime": ui_exit_regime,
             "nq_vel_bypass": False,
@@ -1107,24 +1126,24 @@ async def manage_mechanical_profit_trap_plugin(
 
         gain_pct_now = (live_p - avg_price) / avg_price * 100.0
         if is_trend_pb_regime:
-            fire_title = f"🔥 🚀 [진성상승 추세추종 트레일링 점화!] 초입 양봉 홀딩 & -0.20% 타이트 스윕 ({symbol})"
+            fire_title = f"🔥 🚀 [진성상승 추세추종 트레일링 점화!] 🕯️HA양봉 홀딩 & 🌑HA음봉 + -0.20% 콜백 스윕 ({symbol})"
         else:
-            fire_title = f"🔥 ⚡ [기술적반등 트레일링 점화!] +1.00% 보존 고정 & -0.30% 콜백/HA음봉 스윕 ({symbol})"
+            fire_title = f"🔥 ⚡ [기술적반등 트레일링 점화!] 🕯️HA양봉 홀딩 & 🌑HA음봉 + -0.30% 콜백 스윕 ({symbol})"
 
         await _send_tg_safe(
             ctx,
             (
                 f"<b>{html.escape(fire_title)}</b>\n"
                 f"▫️ 평단가: ${avg_price:.2f} ➡️ 점화 현재가: <b>${live_p:.2f} (+{gain_pct_now:.2f}%)</b>\n"
-                f"▫️ 현재 스탑선: <b>${init_floor:.2f}</b> · 상단 안전 캡: <b>${safety_cap_price:.2f}</b>\n"
-                f"▫️ 조치: 0.4초 고주파 부스터 고정 및 최고가 무제한 추적 개시!"
+                f"▫️ 초입 스탑선(🌑HA음봉 시): <b>${init_stop:.2f}</b> (비상쿠션 ${cushion_floor:.2f} · +1.30% 돌파 시 +1.00% 잠금)\n"
+                f"▫️ 조치: 🕯️HA양봉 유지 중 밑꼬리 스탑 유예 및 0.4초 고주파 최고가 무제한 추적 개시!"
             ),
         )
         if ctx.wakeup_event:
             ctx.wakeup_event.set()
 
     # =================================================================
-    # [단계 3] 최고가 갱신 및 이원화 매도 믹스(⚡ OLD_IMM_CB vs 🚀 PEAK_LCK_130 × 📊 BAR_BEAR_020) 판정
+    # [단계 3] 최고가 갱신 및 '🕯️HA양봉 홀딩 & 🌑HA음봉 + 콜백(-0.30%/-0.20%) 도달' 정밀 판정
     # =================================================================
     peak_price = max(float(tr_state.get("peak_price", 0.0) or 0.0), live_p, arm_price)
     tr_state["peak_price"] = peak_price
@@ -1132,16 +1151,23 @@ async def manage_mechanical_profit_trap_plugin(
     snap["peak_price"] = max(float(snap.get("peak_price", 0.0) or 0.0), peak_price)
 
     peak_pct = ((peak_price - avg_price) / avg_price * 100.0) if avg_price > 0.0 else 0.0
-    elapsed_arm = max(0.0, time.time() - float(tr_state.get("armed_at", 0.0) or 0.0))
-    armed_hm = int(tr_state.get("armed_hm", -1))
 
+    # NEW: 매 0.4초 틱마다 실시간 현재가(live_p)를 대입하여 0.0ms 실시간 하이킨 아시 양/음봉 직접 합성!
     ewm_st = ((ctx.shared_rsi_state or {}).get(symbol) or {}).get("ewm_state") or {}
-    cur_bar_open = float(ewm_st.get("cur_bar_open", 0.0) or 0.0)
+    if live_p > 0.0 and isinstance(ewm_st, dict) and ewm_st:
+        try:
+            compute_realtime_tick_heikin_ashi(live_p, ewm_st)
+        except Exception:
+            pass
+
     live_ha_open = float(ewm_st.get("live_ha_open", ewm_st.get("prev_ha_open", 0.0)) or 0.0)
     live_ha_close = float(ewm_st.get("live_ha_close", ewm_st.get("prev_ha_close", 0.0)) or 0.0)
-    is_ha_bull = bool(ewm_st.get("live_ha_bull", ewm_st.get("ha_bull", True)))
-    is_ha_bear = bool((live_ha_open > 0.0 and live_ha_close <= live_ha_open) or not is_ha_bull)
-    is_bar_bear = bool(cur_bar_open > 0.0 and live_p < cur_bar_open)
+    if live_ha_open > 0.0 and live_ha_close > 0.0:
+        is_ha_bull = bool(live_ha_close > live_ha_open)
+        is_ha_bear = bool(live_ha_close <= live_ha_open)
+    else:
+        is_ha_bull = bool(ewm_st.get("live_ha_bull", ewm_st.get("ha_bull", True)))
+        is_ha_bear = not is_ha_bull
 
     # 초과 Case 89: 토스 Open API QQQ 실시간 10m/3m 변화율 ±0.20% 급등락 진행 중에는 HA음봉 바이패스(🚀 NQ_VEL_BYPASS)
     nq_vel_10m, nq_vel_3m = await MacroDataCache.get_nq_velocity_metrics()
@@ -1152,56 +1178,55 @@ async def manage_mechanical_profit_trap_plugin(
 
     tr_state["nq_vel_bypass"] = nq_vel_bypass
     effective_ha_bear = bool(is_ha_bear and not nq_vel_bypass)
+    if effective_ha_bear:
+        tr_state["bear_candle_seen"] = True
 
+    # 경유 최고가가 +1.30% 이상 본궤도에 진입하면 최소 익절 보존선(+1.00% arm_price)을 영구 잠금
+    if peak_pct >= TREND_PB_LAUNCH_RATCHET_PCT:
+        tr_state["ratchet_130_locked"] = True
+    ratchet_locked = bool(tr_state.get("ratchet_130_locked", False))
+
+    raw_cb_stop = math.floor(peak_price * (1.0 - active_cb_pct / 100.0) * 100.0) / 100.0
+    if ratchet_locked:
+        floor_price = arm_price
+        effective_stop_p = max(arm_price, raw_cb_stop)
+    else:
+        # +1.00% ~ +1.29% 초입 구간: 스탑선이 점화가(+1.00%)와 같아져 여유폭 0.00%로 즉시 팔리는 함정 제거
+        floor_price = cushion_floor
+        effective_stop_p = max(cushion_floor, raw_cb_stop)
+
+    tr_state["floor_price"] = floor_price
+    tr_state["stop_price"] = effective_stop_p
+
+    # 양봉 중 기습 플래시 크래시 대비 하드 세이프티 가드 (콜백폭의 2.5배: 진성상승 -0.50% / 기술적반등 -0.75%)
+    hard_guard_pct = active_cb_pct * 2.5
+    hard_wick_stop = max(
+        floor_price,
+        math.floor(peak_price * (1.0 - hard_guard_pct / 100.0) * 100.0) / 100.0,
+    )
+
+    mode_badge = "🚀진성추세추종(-0.20%)" if is_trend_pb_regime else "⚡기술적반등(-0.30%)"
     trigger_sweep = False
     sweep_reason = ""
-    mode_badge = ""
 
-    if is_trend_pb_regime:
-        # [3단계-B : 진성 상승종목 / 수동 매수 추세추종 매도 모드 (🚀 PEAK_LCK_130 × 📊 BAR_BEAR_020)]
-        mode_badge = "🚀진성추세추종(-0.20%)"
-        if is_bar_bear or effective_ha_bear:
-            tr_state["bear_candle_seen"] = True
-
-        bear_seen = bool(tr_state.get("bear_candle_seen", False))
-        cushion_floor = math.ceil(float(avg_price) * (1.0 + TREND_PB_CUSHION_FLOOR_RATE / 100.0) * 100.0) / 100.0
-
-        if peak_pct < TREND_PB_LAUNCH_RATCHET_PCT and not bear_seen and not is_bar_bear and is_ha_bull:
-            effective_stop_p = cushion_floor
-            tr_state["floor_price"] = cushion_floor
-            tr_state["stop_price"] = effective_stop_p
-            if live_p <= effective_stop_p:
-                trigger_sweep = True
-                sweep_reason = f"초입 비상 쿠션(${effective_stop_p:.2f}) 도달"
-        else:
-            floor_price = arm_price
-            raw_cb_stop = math.floor(peak_price * (1.0 - TREND_PB_CALLBACK_PCT / 100.0) * 100.0) / 100.0
-            effective_stop_p = max(floor_price, raw_cb_stop)
-            tr_state["floor_price"] = floor_price
-            tr_state["stop_price"] = effective_stop_p
-
-            if live_p <= effective_stop_p:
-                trigger_sweep = True
-                sweep_reason = f"고점(${peak_price:.2f}) 대비 -0.20% 타이트 스탑(${effective_stop_p:.2f}) 도달"
-            elif effective_ha_bear and (cur_hm != armed_hm or elapsed_arm >= 8.0 or peak_pct >= 1.30):
-                trigger_sweep = True
-                sweep_reason = f"하이킨 아시 1분봉 음봉 전환(🌑HA음봉 · 경유고점 ${peak_price:.2f})"
-    else:
-        # [3단계-A : 기술적 반등 매도 모드 (⚡ OLD_IMM_CB)]
-        mode_badge = "⚡기술적반등(-0.30%)"
-        floor_price = arm_price
-        raw_cb_stop = math.floor(peak_price * (1.0 - TRAIL_DROP_CALLBACK_PCT / 100.0) * 100.0) / 100.0
-        effective_stop_p = max(floor_price, raw_cb_stop)
-        tr_state["floor_price"] = floor_price
-        tr_state["stop_price"] = effective_stop_p
-
-        can_check_cb = bool(cur_hm != armed_hm or elapsed_arm >= 8.0 or peak_pct >= 1.15 or live_p < floor_price)
-        if can_check_cb and live_p <= effective_stop_p:
+    # [핵심 판정 1] 🌑HA음봉 전환 + 최고가 대비 콜백(-0.30% / -0.20%) 동시 도달 시 정밀 익절 스윕!
+    if effective_ha_bear and live_p <= effective_stop_p:
+        trigger_sweep = True
+        sweep_reason = (
+            f"🌑HA음봉 전환 + 고점(${peak_price:.2f}) 대비 -{active_cb_pct:.2f}% 콜백 스탑(${effective_stop_p:.2f}) 도달"
+        )
+    # [핵심 판정 2] 🕯️HA양봉 유지 중에는 일반 콜백(-0.20%/-0.30%)을 100% 유예하고 홀딩하되,
+    #               비상 쿠션(+0.75%) 또는 +1.30% 돌파 후 최소 보존선(+1.00%) / 플래시 크래시 가드 이탈 시에만 수익 보호!
+    elif not effective_ha_bear:
+        if live_p <= cushion_floor:
             trigger_sweep = True
-            sweep_reason = f"고점(${peak_price:.2f}) 대비 콜백 스탑(${effective_stop_p:.2f}) 도달"
-        elif effective_ha_bear and (cur_hm != armed_hm or elapsed_arm >= 8.0 or peak_pct >= 1.15):
+            sweep_reason = f"초입 비상 쿠션 보존선(${cushion_floor:.2f}, +{TREND_PB_CUSHION_FLOOR_RATE:.2f}%) 도달 보호"
+        elif ratchet_locked and live_p <= arm_price:
             trigger_sweep = True
-            sweep_reason = f"하이킨 아시 1분봉 음봉 전환(🌑HA음봉 · 경유고점 ${peak_price:.2f})"
+            sweep_reason = f"+1.30% 돌파 후 최소 익절 보존선(${arm_price:.2f}, +1.00%) 도달 수익 잠금"
+        elif ratchet_locked and live_p <= hard_wick_stop:
+            trigger_sweep = True
+            sweep_reason = f"🕯️HA양봉 중 급락 하드 세이프티 가드(-{hard_guard_pct:.2f}%, ${hard_wick_stop:.2f}) 도달 수익 보호"
 
     if not trigger_sweep:
         return False
@@ -1220,8 +1245,8 @@ async def manage_mechanical_profit_trap_plugin(
         best_bid = await ctx.client.get_best_bid_price(symbol, fallback_price=live_p)
         raw_sweep_p = best_bid if best_bid > 0.0 else (math.floor(live_p * 100.0) / 100.0)
 
-        floor_lock_p = float(tr_state.get("floor_price", arm_price) or arm_price)
-        if live_p >= arm_price * 0.997:
+        floor_lock_p = float(tr_state.get("floor_price", cushion_floor) or cushion_floor)
+        if live_p >= floor_lock_p * 0.997:
             sweep_price = max(floor_lock_p, raw_sweep_p)
         else:
             sweep_price = raw_sweep_p
