@@ -7,6 +7,7 @@
 #           07:00 ~ 08:14 EST 후반 황금 구간에 해당 상승 종목이 RSI<=35.0 도달 시 추세추종 저가 매수(🚀 PB_0700_35)
 #       무한 출동 듀얼 스나이퍼(SOXS/SOXL), 3차 손절 후 최저점 역트레일링 +0.30% 반등 재진입(🪤 RE_BOT_TRAIL),
 #       진입 성격별 '이원화 매도 믹스(기술적 반등 ⚡ OLD_IMM_CB × 진성 상승종목 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020 × 🚀 NQ_VEL_BYPASS)',
+#       매수 체결 직후 잔고 인덱싱 시차 중 자동 진입 물량의 MANUAL 오분류 원천 차단(초과 Case 100),
 #       15:00 ~ 15:58 EST 장마감 1시간 전 미익절 물량 VWAP 도달 탈출(🛟 VWAP_ESCAPE) 정산 및 통합 실수익 복리 정산 코어
 # =====================================================================
 # MODIFIED: 제3헌법 및 초과 Case 88 의거 매크로 3단 방어·08:15 선제 컷오프·15:00 VWAP 탈출·15:59 MOC 청산 모듈을 defense_plugin.py로 분리 및 리익스포트 결속
@@ -26,6 +27,8 @@
 #      07:00 ~ 08:14 EST 해당 상승 종목 RSI <= 35.0 도달 시 추세추종 저가 매수(PRE_PULLBACK) + 조건부 30초 타임쉴드(RSI > 35.0 반등 정정) 결합
 # NEW: 초과 Case 98 — 정규장 마감 1시간 전(15:00 ~ 15:58 EST) 미익절 물량 VWAP 도달 즉시 덤핑 탈출(execute_late_regular_vwap_escape_plugin) 리익스포트 및 정산 연동
 # NEW: 초과 Case 99 — 기술적 반등(PRE_SNIPER : ⚡ OLD_IMM_CB [-0.30% 콜백]) × 진성 상승종목 추세추종(PRE_PULLBACK : 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020 [초입 +1.30% 전 양봉 홀딩 후 -0.20% 타이트 스탑]) 이원화 매도 믹스 탑재
+# NEW: 초과 Case 100 — 매수 주문 FILLED(또는 filledQuantity > 0) 직후 토스 잔고 API 인덱싱 시차(0.1~0.4초) 동안
+#      reconcile_zero_holdings_exit_plugin이 장부를 매수 취소로 오판해 초기화함으로써 자동 진입 물량이 MANUAL(수동 진입 · 2차 방어 패스)로 둔갑하는 경합 버그 원천 소각
 # MODIFIED: 04:07 ~ 08:14 EST 중 NQ=F < 2.0% 내 3차 역행 손절 후 최저점 역트레일링 +0.30% 양봉 반등 재진입(RE_BOT_TRAIL) 가동 (Case 87)
 # MODIFIED: 통합 시드 풀(Unified Seed Pool) 기반 실제 발생 순수익금((실제매도가-실제매수가)*체결수량 - 수수료 0.14%) 복리 정산 동기화 (Case 76)
 
@@ -184,7 +187,7 @@ async def execute_rsi_monitoring_plugin(
 
 # 하이킨 아시 트레일링 익절(+1.00% ~ +5.00%+), 15:00~15:58 VWAP 탈출(VWAP_ESCAPE), 3차 손절 후 최저점 역트레일링 전환(STAGE3_STOP_TRACK) 및 모든 청산 시
 # 실제 발생 순수익금((실제매도가 - 실제매수가) * 체결수량 - 왕복수수료 0.14%) 복리 정산 및
-# 프리장 골든타임(04:00 ~ 08:14 EST) 내 조건 충족 시 양쪽 장부 동시 재출동 락 해제 (Case 52, 76, 80, 84, 87, 94, 95, 97, 98, 99)
+# 프리장 골든타임(04:00 ~ 08:14 EST) 내 조건 충족 시 양쪽 장부 동시 재출동 락 해제 (Case 52, 76, 80, 84, 87, 94, 95, 97, 98, 99, 100)
 async def reconcile_zero_holdings_exit_plugin(
     ctx: SniperPluginContext,
     symbol: str,
@@ -200,9 +203,19 @@ async def reconcile_zero_holdings_exit_plugin(
     if buy_order_id:
         try:
             od = await ctx.client.get_order_detail(buy_order_id)
-            st = od.get("status", "")
-            if st in ["PENDING", "PARTIAL_FILLED", "PENDING_CANCEL", "PENDING_REPLACE"]:
+            st = str(od.get("status") or "")
+            exec_info_b = od.get("execution") or {}
+            filled_q_b = float(exec_info_b.get("filledQuantity") or 0.0)
+
+            # MODIFIED: 초과 Case 100 — 매수 주문이 PENDING / PARTIAL_FILLED / REPLACED 상태일 뿐만 아니라,
+            # 방금 전량 체결(status == "FILLED" 또는 filledQuantity > 0)되었는데 아직 토스 잔고 API 인덱싱 시차(0.1~0.4초)로 인해
+            # holdings_qty == 0 으로 조회되고 안전 캡 매도 주문(sell_order_id) 및 평단가(last_buy_price)가 결속되기 전이라면,
+            # 절대 장부를 매수 취소로 오판해 지우지 않고 보호(can_clear = False)하여 MANUAL(수동 진입) 둔갑 사고를 100% 원천 차단!
+            if st in ["PENDING", "PARTIAL_FILLED", "PENDING_CANCEL", "PENDING_REPLACE", "REPLACED"]:
                 can_clear = False
+            elif (st == "FILLED" or filled_q_b > 0.0) and not sell_order_id and last_buy_price <= 0.0:
+                can_clear = False
+                ctx.wakeup_event.set()
         except Exception:
             can_clear = False
 
@@ -1265,7 +1278,7 @@ async def rearm_premarket_buy_trap_after_30s_plugin(
         ctx.in_memory_ordering_lock[symbol] = False
 
 
-# MODIFIED: 초과 Case 58, 79, 85, 89, 91, 92, 93, 94, 95, 97, 99 —
+# MODIFIED: 초과 Case 58, 79, 85, 89, 91, 92, 93, 94, 95, 97, 99, 100 —
 #           진입 성격별 '이원화 매도 믹스 (Dual-Regime Mixed Exit)' :
 #           1) 기술적 반등(PRE_SNIPER / PRE_SNIPER_REARM) : ⚡ OLD_IMM_CB (+1.00% 보존 고정 & 고점 대비 -0.30% 콜백/HA음봉 스윕)
 #           2) 진성 상승종목 추세추종(PRE_PULLBACK / PRE_PULLBACK_REARM / 상승주도주 MANUAL) :
@@ -1666,7 +1679,7 @@ async def manage_mechanical_profit_trap_plugin(
                             skip_trap = True
                         else:
                             is_rearm = False
-                    elif status in ["CANCELED", "REJECTED"]:
+                    elif status in ["CANCELED", "REJECTED", "REPLACED"]:
                         is_rearm = False
                     else:
                         skip_trap = True
@@ -1752,9 +1765,12 @@ async def manage_mechanical_profit_trap_plugin(
                     eff_nq_p = ref_p_now if ref_p_now > 0.0 else saved_nq_p
                     eff_nq_a = nq_amp_now if nq_amp_now > 0.0 else saved_nq_a
 
+                    # 초과 Case 100 — 상단 안전 캡 매도 주문(new_sell_id) 및 평단가(price=avg_price) 결속 시
+                    # entry_session(PRE_SNIPER / PRE_SNIPER_REARM / PRE_PULLBACK / PRE_PULLBACK_REARM 등)은 그대로 유지하고
+                    # 체결 완료된 buy_order_id는 깔끔히 비워 정산 시 불필요한 매수 상세 조회를 방지
                     kwargs = {
                         "price": avg_price, "target_sell_price": ledger_target_price,
-                        "sell_order_id": new_sell_id, "is_session_done": True,
+                        "buy_order_id": "", "sell_order_id": new_sell_id, "is_session_done": True,
                         "nq_entry_price": eff_nq_p, "nq_entry_amp": eff_nq_a,
                     }
 
@@ -1826,7 +1842,7 @@ async def manage_mechanical_profit_trap_plugin(
                 else:
                     if is_manual_trap:
                         mark_manual_stage3_anchored(symbol, new_sell_id)
-                    await AssassinLedger.save_state(symbol, sell_order_id=new_sell_id)
+                    await AssassinLedger.save_state(symbol, buy_order_id="", sell_order_id=new_sell_id)
 
                 ctx.idempotency_keys[symbol]["TRAP"] = None
                 runtime_state["last_trap_error_msg"] = ""

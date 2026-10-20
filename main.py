@@ -8,6 +8,7 @@
 #       무한 출동 듀얼 스나이퍼(SOXS/SOXL),
 #       진입 성격별 '이원화 매도 믹스(기술적 반등 ⚡ OLD_IMM_CB × 진성 상승종목 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020 × 🚀 NQ_VEL_BYPASS)',
 #       3차 손절 후 최저점 역트레일링 +0.30% 반등 재진입(RE_BOT_TRAIL),
+#       매수 체결 직후 잔고 인덱싱 시차 중 자동 진입 물량의 MANUAL 오분류 원천 차단(초과 Case 100),
 #       15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 물량 당일 정규장 VWAP 도달 즉시 덤핑 탈출(🛟 VWAP_ESCAPE) 및
 #       03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 오케스트레이터
 # 구조: sniper_plugin.py / defense_plugin.py / whipsaw_plugin.py 3대 전술 플러그인과 SniperPluginContext로 결속된 아키텍처
@@ -16,12 +17,14 @@
 # MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30 ~ 17:00 EST로 전면 확장 (Case 07)
 # MODIFIED: SOXS 및 SOXL 양방향 대칭 클라이맥스 및 추세추종 눌림목 듀얼 감시 루프(TRADE_SYMBOLS = ("SOXS", "SOXL")) 가동 (Case 09, 54, 71, 81, 97)
 # MODIFIED: 03:55 ~ 08:14 EST 구간 및 포지션 보유(수동 포함)/트레일링 점화/최저점 추적 중 5.0초 듀얼 캔들 스캔 가속 및
-#           정규장 후반(14:55 ~ 15:58 EST) 보유 중 2페이지(최대 400분봉) 페이지네이션 스캔으로 09:30 EST 개장 첫 봉부터 누락 없는 정규장 누적 VWAP 산출 (Case 73, 84, 85, 87, 98)
+#           정규장 후반(12:50 ~ 15:58 EST) 보유 중 2페이지(최대 400분봉) 페이지네이션 스캔으로 09:30 EST 개장 첫 봉부터 누락 없는 정규장 누적 VWAP 산출 (Case 73, 84, 85, 87, 98)
 # MODIFIED: 6대 0.4초 고주파 부스터(1차 매수덫 대기 · RSI>=79.0 프리-클라이맥스 · 07:00~08:14 상승종목 RSI<=38.0 근접 · HA트레일링 점화/근접 · 3차 손절 후 최저점 추적 · 15:00~15:58 미익절 VWAP 탈출 감시) 자동 가속 (Case 28, 83, 85, 87, 97, 98)
 # NEW: 수동 진입(MANUAL) 첫 틱 감지 시 execute_macro_defense_plugin과 로컬 상태를 즉시 동기화하여 NQ>=2.0% 구간에서도 2차 방어 패스 후 3차 안전망 & HA트레일링 직결 (Case 50, 66, 67, 86)
 # NEW: 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 역행 손절 후 최저점 역트레일링 +0.30% 양봉 반등 재진입(execute_post_stop_bottom_rebound_plugin) 결속 (Case 87)
 # NEW: 초과 Case 97 — 04:07 ~ 08:14 EST 첫 RSI>=79.9 상승 추세 종목(leader_sym) 실시간 틱 각인·복원 및 07:00 ~ 08:14 EST RSI<=35.0 추세추종 타격 게이트 결속
 # NEW: 초과 Case 98 & Case 99 — 15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 보유 물량 당일 정규장 VWAP 도달 즉시 덤핑 탈출(execute_late_regular_vwap_escape_plugin) 및 이원화 매도 믹스 연동
+# NEW: 초과 Case 100 — rearm_premarket_buy_trap_after_30s_plugin 실행 직후 실잔고(holdings_qty)를 즉시 재조회 동기화하여,
+#      재장전 정정 주문이 즉시 체결되었을 때 reconcile_zero_holdings_exit_plugin 오진입 없이 동일 틱 내 안전 캡 장전으로 직행하도록 방어
 # MODIFIED: 프리장 본진 신규 진입·무한 재출동·자가 치유(Self-Healing) 허용 구간을 04:07 ~ 08:14 EST로 락온 및 08:15 EST 거시지표 선제 컷오프 결속 (Case 48, 52, 53, 71, 84)
 # MODIFIED: 수동 매매·1주 휩소 작전·장마감 1시간 전 VWAP 탈출·본진 하이킨 아시 트레일링 청산 시 실제 보유 수량(last_known_qty) 추적 및 통합 복리 정산 연동 (Case 76)
 # MODIFIED: 시스템 기동 완료 텔레그램 메시지를 "정상작동 중입니다." 단일 라인으로 슬림화 유지 (Case 38, 88)
@@ -241,8 +244,8 @@ async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
                 candles = list(data.get("candles") or [])
                 next_before = data.get("nextBefore")
 
-                # NEW: 초과 Case 98 — 정규장 후반(14:55 ~ 15:58 EST, 정규장 총 390분)에 보유 포지션이 존재할 때는
-                #      2페이지(최대 400분봉)까지 페이지네이션 조회하여 09:30 EST 개장 첫 봉부터 누락 없는 정규장 누적 VWAP을 산출!
+                # 초과 Case 98 — 정규장 후반(12:50 ~ 15:58 EST, 정규장 총 390분)에 보유 포지션이 존재할 때는
+                # 2페이지(최대 400분봉)까지 페이지네이션 조회하여 09:30 EST 개장 첫 봉부터 누락 없는 정규장 누적 VWAP을 산출!
                 if (
                     candles
                     and next_before
@@ -632,8 +635,8 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 nq_entry_price = st_sync[10]
                 nq_entry_amp = st_sync[11]
 
-            # NEW: 초과 Case 98 — 정규장 장마감 1시간 전(15:00 ~ 15:58 EST)까지 +1.00% 익절하지 못한
-            #      미익절 표류 물량이 당일 정규장 누적 VWAP 가격에 도달하면 즉시 덤핑 탈출 스윕!
+            # 초과 Case 98 — 정규장 장마감 1시간 전(15:00 ~ 15:58 EST)까지 +1.00% 익절하지 못한
+            # 미익절 표류 물량이 당일 정규장 누적 VWAP 가격에 도달하면 즉시 덤핑 탈출 스윕!
             if is_active and is_late_reg_vwap_window and holdings_qty > 0:
                 vwap_escaped = await execute_late_regular_vwap_escape_plugin(
                     ctx=ctx,
@@ -695,7 +698,14 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     if buy_order_id:
                         try:
                             od = await ctx.client.get_order_detail(buy_order_id)
-                            if od.get("status") in ["PENDING", "PARTIAL_FILLED"]:
+                            st_od = str(od.get("status") or "")
+                            exec_od = od.get("execution") or {}
+                            fq_od = float(exec_od.get("filledQuantity") or 0.0)
+                            # MODIFIED: 초과 Case 100 — 세션 전이 시에도 매수 주문이 PENDING/PARTIAL/REPLACED 상태이거나
+                            # 방금 FILLED(또는 filledQuantity > 0)되어 아직 안전 캡 매도 주문(sell_order_id)이 장전되기 전이면 초기화 금지!
+                            if st_od in ["PENDING", "PARTIAL_FILLED", "PENDING_CANCEL", "PENDING_REPLACE", "REPLACED"]:
+                                can_reset = False
+                            elif (st_od == "FILLED" or fq_od > 0.0) and not sell_order_id and last_buy_price <= 0.0:
                                 can_reset = False
                         except Exception:
                             can_reset = False
@@ -920,6 +930,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                 and buy_order_id
                 and entry_session in ("PRE_SNIPER", "PRE_PULLBACK")
             ):
+                prev_es_before_rearm = entry_session
                 buy_order_id, entry_session = await rearm_premarket_buy_trap_after_30s_plugin(
                     ctx=ctx,
                     symbol=symbol,
@@ -932,8 +943,20 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     current_price=current_price,
                     rsi_val=live_rsi_val,
                 )
+                # NEW: 초과 Case 100 ③ — 30초 타임쉴드 해제 및 현재가 상향 정정(또는 부분체결 확정) 직후
+                # 거래소에서 즉시 체결된 물량을 놓치지 않고 동기화하기 위해 실잔고(holdings_detail)를 즉시 재조회!
+                if entry_session != prev_es_before_rearm or not buy_order_id:
+                    try:
+                        holdings_detail = await ctx.client.get_symbol_holdings_detail(symbol)
+                        holdings_qty = int(math.floor(holdings_detail["qty"]))
+                        ctx.shared_holdings[symbol] = holdings_qty
+                        if holdings_qty > 0:
+                            runtime_state["last_known_qty"] = holdings_qty
+                            avg_price_dump = float(holdings_detail.get("avg_price", 0.0)) or last_buy_price
+                    except Exception:
+                        pass
 
-            # 목표 3·4 & 초과 Case 46, 49, 51, 52, 76, 84, 87, 97, 98: 잔고 0주 복귀 시 통합 실수익 복리 정산 및 08:14 EST까지 재출동 릴리스
+            # 목표 3·4 & 초과 Case 46, 49, 51, 52, 76, 84, 87, 97, 98, 100: 잔고 0주 복귀 시 통합 실수익 복리 정산 및 08:14 EST까지 재출동 릴리스
             if holdings_qty == 0 and (
                 target_sell_price > 0.0 or buy_order_id or sell_order_id or last_buy_price > 0.0
             ):
@@ -1056,7 +1079,7 @@ async def assassin_loop(ctx: SniperPluginContext, symbol: str):
                     opp_rsi_val=opp_live_rsi_val,
                 )
 
-            # 목표 4 & 초과 Case 50, 58, 64, 85, 97, 99: 매수 전량 체결(본진 및 수동 진입 공통) 확인 즉시 상단 안전 캡(+5.00%) 선장전 및
+            # 목표 4 & 초과 Case 50, 58, 64, 85, 97, 99, 100: 매수 전량 체결(본진 및 수동 진입 공통) 확인 즉시 상단 안전 캡(+5.00%) 선장전 및
             # +1.00% 도달 시 진입 성격별 이원화 하이킨 아시 트레일링(기술적 반등 ⚡ OLD_IMM_CB × 진성 상승종목 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020) 0.1초 즉시 정정 스윕 가동
             await manage_mechanical_profit_trap_plugin(
                 ctx=ctx,
