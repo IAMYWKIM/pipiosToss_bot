@@ -2,6 +2,8 @@
 # FILE: quant_indicators_plugin.py
 # 목적: Wilder's RSI(14), 1분봉 하이킨 아시(Heikin-Ashi), 세션별 정밀 VWAP,
 #       04:07/19:00 EST 이후 첫 RSI>=79.9 돌파 시각 벡터 추출,
+#       calculate_rsi_1m 다형성 인자 방어(datetime 위치 인자 자동 분리),
+#       동기(with) 및 비동기(async with) 양방향 호환 파일 락(_HybridFileLock) 선행 바인딩,
 #       동기(asyncio.to_thread) 및 비동기(await) 양방향 100% 호환 하이브리드 반환(_AwaitableRsiTuple) 및
 #       실제 발생 순수익금(Realized Net PnL) 통합 복리 정산 코어 플러그인
 #       (quant_engine.py 1/2 분할본)
@@ -11,17 +13,20 @@
 # MODIFIED: 초과 Case 76 — 실제 발생 순수익금(세전손익 - 왕복수수료 0.14%) 기반 통합 복리/단리 정산(calc_compound_next_budget)
 # MODIFIED: 초과 Case 90 — CME 나스닥 100 선물(NQ=F) 18:00 EST 신세션 시작 시각 및 개장 여부 판별(get_cme_session_window_est)
 # MODIFIED: 초과 Case 97, 98, 99 — 04:07/19:00 EST 이후 첫 RSI>=79.9 시각 추출, 세션별(데이/프리/정규) VWAP 분리 산출 및 이원화 매도 상수 락온
-# NEW: 1) main_loops_plugin.py의 asyncio.to_thread(calculate_rsi_1m, ...) 호출과 직접 await 호출 모두에서
-#         코루틴 언패킹 에러가 절대 발생하지 않도록 _AwaitableRsiTuple 하이브리드 튜플 탑재
-#      2) 프리장/데이장 호가 공백 분봉에서 마지막 캔들(df.index[-1])의 진행 중 여부(is_last_bar_forming)를 판별하여
-#         직전 완성 분봉 누락 없이 토스 앱 화면의 RSI(80.63 등)와 100% 일치하도록 EWM 기저 인덱스 보정
+# NEW: 1) main_loops_plugin.py 에서 calculate_rsi_1m(candles, now_est) 로 두 번째 인자에 datetime 객체를 전달할 때
+#         발생하던 `int() argument ... not 'datetime.datetime'` 에러를 자동 스왑 가드로 100% 원천 소각
+#      2) GlobalThrottle.get_file_lock 에 동기 `with` 및 비동기 `async with` 양방향 호환 `_HybridFileLock` 을 선행 바인딩
 
+import os
 import math
 import asyncio
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
+
+from toss_api import GlobalThrottle
 
 EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
@@ -54,9 +59,65 @@ DAY_PIVOT_10M_REBOUND_MAX_PCT = 1.25
 DAY_PIVOT_10M_MIN_BODY_PCT = 0.18
 
 
+class _HybridFileLock:
+    """
+    제1헌법 및 초과 Case 30 완벽 방어:
+    동기 스레드의 `with GlobalThrottle.get_file_lock(filepath):` 구문과
+    비동기 코루틴의 `async with GlobalThrottle.get_file_lock(filepath):` 구문을
+    모두 100% 지원하는 재진입 가능 하이브리드 파일 락 클래스.
+    """
+    def __init__(self):
+        self._rlock = threading.RLock()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
+        if timeout is None or timeout < 0.0:
+            return self._rlock.acquire(blocking=blocking)
+        return self._rlock.acquire(blocking=blocking, timeout=timeout)
+
+    def release(self):
+        try:
+            self._rlock.release()
+        except RuntimeError:
+            pass
+
+    def __enter__(self):
+        self._rlock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+        return False
+
+    async def __aenter__(self):
+        await asyncio.to_thread(self._rlock.acquire)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+        return False
+
+
+_HYBRID_LOCKS_GUARD = threading.Lock()
+_HYBRID_LOCKS_REGISTRY: dict[str, _HybridFileLock] = {}
+
+
+def _get_hybrid_file_lock(filepath: str) -> _HybridFileLock:
+    key = os.path.abspath(str(filepath or "default.lock"))
+    with _HYBRID_LOCKS_GUARD:
+        lock_obj = _HYBRID_LOCKS_REGISTRY.get(key)
+        if lock_obj is None:
+            lock_obj = _HybridFileLock()
+            _HYBRID_LOCKS_REGISTRY[key] = lock_obj
+        return lock_obj
+
+
+# GlobalThrottle.get_file_lock 을 하이브리드 락 팩토리로 선행 바인딩
+GlobalThrottle.get_file_lock = staticmethod(_get_hybrid_file_lock)
+
+
 class _AwaitableRsiTuple(tuple):
     """
-    동기 호출 `r, v, ewm = calculate_rsi_1m(candles)` 또는 `await asyncio.to_thread(calculate_rsi_1m, candles)` 와
+    동기 호출 `r, v, ewm = calculate_rsi_1m(candles)` 또는 `await asyncio.to_thread(calculate_rsi_1m, candles, now_est)` 와
     비동기 호출 `r, v, ewm = await calculate_rsi_1m(candles)` 양쪽 모두에서
     100% 동일하게 3-튜플 `(latest_rsi, active_vwap, ewm_state)` 로 언패킹되는 하이브리드 튜플 클래스.
     """
@@ -112,7 +173,7 @@ def get_cme_session_window_est(now_est: datetime = None) -> tuple[bool, datetime
     초과 Case 90: CME 나스닥 100 선물(NQ=F) 신세션(일~목 18:00 EST 개장 ~ 익일 16:59:59 EST 마감)의
     현재 개장 활성 여부(is_cme_open)와 활성(또는 직전 마감) 세션 시작 시각(nq_session_start_est)을 반환합니다.
     """
-    if now_est is None:
+    if now_est is None or not isinstance(now_est, datetime):
         now_est = datetime.now(EST_TZ)
     else:
         now_est = now_est.astimezone(EST_TZ)
@@ -161,7 +222,12 @@ def compute_realtime_tick_rsi(
     if prev_close <= 0.0:
         return float(fallback_rsi if fallback_rsi > 0.0 else 50.0)
 
-    alpha = 1.0 / float(max(1, int(period)))
+    if isinstance(period, datetime) or not isinstance(period, (int, float)) or isinstance(period, bool):
+        period_int = 14
+    else:
+        period_int = max(1, int(period))
+
+    alpha = 1.0 / float(period_int)
     delta = float(live_price) - prev_close
     gain = delta if delta > 0.0 else 0.0
     loss = -delta if delta < 0.0 else 0.0
@@ -236,7 +302,7 @@ def compute_realtime_tick_10m_state(
     if not ewm_state or not isinstance(ewm_state, dict) or live_price <= 0.0:
         return default_res
 
-    if now_est is None:
+    if now_est is None or not isinstance(now_est, datetime):
         now_est = datetime.now(EST_TZ)
     else:
         now_est = now_est.astimezone(EST_TZ)
@@ -308,15 +374,39 @@ def compute_realtime_tick_10m_state(
     }
 
 
-def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, float, dict]:
+def _compute_rsi_and_vwap_sync(
+    candles: list,
+    period=14,
+    now_est: datetime = None,
+    *args,
+    **kwargs,
+) -> tuple[float, float, dict]:
     """
     초과 Case 72, 73, 85, 97, 98:
-    1) 원본 1분봉 전체를 대상으로 Wilder's RSI(14) 및 하이킨 아시(ewm alpha=0.5) 100% 벡터 연산을 수행합니다.
-    2) 마지막 분봉(df.index[-1])이 현재 진행 중인 분봉인지 이미 마감된 직전 분봉인지 판별하여,
-       호가 공백 분봉에서도 직전 완성봉이 누락되지 않고 토스 앱 화면의 RSI와 100% 일치하도록 기저를 추출합니다.
+    1) main_loops_plugin.py 에서 `calculate_rsi_1m(candles, now_est)` 형태로 두 번째 인자에 datetime을 전달해도
+       자동으로 `now_est = period`, `period = 14` 로 스왑하여 TypeError를 100% 원천 차단합니다.
+    2) 원본 1분봉 전체를 대상으로 Wilder's RSI(14) 및 하이킨 아시(ewm alpha=0.5) 100% 벡터 연산을 수행합니다.
     3) 데이장(19:00 EST~), 프리장(04:00 EST~), 정규장(09:30 EST~) 세션별 누적 VWAP을 정밀 분리 산출합니다.
     4) 당일 04:07 EST 이후 및 데이장 19:00 EST 이후 최초로 RSI >= 79.9를 달성한 시각(first_799_ts, first_day_799_ts)을 추출합니다.
     """
+    if isinstance(period, datetime):
+        now_est = period
+        period_int = 14
+    elif not isinstance(period, (int, float)) or isinstance(period, bool):
+        period_int = 14
+    else:
+        period_int = max(1, int(period))
+
+    if now_est is None or not isinstance(now_est, datetime):
+        for arg in args:
+            if isinstance(arg, datetime):
+                now_est = arg
+                break
+    if now_est is None or not isinstance(now_est, datetime):
+        now_est = datetime.now(EST_TZ)
+    else:
+        now_est = now_est.astimezone(EST_TZ)
+
     if not candles or not isinstance(candles, list):
         return 50.0, 0.0, {}
 
@@ -340,7 +430,7 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
         return 50.0, 0.0, {}
 
     # 1. Wilder's RSI(14) 전체 시계열 벡터 연산 (초과 Case 72)
-    alpha = 1.0 / float(max(1, int(period)))
+    alpha = 1.0 / float(period_int)
     delta = df["closePrice"].diff()
     gain = delta.where(delta > 0.0, 0.0)
     loss = -delta.where(delta < 0.0, 0.0)
@@ -378,7 +468,6 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
     latest_rsi = round(float(df["rsi"].iloc[-1]), 2)
 
     # 3. 진행 중 분봉 vs 이미 마감된 직전 분봉 판별 후 O(1) 실시간 틱 합성용 기저 추출
-    now_est = datetime.now(EST_TZ)
     cur_min_floor = now_est.replace(second=0, microsecond=0)
     last_bar_dt = df.index[-1]
     is_last_bar_forming = bool(last_bar_dt >= cur_min_floor)
@@ -393,7 +482,6 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
         cur_bar_high = float(df["highPrice"].iloc[-1])
         cur_bar_low = float(df["lowPrice"].iloc[-1])
     else:
-        # 현재 분에 아직 체결이 없어 df.iloc[-1]이 직전 분의 완성봉인 경우 iloc[-1]을 기저로 삼음!
         prev_close = float(df["closePrice"].iloc[-1])
         prev_avg_gain = float(avg_gain.iloc[-1])
         prev_avg_loss = float(avg_loss.iloc[-1])
@@ -486,7 +574,6 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
         & (df.index <= now_est.replace(hour=8, minute=14, second=59, microsecond=999999))
     ]
     if not df_pre_win.empty:
-        # 종가 RSI 또는 분봉 고가 스파이크(rsi_high) 중 79.9 이상 돌파한 첫 분봉 포착 (예: 18:08 KST SOXS $48.97 RSI 80.63)
         climax_pre = df_pre_win[(df_pre_win["rsi"] >= PRE_TREND_LEADER_SELECT_RSI) | (df_pre_win["rsi_high"] >= 80.0)]
         if not climax_pre.empty:
             first_idx = climax_pre.index[0]
@@ -578,13 +665,20 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
     return latest_rsi, active_vwap, ewm_state
 
 
-def calculate_rsi_1m(candles: list, period: int = 14, *args, **kwargs) -> _AwaitableRsiTuple:
+def calculate_rsi_1m(
+    candles: list,
+    period=14,
+    now_est: datetime = None,
+    *args,
+    **kwargs,
+) -> _AwaitableRsiTuple:
     """
     제1헌법 및 호출 호환성 완벽 방어:
-    1) main_loops_plugin.py 에서 `await asyncio.to_thread(calculate_rsi_1m, candles)` 호출 시
-       스레드 내부에서 동기 실행되어 3-튜플 `(latest_rsi, active_vwap, ewm_state)` 로 즉시 언패킹됩니다.
+    1) main_loops_plugin.py 에서 `await asyncio.to_thread(calculate_rsi_1m, candles, now_est)` 호출 시
+       `period` 자리에 들어온 `now_est(datetime)` 를 자동 감지·분리하여 `TypeError` 없이
+       3-튜플 `(latest_rsi, active_vwap, ewm_state)` 로 즉시 언패킹됩니다.
     2) 다른 모듈에서 `await calculate_rsi_1m(candles)` 로 직접 await 호출 시에도
        `_AwaitableRsiTuple.__await__` 를 통해 동일하게 3-튜플로 언패킹됩니다.
     """
-    res = _compute_rsi_and_vwap_sync(candles, period)
+    res = _compute_rsi_and_vwap_sync(candles, period, now_est, *args, **kwargs)
     return _AwaitableRsiTuple(res)

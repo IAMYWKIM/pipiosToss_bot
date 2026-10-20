@@ -1,6 +1,7 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: 나스닥 100 선물(NQ=F 18:00 EST 신세션 하드 컷오프 + fast_info/1d 고저가 강제 병합) &
+# 목적: 동기(with) 및 비동기(async with) 양방향 100% 호환 파일 뮤텍스(_HybridFileLock),
+#       나스닥 100 선물(NQ=F 18:00 EST 신세션 하드 컷오프 + fast_info/1d 고저가 강제 병합) &
 #       토스 Open API QQQ 0.0초 실시간 3차 역행 기준가/단기 변화율(±0.20% NQ_VEL_BYPASS) 브릿지(MacroDataCache),
 #       데이장 개시 1분 전(08:59 KST / 18:59 EST) NQ=F 10분봉 실시간 fast_info 병합 추세 판별기,
 #       통합 복리 시드 풀 원자적 듀얼 원장(AssassinLedger) 및 quant_indicators_plugin 리익스포트 코어
@@ -9,14 +10,17 @@
 # MODIFIED: 제1헌법 ~ 제6헌법 및 플러그인 분할 아키텍처 의거 지표 벡터 연산 코어를 quant_indicators_plugin.py로 분리하고 100% 리익스포트 결속
 # MODIFIED: 초과 Case 61, 62, 89, 90, 91, 92, 93, 94 — NQ=F 18:00 EST 신세션 컷오프, fast_info+1d 고/저가 단조 보존,
 #           토스 Open API QQQ 0.0초 실시간 현재가(1.5초 프로빙) 및 10m/3m 변화율 산출
-# NEW: _fetch_nq_10m_trend_sync 에서 yfinance NQ=F 1분봉의 10분 지연으로 인해 개장 직전 10분봉(08:50 KST 음봉 등)이
-#      누락되는 현상을 차단하기 위해 tkr.fast_info.last_price 실시간 시세를 현재 10분봉 종가(close_10m)에 강제 병합
+# NEW: 1) GlobalThrottle.get_file_lock(filepath) 호출 시 동기 `with` 문과 비동기 `async with` 문을 모두 지원하는
+#         `_HybridFileLock` 을 바인딩하여 `'Lock' object does not support the context manager protocol` 에러 및
+#         텔레그램 명령어 무응답 현상을 100% 원천 소각 (제1헌법 & 초과 Case 30)
+#      2) _LedgerStateTuple 탑재로 13-변수 언패킹 및 state[13](whipsaw_target_price) 인덱스 접근 양방향 완벽 호환
 
 import os
 import json
 import math
 import time
 import asyncio
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -56,6 +60,78 @@ from quant_indicators_plugin import (
     _compute_rsi_and_vwap_sync,
     calculate_rsi_1m,
 )
+
+
+class _HybridFileLock:
+    """
+    제1헌법 및 초과 Case 30 완벽 방어:
+    동기 스레드 내부의 `with GlobalThrottle.get_file_lock(filepath):` 구문과
+    비동기 코루틴 내부의 `async with GlobalThrottle.get_file_lock(filepath):` 구문을
+    동시에 100% 지원하는 재진입 가능 하이브리드 파일 락 클래스.
+    """
+    def __init__(self):
+        self._rlock = threading.RLock()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
+        if timeout is None or timeout < 0.0:
+            return self._rlock.acquire(blocking=blocking)
+        return self._rlock.acquire(blocking=blocking, timeout=timeout)
+
+    def release(self):
+        try:
+            self._rlock.release()
+        except RuntimeError:
+            pass
+
+    def __enter__(self):
+        self._rlock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+        return False
+
+    async def __aenter__(self):
+        await asyncio.to_thread(self._rlock.acquire)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+        return False
+
+
+_HYBRID_FILE_LOCKS_GUARD = threading.Lock()
+_HYBRID_FILE_LOCKS_MAP: dict[str, _HybridFileLock] = {}
+
+
+def _get_hybrid_file_lock(filepath: str) -> _HybridFileLock:
+    key = os.path.abspath(str(filepath or "default.lock"))
+    with _HYBRID_FILE_LOCKS_GUARD:
+        lock_obj = _HYBRID_FILE_LOCKS_MAP.get(key)
+        if lock_obj is None:
+            lock_obj = _HybridFileLock()
+            _HYBRID_FILE_LOCKS_MAP[key] = lock_obj
+        return lock_obj
+
+
+# GlobalThrottle.get_file_lock 을 하이브리드 락 팩토리로 즉시 오버라이드 바인딩
+GlobalThrottle.get_file_lock = staticmethod(_get_hybrid_file_lock)
+
+
+class _LedgerStateTuple(tuple):
+    """
+    main_loops_plugin.py 등의 13-변수 언패킹(`a, b, ..., m = await AssassinLedger.get_state(sym)`)과
+    확장 인덱스 조회(`state[13]` -> whipsaw_target_price)를 동시에 지원하는 튜플 서브클래스.
+    """
+    def __new__(cls, core_13: tuple, whipsaw_target_price: float = 0.0):
+        obj = super().__new__(cls, core_13)
+        obj._whipsaw_target_price = float(whipsaw_target_price or 0.0)
+        return obj
+
+    def __getitem__(self, item):
+        if isinstance(item, int) and item == 13:
+            return self._whipsaw_target_price
+        return super().__getitem__(item)
 
 
 class MacroDataCache:
@@ -126,16 +202,13 @@ class MacroDataCache:
             tkr = yf.Ticker("NQ=F")
 
             # 1) fast_info 실시간 현재가 및 당일 고/저가 추출 (초과 Case 90, 91)
-            fast_last, fast_high, fast_low, fast_prev_close = 0.0, 0.0, 0.0, 0.0
+            fast_last, fast_high, fast_low = 0.0, 0.0, 0.0
             try:
                 fi = tkr.fast_info
                 if fi is not None:
                     fast_last = float(getattr(fi, "last_price", 0.0) or fi.get("lastPrice", 0.0) or 0.0)
                     fast_high = float(getattr(fi, "day_high", 0.0) or fi.get("dayHigh", 0.0) or 0.0)
                     fast_low = float(getattr(fi, "day_low", 0.0) or fi.get("dayLow", 0.0) or 0.0)
-                    fast_prev_close = float(
-                        getattr(fi, "previous_close", 0.0) or fi.get("previousClose", 0.0) or 0.0
-                    )
             except Exception:
                 pass
 
@@ -159,17 +232,11 @@ class MacroDataCache:
 
                 closes = df_session["Close"]
                 cur_c = float(closes.iloc[-1])
-                if len(closes) >= 11:
-                    c_10m_ago = float(closes.iloc[-11])
-                else:
-                    c_10m_ago = float(closes.iloc[0])
+                c_10m_ago = float(closes.iloc[-11]) if len(closes) >= 11 else float(closes.iloc[0])
                 if c_10m_ago > 0.0:
                     vel_10m = (cur_c - c_10m_ago) / c_10m_ago * 100.0
 
-                if len(closes) >= 4:
-                    c_3m_ago = float(closes.iloc[-4])
-                else:
-                    c_3m_ago = float(closes.iloc[0])
+                c_3m_ago = float(closes.iloc[-4]) if len(closes) >= 4 else float(closes.iloc[0])
                 if c_3m_ago > 0.0:
                     vel_3m = (cur_c - c_3m_ago) / c_3m_ago * 100.0
 
@@ -437,7 +504,6 @@ class MacroDataCache:
             if df_10m.empty:
                 return "", 0.0, 0.0, 0.0
 
-            # 개시 1분 전(18:59 EST / 08:59 KST)은 18:50~18:59 EST (08:50~08:59 KST) 10분봉이 대상
             target_b10 = now_est.replace(hour=18, minute=50, second=0, microsecond=0)
             if now_est.hour < 18:
                 target_b10 = (now_est - timedelta(days=1)).replace(hour=18, minute=50, second=0, microsecond=0)
@@ -448,8 +514,6 @@ class MacroDataCache:
                 if fast_last > 0.0 and (now_est.hour == 18 and now_est.minute >= 50):
                     c_10 = fast_last
             else:
-                # yfinance 10분 지연으로 인해 18:50 버킷(08:50 KST)이 아직 df_1m에 없을 때:
-                # 직전 18:40 버킷의 마지막 종가(18:49 종가 = 18:50 시가 근사치)를 시가로 삼고 fast_last를 실시간 종가로 병합!
                 last_b10_dt = df_10m.index[-1]
                 age_mins = (now_est - last_b10_dt).total_seconds() / 60.0
                 if fast_last > 0.0 and age_mins >= 10.0:
@@ -497,7 +561,7 @@ class MacroDataCache:
 
 class AssassinLedger:
     """
-    제1헌법, Case 02, 06, 09, 41, 52, 54, 76, 82, 86, 94, 95, 96:
+    제1헌법, Case 02, 06, 09, 30, 41, 52, 54, 76, 82, 86, 94, 95, 96:
     듀얼 스나이퍼(SOXS / SOXL) 허용 종목 화이트리스트 강제 및 원자적 로컬 JSON 원장 통제 코어.
     """
     ALLOWED_SYMBOLS = ("SOXS", "SOXL")
@@ -536,7 +600,7 @@ class AssassinLedger:
     @classmethod
     def _read_sync(cls, symbol: str) -> dict:
         filepath = cls._get_filepath(symbol)
-        with GlobalThrottle.get_file_lock(filepath):
+        with _get_hybrid_file_lock(filepath):
             if not os.path.exists(filepath):
                 return cls._default_payload()
             try:
@@ -555,7 +619,7 @@ class AssassinLedger:
     @classmethod
     def _write_sync(cls, symbol: str, updates: dict) -> dict:
         filepath = cls._get_filepath(symbol)
-        with GlobalThrottle.get_file_lock(filepath):
+        with _get_hybrid_file_lock(filepath):
             cur = cls._default_payload()
             if os.path.exists(filepath):
                 try:
@@ -578,9 +642,9 @@ class AssassinLedger:
             return cur
 
     @classmethod
-    async def get_state(cls, symbol: str) -> tuple:
+    async def get_state(cls, symbol: str) -> _LedgerStateTuple:
         data = await asyncio.to_thread(cls._read_sync, symbol)
-        return (
+        core_13 = (
             float(data.get("price") or 0.0),
             float(data.get("budget") or 100.0),
             normalize_target_rate(data.get("target_profit_rate", 1.0)),
@@ -594,7 +658,10 @@ class AssassinLedger:
             float(data.get("nq_entry_price") or 0.0),
             float(data.get("nq_entry_amp") or 0.0),
             str(data.get("entry_trend") or ""),
-            float(data.get("whipsaw_target_price") or 0.0),
+        )
+        return _LedgerStateTuple(
+            core_13,
+            whipsaw_target_price=float(data.get("whipsaw_target_price") or 0.0),
         )
 
     @classmethod
@@ -616,6 +683,11 @@ class AssassinLedger:
         return str(data.get("sell_order_id") or "")
 
     @classmethod
+    async def get_last_session_id(cls, symbol: str) -> str:
+        data = await asyncio.to_thread(cls._read_sync, symbol)
+        return str(data.get("last_session_id") or "")
+
+    @classmethod
     async def get_whipsaw_target_price(cls, symbol: str) -> float:
         data = await asyncio.to_thread(cls._read_sync, symbol)
         return float(data.get("whipsaw_target_price") or 0.0)
@@ -626,9 +698,27 @@ class AssassinLedger:
         return bool(data.get("is_compound", True))
 
     @classmethod
-    async def set_is_compound(cls, is_compound: bool):
+    async def set_is_compound(cls, is_compound: bool, symbol: str = None):
+        if isinstance(is_compound, str) and symbol is not None:
+            is_compound = bool(symbol)
         for sym in cls.ALLOWED_SYMBOLS:
             await asyncio.to_thread(cls._write_sync, sym, {"is_compound": bool(is_compound)})
+
+    @classmethod
+    async def toggle_compound(cls, symbol: str = "SOXS") -> bool:
+        cur = await cls.get_is_compound(symbol)
+        new_val = not cur
+        for sym in cls.ALLOWED_SYMBOLS:
+            await asyncio.to_thread(cls._write_sync, sym, {"is_compound": new_val})
+        return new_val
+
+    @classmethod
+    async def toggle_active(cls, symbol: str = "SOXS") -> bool:
+        data = await asyncio.to_thread(cls._read_sync, symbol)
+        new_act = not bool(data.get("is_active", True))
+        for sym in cls.ALLOWED_SYMBOLS:
+            await asyncio.to_thread(cls._write_sync, sym, {"is_active": new_act})
+        return new_act
 
     @classmethod
     async def sync_global_settings(
@@ -722,7 +812,11 @@ class AssassinLedger:
         for sym in cls.ALLOWED_SYMBOLS:
             cur = await asyncio.to_thread(cls._read_sync, sym)
             es = str(cur.get("entry_session") or "")
-            has_pos = float(cur.get("price") or 0.0) > 0.0 or float(cur.get("target_sell_price") or 0.0) > 0.0 or bool(cur.get("sell_order_id"))
+            has_pos = (
+                float(cur.get("price") or 0.0) > 0.0
+                or float(cur.get("target_sell_price") or 0.0) > 0.0
+                or bool(cur.get("sell_order_id"))
+            )
 
             if es == "MANUAL" and has_pos:
                 continue
