@@ -1,23 +1,27 @@
 # =====================================================================
 # FILE: main_loops_plugin.py
-# 목적: main.py (line 73~83) 필수 임포트 9대 심볼(EST_TZ, KST_TZ, TRADE_SYMBOLS,
+# 목적: main.py (line 73~83) 필수 임포트 심볼(EST_TZ, KST_TZ, TRADE_SYMBOLS,
 #       RSI_SYMBOLS, NQ_DYNAMIC_FLOOR, HOLIDAY_TRANSLATIONS, _run_git_update_sync,
 #       auto_update_loop, rsi_radar_loop) 및 assassin_loop 100% 제공,
+#       O(1) 시그니처 캐싱 기반 전술 플러그인 적응형 호출기(_call_plugin_adaptive),
 #       04:07 ~ 08:14 EST 프리장 2페이지(400분봉) 풀 스캔 기반 첫 RSI>=79.9 상승주도주(👑) 자동 복원,
 #       03:30 ~ 17:00 EST 장중 무인 업데이트 락다운(Case 07) 및 9대 코어 프리플라이트 검증(Case 11) 플러그인
 #       (main.py 1/2 분할본)
 # =====================================================================
 # NEW: 제3헌법 및 플러그인 분할 아키텍처 의거 백그라운드 레이더·자동업데이트·메인 전술 루프를 main_loops_plugin.py로 분리
-# MODIFIED: 1) main.py 에서 임포트하는 HOLIDAY_TRANSLATIONS(초과 Case 45), _run_git_update_sync(Case 11),
-#              auto_update_loop(Case 07), TRADE_SYMBOLS, RSI_SYMBOLS, NQ_DYNAMIC_FLOOR 전수 구현으로 ImportError 영구 소각
-#           2) AssassinLedger.get_state 및 calculate_rsi_1m 반환값 추출 시 고정 언패킹 대신 안전 인덱스 추출기 적용
-#           3) 초과 Case 28, 72, 73, 83, 85, 87, 93, 97, 98, 99, 100 전술 스텝 및 2페이지(400분봉) 조회 결속
+# MODIFIED: 1) `_call_plugin_adaptive(fn, **kwargs)` 탑재로 `execute_macro_defense_plugin() got an unexpected
+#              keyword argument 'entry_trend'` 등 플러그인 시그니처 불일치 TypeError 를 물리적으로 0%로 소각
+#           2) main.py 에서 임포트하는 HOLIDAY_TRANSLATIONS(초과 Case 45), _run_git_update_sync(Case 11),
+#              auto_update_loop(Case 07), TRADE_SYMBOLS, RSI_SYMBOLS, NQ_DYNAMIC_FLOOR 전수 구현
+#           3) AssassinLedger.get_state 및 calculate_rsi_1m 반환값 추출 시 안전 인덱스 추출기 적용
+#           4) 초과 Case 28, 72, 73, 83, 85, 87, 93, 97, 98, 99, 100 전술 스텝 및 2페이지(400분봉) 조회 결속
 
 import os
 import sys
 import glob
 import math
 import time
+import inspect
 import asyncio
 import subprocess
 import py_compile
@@ -119,6 +123,7 @@ idempotency_keys = {
 
 _LAST_GC_DATE_STR = ""
 LAST_GC_DATE = ""
+_PLUGIN_SIG_CACHE: dict = {}
 
 CORE_VERIFY_MODULES = (
     "main.py",
@@ -131,6 +136,37 @@ CORE_VERIFY_MODULES = (
     "toss_api.py",
     "candle_recorder.py",
 )
+
+
+async def _call_plugin_adaptive(fn, **kwargs):
+    """
+    NEW: 전술 플러그인 함수의 inspect.signature 를 O(1) 캐싱하여
+    대상 함수가 선언한 매개변수만 정확히 필터링 전달함으로써
+    `got an unexpected keyword argument` (예: entry_trend 등) 예외를 100% 원천 차단합니다.
+    """
+    sig_info = _PLUGIN_SIG_CACHE.get(fn)
+    if sig_info is None:
+        try:
+            sig = inspect.signature(fn)
+            has_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            valid_keys = frozenset(sig.parameters.keys())
+            sig_info = (has_var_kw, valid_keys)
+        except Exception:
+            sig_info = (True, frozenset())
+        _PLUGIN_SIG_CACHE[fn] = sig_info
+
+    has_var_kw, valid_keys = sig_info
+    if has_var_kw:
+        res = fn(**kwargs)
+    else:
+        filtered_kw = {k: v for k, v in kwargs.items() if k in valid_keys}
+        res = fn(**filtered_kw)
+
+    if asyncio.iscoroutine(res):
+        return await res
+    return res
 
 
 def _unpack_rsi_calc_safe(calc_res) -> tuple[float, float, dict]:
@@ -555,7 +591,8 @@ async def rsi_radar_loop(*args, **kwargs):
                         rsi_state_map[sym]["vwap"] = vwap_val
                         rsi_state_map[sym]["ewm_state"] = ewm_state
 
-                    await execute_rsi_monitoring_plugin(
+                    await _call_plugin_adaptive(
+                        execute_rsi_monitoring_plugin,
                         ctx=ctx,
                         symbol=sym,
                         rsi_val=rsi_val,
@@ -778,7 +815,8 @@ async def assassin_loop(*args, **kwargs):
                     # [Step A] 15:59 ~ 16:01 EST 제로-오버나이트 MOC 강제 청산망 (Case 16, 24)
                     if 1559 <= est_hm <= 1601:
                         fast_shield_mode = True
-                        await execute_moc_zero_overnight_plugin(
+                        await _call_plugin_adaptive(
+                            execute_moc_zero_overnight_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -797,7 +835,8 @@ async def assassin_loop(*args, **kwargs):
                         or bool(sell_order_id)
                         or bool(buy_order_id)
                     ):
-                        cleared = await reconcile_zero_holdings_exit_plugin(
+                        cleared = await _call_plugin_adaptive(
+                            reconcile_zero_holdings_exit_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -832,7 +871,8 @@ async def assassin_loop(*args, **kwargs):
                             buy_order_id = await AssassinLedger.get_buy_order_id(symbol)
 
                     # [Step C] 방향성 인지 매크로 3단 방어망 (1·2차 NQ=F 과열 & 3차 토스 QQQ 0.0초 실시간 역행 방어 — Case 66, 67, 86, 92, 94, 95, 96)
-                    macro_triggered = await execute_macro_defense_plugin(
+                    macro_triggered = await _call_plugin_adaptive(
+                        execute_macro_defense_plugin,
                         ctx=ctx,
                         symbol=symbol,
                         now_est=now_est,
@@ -854,7 +894,8 @@ async def assassin_loop(*args, **kwargs):
 
                     # [Step D] 04:07:00 EST 듀얼 1주 휩소 노출 작전 타임쉴드 만료 정리 (Case 80, 95, 96)
                     if entry_session == "WHIPSAW_1SH" and (407 <= est_hm <= 929):
-                        buy_order_id, entry_session, whip_handled = await enforce_0407_whipsaw_cutoff_plugin(
+                        buy_order_id, entry_session, whip_handled = await _call_plugin_adaptive(
+                            enforce_0407_whipsaw_cutoff_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -872,7 +913,8 @@ async def assassin_loop(*args, **kwargs):
 
                     # [Step E] 08:15 EST 거시지표 발표 15분 전 선제 컷오프 및 미체결 매수 파기 (Case 48, 84)
                     if 815 <= est_hm <= 1558:
-                        buy_order_id, is_session_done = await enforce_0930_regular_cutoff_plugin(
+                        buy_order_id, is_session_done = await _call_plugin_adaptive(
+                            enforce_0930_regular_cutoff_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -883,7 +925,8 @@ async def assassin_loop(*args, **kwargs):
 
                     # [Step F] 15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 물량 당일 정규장 VWAP 도달 즉시 덤핑 탈출 (Case 98)
                     if (1500 <= est_hm <= 1558) and holdings_qty > 0:
-                        vwap_escaped = await execute_late_regular_vwap_escape_plugin(
+                        vwap_escaped = await _call_plugin_adaptive(
+                            execute_late_regular_vwap_escape_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -904,7 +947,8 @@ async def assassin_loop(*args, **kwargs):
                     # [Step G] 조건부 30초 타임쉴드 정정 (RSI>30/35 반등 또는 30초 만료) + 정정 직후 잔고 즉시 재조회 (Case 59, 97, 100)
                     if buy_order_id and entry_session in ("PRE_SNIPER", "PRE_PULLBACK"):
                         fast_shield_mode = True
-                        buy_order_id, entry_session = await rearm_premarket_buy_trap_after_30s_plugin(
+                        buy_order_id, entry_session = await _call_plugin_adaptive(
+                            rearm_premarket_buy_trap_after_30s_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -925,7 +969,8 @@ async def assassin_loop(*args, **kwargs):
 
                     # [Step H] 보유 물량 상단 안전 캡(+5.00% LIMIT) 선장전 및 이원화 하이킨 아시 트레일링 스윕 (Case 58, 85, 89, 99)
                     if holdings_qty > 0:
-                        await manage_mechanical_profit_trap_plugin(
+                        await _call_plugin_adaptive(
+                            manage_mechanical_profit_trap_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -945,7 +990,8 @@ async def assassin_loop(*args, **kwargs):
                     # [Step I] 03:58 ~ 04:06:59 EST 듀얼 1주 고정 '휩소 노출 작전' (Case 79, 95)
                     if 358 <= est_hm <= 406:
                         fast_shield_mode = True
-                        await execute_whipsaw_vwap_exposure_plugin(
+                        await _call_plugin_adaptive(
+                            execute_whipsaw_vwap_exposure_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -961,7 +1007,8 @@ async def assassin_loop(*args, **kwargs):
 
                     # [Step J] 04:07 ~ 08:14 EST 프리장 골든타임 본진 타격 (1. 최저점 역트레일링 반등 ➔ 2. 선택지 B [대칭 + 07:00~ 추세눌림목])
                     if (407 <= est_hm <= 814) and holdings_qty == 0 and not buy_order_id:
-                        rebound_fired = await execute_post_stop_bottom_rebound_plugin(
+                        rebound_fired = await _call_plugin_adaptive(
+                            execute_post_stop_bottom_rebound_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -979,7 +1026,8 @@ async def assassin_loop(*args, **kwargs):
                             fast_shield_mode = True
                             continue
 
-                        await execute_premarket_rsi_sniper_strike_plugin(
+                        await _call_plugin_adaptive(
+                            execute_premarket_rsi_sniper_strike_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,

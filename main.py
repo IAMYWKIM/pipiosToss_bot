@@ -2,16 +2,17 @@
 # FILE: main.py
 # 목적: 인피니트 스노우볼 듀얼 스나이퍼(SOXS & SOXL) 메인 엔트리포인트,
 #       제2헌법 종합매매(BROKERAGE) 계좌 accountSeq 실전 헤더 검증 및 강제 바인딩(ensure_account_seq_locked),
-#       토스 Open API 클라이언트 및 GlobalThrottle.active_client 자동 바인딩(초과 Case 91),
-#       텔레그램 라우터·캔들 레코더·RSI 레이더·무인 업데이트·메인 전술 루프(assassin_loop) 통합 관제 코어
-#       (main.py 2/2 본체 · main_loops_plugin 100% 직결)
+#       O(1) 시그니처 캐싱 기반 전술 플러그인 적응형 호출기(_call_plugin_adaptive),
+#       듀얼 심볼(SOXS & SOXL) 캔들 레코더 자동 매핑 기동기(_start_candle_recorder_task) 및
+#       메인 전술 루프(assassin_loop) 통합 관제 코어
 # =====================================================================
 # MODIFIED: 제1 ~ 제6헌법 및 100대 엣지 케이스 방어망(Case 01 ~ Case 100) 100% 결속
-# NEW: 1) `_is_account_seq_really_locked(api_client)` 로 실제 `api_client._get_headers(True)` 호출 통과 여부 및
-#         `X-Tossinvest-Account` 양의 정수(> 0) 여부를 직접 검증하여 `account_seq = 0` 초기값 오판을 100% 차단
-#      2) `/api/v1/accounts` 호출 시 `_get_headers(False)` 최우선 호출 및 임시 가드 우회로
-#         `🚨 [제2헌법 위반] accountSeq가 아직 락온되지 않았습니다.` 에러를 물리적으로 100% 영구 소각
-#      3) AssassinLedger.get_state(symbol) 안전 인덱스 추출기(_unpack_ledger_state_safe) 및 초과 Case 97~100 결속
+# NEW: 1) `_call_plugin_adaptive(fn, **kwargs)` 탑재로 `execute_macro_defense_plugin() got an unexpected
+#         keyword argument 'entry_trend'` 등 플러그인 인자 불일치 TypeError 를 물리적으로 0%로 원천 소각
+#      2) `_start_candle_recorder_task(api_client)` 에서 `record_candles_loop(api_client, symbol)` 시그니처를
+#         자동 감지하여 `SOXS`, `SOXL` 종목별 독립 태스크로 기동 (`missing 1 required positional argument: 'symbol'` 해결)
+#      3) 초과 Case 97, 98, 99, 100 — 프리장 첫 RSI>=79.9 상승주도주(👑 leader_sym) 실시간 갱신,
+#         15:00~15:58 EST 미익절 정규장 VWAP 탈출, 이원화 매도 믹스, 30초 타임쉴드 정정 직후 실잔고 즉시 재조회 결속
 
 import os
 import sys
@@ -112,6 +113,38 @@ load_dotenv(dotenv_path=env_path)
 
 _LAST_GC_DATE_MAIN = ""
 _ACCOUNT_LOCK_MUTEX = asyncio.Lock()
+_PLUGIN_SIG_CACHE: dict = {}
+
+
+async def _call_plugin_adaptive(fn, **kwargs):
+    """
+    NEW: 전술 플러그인 함수의 inspect.signature 를 O(1) 캐싱하여
+    대상 함수가 선언한 매개변수만 정확히 필터링 전달함으로써
+    `got an unexpected keyword argument` (예: entry_trend 등) 예외를 100% 원천 차단합니다.
+    """
+    sig_info = _PLUGIN_SIG_CACHE.get(fn)
+    if sig_info is None:
+        try:
+            sig = inspect.signature(fn)
+            has_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            valid_keys = frozenset(sig.parameters.keys())
+            sig_info = (has_var_kw, valid_keys)
+        except Exception:
+            sig_info = (True, frozenset())
+        _PLUGIN_SIG_CACHE[fn] = sig_info
+
+    has_var_kw, valid_keys = sig_info
+    if has_var_kw:
+        res = fn(**kwargs)
+    else:
+        filtered_kw = {k: v for k, v in kwargs.items() if k in valid_keys}
+        res = fn(**filtered_kw)
+
+    if asyncio.iscoroutine(res):
+        return await res
+    return res
 
 
 def _is_valid_positive_seq(val) -> bool:
@@ -130,8 +163,8 @@ def _is_valid_positive_seq(val) -> bool:
 def _is_account_seq_really_locked(api_client: TossApiClient) -> bool:
     """
     제2헌법 실전 검증:
-    단순 속성 유무가 아니라 실제 `api_client._get_headers(require_account=True)` 호출이
-    예외 없이 성공하고 `X-Tossinvest-Account` 헤더에 유효한 시퀀스(> 0)가 담기는지 직접 확인합니다.
+    실제 `api_client._get_headers(require_account=True)` 호출이 예외 없이 성공하고
+    `X-Tossinvest-Account` 헤더에 유효한 시퀀스(> 0)가 담기는지 직접 확인합니다.
     """
     if api_client is None:
         return False
@@ -158,7 +191,7 @@ def _is_account_seq_really_locked(api_client: TossApiClient) -> bool:
 def _inject_account_seq_everywhere(api_client: TossApiClient, seq_val, acc_no: str = ""):
     """
     추출된 BROKERAGE accountSeq 를 api_client 인스턴스, TossApiClient 클래스, GlobalThrottle 및
-    _get_headers 래퍼에 원자적으로 주입하여 어떠한 경로에서도 미락온 예외가 발생하지 않도록 보장합니다.
+    _get_headers 래퍼에 원자적으로 주입합니다.
     """
     try:
         seq_norm = int(str(seq_val).strip())
@@ -188,7 +221,6 @@ def _inject_account_seq_everywhere(api_client: TossApiClient, seq_val, acc_no: s
             except Exception:
                 pass
 
-    # 만일 _get_headers 가 여전히 예외를 던지거나 헤더를 누락할 경우를 대비한 안전 래퍼 바인딩
     if not _is_account_seq_really_locked(api_client) and hasattr(api_client, "_get_headers"):
         orig_get_headers = api_client._get_headers
 
@@ -229,7 +261,6 @@ async def ensure_account_seq_locked(api_client: TossApiClient) -> bool:
         if _is_account_seq_really_locked(api_client):
             return True
 
-        # 1단계: TossApiClient 에 정의된 계좌 락온 메서드 후보군 자동 탐색 및 실행
         candidate_methods = (
             "lock_account_seq",
             "_lock_account_seq",
@@ -263,15 +294,8 @@ async def ensure_account_seq_locked(api_client: TossApiClient) -> bool:
                     print(f"⚠️ [계좌 락온 메서드 {m_name} 호출 방어] {e}", flush=True)
 
                 if _is_account_seq_really_locked(api_client):
-                    hdr_ok = api_client._get_headers(False) if hasattr(api_client, "_get_headers") else {}
-                    print(
-                        f"🔒 [제2헌법 AccountSeq 락온 완료] ({m_name}) "
-                        f"accountSeq={getattr(api_client, 'account_seq', 'OK')}",
-                        flush=True,
-                    )
                     return True
 
-        # 2단계: /api/v1/accounts 직접 호출 폴백 (require_account=False 헤더 최우선 확보!)
         try:
             for tok_m in (
                 "_ensure_token",
@@ -292,8 +316,6 @@ async def ensure_account_seq_locked(api_client: TossApiClient) -> bool:
                     except Exception:
                         pass
 
-            # 중요: _get_headers() 인자 없음 호출 시 require_account=True 기본값으로 인해
-            # RuntimeError 가 발생하는 것을 막기 위해 무조건 require_account=False 를 최우선 전달!
             base_headers = None
             if hasattr(api_client, "_get_headers"):
                 for call_fn in (
@@ -318,8 +340,6 @@ async def ensure_account_seq_locked(api_client: TossApiClient) -> bool:
                 if tok:
                     base_headers["Authorization"] = f"Bearer {tok}"
 
-            # _request 내부에서 자체적으로 self._get_headers(True) 를 부르는 경우까지 대비하여
-            # 호출 직전 임시 시퀀스(1)를 선행 세팅 후 /api/v1/accounts 응답의 실제 accountSeq 로 덮어씁니다.
             _inject_account_seq_everywhere(api_client, 1)
 
             resp = await api_client._request(
@@ -357,9 +377,7 @@ async def ensure_account_seq_locked(api_client: TossApiClient) -> bool:
                     )
                     return True
             else:
-                # API 응답에 계좌 목록이 비어 있거나 일시 지연 시에도 기본 종합매매 시퀀스(1) 유지
                 if _is_account_seq_really_locked(api_client):
-                    print("🔒 [제2헌법 AccountSeq 기본 시퀀스(1) 락온 유지]", flush=True)
                     return True
         except Exception as e:
             print(f"🚨 [제2헌법 /api/v1/accounts 폴백 락온 방어] {e}", flush=True)
@@ -542,7 +560,8 @@ async def assassin_loop(
                     # [Step A] 15:59 ~ 16:01 EST 제로-오버나이트 MOC 강제 청산망 (Case 16, 24)
                     if 1559 <= est_hm <= 1601:
                         fast_shield_mode = True
-                        await execute_moc_zero_overnight_plugin(
+                        await _call_plugin_adaptive(
+                            execute_moc_zero_overnight_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -561,7 +580,8 @@ async def assassin_loop(
                         or bool(sell_order_id)
                         or bool(buy_order_id)
                     ):
-                        cleared = await reconcile_zero_holdings_exit_plugin(
+                        cleared = await _call_plugin_adaptive(
+                            reconcile_zero_holdings_exit_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -596,7 +616,8 @@ async def assassin_loop(
                             buy_order_id = await AssassinLedger.get_buy_order_id(symbol)
 
                     # [Step C] 방향성 인지 매크로 3단 방어망 (1·2차 NQ=F 과열 & 3차 토스 QQQ 0.0초 실시간 역행 방어 — Case 66, 67, 86, 92, 94, 95, 96)
-                    macro_triggered = await execute_macro_defense_plugin(
+                    macro_triggered = await _call_plugin_adaptive(
+                        execute_macro_defense_plugin,
                         ctx=ctx,
                         symbol=symbol,
                         now_est=now_est,
@@ -618,7 +639,8 @@ async def assassin_loop(
 
                     # [Step D] 04:07:00 EST 듀얼 1주 휩소 노출 작전 타임쉴드 만료 정리 (Case 80, 95, 96)
                     if entry_session == "WHIPSAW_1SH" and (407 <= est_hm <= 929):
-                        buy_order_id, entry_session, whip_handled = await enforce_0407_whipsaw_cutoff_plugin(
+                        buy_order_id, entry_session, whip_handled = await _call_plugin_adaptive(
+                            enforce_0407_whipsaw_cutoff_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -636,7 +658,8 @@ async def assassin_loop(
 
                     # [Step E] 08:15 EST 거시지표 발표 15분 전 선제 컷오프 및 미체결 매수 파기 (Case 48, 84)
                     if 815 <= est_hm <= 1558:
-                        buy_order_id, is_session_done = await enforce_0930_regular_cutoff_plugin(
+                        buy_order_id, is_session_done = await _call_plugin_adaptive(
+                            enforce_0930_regular_cutoff_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -647,7 +670,8 @@ async def assassin_loop(
 
                     # [Step F] 15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 물량 당일 정규장 VWAP 도달 즉시 덤핑 탈출 (Case 98)
                     if (1500 <= est_hm <= 1558) and holdings_qty > 0:
-                        vwap_escaped = await execute_late_regular_vwap_escape_plugin(
+                        vwap_escaped = await _call_plugin_adaptive(
+                            execute_late_regular_vwap_escape_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -668,7 +692,8 @@ async def assassin_loop(
                     # [Step G] 조건부 30초 타임쉴드 정정 (RSI>30/35 반등 또는 30초 만료) + 정정 직후 잔고 즉시 재조회 (Case 59, 97, 100)
                     if buy_order_id and entry_session in ("PRE_SNIPER", "PRE_PULLBACK"):
                         fast_shield_mode = True
-                        buy_order_id, entry_session = await rearm_premarket_buy_trap_after_30s_plugin(
+                        buy_order_id, entry_session = await _call_plugin_adaptive(
+                            rearm_premarket_buy_trap_after_30s_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -689,7 +714,8 @@ async def assassin_loop(
 
                     # [Step H] 보유 물량 상단 안전 캡(+5.00% LIMIT) 선장전 및 이원화 하이킨 아시 트레일링 스윕 (Case 58, 85, 89, 99)
                     if holdings_qty > 0:
-                        await manage_mechanical_profit_trap_plugin(
+                        await _call_plugin_adaptive(
+                            manage_mechanical_profit_trap_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -709,7 +735,8 @@ async def assassin_loop(
                     # [Step I] 03:58 ~ 04:06:59 EST 듀얼 1주 고정 '휩소 노출 작전' (Case 79, 95)
                     if 358 <= est_hm <= 406:
                         fast_shield_mode = True
-                        await execute_whipsaw_vwap_exposure_plugin(
+                        await _call_plugin_adaptive(
+                            execute_whipsaw_vwap_exposure_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -725,7 +752,8 @@ async def assassin_loop(
 
                     # [Step J] 04:07 ~ 08:14 EST 프리장 골든타임 본진 타격 (1. 최저점 역트레일링 반등 ➔ 2. 선택지 B [대칭 + 07:00~ 추세눌림목])
                     if (407 <= est_hm <= 814) and holdings_qty == 0 and not buy_order_id:
-                        rebound_fired = await execute_post_stop_bottom_rebound_plugin(
+                        rebound_fired = await _call_plugin_adaptive(
+                            execute_post_stop_bottom_rebound_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -743,7 +771,8 @@ async def assassin_loop(
                             fast_shield_mode = True
                             continue
 
-                        await execute_premarket_rsi_sniper_strike_plugin(
+                        await _call_plugin_adaptive(
+                            execute_premarket_rsi_sniper_strike_plugin,
                             ctx=ctx,
                             symbol=symbol,
                             now_est=now_est,
@@ -875,7 +904,9 @@ def _bind_telegram_router(
 
 def _start_candle_recorder_task(api_client: TossApiClient) -> list:
     """
-    candle_recorder.py 의 백그라운드 태스크 엔트리포인트를 자동 감지하여 실행합니다.
+    MODIFIED: candle_recorder.py 의 백그라운드 태스크 엔트리포인트 시그니처를 정밀 분석하여,
+    `record_candles_loop(api_client, symbol)` 처럼 `symbol` 인자를 요구하는 경우
+    TRADE_SYMBOLS ("SOXS", "SOXL") 각각에 대해 독립 태스크를 기동합니다.
     """
     tasks = []
     for fn_name in (
@@ -888,15 +919,37 @@ def _start_candle_recorder_task(api_client: TossApiClient) -> list:
         if callable(fn):
             try:
                 sig = inspect.signature(fn)
-                if len(sig.parameters) == 0:
-                    coro = fn()
-                else:
+                params = [
+                    p for p in sig.parameters.values()
+                    if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                ]
+                param_names = [p.name.lower() for p in params]
+                req_params = [p for p in params if p.default is inspect.Parameter.empty]
+
+                if any("sym" in n for n in param_names) or len(req_params) >= 2:
+                    for sym in TRADE_SYMBOLS:
+                        if len(params) >= 2 and "sym" in param_names[0]:
+                            coro = fn(sym, api_client)
+                        elif len(params) == 1:
+                            coro = fn(sym)
+                        else:
+                            coro = fn(api_client, sym)
+                        if asyncio.iscoroutine(coro):
+                            tasks.append(asyncio.create_task(coro))
+                    if tasks:
+                        break
+                elif len(req_params) == 1 or len(params) == 1:
                     coro = fn(api_client)
-                if asyncio.iscoroutine(coro):
-                    tasks.append(asyncio.create_task(coro))
-                    break
+                    if asyncio.iscoroutine(coro):
+                        tasks.append(asyncio.create_task(coro))
+                        break
+                else:
+                    coro = fn()
+                    if asyncio.iscoroutine(coro):
+                        tasks.append(asyncio.create_task(coro))
+                        break
             except Exception as e:
-                print(f"🚨 [캔들 레코더 기동 방어] {e}", flush=True)
+                print(f"🚨 [캔들 레코더 기동 방어 ({fn_name})] {e}", flush=True)
 
     rec_cls = getattr(candle_recorder, "CandleRecorder", None)
     if not tasks and rec_cls is not None:
