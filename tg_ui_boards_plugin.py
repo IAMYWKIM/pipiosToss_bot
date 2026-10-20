@@ -2,15 +2,17 @@
 # FILE: tg_ui_boards_plugin.py
 # 목적: 듀얼 통합 지시서(/sync) 및 전술 제어반(/settlement) 초슬림 텔레그램 UI 렌더링 플러그인
 #       (tg_ui_plugin.py 1/2 분할본)
-#       — SOXS & SOXL 당일 동적 고가/저가·환율·보유수익 지시서(build_sync_board) 및
+#       — SOXS & SOXL 당일 세션(19:00 EST~) 1m 분봉 동적 고가/저가 집계(초과 Case 40)·환율·보유수익 지시서(build_sync_board) 및
 #         마스터 전원·양방향 보유·이원화 트레일링(⚡반등 / 🚀진성)·15:00~15:58 VWAP탈출·
-#         03:58~04:07 휩소 1주 타점 락온/접수 상태·데이장 100% [모의] 출격 승률(%) 전술 제어반(build_settlement_board)
+#         03:58~04:07 휩소 1주 타점 락온/접수 상태·프리장 첫 RSI>=79.9 상승주도주(👑) 자가 복원·
+#         데이장 100% [모의] 출격 승률(%) 전술 제어반(build_settlement_board)
 # =====================================================================
 # NEW: 제3헌법 및 플러그인 분할 아키텍처 의거 tg_ui_plugin.py의 /sync 및 /settlement 보드 빌더를 tg_ui_boards_plugin.py로 무손실 분리
 # MODIFIED: 제3헌법 및 Case 43 의거 구버전 +0.64% / +1.00% 익절률 선택 버튼 및 데드코드 영구 소각
-# MODIFIED: 초과 Case 13, 38, 40, 77 — 듀얼 지시서(/sync) 및 제어반(/settlement)에서 불필요한 부연 설명을 삭제하여 모바일 2줄 이내 초슬림화
+# MODIFIED: 초과 Case 13, 38, 40, 77 — 듀얼 지시서(/sync)에서 당일 세션(19:00 EST~) 1m 분봉 전체와 실시간 현재가를 동적 병합하여
+#           전일 일봉 고/저가 오표출을 원천 차단하고, 모바일 2줄 이내 초슬림 레이아웃 유지
 # MODIFIED: 초과 Case 78, 79, 80, 93, 94, 95, 97, 98, 99 — 양방향 동시 수동 보유 표출, 데이장 모의 전적(승률 %),
-#           03:58~04:07 휩소 1주 사전 락온 타점 및 주문 접수 상태 구분 표출, 이원화 트레일링 및 15:00 VWAP 탈출 표시 반영
+#           03:58~04:07 휩소 1주 사전 락온 타점 및 주문 접수 상태 구분 표출, 프리장 상승주도주(👑) 온디맨드 소급 복원 반영
 
 import asyncio
 from datetime import datetime, timedelta
@@ -18,9 +20,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from toss_api import GlobalThrottle
 from quant_engine import (
     AssassinLedger,
     MIN_STAGE3_QQQ_ADVERSE_PCT,
+    calculate_rsi_1m,
+    compute_realtime_tick_rsi,
 )
 from sniper_plugin import (
     get_daymarket_sim_status,
@@ -28,6 +33,7 @@ from sniper_plugin import (
     get_trailing_runtime_status,
     get_bottom_track_status,
     get_pre_leader_status,
+    update_premarket_trend_leader,
 )
 
 EST_TZ = ZoneInfo("America/New_York")
@@ -46,7 +52,60 @@ _AUTO_ENTRY_TAGS_UI = (
 )
 
 
-# MODIFIED: 듀얼 지시서(/sync)에서 종목 대기 상태의 불필요한 부연 설명을 삭제하여 1줄 고정 및 휩소 타점 락온·이원화 트레일링·VWAP 탈출 표시 (Case 38, 78, 79, 93, 97, 98, 99)
+async def _heal_pre_leader_from_api_if_needed(api_client, now_est: datetime):
+    """
+    초과 Case 97:
+    04:07 ~ 08:14 EST 구간에 프로세스 재기동 직후 아직 _PRE_LEADER_CACHE["leader_sym"] 이 비어 있을 때,
+    전일 19:00 EST 이후 다중 페이지 1분봉을 스캔하여 당일 04:07 EST 이후 첫 RSI >= 79.9 상승 주도주를 즉시 복원합니다.
+    """
+    est_hm = now_est.hour * 100 + now_est.minute
+    if not (407 <= est_hm <= 814) or api_client is None:
+        return
+    if str(get_pre_leader_status().get("leader_sym") or ""):
+        return
+
+    if now_est.hour >= 19:
+        session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
+    else:
+        session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
+
+    temp_rsi_state = {"SOXS": {}, "SOXL": {}}
+    for sym in ("SOXS", "SOXL"):
+        all_c = []
+        before = None
+        for _ in range(4):
+            try:
+                page = await api_client.get_1m_candles_pagination(sym, count=200, before=before)
+                c_list = (page or {}).get("candles", [])
+                if not c_list:
+                    break
+                all_c.extend(c_list)
+                oldest_dt = pd.to_datetime(c_list[-1]["timestamp"], utc=True).tz_convert(EST_TZ)
+                if oldest_dt <= session_start_est:
+                    break
+                before = (page or {}).get("nextBefore")
+                if not before:
+                    break
+            except Exception:
+                break
+        if all_c:
+            try:
+                r_v, v_v, ewm_v = await asyncio.to_thread(calculate_rsi_1m, all_c, now_est)
+                temp_rsi_state[sym] = {"value": r_v, "vwap": v_v, "ewm_state": ewm_v}
+            except Exception:
+                pass
+
+    for sym in ("SOXS", "SOXL"):
+        r_now = float((temp_rsi_state.get(sym) or {}).get("value", 0.0))
+        update_premarket_trend_leader(
+            symbol=sym,
+            live_rsi_val=r_now,
+            now_est=now_est,
+            shared_rsi_state=temp_rsi_state,
+        )
+
+
+# MODIFIED: 듀얼 지시서(/sync) 당일 1m 분봉 동적 고가/저가 집계(초과 Case 40) 및 상승주도주·휩소 타점·이원화 트레일링·VWAP 탈출 표시 (Case 38, 40, 78, 79, 93, 97, 98, 99)
 async def build_sync_board(api_client) -> str:
     now_est = datetime.now(EST_TZ)
     wk = now_est.weekday()
@@ -87,6 +146,15 @@ async def build_sync_board(api_client) -> str:
     except Exception:
         pass
 
+    if now_est.hour >= 19:
+        session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
+        logical_today = (now_est + timedelta(days=1)).date()
+    else:
+        session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
+        logical_today = now_est.date()
+
+    sync_rsi_holder = {"SOXS": {}, "SOXL": {}}
+
     async def get_symbol_sync_data(symbol: str):
         state = await AssassinLedger.get_state(symbol)
         buy_id = await AssassinLedger.get_buy_order_id(symbol)
@@ -105,11 +173,7 @@ async def build_sync_board(api_client) -> str:
         prev_close = curr
         high, low = curr, curr
 
-        if now_est.hour >= 19:
-            session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
-        else:
-            session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
-
+        # 1. 직전 영업일 정규장 마감 종가(prev_close) 추출
         try:
             data_1d = await api_client._request(
                 "GET",
@@ -118,22 +182,62 @@ async def build_sync_board(api_client) -> str:
                 headers=api_client._get_headers(),
             )
             candles_1d = (data_1d or {}).get("result", {}).get("candles", [])
-            target_date = session_start_est.date()
-
             for c in candles_1d:
                 c_dt = pd.to_datetime(c["timestamp"], format="ISO8601", utc=True).tz_convert(EST_TZ).date()
-                if c_dt == target_date:
-                    h_val = float(c.get("highPrice") or 0.0)
-                    l_val = float(c.get("lowPrice") or 0.0)
-                    if h_val > 0:
-                        high = h_val
-                    if l_val > 0:
-                        low = l_val
-                elif c_dt < target_date:
-                    prev_close = float(c.get("closePrice") or 0.0)
-                    break
+                if c_dt < logical_today:
+                    pc_val = float(c.get("closePrice") or 0.0)
+                    if pc_val > 0.0:
+                        prev_close = pc_val
+                        break
         except Exception:
             pass
+
+        # 2. 초과 Case 40: 당일 세션(19:00 EST~) 1m 분봉 페이지네이션 동적 고가/저가 Aggregation
+        session_candles_1m = []
+        before_cursor = None
+        for _ in range(6):
+            try:
+                page_1m = await api_client.get_1m_candles_pagination(symbol, count=200, before=before_cursor)
+                c_list = (page_1m or {}).get("candles", [])
+                if not c_list:
+                    break
+                session_candles_1m.extend(c_list)
+                oldest_dt = pd.to_datetime(c_list[-1]["timestamp"], utc=True).tz_convert(EST_TZ)
+                if oldest_dt <= session_start_est:
+                    break
+                before_cursor = (page_1m or {}).get("nextBefore")
+                if not before_cursor:
+                    break
+            except Exception:
+                break
+
+        if session_candles_1m:
+            try:
+                r_c, v_c, ewm_c = await asyncio.to_thread(calculate_rsi_1m, session_candles_1m, now_est)
+                if curr > 0.0 and ewm_c:
+                    r_c = compute_realtime_tick_rsi(curr, ewm_c, fallback_rsi=r_c)
+                sync_rsi_holder[symbol] = {"value": r_c, "vwap": v_c, "ewm_state": ewm_c}
+            except Exception:
+                pass
+
+            session_highs = [curr] if curr > 0.0 else []
+            session_lows = [curr] if curr > 0.0 else []
+            for c_item in session_candles_1m:
+                try:
+                    c_ts = pd.to_datetime(c_item["timestamp"], format="ISO8601", utc=True).tz_convert(EST_TZ)
+                    if c_ts >= session_start_est:
+                        h_v = float(c_item.get("highPrice") or 0.0)
+                        l_v = float(c_item.get("lowPrice") or 0.0)
+                        if h_v > 0.0:
+                            session_highs.append(h_v)
+                        if l_v > 0.0:
+                            session_lows.append(l_v)
+                except Exception:
+                    pass
+            if session_highs:
+                high = max(session_highs)
+            if session_lows:
+                low = min(session_lows)
 
         high_rate = ((high - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
         low_rate = ((low - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
@@ -150,6 +254,17 @@ async def build_sync_board(api_client) -> str:
         get_symbol_sync_data("SOXS"),
         get_symbol_sync_data("SOXL"),
     )
+
+    if 407 <= t <= 814:
+        for sym_k in ("SOXS", "SOXL"):
+            r_k = float((sync_rsi_holder.get(sym_k) or {}).get("value", 0.0))
+            update_premarket_trend_leader(
+                symbol=sym_k,
+                live_rsi_val=r_k,
+                now_est=now_est,
+                shared_rsi_state=sync_rsi_holder,
+            )
+
     pre_ld = get_pre_leader_status()
     pre_leader_sym = str(pre_ld.get("leader_sym") or "")
     day_sim = get_daymarket_sim_status()
@@ -222,7 +337,7 @@ async def build_sync_board(api_client) -> str:
     return text
 
 
-# MODIFIED: 전술 제어반(/settlement) 슬림화, 03:58~04:07 휩소 타점 사전 락온/주문 접수 구분 표출, 양방향 동시 보유 표출, 데이장 모의 전적(승률 %), 이원화 트레일링 및 15:00 VWAP 탈출 표시 (Case 37, 77, 78, 79, 93, 94, 97, 98, 99)
+# MODIFIED: 전술 제어반(/settlement) 슬림화, 프리장 상승주도주(👑) 자가 복원, 03:58~04:07 휩소 타점 사전 락온/주문 접수 구분 표출, 양방향 동시 보유 표출, 데이장 모의 전적(승률 %), 이원화 트레일링 및 15:00 VWAP 탈출 표시 (Case 37, 77, 78, 79, 93, 94, 97, 98, 99)
 async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     now_kst = now_est.astimezone(KST_TZ)
@@ -240,6 +355,10 @@ async def build_settlement_board() -> tuple[str, InlineKeyboardMarkup]:
         AssassinLedger.get_buy_order_id("SOXL"),
     )
     is_comp_s = await AssassinLedger.get_is_compound("SOXS")
+
+    if (407 <= t <= 814) and not str(get_pre_leader_status().get("leader_sym") or ""):
+        await _heal_pre_leader_from_api_if_needed(getattr(GlobalThrottle, "active_client", None), now_est)
+
     day_sim = get_daymarket_sim_status()
     whip_st = get_whipsaw_runtime_status()
     bot_all = get_bottom_track_status()

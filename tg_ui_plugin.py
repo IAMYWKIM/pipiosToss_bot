@@ -8,10 +8,9 @@
 # MODIFIED: 초과 Case 13, 38, 77 — 메인 메뉴(/start) 및 관제탑(/avwap)에서 모든 항목이 모바일 화면 2줄을 넘어가지 않도록 초슬림화
 # MODIFIED: 초과 Case 90 & Case 91 — 17:00 ~ 17:59 EST(06:00 ~ 06:59 KST) 선물 일일 마감 휴장 및 주말 휴장 구간에서
 #           직전 마감된 선물 세션 기준일과 '(마감 시세 · 18:00 신세션 대기)' 라벨 및 마감가를 명확히 표출
-# MODIFIED: 초과 Case 78, 92, 93, 94, 97, 98, 99 — 데이장 개시 7분 추세·1.3% 락온·40~70 리셋·당일 모의 출격 승률,
-#           SOXS·SOXL 동시 수동 보유 시 3차 방어 라인 독립 표출, 선택지 B(👑HYB_35_1ST), 이원화 매도 및 15:00 VWAP 탈출 상태 표출
-# NEW: /avwap 호출 시 shared_rsi_state의 RSI가 0.0이거나 ewm_state 미동기화 상태일 때 즉시 1분봉 자가 치유(Self-Healing) 연산 및
-#      실시간 틱 RSI·HA 합성 + update_premarket_trend_leader(04:07~ 첫 RSI>=79.9 상승주도주 소급 복원) 자동 실행 탑재
+# MODIFIED: 초과 Case 72, 78, 92, 93, 94, 97, 98, 99 — /avwap 호출 시 _fetch_session_stats로 수집된 전일 19:00 EST 이후
+#           전체 다중 페이지 1분봉(raw_candles)을 사용하여 Wilder's RSI(14) 풀 워밍업 연산 및
+#           04:07 EST 이후 첫 RSI>=79.9 상승 주도주(leader_sym)를 100% 복원 각인
 
 import math
 import asyncio
@@ -356,9 +355,9 @@ def build_compact_status(
     return f"{sym_icon} <b>{symbol}</b> <code>[{state_flag}]</code> {state_text}"
 
 
-# MODIFIED: 초과 Case 38, 78, 90, 91, 92, 93, 94, 97, 98, 99 —
-#           관제탑(/avwap)에서 17:00~17:59 EST(06:00~06:59 KST) 선물 마감 휴장 시 직전 세션 마감 시세·기준일을 명확히 표시하고
-#           RSI 0.0 자가 치유(Self-Healing), 선택지 B(👑HYB_35_1ST), 이원화 매도 및 15:00 VWAP 탈출 상태 표출
+# MODIFIED: 초과 Case 38, 72, 78, 90, 91, 92, 93, 94, 97, 98, 99 —
+#           관제탑(/avwap)에서 _fetch_session_stats로 수집한 전체 다중 페이지 1분봉(raw_candles)으로
+#           Wilder's RSI(14) 풀 워밍업 동기화 및 04:07 EST 이후 첫 RSI>=79.9 상승 주도주(leader_sym) 소급 복원 결속
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     now_kst = now_est.astimezone(KST_TZ)
@@ -470,7 +469,9 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
             _fetch_session_stats(api_client, "SOXL", now_est),
         )
 
-    # NEW: /avwap 호출 시 shared_rsi_state의 RSI가 0.0이거나 ewm_state가 비어 있으면 즉시 자가 치유(Self-Healing) 연산 수행!
+    # NEW: 초과 Case 72 & Case 97 — _fetch_session_stats가 조회한 전일 19:00 EST 이후 전체 다중 페이지 1분봉(raw_candles)이
+    #      존재하거나 shared_rsi_state가 미동기화 상태일 때, 전체 분봉으로 Wilder's RSI(14) 풀 워밍업 연산을 수행하여
+    #      단일 200봉 한계로 인해 04:07~ 초반 클라이맥스(예: 05:08 EST SOXS RSI 80.63)가 누락되는 현상을 100% 원천 차단!
     if isinstance(shared_rsi_state, dict):
         for sym_heal, p_heal, c_heal in (("SOXS", price_s, raw_candles_s), ("SOXL", price_l, raw_candles_l)):
             st_dict = shared_rsi_state.get(sym_heal)
@@ -480,11 +481,11 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
             cur_r_val = float(st_dict.get("value", 0.0) or 0.0)
             cur_ewm = st_dict.get("ewm_state") or {}
-            if cur_r_val <= 0.0 or not cur_ewm:
+            if c_heal or cur_r_val <= 0.0 or not cur_ewm:
                 try:
                     candles_use = c_heal if c_heal else await api_client.get_1m_candles(sym_heal, count=200)
                     if candles_use:
-                        r_calc, v_calc, ewm_calc = await asyncio.to_thread(calculate_rsi_1m, candles_use)
+                        r_calc, v_calc, ewm_calc = await asyncio.to_thread(calculate_rsi_1m, candles_use, now_est)
                         if p_heal > 0.0 and ewm_calc:
                             r_calc = compute_realtime_tick_rsi(p_heal, ewm_calc, fallback_rsi=r_calc)
                             compute_realtime_tick_heikin_ashi(p_heal, ewm_calc)
@@ -492,7 +493,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
                         st_dict["vwap"] = v_calc
                         st_dict["ewm_state"] = ewm_calc
                 except Exception as he:
-                    print(f"🚨 [/avwap RSI 자가치유 방어 {sym_heal}] {he}", flush=True)
+                    print(f"🚨 [/avwap RSI 풀워밍업 동기화 방어 {sym_heal}] {he}", flush=True)
             elif p_heal > 0.0 and cur_ewm:
                 live_r = compute_realtime_tick_rsi(p_heal, cur_ewm, fallback_rsi=cur_r_val)
                 compute_realtime_tick_heikin_ashi(p_heal, cur_ewm)

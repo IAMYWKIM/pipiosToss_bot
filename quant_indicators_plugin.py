@@ -1,7 +1,7 @@
 # =====================================================================
 # FILE: quant_indicators_plugin.py
 # 목적: Wilder's RSI(14), 1분봉 하이킨 아시(Heikin-Ashi), 세션별 정밀 VWAP,
-#       04:07/19:00 EST 이후 첫 RSI>=79.9 돌파 시각 벡터 추출,
+#       04:07/19:00 EST 이후 첫 RSI>=79.9 돌파 시각(first_0407_799_ts & first_799_ts) 벡터 추출,
 #       calculate_rsi_1m 다형성 인자 방어(datetime 위치 인자 자동 분리),
 #       동기(with) 및 비동기(async with) 양방향 호환 파일 락(_HybridFileLock) 선행 바인딩,
 #       동기(asyncio.to_thread) 및 비동기(await) 양방향 100% 호환 하이브리드 반환(_AwaitableRsiTuple) 및
@@ -12,10 +12,8 @@
 # MODIFIED: 초과 Case 72, 73, 85 — 원본 1분봉 전체 Wilder's RSI(14) 및 하이킨 아시(ewm alpha=0.5) 벡터 연산과 O(1) 실시간 틱 합성
 # MODIFIED: 초과 Case 76 — 실제 발생 순수익금(세전손익 - 왕복수수료 0.14%) 기반 통합 복리/단리 정산(calc_compound_next_budget)
 # MODIFIED: 초과 Case 90 — CME 나스닥 100 선물(NQ=F) 18:00 EST 신세션 시작 시각 및 개장 여부 판별(get_cme_session_window_est)
-# MODIFIED: 초과 Case 97, 98, 99 — 04:07/19:00 EST 이후 첫 RSI>=79.9 시각 추출, 세션별(데이/프리/정규) VWAP 분리 산출 및 이원화 매도 상수 락온
-# NEW: 1) main_loops_plugin.py 에서 calculate_rsi_1m(candles, now_est) 로 두 번째 인자에 datetime 객체를 전달할 때
-#         발생하던 `int() argument ... not 'datetime.datetime'` 에러를 자동 스왑 가드로 100% 원천 소각
-#      2) GlobalThrottle.get_file_lock 에 동기 `with` 및 비동기 `async with` 양방향 호환 `_HybridFileLock` 을 선행 바인딩
+# MODIFIED: 초과 Case 97, 98, 99 — 04:07/19:00 EST 이후 첫 RSI>=79.9 시각(first_0407_799_ts & first_799_ts 이중 바인딩) 추출,
+#           세션별(데이/프리/정규) VWAP 분리 산출 및 이원화 매도 상수 락온
 
 import os
 import math
@@ -387,7 +385,8 @@ def _compute_rsi_and_vwap_sync(
        자동으로 `now_est = period`, `period = 14` 로 스왑하여 TypeError를 100% 원천 차단합니다.
     2) 원본 1분봉 전체를 대상으로 Wilder's RSI(14) 및 하이킨 아시(ewm alpha=0.5) 100% 벡터 연산을 수행합니다.
     3) 데이장(19:00 EST~), 프리장(04:00 EST~), 정규장(09:30 EST~) 세션별 누적 VWAP을 정밀 분리 산출합니다.
-    4) 당일 04:07 EST 이후 및 데이장 19:00 EST 이후 최초로 RSI >= 79.9를 달성한 시각(first_799_ts, first_day_799_ts)을 추출합니다.
+    4) 당일 04:07 EST 이후 및 데이장 19:00 EST 이후 최초로 RSI >= 79.9를 달성한 시각을
+       `first_799_ts` 와 `first_0407_799_ts` 양쪽 키에 모두 기록하여 모듈 간 호환성을 100% 보장합니다.
     """
     if isinstance(period, datetime):
         now_est = period
@@ -574,7 +573,10 @@ def _compute_rsi_and_vwap_sync(
         & (df.index <= now_est.replace(hour=8, minute=14, second=59, microsecond=999999))
     ]
     if not df_pre_win.empty:
-        climax_pre = df_pre_win[(df_pre_win["rsi"] >= PRE_TREND_LEADER_SELECT_RSI) | (df_pre_win["rsi_high"] >= 80.0)]
+        climax_pre = df_pre_win[
+            (df_pre_win["rsi"] >= PRE_TREND_LEADER_SELECT_RSI)
+            | (df_pre_win["rsi_high"] >= PRE_TREND_LEADER_SELECT_RSI)
+        ]
         if not climax_pre.empty:
             first_idx = climax_pre.index[0]
             first_799_ts = float(first_idx.timestamp())
@@ -586,7 +588,10 @@ def _compute_rsi_and_vwap_sync(
     first_day_799_rsi = 0.0
     first_day_799_time_str = ""
     if not df_day.empty:
-        climax_day = df_day[(df_day["rsi"] >= PRE_TREND_LEADER_SELECT_RSI) | (df_day["rsi_high"] >= 80.0)]
+        climax_day = df_day[
+            (df_day["rsi"] >= PRE_TREND_LEADER_SELECT_RSI)
+            | (df_day["rsi_high"] >= PRE_TREND_LEADER_SELECT_RSI)
+        ]
         if not climax_day.empty:
             f_day_idx = climax_day.index[0]
             first_day_799_ts = float(f_day_idx.timestamp())
@@ -646,6 +651,9 @@ def _compute_rsi_and_vwap_sync(
         "first_799_ts": first_799_ts,
         "first_799_rsi": first_799_rsi,
         "first_799_time_str": first_799_time_str,
+        "first_0407_799_ts": first_799_ts,
+        "first_0407_799_rsi": first_799_rsi,
+        "first_0407_799_time_str": first_799_time_str,
         "first_day_799_ts": first_day_799_ts,
         "first_day_799_rsi": first_day_799_rsi,
         "first_day_799_time_str": first_day_799_time_str,
