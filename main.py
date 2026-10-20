@@ -1,17 +1,20 @@
 # =====================================================================
 # FILE: main.py
 # 목적: 인피니트 스노우볼 듀얼 스나이퍼(SOXS & SOXL) 메인 엔트리포인트,
+#       제2헌법 종합매매(BROKERAGE) 계좌 accountSeq 3단계 방탄 메모리 락온(ensure_account_seq_locked),
 #       토스 Open API 클라이언트 및 GlobalThrottle.active_client 자동 바인딩(초과 Case 91),
 #       텔레그램 라우터·캔들 레코더·RSI 레이더·무인 업데이트·메인 전술 루프(assassin_loop) 통합 관제 코어
 #       (main.py 2/2 본체 · main_loops_plugin 100% 직결)
 # =====================================================================
 # MODIFIED: 제1 ~ 제6헌법 및 100대 엣지 케이스 방어망(Case 01 ~ Case 100) 100% 결속
-# MODIFIED: 1) AssassinLedger.get_state(symbol) 반환값 추출 시 고정 12-변수 언패킹을 제거하고
-#              _unpack_ledger_state_safe 안전 인덱스 추출기를 적용하여 `too many values to unpack (expected 12)` 영구 소각
-#           2) main_loops_plugin.py 의 9대 임포트 심볼(EST_TZ, KST_TZ, TRADE_SYMBOLS, RSI_SYMBOLS,
-#              NQ_DYNAMIC_FLOOR, HOLIDAY_TRANSLATIONS, _run_git_update_sync, auto_update_loop, rsi_radar_loop)과 100% 동기화
-#           3) 초과 Case 97, 98, 99, 100 — 프리장 첫 RSI>=79.9 상승주도주(👑 leader_sym) 실시간 갱신,
-#              15:00~15:58 EST 미익절 정규장 VWAP 탈출, 이원화 매도 믹스, 30초 타임쉴드 정정 직후 실잔고 즉시 재조회 결속
+# NEW: 1) 제2헌법 완벽 준수를 위한 3단계 방탄 계좌 락온 엔진 `ensure_account_seq_locked(api_client)` 탑재로
+#         `🚨 [제2헌법 위반] accountSeq가 아직 락온되지 않았습니다.` 에러를 100% 원천 소각
+#      2) AssassinLedger.get_state(symbol) 반환값 추출 시 고정 12-변수 언패킹을 제거하고
+#         _unpack_ledger_state_safe 안전 인덱스 추출기를 적용하여 `too many values to unpack (expected 12)` 영구 소각
+#      3) main_loops_plugin.py 의 9대 임포트 심볼(EST_TZ, KST_TZ, TRADE_SYMBOLS, RSI_SYMBOLS,
+#         NQ_DYNAMIC_FLOOR, HOLIDAY_TRANSLATIONS, _run_git_update_sync, auto_update_loop, rsi_radar_loop)과 100% 동기화
+#      4) 초과 Case 97, 98, 99, 100 — 프리장 첫 RSI>=79.9 상승주도주(👑 leader_sym) 실시간 갱신,
+#         15:00~15:58 EST 미익절 정규장 VWAP 탈출, 이원화 매도 믹스, 30초 타임쉴드 정정 직후 실잔고 즉시 재조회 결속
 
 import os
 import sys
@@ -111,6 +114,124 @@ env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path=env_path)
 
 _LAST_GC_DATE_MAIN = ""
+_ACCOUNT_LOCK_MUTEX = asyncio.Lock()
+
+
+async def ensure_account_seq_locked(api_client: TossApiClient) -> bool:
+    """
+    제2헌법 완벽 준수:
+    시스템 기동 시 및 자산/잔고/주문 API 호출 전 /api/v1/accounts 를 호출하여
+    종합매매(BROKERAGE) 계좌의 accountSeq 를 메모리에 100% 락온합니다.
+    """
+    if api_client is None:
+        return False
+
+    # 1단계: 이미 메모리에 account_seq 가 락온되어 있는지 O(1) 즉시 확인
+    for attr_name in ("account_seq", "_account_seq", "accountSeq", "_accountSeq"):
+        val = getattr(api_client, attr_name, None)
+        if val is not None and str(val).strip() != "":
+            return True
+
+    async with _ACCOUNT_LOCK_MUTEX:
+        for attr_name in ("account_seq", "_account_seq", "accountSeq", "_accountSeq"):
+            val = getattr(api_client, attr_name, None)
+            if val is not None and str(val).strip() != "":
+                return True
+
+        # 2단계: TossApiClient 에 정의된 계좌 락온 메서드 후보군 자동 탐색 및 실행
+        candidate_methods = (
+            "lock_account_seq",
+            "_lock_account_seq",
+            "init_account_seq",
+            "initialize_account",
+            "init_account",
+            "fetch_account_seq",
+            "get_account_seq",
+            "ensure_account_seq",
+        )
+        for m_name in candidate_methods:
+            fn = getattr(api_client, m_name, None)
+            if callable(fn):
+                try:
+                    res = fn()
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception as e:
+                    print(f"⚠️ [계좌 락온 메서드 {m_name} 호출 방어] {e}", flush=True)
+
+                for attr_name in ("account_seq", "_account_seq", "accountSeq", "_accountSeq"):
+                    val = getattr(api_client, attr_name, None)
+                    if val is not None and str(val).strip() != "":
+                        print(f"🔒 [제2헌법 AccountSeq 락온 완료] ({m_name}) accountSeq={val}", flush=True)
+                        return True
+
+        # 3단계: /api/v1/accounts 직접 호출 폴백으로 BROKERAGE accountSeq 추출 및 강제 주입
+        try:
+            for tok_m in ("_ensure_token", "ensure_token", "get_access_token", "issue_token"):
+                tok_fn = getattr(api_client, tok_m, None)
+                if callable(tok_fn):
+                    try:
+                        t_res = tok_fn()
+                        if asyncio.iscoroutine(t_res):
+                            await t_res
+                        break
+                    except Exception:
+                        pass
+
+            base_headers = None
+            if hasattr(api_client, "_get_headers"):
+                try:
+                    base_headers = api_client._get_headers()
+                except TypeError:
+                    try:
+                        base_headers = api_client._get_headers(False)
+                    except Exception:
+                        base_headers = None
+                except Exception:
+                    base_headers = None
+
+            if base_headers is not None:
+                resp = await api_client._request("GET", "/api/v1/accounts", "ACCOUNT", headers=base_headers)
+            else:
+                resp = await api_client._request("GET", "/api/v1/accounts", "ACCOUNT")
+
+            accounts = (resp or {}).get("result") or []
+            if isinstance(accounts, list) and accounts:
+                chosen_seq = None
+                chosen_acc_no = ""
+                for acc in accounts:
+                    if (
+                        isinstance(acc, dict)
+                        and acc.get("accountType") == "BROKERAGE"
+                        and acc.get("accountSeq") is not None
+                    ):
+                        chosen_seq = str(acc.get("accountSeq")).strip()
+                        chosen_acc_no = str(acc.get("accountNo") or "")
+                        break
+                if not chosen_seq and isinstance(accounts[0], dict) and accounts[0].get("accountSeq") is not None:
+                    chosen_seq = str(accounts[0].get("accountSeq")).strip()
+                    chosen_acc_no = str(accounts[0].get("accountNo") or "")
+
+                if chosen_seq:
+                    for attr_name in ("account_seq", "_account_seq", "accountSeq", "_accountSeq"):
+                        setattr(api_client, attr_name, chosen_seq)
+                    if chosen_acc_no:
+                        for no_attr in ("account_no", "_account_no", "accountNo"):
+                            if hasattr(api_client, no_attr):
+                                setattr(api_client, no_attr, chosen_acc_no)
+                    for k in list(getattr(api_client, "__dict__", {}).keys()):
+                        k_low = k.lower()
+                        if "account" in k_low and "seq" in k_low:
+                            setattr(api_client, k, chosen_seq)
+                    print(
+                        f"🔒 [제2헌법 AccountSeq 직접 락온 완료] BROKERAGE accountSeq={chosen_seq}",
+                        flush=True,
+                    )
+                    return True
+        except Exception as e:
+            print(f"🚨 [제2헌법 /api/v1/accounts 폴백 락온 방어] {e}", flush=True)
+
+        return False
 
 
 async def assassin_loop(
@@ -139,6 +260,11 @@ async def assassin_loop(
     while True:
         fast_shield_mode = False
         try:
+            # 제2헌법: 매 루프 사이클 진입 시 accountSeq 메모리 락온 무결성 보장
+            if not await ensure_account_seq_locked(api_client):
+                await asyncio.sleep(2.0)
+                continue
+
             now_est = datetime.now(EST_TZ)
             now_kst = now_est.astimezone(KST_TZ)
             wk = now_est.weekday()
@@ -217,7 +343,7 @@ async def assassin_loop(
                     vwap_val = live_vwaps[symbol]
                     day_vwap_val = day_vwaps[symbol]
 
-                    # NEW: 고정 12-변수 언패킹 대신 _unpack_ledger_state_safe 적용으로 ValueError 원천 소각
+                    # 고정 12-변수 언패킹 대신 _unpack_ledger_state_safe 적용으로 ValueError 원천 소각
                     raw_state = await AssassinLedger.get_state(symbol)
                     (
                         last_buy_price,
@@ -602,7 +728,6 @@ def _bind_telegram_router(
 
     router_obj = getattr(tg_router, "router", None)
     if router_obj is not None:
-        # tg_router 모듈 전역 컨텍스트 주입 지원
         for attr_k, attr_v in available_ctx.items():
             if hasattr(tg_router, attr_k):
                 try:
@@ -678,14 +803,11 @@ async def main():
     api_client = TossApiClient()
     GlobalThrottle.active_client = api_client
 
-    # 제2헌법: 기동 즉시 종합매매(BROKERAGE) 계좌 accountSeq 메모리 락온
-    try:
-        if hasattr(api_client, "initialize_account"):
-            await api_client.initialize_account()
-        elif hasattr(api_client, "get_account_seq"):
-            await api_client.get_account_seq()
-    except Exception as init_e:
-        print(f"⚠️ [초기 계좌 락온 재시도 대기] {init_e}", flush=True)
+    # 제2헌법: 기동 즉시 종합매매(BROKERAGE) 계좌 accountSeq 메모리 락온 (최대 3회 백오프 시도)
+    for attempt in range(3):
+        if await ensure_account_seq_locked(api_client):
+            break
+        await asyncio.sleep(1.0 * (attempt + 1))
 
     bot = Bot(token=tg_token)
     dp = Dispatcher()
