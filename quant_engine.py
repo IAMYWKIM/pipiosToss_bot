@@ -4,7 +4,8 @@
 #       기술적 반등(⚡ OLD_IMM_CB) × 진성 상승종목(🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020) 이원화 매도 상수(초과 Case 99),
 #       NQ=F 18:00 EST 신세션 하드 컷오프 + fast_info 및 1d 일봉 당일 실제 고/저가·마감가 3중 강제 병합 + 동일 세션 단조 보존
 #       (개장 중은 물론 17:00~17:59 EST [06:00~06:59 KST] 마감 휴장 중에도 직전 마감 세션 시세·저가 100% 무결 보존 · 초과 Case 62, 90, 91),
-#       데이장 개시 1분(09:00:00~09:00:59 KST) [모의] 전용 진폭×3.0배 역산 하락가 버퍼 산출 엔진(초과 Case 93 · 🛡️ BUFFER_WAIT),
+#       데이장(19:00~03:57 EST) 100% [모의] 전용 — 개시 1분 전 NQ=F 10분봉 추세 판별(get_nq_10m_candle_trend) ➔
+#       개시 7분간 RSI>=50.0 최종 판별 현재가 진입 · +1.30% 락온(-0.30% 콜백 시 +1.00% 보장) · 40.0<=RSI<=70.0 리셋 상수(초과 Case 78, 93),
 #       토스 Open API QQQ 0.0초 실시간 3차 역행 비교 기준가(1.5초 프로빙 · 최소 0.80% 역행 하한 강제) + 10분/3분 단기 변화율 산출(해법 2 방법 A) 및
 #       Wilder's RSI(14) + 하이킨 아시(Heikin-Ashi) 1분봉 + 세션별(데이/프리/정규장 09:30~) 정밀 누적 VWAP(초과 Case 98) 벡터/틱 합성 엔진
 # =====================================================================
@@ -22,8 +23,9 @@
 # NEW: 초과 Case 91 [해법 2 방법 A] — 토스 Open API QQQ 실시간 현재가·1분봉으로 최근 10분/3분 변화율(±0.20% 동일 임계치)을 최우선 산출
 # NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)은 NQ=F 선물 진폭(nq_entry_amp)을 기준으로 산출하고,
 #      해당 임계치를 적용하는 진입 기준가 및 실시간 역행 비교가는 토스 Open API QQQ 0.0초 실시간 현재가(get_stage3_reference_price, 보유중 1.5초 프로빙)로 전면 대체
-# MODIFIED: 초과 Case 93 — 데이장 개시 1분(09:00:00~09:00:59 KST) [모의] 전용 충격 전 기준 고가(session_anchor_high) 벡터 추출 및
-#           3배 레버리지 역산 예상 하락가 버퍼 산출 함수(compute_amp_buffer_target_price) 유지
+# MODIFIED: 초과 Case 78 & Case 93 — 데이장 개시 1분 전(08:59 KST / 18:59 EST) 나스닥 100 선물지수(NQ=F) 10분봉 양/음봉 판별 메서드(get_nq_10m_candle_trend),
+#           개시 후 7분간 RSI >= 50.0 최종 상승종목 판별 상수(DAY_OPEN_7M_RSI_THRESHOLD = 50.0),
+#           +1.30% 상승가 락온 × 최고가 -0.30% 하락 시 +1.00% 익절 보장 상수 및 40.0 <= RSI <= 70.0 중립 리셋 상수 탑재
 # NEW: 초과 Case 94 — 포지션 자체 손실률 기반 즉시 손절 절대 금지 및 실시간 QQQ 최소 0.80% 역행 하한선(MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80) 강제
 # MODIFIED: 초과 Case 82, 95 & 96 — lock_all_symbols_macro 호출 시 수동 보유 종목(MANUAL)과 03:58 ~ 04:06 EST 진행 중인
 #           1주 휩소 노출 작전(WHIPSAW_1SH)을 보호하되, 04:07 EST 이후 미체결 buy_order_id 잔재는 즉시 ""로 소각하여 장부 고착 무한 루프를 원천 차단
@@ -49,19 +51,27 @@ from toss_api import GlobalThrottle
 
 EST_TZ = ZoneInfo("America/New_York")
 
-# 초과 Case 93 — 데이장 개시 1분(09:00:00 ~ 09:00:59 KST) [모의] 스나이퍼 전용 진폭 역산 하락가 버퍼(BUFFER_WAIT) 전역 상수
-AMP_BUFFER_ACTIVATE_NQ_PCT = 0.80      # 데이장 개시 1분 중 NQ=F 당일 진폭이 0.80% 이상일 때 [모의] 역산 버퍼 가동
-AMP_BUFFER_LEVERAGE_MULT = 3.0         # NQ=F 진폭 대비 3배 레버리지 ETF 기대 하락폭 역산 배수 (3.0x)
-AMP_BUFFER_PARTIAL_MULT = 2.1          # 최소 부분 흡수 인정 배수 (2.1x, 포착가 대비 최소 -1.00% 추가 하락 병행)
-AMP_BUFFER_REBOUND_PCT = 0.30          # 역산 하락가 도달 후 최저점 대비 +0.30% 양봉 반등 시 모의 가상 체결
+# 하위 호환 유지용 상수
+AMP_BUFFER_ACTIVATE_NQ_PCT = 0.80
+AMP_BUFFER_LEVERAGE_MULT = 3.0
+AMP_BUFFER_PARTIAL_MULT = 2.1
+AMP_BUFFER_REBOUND_PCT = 0.30
+
+# NEW: 초과 Case 78 & Case 93 — 데이장(19:00 ~ 03:57 EST) 100% [모의] 스나이퍼 전용 추세·트레일링·리셋 전역 상수
+DAY_OPEN_7M_RSI_THRESHOLD = 50.0       # 데이장 개시 후 7분간(09:00~09:06:59 KST / 19:00~19:06:59 EST) 1차 락온 종목의 최종 상승 판별 RSI 기준 (>= 50.0)
+DAY_SIM_LOCK_PROFIT_RATE = 1.30        # 데이장 [모의] 추세추종 시 +1.30% 상승가 도달 시 트레일링 락온 (1.0130 * 0.9970 = +1.00% 보장)
+DAY_SIM_FLOOR_PROFIT_RATE = 1.00       # 데이장 [모의] +1.30% 락온 후 보장되는 최소 익절 보존선 (+1.00%)
+DAY_SIM_CALLBACK_PCT = 0.30            # 데이장 [모의] +1.30% 락온 후 최고가(Peak) 대비 콜백 하락폭 (-0.30%)
+DAY_REARM_RESET_RSI_MIN = 40.0         # 데이장 [모의] 1회 조건 달성 후 리셋 허용 RSI 하한 (40.0 이상)
+DAY_REARM_RESET_RSI_MAX = 70.0         # 데이장 [모의] 1회 조건 달성 후 리셋 허용 RSI 상한 (70.0 이하)
 
 # 초과 Case 94 — 3차 안전망 최소 실시간 QQQ 역행 하한선 (0.80% 하드 락온)
 MIN_STAGE3_QQQ_ADVERSE_PCT = 0.80
 
 # 초과 Case 97 — 선택지 B (👑 HYB_35_1ST) : 04:07 EST 이후 첫 RSI >= 79.9 상승 추세 종목 각인 및 07:00 ~ 08:14 EST RSI <= 35.0 추세추종 매수 상수
-PRE_TREND_LEADER_SELECT_RSI = 79.9         # 04:07 EST 이후 당일 첫 상승 추세 종목(leader_sym) 선정 임계치 (79.9 [80.0 클라이맥스 인지])
-PRE_TREND_PULLBACK_RSI_THRESHOLD = 35.0    # 07:00 ~ 08:14 EST 선정된 상승 추세 종목의 눌림목 매수 임계치 (RSI <= 35.0)
-PRE_TREND_REARM_RESET_RSI = 40.0           # 추세눌림목 매매 익절 후 동일 눌림목 고점 재진입 방지를 위한 RSI 회복 기준 (> 40.0)
+PRE_TREND_LEADER_SELECT_RSI = 79.9         # 04:07 EST / 19:00 EST 이후 당일 첫 상승 추세 종목 선정 임계치 (79.9 [80.0 클라이맥스 인지])
+PRE_TREND_PULLBACK_RSI_THRESHOLD = 35.0    # 선정된 상승 추세 종목의 눌림목 매수 임계치 (RSI <= 35.0)
+PRE_TREND_REARM_RESET_RSI = 40.0           # 프리장 추세눌림목 매매 익절 후 동일 눌림목 고점 재진입 방지를 위한 RSI 회복 기준 (> 40.0)
 
 # 초과 Case 99 — 기술적 반등(⚡ OLD_IMM_CB) × 진성 상승종목 추세추종(🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020) 이원화 매도 전역 상수
 TREND_PB_CALLBACK_PCT = 0.20               # 진성 상승종목 추세추종 매도 시 최고가(Peak) 대비 타이트 콜백 스탑 (-0.20%)
@@ -75,14 +85,7 @@ def compute_amp_buffer_target_price(
     nq_amp: float,
     leverage_mult: float = AMP_BUFFER_LEVERAGE_MULT,
 ) -> tuple[float, float, float, float]:
-    """
-    초과 Case 93 — 데이장 개시 시각(09:00:00 ~ 09:00:59 KST / 19:00:00 ~ 19:00:59 EST) 1분간
-    나스닥 100 선물(NQ=F)이 이미 급등·급락(nq_amp >= 0.80%)한 상태에서 [모의] 스나이퍼가
-    오프닝 휩소 고가에 즉시 모의 체결하지 않도록, 충격 전 기준 고가(anchor_high_price)에서
-    3배 레버리지 기대 하락률(expected_drop_pct = min(15.0, nq_amp * 3.0))을 역산하여
-    예상 하락가 버퍼(target_drop_p)와 유효 흡수 하한선(partial_drop_p)을 산출합니다.
-    반환값: (target_drop_price, partial_drop_price, expected_drop_pct, effective_anchor_high)
-    """
+    """하위 호환 유지를 위한 3배 레버리지 기대 하락폭 역산 헬퍼."""
     sp_fl = math.floor(float(spot_price or 0.0) * 100.0) / 100.0
     ah_fl = math.floor(float(anchor_high_price or 0.0) * 100.0) / 100.0
     nq_a = max(0.0, float(nq_amp or 0.0))
@@ -240,8 +243,7 @@ def calculate_rsi_1m(
     """
     Pandas 기반 백그라운드 벡터 연산.
     세션별 누적 VWAP(데이/프리/정규장 09:30~), Wilder's RSI(14), 하이킨 아시(Heikin-Ashi) 1분봉,
-    데이장 개시 1분 [모의] 버퍼용 기준 고가(session_anchor_high) 및
-    당일 04:07 EST / 19:00 EST 이후 첫 RSI >= 79.9 달성 타임스탬프(초과 Case 97, 98)를
+    기준 고가(session_anchor_high) 및 당일 04:07 EST / 19:00 EST 이후 첫 RSI >= 79.9 달성 타임스탬프(초과 Case 97, 98)를
     1개의 데이터프레임에서 동시 산출하여 CPU 블로킹 및 API 중복 호출을 원천 차단합니다.
     """
     if not candles_json:
@@ -311,7 +313,6 @@ def calculate_rsi_1m(
     session_df = df[df.index >= session_start_est].copy()
     pre_session_df = df[df.index < session_start_est]
 
-    # 초과 Case 93 — 데이장 개시 1분(09:00 KST) [모의] 역산 버퍼용 충격 전 기준 고가(session_anchor_high) 추출
     recent_60_high = float(df["highPrice"].tail(60).max()) if not df.empty else 0.0
     sess_high = float(session_df["highPrice"].max()) if not session_df.empty else 0.0
     prev_sess_ref = (
@@ -526,14 +527,18 @@ def compute_realtime_tick_heikin_ashi(
 
 
 class MacroDataCache:
-    # MODIFIED: 초과 Case 61, 62, 89, 90, 91, 92, 94 —
+    # MODIFIED: 초과 Case 61, 62, 78, 89, 90, 91, 92, 93, 94 —
     #           1) [해법 1] CME 18:00 EST 신세션 하드 컷오프 + fast_info 및 1d 일봉 당일 실제 고가/저가/마감가 3중 강제 병합 +
     #              동일 세션 단조 보존 락으로 개장 중은 물론 17:00~17:59 EST(06:00~06:59 KST) 마감 휴장 중에도
     #              직전 마감 세션(예: 어제 10월 19일 저가 29,226.00 / 마감가 29,722.50 / 진폭 2.59%)을 100% 무결하게 보존!
     #           2) [해법 2 방법 A & Case 92, 94] 3차 역행 안전망의 진입 기준가·실시간 비교가(get_stage3_reference_price) 및
     #              10분/3분 변화율은 토스 Open API QQQ 0.0초 실시간 시세로 산출 (보유 중 1.5초 프로빙, 폴백 NQ=F)
+    #           3) [Case 78 & Case 93] 데이장 개시 1분 전(08:59 KST / 18:59 EST) 나스닥 100 선물지수(NQ=F) 순수 10분봉
+    #              시가·종가·등락률 캐시(_nq_pure_10m_data) 및 추세 판별 메서드(get_nq_10m_candle_trend) 탑재
     # 튜플 구조: (curr_val, high_val, low_val, updated_ts, nq_vel_10m, nq_vel_3m)
     _nq_cache_data = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    # 순수 NQ=F 선물 10분봉 데이터: (open_10m, close_10m, nq_vel_10m_pure, nq_vel_3m_pure)
+    _nq_pure_10m_data = (0.0, 0.0, 0.0, 0.0)
     _nq_session_id = ""
     _nq_vel_source = "NQ선물"
     _qqq_curr_price = 0.0
@@ -572,15 +577,14 @@ class MacroDataCache:
             now_est = datetime.now(EST_TZ)
             is_cme_open, nq_session_start_est = get_cme_session_window_est(now_est)
             cur_sess_id = nq_session_start_est.strftime("%Y-%m-%d_%H%M")
-            # 해당 선물 세션(18:00 EST 개장 ~ 익일 17:00 EST 마감)의 기준 영업일 (예: 10-18 18:00 개장 -> 2026-10-19)
             target_session_date = (nq_session_start_est + timedelta(hours=6)).date()
 
             # 초과 Case 90 — 18:00:00 EST(한국시간 07:00 KST) CME 선물 신세션 롤오버 감지 시에만 이전 세션 캐시 0점 소각!
-            # (17:00~17:59 EST [06:00~06:59 KST] 마감 휴장 중에는 cur_sess_id가 어제 세션 그대로 유지되므로 리셋되지 않음)
             session_rolled = (cls._nq_session_id != cur_sess_id)
             if session_rolled:
                 cls._nq_session_id = cur_sess_id
                 cls._nq_cache_data = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                cls._nq_pure_10m_data = (0.0, 0.0, 0.0, 0.0)
                 cls._qqq_curr_price = 0.0
                 cls._qqq_price_ts = 0.0
 
@@ -614,8 +618,7 @@ class MacroDataCache:
                 except Exception:
                     pass
 
-                # NEW: 초과 Case 91 — 1일봉(interval="1d")에서 해당 세션 기준일(target_session_date)의 공식 고가/저가/종가 추출
-                #      (1분봉 개장 첫 틱 누락 또는 17:00 EST 장마감 직후에도 29,226.00 저가를 100% 복원)
+                # 초과 Case 91 — 1일봉(interval="1d")에서 해당 세션 기준일(target_session_date)의 공식 고가/저가/종가 추출
                 daily_sess_high = 0.0
                 daily_sess_low = 0.0
                 daily_sess_close = 0.0
@@ -655,8 +658,8 @@ class MacroDataCache:
                         h_init = max(seed_c, fast_day_high, daily_sess_high)
                         l_cands = [v for v in (seed_c, fast_day_low, daily_sess_low) if v > 0.0]
                         l_init = min(l_cands) if l_cands else seed_c
-                        return seed_c, h_init, l_init, 0.0, 0.0
-                    return 0.0, 0.0, 0.0, 0.0, 0.0
+                        return seed_c, h_init, l_init, 0.0, 0.0, seed_c
+                    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
                 df = df[~df.index.duplicated(keep="last")]
@@ -670,15 +673,15 @@ class MacroDataCache:
                 if df.empty:
                     seed_c = fast_last_p or daily_sess_close
                     if seed_c > 0.0:
-                        return seed_c, seed_c, seed_c, 0.0, 0.0
-                    return 0.0, 0.0, 0.0, 0.0, 0.0
+                        return seed_c, seed_c, seed_c, 0.0, 0.0, seed_c
+                    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
                 if "Open" in df.columns:
                     df["Open"] = np.where(df["Open"] > 0.0, df["Open"], df["Close"])
                 else:
                     df["Open"] = df["Close"]
 
-                # 직전 구세션(nq_session_start_est 이전 세션) 고가·저가 추출 (18:00 EST 신세션 직후 fast_info 미갱신 여부 대조용)
+                # 직전 구세션(nq_session_start_est 이전 세션) 고가·저가 추출
                 df_before = df[df.index < nq_session_start_est]
                 prev_sess_h, prev_sess_l = 0.0, 0.0
                 if not df_before.empty:
@@ -692,7 +695,6 @@ class MacroDataCache:
                 # 초과 Case 62 & Case 90 — 현재 대상 CME 선물 세션 시작 시각(18:00:00 EST) 이전의 전일/금요일 캔들 100% 절삭
                 df_session = df[df.index >= nq_session_start_est].copy()
 
-                # fast_info의 day_high/day_low가 구세션(nq_session_start_est 이전 세션) 값 그대로인지 판별
                 is_fast_hl_stale = (
                     prev_sess_h > 0.0
                     and prev_sess_l > 0.0
@@ -712,25 +714,20 @@ class MacroDataCache:
                             h_seed = max(h_seed, fast_day_high)
                         if fast_day_low > 0.0 and abs(fast_day_low - seed_p) / seed_p < 0.12:
                             l_seed = min(l_seed, fast_day_low)
-                    return seed_p, h_seed, l_seed, 0.0, 0.0
+                    return seed_p, h_seed, l_seed, 0.0, 0.0, seed_p
 
-                # MODIFIED: 초과 Case 62 & Case 90 & Case 91 —
-                # 이미 df[df.index >= nq_session_start_est] 로 18:00:00 EST 신세션 하드 컷오프가 완료된 df_session 에 대해
-                # 야간 1분봉 공백(45분 갭)을 휴장으로 착각해 개장 직후 최저점(29,226.00)을 잘라버리던 gaps_inner 절삭을 영구 소각!
                 curr_val = float(df_session["Close"].iloc[-1])
                 high_val = float(df_session["High"].max())
                 low_val = float(df_session["Low"].min())
 
-                # 1) 1일봉(interval="1d")의 해당 세션 공식 고가/저가 강제 병합 (# NEW)
+                # 1) 1일봉(interval="1d")의 해당 세션 공식 고가/저가 강제 병합
                 if curr_val > 0.0:
                     if daily_sess_high > 0.0 and abs(daily_sess_high - curr_val) / curr_val < 0.12:
                         high_val = max(high_val, daily_sess_high)
                     if daily_sess_low > 0.0 and abs(daily_sess_low - curr_val) / curr_val < 0.12:
                         low_val = min(low_val, daily_sess_low) if low_val > 0.0 else daily_sess_low
 
-                # 2) 초과 Case 91 [해법 1] — 개장 중(is_cme_open=True)뿐만 아니라
-                #    17:00~17:59 EST(06:00~06:59 KST) 일일 마감 휴장 및 주말 휴장 중(is_cme_open=False)에도
-                #    fast_info의 마감가(29,722.50) 및 거래소 집계 당일 실제 고가(29,983.50)·저가(29,226.00)를 강제 병합! (# MODIFIED)
+                # 2) 초과 Case 91 [해법 1] — 개장 중 및 마감 휴장 중 fast_info 마감가·고가·저가 강제 병합
                 if curr_val > 0.0:
                     if fast_last_p > 0.0 and abs(fast_last_p - curr_val) / curr_val < 0.05:
                         curr_val = fast_last_p
@@ -743,21 +740,24 @@ class MacroDataCache:
                         if fast_day_low > 0.0 and abs(fast_day_low - curr_val) / curr_val < 0.12:
                             low_val = min(low_val, fast_day_low) if low_val > 0.0 else fast_day_low
 
-                # NQ=F 자체 10분 변화율 및 3분 단기 변화율 (QQQ 미개장 시간대 폴백용)
+                # NQ=F 자체 10분봉 시가(ref_10m) 대비 현재가(curr_val) 변화율 및 3분 변화율 산출
                 first_open = float(df_session["Open"].iloc[0]) or float(df_session["Close"].iloc[0])
                 ref_10m = float(df_session["Close"].iloc[-11]) if len(df_session) >= 11 else first_open
                 ref_3m = float(df_session["Close"].iloc[-4]) if len(df_session) >= 4 else first_open
 
                 vel_10m = ((curr_val - ref_10m) / ref_10m * 100.0) if ref_10m > 0.0 else 0.0
                 vel_3m = ((curr_val - ref_3m) / ref_3m * 100.0) if ref_3m > 0.0 else 0.0
-                return curr_val, high_val, low_val, vel_10m, vel_3m
+                return curr_val, high_val, low_val, vel_10m, vel_3m, ref_10m
 
             try:
                 nq_task = asyncio.wait_for(asyncio.to_thread(_fetch_nq), timeout=5.0)
                 qqq_task = cls._fetch_qqq_velocity_async(now_est)
-                (c, h, l, nq_v10, nq_v3), (qqq_ok, q_v10, q_v3, q_curr) = await asyncio.gather(
+                (c, h, l, nq_v10, nq_v3, nq_ref10), (qqq_ok, q_v10, q_v3, q_curr) = await asyncio.gather(
                     nq_task, qqq_task
                 )
+
+                if c > 0.0:
+                    cls._nq_pure_10m_data = (float(nq_ref10 or c), float(c), float(nq_v10), float(nq_v3))
 
                 # 초과 Case 91 & Case 92 — 토스 Open API QQQ 0.0초 실시간 변화율 및 현재가 캐시 동기화
                 if qqq_ok:
@@ -771,8 +771,7 @@ class MacroDataCache:
                     cls._nq_vel_source = "NQ선물"
 
                 if l > 0.0:
-                    # NEW: 초과 Case 62, 90, 91 — 동일 선물 세션(not session_rolled) 내 누적 최고가(max)·최저가(min) 단조 보존 락!
-                    #      (장중 포착된 최저가 29,226.00이 17:00 EST 마감 후에도 다음 18:00 EST 신세션 개장 전까지 절대 증발하지 않도록 보호)
+                    # 초과 Case 62, 90, 91 — 동일 선물 세션(not session_rolled) 내 누적 최고가(max)·최저가(min) 단조 보존 락!
                     if not session_rolled and prev_l > 0.0:
                         if prev_h > 0.0 and h > 0.0 and abs(prev_h - c) / max(c, 1.0) < 0.12:
                             h = max(h, prev_h)
@@ -797,14 +796,49 @@ class MacroDataCache:
         return cls._nq_cache_data[0], cls._nq_cache_data[1], cls._nq_cache_data[2]
 
     @classmethod
+    async def get_nq_10m_candle_trend(
+        cls, force_refresh: bool = False
+    ) -> tuple[str, str, float, float, float]:
+        """
+        NEW: 초과 Case 78 & Case 93 — 데이장 시작 1분 전(08:59 KST / 18:59 EST) 및 개시 7분 윈도우에서
+        나스닥 100 선물지수(NQ=F)의 직전 10분봉을 판별하여 상승(양봉)이면 ('LONG', 'SOXL'),
+        하락(음봉)이면 ('SHORT', 'SOXS')를 반환합니다.
+        반환값: (trend_dir, target_symbol, vel_10m_pct, open_10m_val, close_10m_val)
+        """
+        await cls._refresh_cache_if_needed(force_refresh=force_refresh)
+        open_10m, close_10m, nq_v10_pure, nq_v3_pure = cls._nq_pure_10m_data
+        c_nq, h_nq, l_nq = cls._nq_cache_data[0], cls._nq_cache_data[1], cls._nq_cache_data[2]
+
+        if close_10m <= 0.0:
+            close_10m = float(c_nq)
+        if open_10m <= 0.0 and close_10m > 0.0:
+            v10_fallback = float(cls._nq_cache_data[4])
+            open_10m = close_10m / (1.0 + v10_fallback / 100.0) if abs(v10_fallback) > 1e-6 else close_10m
+            nq_v10_pure = v10_fallback
+
+        if close_10m > open_10m or nq_v10_pure > 0.0:
+            return "LONG", "SOXL", float(nq_v10_pure), float(open_10m), float(close_10m)
+        if close_10m < open_10m or nq_v10_pure < 0.0:
+            return "SHORT", "SOXS", float(nq_v10_pure), float(open_10m), float(close_10m)
+
+        # 만약 10분봉 시가와 종가가 정확히 0.00% 보합일 경우 3분 변화율 -> 당일 중간값 순으로 판별
+        if nq_v3_pure > 0.0:
+            return "LONG", "SOXL", float(nq_v3_pure), float(open_10m), float(close_10m)
+        if nq_v3_pure < 0.0:
+            return "SHORT", "SOXS", float(nq_v3_pure), float(open_10m), float(close_10m)
+
+        mid_nq = ((h_nq + l_nq) / 2.0) if (h_nq > 0.0 and l_nq > 0.0) else close_10m
+        if close_10m >= mid_nq and close_10m > 0.0:
+            return "LONG", "SOXL", 0.0, float(open_10m), float(close_10m)
+        return "SHORT", "SOXS", 0.0, float(open_10m), float(close_10m)
+
+    @classmethod
     async def get_stage3_reference_price(
         cls, force_refresh: bool = False, realtime_probing: bool = False
     ) -> tuple[float, str]:
         """
         초과 Case 92 & Case 94 — 나스닥 100 선물(NQ=F) 진폭으로 산출된 3차 진입 임계치 max(nq_entry_amp * 0.5, 0.80%)를
         10분 지연 없이 시차 0.0초로 적용하기 위한 토스 Open API QQQ 실시간 현재가 반환 헬퍼.
-        - 포지션 보유 중(realtime_probing=True)에는 1.5초 주기로 토스 QQQ 실시간 현재가를 직접 프로빙합니다.
-        - 평시 대기 중(realtime_probing=False)에는 15.0초 캐시를 사용하며, QQQ 미수신 시간대(18:00~18:59 EST 등)에만 NQ=F로 폴백합니다.
         """
         now_est = datetime.now(EST_TZ)
         wk = now_est.weekday()
@@ -880,7 +914,7 @@ class AssassinLedger:
     # 이원화 하이킨 아시 트레일링(기술적 반등 ⚡ OLD_IMM_CB × 진성 상승종목 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020) 상수 (Case 68, 85, 89, 99)
     DEFAULT_TARGET_PROFIT_RATE = 1.00
     ALLOWED_TARGET_RATES = (1.00,)
-    TRAIL_ARM_PROFIT_RATE = 1.00          # +1.00% 도달 시 하이킨 아시 트레일링 점화(Arming)
+    TRAIL_ARM_PROFIT_RATE = 1.00          # 프리장/정규장 본진 +1.00% 도달 시 하이킨 아시 트레일링 점화(Arming)
     TRAIL_FLOOR_LOCK_RATE = 1.00          # 기본 최소 +1.00% 익절 보존선 하드 락온
     TRAIL_DROP_CALLBACK_PCT = 0.30        # 기술적 반등(PRE_SNIPER) 최고가 대비 -0.30% 콜백 스탑
     TREND_PB_CALLBACK_PCT = TREND_PB_CALLBACK_PCT              # 진성 상승종목(PRE_PULLBACK) 최고가 대비 -0.20% 타이트 콜백 스탑 (Case 99)
@@ -889,9 +923,16 @@ class AssassinLedger:
     TRAIL_SAFETY_CAP_RATE = 5.00          # 매수 체결 직후 거래소에 선장전하는 상단 안전 캡 (+5.00% LIMIT)
     NQ_VELOCITY_SURGE_PCT = 0.20          # QQQ/NQ 10분/3분 변화율 ±0.20% 이상 급등락 시 HA음봉 바이패스 임계치 (Case 89, 91)
     MIN_STAGE3_QQQ_ADVERSE_PCT = MIN_STAGE3_QQQ_ADVERSE_PCT  # 3차 안전망 최소 실시간 QQQ 역행 하한선 0.80% (Case 94)
-    AMP_BUFFER_ACTIVATE_NQ_PCT = AMP_BUFFER_ACTIVATE_NQ_PCT  # 데이장 09:00 KST 1분 한정 역산 버퍼 가동 기준 (Case 93)
-    AMP_BUFFER_LEVERAGE_MULT = AMP_BUFFER_LEVERAGE_MULT      # 진폭 × 3.0배 레버리지 기대 하락폭 역산 배수 (Case 93)
-    AMP_BUFFER_REBOUND_PCT = AMP_BUFFER_REBOUND_PCT          # 최저점 대비 +0.30% 양봉 반등 시 모의 진입 (Case 93)
+    # 데이장 100% [모의] 전용 추세·트레일링·리셋 상수 바인딩 (Case 78, 93)
+    DAY_OPEN_7M_RSI_THRESHOLD = DAY_OPEN_7M_RSI_THRESHOLD
+    DAY_SIM_LOCK_PROFIT_RATE = DAY_SIM_LOCK_PROFIT_RATE
+    DAY_SIM_FLOOR_PROFIT_RATE = DAY_SIM_FLOOR_PROFIT_RATE
+    DAY_SIM_CALLBACK_PCT = DAY_SIM_CALLBACK_PCT
+    DAY_REARM_RESET_RSI_MIN = DAY_REARM_RESET_RSI_MIN
+    DAY_REARM_RESET_RSI_MAX = DAY_REARM_RESET_RSI_MAX
+    AMP_BUFFER_ACTIVATE_NQ_PCT = AMP_BUFFER_ACTIVATE_NQ_PCT
+    AMP_BUFFER_LEVERAGE_MULT = AMP_BUFFER_LEVERAGE_MULT
+    AMP_BUFFER_REBOUND_PCT = AMP_BUFFER_REBOUND_PCT
     PRE_TREND_LEADER_SELECT_RSI = PRE_TREND_LEADER_SELECT_RSI          # 04:07 EST 이후 첫 상승 추세 종목 각인 기준 79.9 (Case 97)
     PRE_TREND_PULLBACK_RSI_THRESHOLD = PRE_TREND_PULLBACK_RSI_THRESHOLD# 07:00~08:14 EST 추세추종 눌림목 매수 기준 35.0 (Case 97)
     PRE_TREND_REARM_RESET_RSI = PRE_TREND_REARM_RESET_RSI              # 추세눌림목 익절 후 재장전 회복 기준 40.0 (Case 97)
@@ -911,12 +952,10 @@ class AssassinLedger:
         sym = cls._validate_symbol(symbol)
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"AssassinLedger_{sym}.json")
 
-    # 단일 하이킨 아시 트레일링 모드 락온에 따라 점화 기준 수익률 1.00% 단일 반환 (Case 68)
     @classmethod
     def normalize_target_rate(cls, rate_val=None) -> float:
         return 1.00
 
-    # 최소 익절 보존선(+1.00%)에서 왕복 협의 수수료(0.14%)를 공제한 최소 보장 순수익률 (+0.86%) 반환
     @classmethod
     def get_net_compound_rate(cls, target_profit_rate: float = 1.00) -> float:
         return round(cls.TRAIL_FLOOR_LOCK_RATE - cls.ROUND_TRIP_COMM_PCT, 2)
@@ -990,7 +1029,6 @@ class AssassinLedger:
                     return ""
             return await asyncio.to_thread(_read)
 
-    # 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전 전용 목표 매도가 조회
     @classmethod
     async def get_whipsaw_target_price(cls, symbol: str) -> float:
         filepath = cls._get_file_path(symbol)
@@ -1008,7 +1046,6 @@ class AssassinLedger:
                     return 0.0
             return await asyncio.to_thread(_read)
 
-    # 복리 모드(is_compound) 활성화 상태 조회 (기본값 True)
     @classmethod
     async def get_is_compound(cls, symbol: str) -> bool:
         filepath = cls._get_file_path(symbol)
@@ -1026,8 +1063,6 @@ class AssassinLedger:
                     return True
             return await asyncio.to_thread(_read)
 
-    # Case 76: 하이킨 아시 트레일링 익절(+1.00% ~ +5.00%+) / 15:00~15:58 VWAP 탈출 / 손절 / 수동개입 / 1주휩소 작전 모두
-    #          실제 발생한 순수익금((실제매도가 - 실제매수가) * 실제체결수량 - 왕복수수료 0.14%)을 기반으로 통합 복리 시드(budget) 정밀 갱신
     @classmethod
     def calc_compound_next_budget(
         cls,
@@ -1042,7 +1077,6 @@ class AssassinLedger:
         if base_budget < cls.MIN_BUDGET_FLOOR:
             base_budget = cls.MIN_BUDGET_FLOOR
 
-        # 1순위 (핵심): 실제 체결 단가(entry_price, exit_price)와 실제 체결 수량(filled_qty)이 확인된 경우
         if entry_price > 0.0 and exit_price > 0.0 and filled_qty > 0.0:
             invested_usd = float(entry_price) * float(filled_qty)
             returned_usd = float(exit_price) * float(filled_qty)
@@ -1052,7 +1086,6 @@ class AssassinLedger:
             new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
             return new_budget, net_delta_usd, round(comm_usd, 2)
 
-        # 2순위: 체결 단가(entry_price, exit_price)만 확보되고 수량이 누락된 경우 시드 기준 추정 수량(최소 1주)으로 실수익 역산
         if entry_price > 0.0 and exit_price > 0.0:
             est_qty = max(1, math.floor(base_budget / float(entry_price)))
             invested_usd = float(entry_price) * est_qty
@@ -1063,7 +1096,6 @@ class AssassinLedger:
             new_budget = round(max(cls.MIN_BUDGET_FLOOR, base_budget + net_delta_usd), 2)
             return new_budget, net_delta_usd, round(comm_usd, 2)
 
-        # 3순위 폴백: API 체결 내역 인덱싱이 완전히 지연된 경우 최소 보존 익절률(+1.00%, 순+0.86%)/수수료 기준 정산
         if is_take_profit:
             net_comp_rate = cls.get_net_compound_rate(target_profit_rate)
             net_delta_usd = round(base_budget * (net_comp_rate / 100.0), 2)
@@ -1159,7 +1191,6 @@ class AssassinLedger:
 
             await asyncio.to_thread(_write)
 
-    # 통합 시드 풀(Unified Seed Pool) 및 전술 제어반 공통 설정(시드, 복리여부, 마스터전원) 양쪽 원장 동시 동기화 (Case 76)
     @classmethod
     async def sync_global_settings(
         cls,
@@ -1177,11 +1208,6 @@ class AssassinLedger:
                 is_active=is_active,
             )
 
-    # MODIFIED: 매크로 1·2·3차 방어선 작동 시 SOXS와 SOXL 양쪽 장부 동시 잠금하되,
-    #           현재 수동 보유 중(entry_session == "MANUAL")인 종목과
-    #           03:58 ~ 04:06 EST 진행 중인 1주 휩소 작전(entry_session == "WHIPSAW_1SH") 종목은
-    #           표식과 목표가(whipsaw_target_price), 미체결 buy_order_id를 보존하며,
-    #           04:07 EST 이후에는 미체결 buy_order_id 잔재를 즉시 ""로 소각하여 무한 루프를 원천 차단 (Case 50, 82, 94, 95, 96)
     @classmethod
     async def lock_all_symbols_macro(cls, last_session_id: str = None, force_all: bool = False):
         now_est = datetime.now(EST_TZ)
@@ -1231,8 +1257,6 @@ class AssassinLedger:
                 kwargs["last_session_id"] = last_session_id
             await cls.save_state(sym, **kwargs)
 
-    # 프리장 골든타임 내 익절 완료 또는 04:07 휩소 정리 완료 시 양쪽 장부 동시 무한 재출동 락 해제하되,
-    # 당일 NQ=F 진폭이 이미 2.0% 이상인 과열 장세라면 자동 스나이퍼 재해금을 차단하고 CANCELED_MACRO 복원 (Case 52, 66, 80, 84, 95)
     @classmethod
     async def unlock_all_symbols_for_reentry(cls):
         nq_h = float(MacroDataCache._nq_cache_data[1] or 0.0)
