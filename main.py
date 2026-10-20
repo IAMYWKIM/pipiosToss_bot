@@ -1,30 +1,19 @@
 # =====================================================================
 # FILE: main.py
 # 목적: 프리장 초중반 골든타임 (04:07 ~ 08:14 EST · 08:15 EST 거시지표 선제 컷오프)
-#       선택지 B (👑 HYB_35_1ST) —
-#       [1] 04:07 ~ 08:14 EST 양방향 대칭 클라이맥스(매수종목 RSI<=30.0 & 반대종목 RSI>=79.9[80.0 클라이맥스 인지]) 상시 타격 +
-#       [2] 04:07 EST 이후 첫 RSI>=79.9 달성 상승 추세 종목(FIRST_799 · leader_sym) 자동 각인 후
-#           07:00 ~ 08:14 EST 후반 황금 구간에 해당 상승 종목이 RSI<=35.0 도달 시 추세추종 저가 매수
-#       무한 출동 듀얼 스나이퍼(SOXS/SOXL),
+#       선택지 B (👑 HYB_35_1ST) 듀얼 스나이퍼(SOXS/SOXL),
 #       진입 성격별 '이원화 매도 믹스(기술적 반등 ⚡ OLD_IMM_CB × 진성 상승종목 🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020 × 🚀 NQ_VEL_BYPASS)',
 #       3차 손절 후 최저점 역트레일링 +0.30% 반등 재진입(RE_BOT_TRAIL),
 #       매수 체결 직후 잔고 인덱싱 시차 중 자동 진입 물량의 MANUAL 오분류 원천 차단(초과 Case 100),
 #       15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 물량 당일 정규장 VWAP 도달 즉시 덤핑 탈출(🛟 VWAP_ESCAPE),
-#       데이장(19:00 ~ 03:57 EST) 100% [모의] 스나이퍼(개시 1분 전 NQ 10분봉 락온 ➔ 개시 7분간 RSI>=50 즉시 진입 · +1.30% 락온 -0.30% 트레일링 · 40~70 리셋 무한출격) 및
-#       03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 오케스트레이터
-# 구조: sniper_plugin.py / defense_plugin.py / whipsaw_plugin.py 3대 전술 플러그인과 SniperPluginContext로 결속된 아키텍처
+#       데이장(19:00 ~ 03:57 EST) 100% [모의] 스나이퍼 및
+#       03:58 ~ 04:07 EST 듀얼 1주 휩소 매수 덫 메인 오케스트레이터
+#       (main.py 2/2 분할본 · main_loops_plugin 100% 리익스포트 결속)
 # =====================================================================
-# MODIFIED: 제3헌법 및 초과 Case 88 의거 defense_plugin.py 분리 모듈을 포함한 9대 코어 모듈 프리플라이트 컴파일 검증 결속 (Case 11, 88)
-# MODIFIED: 프리장 스나이퍼 보호를 위해 무인 업데이트 락다운 시간대를 03:30 ~ 17:00 EST로 전면 확장 (Case 07)
-# MODIFIED: SOXS 및 SOXL 양방향 대칭 클라이맥스 및 추세추종 눌림목 듀얼 감시 루프(TRADE_SYMBOLS = ("SOXS", "SOXL")) 가동 (Case 09, 54, 71, 81, 97)
-# MODIFIED: 03:55 ~ 08:14 EST 구간 및 포지션 보유(수동 포함)/트레일링 점화/최저점 추적 중 5.0초 듀얼 캔들 스캔 가속 및
-#           정규장 후반(12:50 ~ 15:58 EST) 보유 중 2페이지(최대 400분봉) 페이지네이션 스캔으로 09:30 EST 개장 첫 봉부터 누락 없는 정규장 누적 VWAP 산출 (Case 73, 84, 85, 87, 98)
+# MODIFIED: 제3헌법 및 플러그인 분할 아키텍처 의거 무인 업데이트 루프 및 RSI 레이더 루프를 main_loops_plugin.py로 분리하고 100% 리익스포트 결속
 # MODIFIED: 초과 Case 28, 78, 83, 85, 87, 93, 97, 98 — 6대 0.4초 고주파 부스터에 데이장 개시 1분 전(08:59 KST / 18:59 EST) 10분봉 사전 락온,
 #           개시 후 7분간(09:00~09:06:59 KST / 19:00~19:06:59 EST) RSI>=50.0 추세감시 및 데이장 [모의] 트레일링 추적을 연동!
 # NEW: 수동 진입(MANUAL) 첫 틱 감지 시 execute_macro_defense_plugin과 로컬 상태를 즉시 동기화하여 NQ>=2.0% 구간에서도 2차 방어 패스 후 3차 안전망 & HA트레일링 직결 (Case 50, 66, 67, 86)
-# NEW: 04:07 ~ 08:14 EST 중 NQ<2.0% 내 3차 역행 손절 후 최저점 역트레일링 +0.30% 양봉 반등 재진입(execute_post_stop_bottom_rebound_plugin) 결속 (Case 87)
-# NEW: 초과 Case 97 — 04:07 ~ 08:14 EST 첫 RSI>=79.9 상승 추세 종목(leader_sym) 실시간 틱 각인·복원 및 07:00 ~ 08:14 EST RSI<=35.0 추세추종 타격 게이트 결속
-# NEW: 초과 Case 98 & Case 99 — 15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 보유 물량 당일 정규장 VWAP 도달 즉시 덤핑 탈출(execute_late_regular_vwap_escape_plugin) 및 이원화 매도 믹스 연동
 # NEW: 초과 Case 100 — rearm_premarket_buy_trap_after_30s_plugin 실행 직후 실잔고(holdings_qty)를 즉시 재조회 동기화하여,
 #      재장전 정정 주문이 즉시 체결되었을 때 reconcile_zero_holdings_exit_plugin 오진입 없이 동일 틱 내 안전 캡 장전으로 직행하도록 방어
 # MODIFIED: 시스템 기동 완료 텔레그램 메시지를 "정상작동 중입니다." 단일 라인으로 슬림화 유지 (Case 38, 88)
@@ -37,7 +26,6 @@ import asyncio
 import html
 import logging
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from dotenv import load_dotenv
@@ -82,12 +70,20 @@ from sniper_plugin import (
     manage_mechanical_profit_trap_plugin,
     execute_rsi_monitoring_plugin,
 )
+from main_loops_plugin import (
+    EST_TZ,
+    KST_TZ,
+    TRADE_SYMBOLS,
+    RSI_SYMBOLS,
+    NQ_DYNAMIC_FLOOR,
+    HOLIDAY_TRANSLATIONS,
+    _run_git_update_sync,
+    auto_update_loop,
+    rsi_radar_loop,
+)
 
 logging.getLogger("aiogram").setLevel(logging.CRITICAL)
 logging.getLogger("aiohttp").setLevel(logging.CRITICAL)
-
-EST_TZ = ZoneInfo("America/New_York")
-KST_TZ = ZoneInfo("Asia/Seoul")
 
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path=env_path)
@@ -104,25 +100,6 @@ if not all([TOSS_CLIENT_ID, TOSS_CLIENT_SECRET, TELEGRAM_BOT_TOKEN, _telegram_ch
 ADMIN_CHAT_ID = int(_telegram_chat_id_str)
 wakeup_event = asyncio.Event()
 
-TRADE_SYMBOLS = ("SOXS", "SOXL")
-RSI_SYMBOLS = ("SOXS", "SOXL")
-NQ_DYNAMIC_FLOOR = 0.8
-
-HOLIDAY_TRANSLATIONS = {
-    "New Year's Day": "신정 (New Year's Day)",
-    "Martin Luther King Jr. Day": "마틴 루터 킹 주니어 탄생일 (MLK Day)",
-    "Washington's Birthday": "대통령의 날 (Presidents' Day)",
-    "Good Friday": "성금요일 (Good Friday)",
-    "Memorial Day": "메모리얼 데이 (Memorial Day)",
-    "Juneteenth National Independence Day": "노예해방기념일 (Juneteenth)",
-    "Independence Day": "독립기념일 (Independence Day)",
-    "Labor Day": "노동절 (Labor Day)",
-    "Thanksgiving Day": "추수감사절 (Thanksgiving Day)",
-    "Christmas": "크리스마스 (Christmas Day)",
-    "Christmas Day": "크리스마스 (Christmas Day)",
-    "주말 (Weekend)": "주말 (Weekend)",
-}
-
 in_memory_ordering_lock = {sym: False for sym in TRADE_SYMBOLS}
 dual_strike_mutex = asyncio.Lock()
 shared_holdings = {sym: 0 for sym in TRADE_SYMBOLS}
@@ -138,187 +115,6 @@ idempotency_keys = {
 
 holiday_notify_lock = asyncio.Lock()
 last_holiday_notified_date = ""
-
-
-def _run_git_update_sync() -> tuple[bool, str]:
-    import subprocess
-    import py_compile
-
-    def run_cmd(cmd):
-        proc = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        try:
-            out, err = proc.communicate(timeout=30)
-            return proc.returncode, out.strip(), err.strip()
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
-            return -1, out.strip(), "Subprocess Timeout Expired (네트워크 교착 상태 방어)"
-
-    code, current_hash, err = run_cmd("git rev-parse HEAD")
-    if code != 0:
-        return False, f"해시 백업 실패: {err}"
-
-    code, fetch_out, fetch_err = run_cmd("git fetch origin main")
-    if code != 0:
-        return False, f"Fetch 실패:\n{fetch_err}"
-
-    code, local_hash, _ = run_cmd("git rev-parse HEAD")
-    code, remote_hash, _ = run_cmd("git rev-parse origin/main")
-
-    if local_hash == remote_hash:
-        return True, "Already up to date."
-
-    code, reset_out, reset_err = run_cmd("git reset --hard origin/main")
-    if code != 0:
-        run_cmd(f"git reset --hard {current_hash}")
-        return False, f"Hard Reset 붕괴 (원상 복구됨):\n{reset_err}"
-
-    try:
-        # MODIFIED: Case 11 & Case 88 — 분리된 defense_plugin.py를 포함한 9대 코어 모듈 프리플라이트 컴파일 검증
-        for mod_file in (
-            "main.py",
-            "sniper_plugin.py",
-            "defense_plugin.py",
-            "whipsaw_plugin.py",
-            "tg_router.py",
-            "tg_ui_plugin.py",
-            "quant_engine.py",
-            "toss_api.py",
-            "candle_recorder.py",
-        ):
-            if os.path.exists(mod_file):
-                py_compile.compile(mod_file, doraise=True)
-    except Exception as e:
-        run_cmd(f"git reset --hard {current_hash}")
-        return False, f"문법 에러 감지. 롤백 완료:\n{str(e)}"
-
-    return True, f"업데이트 성공:\n{reset_out}"
-
-
-async def auto_update_loop(bot: Bot, chat_id: int):
-    while True:
-        try:
-            now_est = datetime.now(EST_TZ)
-            est_hm = now_est.hour * 100 + now_est.minute
-            # Case 07 프리장 개장 전부터 애프터장 종료 (03:30 ~ 17:00 EST) 까지 무인 업데이트 전면 차단
-            if 330 <= est_hm < 1700:
-                await asyncio.sleep(3600.0)
-                continue
-
-            success, msg = await asyncio.to_thread(_run_git_update_sync)
-            if success:
-                if "Already up to date." not in msg:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            "🚀 <b>[무인 자동 업데이트 성공]</b>\n"
-                            "▫️ 최신 코드가 백그라운드에서 감지되어 구글 클라우드 서버에 안전하게 탑재되었습니다.\n"
-                            "▫️ 파이썬 컴파일 검증 완료. 코어 재기동(os._exit) 격발.\n"
-                            f"<pre>{html.escape(msg)}</pre>"
-                        ),
-                        parse_mode="HTML",
-                    )
-                    await asyncio.sleep(1.0)
-                    os._exit(0)
-            else:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🚨 <b>[무인 자동 업데이트 실패 및 롤백]</b>\n<pre>{html.escape(msg)}</pre>",
-                    parse_mode="HTML",
-                )
-        except Exception as e:
-            print(f"🚨 [무인 업데이트망 붕괴 방어] {e}", flush=True)
-
-        await asyncio.sleep(3600.0)
-
-
-async def rsi_radar_loop(ctx: SniperPluginContext, symbol: str):
-    while True:
-        try:
-            now_est = datetime.now(EST_TZ)
-            now_kst = now_est.astimezone(KST_TZ)
-            est_hm = now_est.hour * 100 + now_est.minute
-            kst_hm = now_kst.hour * 100 + now_kst.minute
-            wk = now_est.weekday()
-            is_weekend_closed = (wk == 4 and est_hm >= 1700) or (wk == 5) or (wk == 6 and est_hm < 1800)
-
-            is_open, _, sess_name, _ = await ctx.client.is_market_open()
-            # 초과 Case 78 & Case 93 — 데이장 개시 직전 2분(18:58~18:59 EST 또는 08:58~08:59 KST)에는
-            # 개시 후 7분간 RSI>=50.0 즉시 판별을 위해 캔들 기저 워밍업 스캔을 선행 허용!
-            is_day_open_warmup = (not is_weekend_closed) and (
-                (1858 <= est_hm <= 1859) or (858 <= kst_hm <= 859)
-            )
-
-            if (is_open and sess_name != "CLOSED") or is_day_open_warmup:
-                data = await ctx.client.get_1m_candles_pagination(symbol, count=200)
-                candles = list(data.get("candles") or [])
-                next_before = data.get("nextBefore")
-
-                # 초과 Case 98 — 정규장 후반(12:50 ~ 15:58 EST, 정규장 총 390분)에 보유 포지션이 존재할 때는
-                # 2페이지(최대 400분봉)까지 페이지네이션 조회하여 09:30 EST 개장 첫 봉부터 누락 없는 정규장 누적 VWAP을 산출!
-                if (
-                    candles
-                    and next_before
-                    and (1250 <= est_hm <= 1559)
-                    and int(ctx.shared_holdings.get(symbol, 0)) > 0
-                ):
-                    try:
-                        data_p2 = await ctx.client.get_1m_candles_pagination(
-                            symbol, count=200, before=next_before
-                        )
-                        candles_p2 = data_p2.get("candles") or []
-                        if candles_p2:
-                            candles.extend(candles_p2)
-                    except Exception:
-                        pass
-
-                if candles:
-                    if now_est.hour >= 19:
-                        session_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
-                    else:
-                        session_start_est = (now_est - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
-
-                    current_price = await ctx.client.get_current_price(symbol)
-
-                    sym_state = ctx.shared_rsi_state.setdefault(
-                        symbol, {"value": 0.0, "vwap": 0.0, "ewm_state": {}}
-                    )
-                    ewm_state_buf = sym_state.setdefault("ewm_state", {})
-
-                    rsi_val, vwap_val = await asyncio.to_thread(
-                        calculate_rsi_1m, candles, session_start_est, 14, current_price, ewm_state_buf
-                    )
-
-                    await execute_rsi_monitoring_plugin(
-                        ctx=ctx, symbol=symbol, rsi_val=rsi_val, vwap_val=vwap_val, current_price=current_price
-                    )
-
-        except Exception as e:
-            print(f"🚨 [RSI 레이더망 {symbol}] 붕괴 방어: {e}", flush=True)
-
-        # Case 73, 78, 84, 85, 87, 93, 98 — 03:55 ~ 08:14 EST 구간, 데이장 개시 7분 윈도우(18:58~19:07 EST / 08:58~09:07 KST),
-        # 또는 포지션 보유(수동 및 데이장 모의 포함)/트레일링 점화/최저점 추적 중에는 5.0초 고속 스캔 유지
-        now_est_chk = datetime.now(EST_TZ)
-        now_kst_chk = now_est_chk.astimezone(KST_TZ)
-        est_hm_chk = now_est_chk.hour * 100 + now_est_chk.minute
-        kst_hm_chk = now_kst_chk.hour * 100 + now_kst_chk.minute
-        day_sim_chk = get_daymarket_sim_status()
-        is_day_open_fast = (1858 <= est_hm_chk <= 1907) or (858 <= kst_hm_chk <= 907)
-        is_holding_or_trailing = (
-            ctx.shared_holdings.get(symbol, 0) > 0
-            or bool(get_trailing_runtime_status(symbol).get("armed", False))
-            or bool(get_bottom_track_status(symbol).get("active", False))
-            or bool(day_sim_chk.get("active", False))
-        )
-        if symbol in RSI_SYMBOLS and ((355 <= est_hm_chk <= 814) or is_day_open_fast or is_holding_or_trailing):
-            sleep_sec = 5.0
-        elif symbol in RSI_SYMBOLS and (est_hm_chk >= 1900 or est_hm_chk <= 354):
-            sleep_sec = 15.0
-        else:
-            sleep_sec = 60.0
-        await asyncio.sleep(sleep_sec)
 
 
 async def assassin_loop(ctx: SniperPluginContext, symbol: str):
@@ -1217,7 +1013,7 @@ async def main():
         asyncio.create_task(record_candles_loop(api_client, sym))
         asyncio.create_task(rsi_radar_loop(plugin_ctx, sym))
 
-    print("시스템 코어: 04:07~08:14 골든타임(👑HYB_35_1ST) & 데이장 모의 추세·반복출격 & 이원화트레일링 & 15:00 VWAP탈출 9대 모듈 결속 완료...", flush=True)
+    print("시스템 코어: 04:07~08:14 골든타임(👑HYB_35_1ST) & 데이장 모의 추세·반복출격 & 이원화트레일링 & 15:00 VWAP탈출 플러그인 모듈 결속 완료...", flush=True)
 
     # 기동 완료 시 단일 상태 메시지만 전송 (Case 38)
     try:
