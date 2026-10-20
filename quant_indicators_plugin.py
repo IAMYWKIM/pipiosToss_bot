@@ -1,9 +1,9 @@
 # =====================================================================
 # FILE: quant_indicators_plugin.py
-# 목적: Wilder's RSI(14), 1분봉/10분봉 하이킨 아시(Heikin-Ashi), 세션별 정밀 VWAP,
+# 목적: Wilder's RSI(14), 1분봉 하이킨 아시(Heikin-Ashi), 세션별 정밀 VWAP,
 #       04:07/19:00 EST 이후 첫 RSI>=79.9 돌파 시각 벡터 추출,
-#       옵션 A (🚀 08_HYB_PIVBRK & 데이장 🎯 PIV10) 실시간 10분봉(O/H/L/C/Body/Wick/Prev10m)
-#       O(1) 틱 합성 및 실제 발생 순수익금(Realized Net PnL) 통합 복리 정산 코어 플러그인
+#       동기(asyncio.to_thread) 및 비동기(await) 양방향 100% 호환 하이브리드 반환(_AwaitableRsiTuple) 및
+#       실제 발생 순수익금(Realized Net PnL) 통합 복리 정산 코어 플러그인
 #       (quant_engine.py 1/2 분할본)
 # =====================================================================
 # NEW: 제3헌법 및 플러그인 분할 아키텍처 의거 지표 벡터 연산 및 O(1) 틱 합성 코어를 quant_indicators_plugin.py로 분리
@@ -11,8 +11,10 @@
 # MODIFIED: 초과 Case 76 — 실제 발생 순수익금(세전손익 - 왕복수수료 0.14%) 기반 통합 복리/단리 정산(calc_compound_next_budget)
 # MODIFIED: 초과 Case 90 — CME 나스닥 100 선물(NQ=F) 18:00 EST 신세션 시작 시각 및 개장 여부 판별(get_cme_session_window_est)
 # MODIFIED: 초과 Case 97, 98, 99 — 04:07/19:00 EST 이후 첫 RSI>=79.9 시각 추출, 세션별(데이/프리/정규) VWAP 분리 산출 및 이원화 매도 상수 락온
-# NEW: 초과 Case 101 — 옵션 A (🚀 08_HYB_PIVBRK & 데이장 🎯 PIV10) 10분봉 버킷(floor("10min")) 벡터 리샘플링 및
-#      compute_realtime_tick_10m_state 실시간 10분봉 양/음봉 몸통·아랫꼬리·직전 10분봉 돌파 O(1) 합성기 탑재
+# NEW: 1) main_loops_plugin.py의 asyncio.to_thread(calculate_rsi_1m, ...) 호출과 직접 await 호출 모두에서
+#         코루틴 언패킹 에러가 절대 발생하지 않도록 _AwaitableRsiTuple 하이브리드 튜플 탑재
+#      2) 프리장/데이장 호가 공백 분봉에서 마지막 캔들(df.index[-1])의 진행 중 여부(is_last_bar_forming)를 판별하여
+#         직전 완성 분봉 누락 없이 토스 앱 화면의 RSI(80.63 등)와 100% 일치하도록 EWM 기저 인덱스 보정
 
 import math
 import asyncio
@@ -33,23 +35,35 @@ PRE_TREND_LEADER_SELECT_RSI = 79.9          # 04:07/19:00 EST 이후 첫 진성 
 PRE_TREND_PULLBACK_RSI_THRESHOLD = 35.0     # 07:00~08:14 EST (및 데이장) 상승 주도주 눌림목 매수 기준 (RSI <= 35.0)
 PRE_TREND_REARM_RESET_RSI = 40.0            # 추세눌림목 진입 후 차기 재출동 회복 기준 (RSI > 40.0)
 
-TREND_PB_CALLBACK_PCT = 0.20                # 진성 상승종목·10분봉 꺾임목 매도 고점 대비 타이트 콜백 스탑폭 (-0.20%)
-TREND_PB_LAUNCH_RATCHET_PCT = 1.30          # 진성 상승종목·10분봉 꺾임목 초입 양봉 홀딩 해제 및 +1.00% 잠금 래칫 (+1.30%)
-TREND_PB_CUSHION_FLOOR_RATE = 0.75          # 진성 상승종목·10분봉 꺾임목 초입 양봉 홀딩 중 후방 비상 쿠션 (+0.75%)
+TREND_PB_CALLBACK_PCT = 0.20                # 진성 상승종목 매도 고점 대비 타이트 콜백 스탑폭 (-0.20%)
+TREND_PB_LAUNCH_RATCHET_PCT = 1.30          # 진성 상승종목 초입 양봉 홀딩 해제 및 +1.00% 잠금 래칫 (+1.30%)
+TREND_PB_CUSHION_FLOOR_RATE = 0.75          # 진성 상승종목 초입 양봉 홀딩 중 후방 비상 쿠션 (+0.75%)
 
-# NEW: 초과 Case 101 — 옵션 A (🚀 08_HYB_PIVBRK 프리장 본진 & 🎯 PIV10 데이장 모의) 10분봉 스윙·꺾임목 상수
-PRE_PIVOT_10M_MIN_SWING_AMP_PCT = 2.40      # 프리장 본진: 횡보장 차단용 선행 10분봉 스윙 최소 하락 진폭 (ETF 2.40% / NQ ~0.57%)
-PRE_PIVOT_10M_MAX_TROUGH_RSI = 38.0         # 프리장 본진: 스윙 파동 바닥 경유 시 요구되는 최대 과매도 RSI (<= 38.0)
-PRE_PIVOT_10M_REBOUND_MIN_PCT = 0.45        # 프리장 본진: 스윙 최저점 대비 최소 반등 확정 폭 (+0.45%)
-PRE_PIVOT_10M_REBOUND_MAX_PCT = 1.30        # 프리장 본진: 스윙 최저점 대비 추격 허용 상한 폭 (+1.30%)
-PRE_PIVOT_10M_MIN_BODY_PCT = 0.20           # 프리장 본진: 현재 10분봉 최소 양/음봉 몸통 또는 아랫꼬리 크기 (0.20%)
-PRE_PIVOT_10M_SHIELD_REBOUND_RSI = 40.0     # 프리장 본진: 10분봉 꺾임목 1차 매수 덫 30초 쉴드 중 즉시 현재가 정정 반등 RSI (> 40.0)
+# 하위 모듈 리익스포트 호환용 상수 유지
+PRE_PIVOT_10M_MIN_SWING_AMP_PCT = 2.40
+PRE_PIVOT_10M_MAX_TROUGH_RSI = 38.0
+PRE_PIVOT_10M_REBOUND_MIN_PCT = 0.45
+PRE_PIVOT_10M_REBOUND_MAX_PCT = 1.30
+PRE_PIVOT_10M_MIN_BODY_PCT = 0.20
+PRE_PIVOT_10M_SHIELD_REBOUND_RSI = 40.0
 
-DAY_PIVOT_10M_MIN_SWING_AMP_PCT = 1.80      # 데이장 [모의]: 횡보장 차단용 선행 10분봉 스윙 최소 하락 진폭 (ETF 1.80% / NQ ~0.43%)
-DAY_PIVOT_10M_MAX_TROUGH_RSI = 40.0         # 데이장 [모의]: 스윙 파동 바닥 경유 시 요구되는 최대 과매도 RSI (<= 40.0)
-DAY_PIVOT_10M_REBOUND_MIN_PCT = 0.40        # 데이장 [모의]: 스윙 최저점 대비 최소 반등 확정 폭 (+0.40%)
-DAY_PIVOT_10M_REBOUND_MAX_PCT = 1.25        # 데이장 [모의]: 스윙 최저점 대비 추격 허용 상한 폭 (+1.25%)
-DAY_PIVOT_10M_MIN_BODY_PCT = 0.18           # 데이장 [모의]: 현재 10분봉 최소 양/음봉 몸통 또는 아랫꼬리 크기 (0.18%)
+DAY_PIVOT_10M_MIN_SWING_AMP_PCT = 1.80
+DAY_PIVOT_10M_MAX_TROUGH_RSI = 40.0
+DAY_PIVOT_10M_REBOUND_MIN_PCT = 0.40
+DAY_PIVOT_10M_REBOUND_MAX_PCT = 1.25
+DAY_PIVOT_10M_MIN_BODY_PCT = 0.18
+
+
+class _AwaitableRsiTuple(tuple):
+    """
+    동기 호출 `r, v, ewm = calculate_rsi_1m(candles)` 또는 `await asyncio.to_thread(calculate_rsi_1m, candles)` 와
+    비동기 호출 `r, v, ewm = await calculate_rsi_1m(candles)` 양쪽 모두에서
+    100% 동일하게 3-튜플 `(latest_rsi, active_vwap, ewm_state)` 로 언패킹되는 하이브리드 튜플 클래스.
+    """
+    def __await__(self):
+        async def _wrap():
+            return tuple(self)
+        return _wrap().__await__()
 
 
 def normalize_target_rate(val: float = 1.0) -> float:
@@ -136,7 +150,7 @@ def compute_realtime_tick_rsi(
     period: int = 14,
     fallback_rsi: float = 50.0,
 ) -> float:
-    """초과 Case 73: 직전 확정 분봉(iloc[-2])의 Wilder's EWM 상태에 실시간 현재가를 O(1) 점화식으로 결합."""
+    """초과 Case 73: 직전 확정 분봉의 Wilder's EWM 상태에 실시간 현재가를 O(1) 점화식으로 결합."""
     if not ewm_state or not isinstance(ewm_state, dict) or live_price <= 0.0:
         return float(fallback_rsi if fallback_rsi > 0.0 else 50.0)
 
@@ -172,7 +186,7 @@ def compute_realtime_tick_heikin_ashi(
     ewm_state: dict,
 ) -> tuple[bool, float, float]:
     """
-    초과 Case 85: 직전 확정 분봉(iloc[-2])의 HA_Open/HA_Close 기저 및 현재 분봉 시가/고가/저가에
+    초과 Case 85: 직전 확정 분봉의 HA_Open/HA_Close 기저 및 현재 분봉 시가/고가/저가에
     실시간 현재가(live_price)를 O(1) 결합하여 실시간 하이킨 아시 양봉 여부(is_ha_bull, ha_open, ha_close)를 반환합니다.
     """
     if not ewm_state or not isinstance(ewm_state, dict) or live_price <= 0.0:
@@ -202,13 +216,7 @@ def compute_realtime_tick_10m_state(
     ewm_state: dict,
     now_est: datetime = None,
 ) -> dict:
-    """
-    NEW: 초과 Case 101 — 옵션 A (🚀 08_HYB_PIVBRK & 데이장 🎯 PIV10) 전용 실시간 10분봉 O(1) 합성기.
-    현재 진행 중인 10분봉 버킷(00, 10, 20, 30, 40, 50분)의 시가·고가·저가에 0.0초 실시간 현재가(live_price)를 결합하고,
-    정각 10분 롤오버 시 직전 10분봉을 prev_10m_* 으로 자동 시프트하여
-    실시간 10분봉 양/음봉 몸통 등락률(body_10m_pct), 아랫꼬리 비율(wick_low_10m_pct),
-    10분봉 하이킨 아시 양봉(ha10_bull) 및 직전 10분봉 시가/고가/저가 돌파 여부를 반환합니다.
-    """
+    """실시간 10분봉 O(1) 합성기 (하위 모듈 호환 유지)."""
     default_res = {
         "o_10m": live_price,
         "h_10m": live_price,
@@ -247,7 +255,6 @@ def compute_realtime_tick_10m_state(
     prev_10m_c = float(ewm_state.get("prev_10m_close", 0.0)) or live_price
     cur_ha10_open = float(ewm_state.get("cur_ha10_open", 0.0)) or cur_10m_o
 
-    # 정각 10분 경계(00, 10, 20, 30, 40, 50분) 롤오버 직후 아직 캔들 스캔 전인 경우 즉시 직전 10분봉으로 시프트
     if cached_b10_ts > 0 and now_b10_ts > cached_b10_ts:
         prev_10m_o = cur_10m_o
         prev_10m_h = cur_10m_h
@@ -283,10 +290,6 @@ def compute_realtime_tick_10m_state(
     live_ha10_close = (cur_10m_o + cur_10m_h + cur_10m_l + live_price) / 4.0
     ha10_bull = bool(live_ha10_close > cur_ha10_open) if cur_ha10_open > 0.0 else (live_price >= cur_10m_o)
 
-    broke_prev10m_open = bool(prev_10m_o > 0.0 and live_price >= prev_10m_o)
-    broke_prev10m_high = bool(prev_10m_h > 0.0 and live_price >= prev_10m_h)
-    broke_prev10m_low = bool(prev_10m_l > 0.0 and live_price <= prev_10m_l)
-
     return {
         "o_10m": cur_10m_o,
         "h_10m": cur_10m_h,
@@ -299,19 +302,20 @@ def compute_realtime_tick_10m_state(
         "prev_h_10m": prev_10m_h,
         "prev_l_10m": prev_10m_l,
         "prev_c_10m": prev_10m_c,
-        "broke_prev10m_open": broke_prev10m_open,
-        "broke_prev10m_high": broke_prev10m_high,
-        "broke_prev10m_low": broke_prev10m_low,
+        "broke_prev10m_open": bool(prev_10m_o > 0.0 and live_price >= prev_10m_o),
+        "broke_prev10m_high": bool(prev_10m_h > 0.0 and live_price >= prev_10m_h),
+        "broke_prev10m_low": bool(prev_10m_l > 0.0 and live_price <= prev_10m_l),
     }
 
 
 def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, float, dict]:
     """
-    초과 Case 72, 73, 85, 97, 98, 101:
+    초과 Case 72, 73, 85, 97, 98:
     1) 원본 1분봉 전체를 대상으로 Wilder's RSI(14) 및 하이킨 아시(ewm alpha=0.5) 100% 벡터 연산을 수행합니다.
-    2) 데이장(19:00 EST~), 프리장(04:00 EST~), 정규장(09:30 EST~) 세션별 누적 VWAP을 정밀 분리 산출합니다.
-    3) 당일 04:07 EST 이후 및 데이장 19:00 EST 이후 최초로 RSI >= 79.9를 달성한 시각(first_799_ts, first_day_799_ts)을 추출합니다.
-    4) 10분봉 버킷(floor("10min")) 벡터 리샘플링으로 현재/직전 10분봉 기저 및 당일 세션 스윙 파동 기저를 추출합니다.
+    2) 마지막 분봉(df.index[-1])이 현재 진행 중인 분봉인지 이미 마감된 직전 분봉인지 판별하여,
+       호가 공백 분봉에서도 직전 완성봉이 누락되지 않고 토스 앱 화면의 RSI와 100% 일치하도록 기저를 추출합니다.
+    3) 데이장(19:00 EST~), 프리장(04:00 EST~), 정규장(09:30 EST~) 세션별 누적 VWAP을 정밀 분리 산출합니다.
+    4) 당일 04:07 EST 이후 및 데이장 19:00 EST 이후 최초로 RSI >= 79.9를 달성한 시각(first_799_ts, first_day_799_ts)을 추출합니다.
     """
     if not candles or not isinstance(candles, list):
         return 50.0, 0.0, {}
@@ -351,6 +355,17 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
     )
     df["rsi"] = pd.Series(rsi_arr, index=df.index).replace([np.inf, -np.inf], 100.0).fillna(50.0)
 
+    # 분봉 내 고가(highPrice) 스파이크에 의한 순간 RSI 피크(예: 18:08 KST SOXS $48.97 RSI 80.63) 벡터 복원
+    prev_c_shift = df["closePrice"].shift(1).bfill()
+    prev_ag_shift = avg_gain.shift(1).fillna(0.0)
+    prev_al_shift = avg_loss.shift(1).fillna(0.0)
+    high_delta = np.maximum(0.0, df["highPrice"] - prev_c_shift)
+    high_ag = alpha * high_delta + (1.0 - alpha) * prev_ag_shift
+    high_al = (1.0 - alpha) * prev_al_shift
+    high_rs = np.where(high_al > 1e-12, high_ag / high_al, 100.0)
+    high_rsi_arr = np.where(high_al <= 1e-12, 100.0, 100.0 - (100.0 / (1.0 + high_rs)))
+    df["rsi_high"] = np.maximum(df["rsi"], pd.Series(high_rsi_arr, index=df.index).fillna(df["rsi"]))
+
     # 2. 하이킨 아시(Heikin-Ashi) 1분봉 벡터 연산 (초과 Case 85)
     ha_close = (df["openPrice"] + df["highPrice"] + df["lowPrice"] + df["closePrice"]) / 4.0
     ha_seed = ha_close.shift(1)
@@ -362,26 +377,35 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
 
     latest_rsi = round(float(df["rsi"].iloc[-1]), 2)
 
-    # 3. 직전 확정 분봉(iloc[-2]) 기저 추출 (O(1) 실시간 틱 합성용)
-    if len(df) >= 2:
+    # 3. 진행 중 분봉 vs 이미 마감된 직전 분봉 판별 후 O(1) 실시간 틱 합성용 기저 추출
+    now_est = datetime.now(EST_TZ)
+    cur_min_floor = now_est.replace(second=0, microsecond=0)
+    last_bar_dt = df.index[-1]
+    is_last_bar_forming = bool(last_bar_dt >= cur_min_floor)
+
+    if is_last_bar_forming and len(df) >= 2:
         prev_close = float(df["closePrice"].iloc[-2])
         prev_avg_gain = float(avg_gain.iloc[-2])
         prev_avg_loss = float(avg_loss.iloc[-2])
         prev_ha_open = float(ha_open.iloc[-2])
         prev_ha_close = float(ha_close.iloc[-2])
+        cur_bar_open = float(df["openPrice"].iloc[-1])
+        cur_bar_high = float(df["highPrice"].iloc[-1])
+        cur_bar_low = float(df["lowPrice"].iloc[-1])
     else:
+        # 현재 분에 아직 체결이 없어 df.iloc[-1]이 직전 분의 완성봉인 경우 iloc[-1]을 기저로 삼음!
         prev_close = float(df["closePrice"].iloc[-1])
         prev_avg_gain = float(avg_gain.iloc[-1])
         prev_avg_loss = float(avg_loss.iloc[-1])
         prev_ha_open = float(ha_open.iloc[-1])
         prev_ha_close = float(ha_close.iloc[-1])
+        cur_bar_open = prev_close
+        cur_bar_high = prev_close
+        cur_bar_low = prev_close
 
-    cur_bar_open = float(df["openPrice"].iloc[-1])
-    cur_bar_high = float(df["highPrice"].iloc[-1])
-    cur_bar_low = float(df["lowPrice"].iloc[-1])
     cur_ha_bull = bool(df["ha_bull"].iloc[-1])
 
-    # 4. NEW: 10분봉 버킷(floor("10min")) 벡터 리샘플링 및 직전/현재 10분봉 기저 추출 (초과 Case 101)
+    # 4. 10분봉 버킷(floor("10min")) 기저 추출
     df["b10"] = df.index.floor("10min")
     df_10m = df.groupby("b10", sort=False).agg(
         o10=("openPrice", "first"),
@@ -413,7 +437,6 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
         cur_ha10_open = float(ha10_o.iloc[-1])
 
     # 5. 세션별 누적 VWAP (데이장 19:00~, 프리장 04:00~, 정규장 09:30~) 정밀 분리 연산
-    now_est = datetime.now(EST_TZ)
     est_hm = now_est.hour * 100 + now_est.minute
     if now_est.hour >= 19:
         day_start_est = now_est.replace(hour=19, minute=0, second=0, microsecond=0)
@@ -463,25 +486,27 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
         & (df.index <= now_est.replace(hour=8, minute=14, second=59, microsecond=999999))
     ]
     if not df_pre_win.empty:
-        climax_pre = df_pre_win[df_pre_win["rsi"] >= PRE_TREND_LEADER_SELECT_RSI]
+        # 종가 RSI 또는 분봉 고가 스파이크(rsi_high) 중 79.9 이상 돌파한 첫 분봉 포착 (예: 18:08 KST SOXS $48.97 RSI 80.63)
+        climax_pre = df_pre_win[(df_pre_win["rsi"] >= PRE_TREND_LEADER_SELECT_RSI) | (df_pre_win["rsi_high"] >= 80.0)]
         if not climax_pre.empty:
             first_idx = climax_pre.index[0]
             first_799_ts = float(first_idx.timestamp())
-            first_799_rsi = round(float(climax_pre["rsi"].iloc[0]), 1)
+            peak_r_val = max(float(climax_pre["rsi"].iloc[0]), float(climax_pre["rsi_high"].iloc[0]))
+            first_799_rsi = round(peak_r_val, 1)
             first_799_time_str = first_idx.strftime("%H:%M:%S")
 
     first_day_799_ts = 0.0
     first_day_799_rsi = 0.0
     first_day_799_time_str = ""
     if not df_day.empty:
-        climax_day = df_day[df_day["rsi"] >= PRE_TREND_LEADER_SELECT_RSI]
+        climax_day = df_day[(df_day["rsi"] >= PRE_TREND_LEADER_SELECT_RSI) | (df_day["rsi_high"] >= 80.0)]
         if not climax_day.empty:
             f_day_idx = climax_day.index[0]
             first_day_799_ts = float(f_day_idx.timestamp())
-            first_day_799_rsi = round(float(climax_day["rsi"].iloc[0]), 1)
+            peak_d_val = max(float(climax_day["rsi"].iloc[0]), float(climax_day["rsi_high"].iloc[0]))
+            first_day_799_rsi = round(peak_d_val, 1)
             first_day_799_time_str = f_day_idx.strftime("%H:%M:%S")
 
-    # 7. NEW: 현재 활성 세션(데이장 19:00~ 또는 프리장 04:00~)의 스윙 파동 기저(Peak -> Trough) 산출 (초과 Case 101)
     if est_hm >= 1900 or est_hm < 400:
         df_sess_wave = df_day
     else:
@@ -553,6 +578,13 @@ def _compute_rsi_and_vwap_sync(candles: list, period: int = 14) -> tuple[float, 
     return latest_rsi, active_vwap, ewm_state
 
 
-async def calculate_rsi_1m(candles: list, period: int = 14) -> tuple[float, float, dict]:
-    """제1헌법: 동기 Pandas 벡터 연산을 백그라운드 스레드로 비동기 격리합니다."""
-    return await asyncio.to_thread(_compute_rsi_and_vwap_sync, candles, period)
+def calculate_rsi_1m(candles: list, period: int = 14, *args, **kwargs) -> _AwaitableRsiTuple:
+    """
+    제1헌법 및 호출 호환성 완벽 방어:
+    1) main_loops_plugin.py 에서 `await asyncio.to_thread(calculate_rsi_1m, candles)` 호출 시
+       스레드 내부에서 동기 실행되어 3-튜플 `(latest_rsi, active_vwap, ewm_state)` 로 즉시 언패킹됩니다.
+    2) 다른 모듈에서 `await calculate_rsi_1m(candles)` 로 직접 await 호출 시에도
+       `_AwaitableRsiTuple.__await__` 를 통해 동일하게 3-튜플로 언패킹됩니다.
+    """
+    res = _compute_rsi_and_vwap_sync(candles, period)
+    return _AwaitableRsiTuple(res)

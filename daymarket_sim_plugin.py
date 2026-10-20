@@ -4,16 +4,13 @@
 #       (whipsaw_plugin.py 1/2 분할본)
 #       — [1막] 개시 1분 전(08:59 KST / 18:59 EST) NQ=F 10분봉 롱/숏 1차 락온 ➔
 #               개시 후 7분간(09:00~09:06:59 KST / 19:00~19:06:59 EST) RSI>=50.0 현재가 즉시 [모의] 진입(OPEN7M_TREND)
-#       — [2막] 개시 7분 이후 ① 양방향 대칭(<=30.0 & 반대>=79.9, OPTA),
-#               ② 데이장 첫 RSI>=79.9 상승장 종목(day_leader_sym)의 RSI<=35.0 눌림목(PB35),
-#               ③ 옵션 A 10분봉 스윙 진폭(>=1.80% / NQ 0.43%) 확정 후 바닥 RSI<=40.0 경유
-#                 10분봉 양/음봉 반전 꺾임목(🎯 PIV10 · 10:20/12:20 KST 차트 모델) 무한 반복 [모의] 출격
+#       — [2막] 개시 7분 이후 ① 양방향 대칭(<=30.0 & 반대>=79.9, OPTA) 및
+#               ② 데이장 첫 RSI>=79.9 상승장 종목(day_leader_sym)의 RSI<=35.0 눌림목(PB35)
+#               (1회 달성 후 40.0 <= RSI <= 70.0 중립 밴드 복귀 시 리셋하여 무제한 반복 [모의] 출격)
 #       — [익절] +1.30% 상승가 락온 × 최고가 -0.30% 하락 & 🌑HA음봉 시 최소 +1.00% 익절 보장 트레일링 & 승률 집계
 # =====================================================================
 # NEW: 제3헌법 및 플러그인 분할 아키텍처 의거 데이장 100% [모의] 스나이퍼 및 휩소 공유 캐시를 daymarket_sim_plugin.py로 분리
 # MODIFIED: 초과 Case 78 & Case 93 — 데이장 실거래 매수 100% 물리적 차단, 개시 7분 추세 진입, 40~70 중립 리셋 및 +1.30% 락온 트레일링
-# NEW: 초과 Case 101 — 옵션 A 데이장 10분봉 스윙 파동 추적기(_update_daymarket_10m_swing_wave) 및
-#      10분봉 양/음봉 반전 꺾임목 타격 게이트(🎯 PIV10) 탑재
 
 import math
 import time
@@ -27,13 +24,7 @@ from quant_engine import (
     MIN_STAGE3_QQQ_ADVERSE_PCT,
     PRE_TREND_LEADER_SELECT_RSI,
     PRE_TREND_PULLBACK_RSI_THRESHOLD,
-    DAY_PIVOT_10M_MIN_SWING_AMP_PCT,
-    DAY_PIVOT_10M_MAX_TROUGH_RSI,
-    DAY_PIVOT_10M_REBOUND_MIN_PCT,
-    DAY_PIVOT_10M_REBOUND_MAX_PCT,
-    DAY_PIVOT_10M_MIN_BODY_PCT,
     compute_realtime_tick_heikin_ashi,
-    compute_realtime_tick_10m_state,
 )
 
 EST_TZ = ZoneInfo("America/New_York")
@@ -62,26 +53,13 @@ WHIPSAW_PROFIT_FACTOR = WHIPSAW_SELL_PROFIT_FACTOR
 _DAY_SIM_LOCK = asyncio.Lock()
 _WHIPSAW_LOCK = asyncio.Lock()
 
-
-def _default_day_swing_sym() -> dict:
-    return {
-        "swing_peak": 0.0,
-        "swing_trough": 0.0,
-        "swing_min_rsi": 100.0,
-        "swing_drop_pct": 0.0,
-        "rebound_pct": 0.0,
-        "made_new_low": False,
-        "pivot_dispatched": False,
-    }
-
-
 _WHIPSAW_SIM_CACHE = {
     # 데이장 [모의] 스나이퍼 런타임 상태
     "day_sim_session_id": "",
     "day_sim_active": False,
     "day_sim_phase": "",                # "TRAP_WAIT" | "HOLDING"
     "day_sim_symbol": "",
-    "day_sim_trig_mode": "",            # "OPEN7M_TREND" | "OPTA" | "PB35" | "PIV10"
+    "day_sim_trig_mode": "",            # "OPEN7M_TREND" | "OPTA" | "PB35"
     "day_sim_spot_price": 0.0,
     "day_sim_trap_price": 0.0,
     "day_sim_entry_price": 0.0,
@@ -110,9 +88,6 @@ _WHIPSAW_SIM_CACHE = {
     "day_leader_time_str": "",
     "day_opta_rearm_ready": True,
     "day_pb_rearm_ready": True,
-    # NEW: 데이장 10분봉 스윙 파동 추적 슬롯 (초과 Case 101)
-    "day_swing_SOXS": _default_day_swing_sym(),
-    "day_swing_SOXL": _default_day_swing_sym(),
     # 데이장 당일 [모의] 출격 전적 및 승률 스코어보드
     "stat_total": 0,
     "stat_wins": 0,
@@ -124,8 +99,6 @@ _WHIPSAW_SIM_CACHE = {
     "stat_opta_wins": 0,
     "stat_pb35_cnt": 0,
     "stat_pb35_wins": 0,
-    "stat_piv10_cnt": 0,
-    "stat_piv10_wins": 0,
     # 03:58 ~ 04:07 EST 실전 1주 휩소 노출 작전 상태
     "whipsaw_date": "",
     "whipsaw_target_sym": "",
@@ -137,6 +110,9 @@ _WHIPSAW_SIM_CACHE = {
     "whipsaw_order_fired": False,
     "whipsaw_cutoff_done": False,
     "whipsaw_last_dump_tick": 0.0,
+    "whipsaw_prelock_notified": False,
+    "whipsaw_skip_notified": False,
+    "whipsaw_last_err": "",
 }
 
 
@@ -186,8 +162,6 @@ def _reset_day_sim_state(new_session_id: str = ""):
         "day_leader_time_str": "",
         "day_opta_rearm_ready": True,
         "day_pb_rearm_ready": True,
-        "day_swing_SOXS": _default_day_swing_sym(),
-        "day_swing_SOXL": _default_day_swing_sym(),
         "stat_total": 0,
         "stat_wins": 0,
         "stat_losses": 0,
@@ -198,8 +172,6 @@ def _reset_day_sim_state(new_session_id: str = ""):
         "stat_opta_wins": 0,
         "stat_pb35_cnt": 0,
         "stat_pb35_wins": 0,
-        "stat_piv10_cnt": 0,
-        "stat_piv10_wins": 0,
     })
 
 
@@ -222,10 +194,6 @@ def _record_day_sim_result(trig_mode: str, is_win: bool, net_pct: float):
         _WHIPSAW_SIM_CACHE["stat_pb35_cnt"] = int(_WHIPSAW_SIM_CACHE.get("stat_pb35_cnt", 0)) + 1
         if is_win:
             _WHIPSAW_SIM_CACHE["stat_pb35_wins"] = int(_WHIPSAW_SIM_CACHE.get("stat_pb35_wins", 0)) + 1
-    elif trig_mode == "PIV10":
-        _WHIPSAW_SIM_CACHE["stat_piv10_cnt"] = int(_WHIPSAW_SIM_CACHE.get("stat_piv10_cnt", 0)) + 1
-        if is_win:
-            _WHIPSAW_SIM_CACHE["stat_piv10_wins"] = int(_WHIPSAW_SIM_CACHE.get("stat_piv10_wins", 0)) + 1
     else:
         _WHIPSAW_SIM_CACHE["stat_opta_cnt"] = int(_WHIPSAW_SIM_CACHE.get("stat_opta_cnt", 0)) + 1
         if is_win:
@@ -245,13 +213,11 @@ def _build_day_sim_scoreboard_line() -> str:
     op_w = int(_WHIPSAW_SIM_CACHE.get("stat_opta_wins", 0))
     pb_c = int(_WHIPSAW_SIM_CACHE.get("stat_pb35_cnt", 0))
     pb_w = int(_WHIPSAW_SIM_CACHE.get("stat_pb35_wins", 0))
-    pv_c = int(_WHIPSAW_SIM_CACHE.get("stat_piv10_cnt", 0))
-    pv_w = int(_WHIPSAW_SIM_CACHE.get("stat_piv10_wins", 0))
 
     return (
         f"📊 <b>당일 데이장 [모의] 누적 전적:</b> <code>{tot}출격 {wins}승 {losses}패 "
         f"(적중확률 {wr:.1f}% · 세후누적 {cum_net:+.2f}%)</code>\n"
-        f"▫️ 부문별: <code>🚀개시7분 {o7_w}/{o7_c} | 🪤대칭 {op_w}/{op_c} | 👑35눌림 {pb_w}/{pb_c} | 🎯10분꺾임 {pv_w}/{pv_c}</code>"
+        f"▫️ 부문별: <code>🚀개시7분추세 {o7_w}/{o7_c} | 🪤대칭클라이맥스 {op_w}/{op_c} | 👑상승장35눌림 {pb_w}/{pb_c}</code>"
     )
 
 
@@ -260,8 +226,6 @@ def get_daymarket_sim_status() -> dict:
     wins = int(_WHIPSAW_SIM_CACHE.get("stat_wins", 0))
     losses = int(_WHIPSAW_SIM_CACHE.get("stat_losses", 0))
     wr = (wins / tot * 100.0) if tot > 0 else 0.0
-    sw_s = _WHIPSAW_SIM_CACHE.get("day_swing_SOXS") or _default_day_swing_sym()
-    sw_l = _WHIPSAW_SIM_CACHE.get("day_swing_SOXL") or _default_day_swing_sym()
 
     return {
         "active": bool(_WHIPSAW_SIM_CACHE.get("day_sim_active", False)),
@@ -282,15 +246,11 @@ def get_daymarket_sim_status() -> dict:
         "leader_rsi": float(_WHIPSAW_SIM_CACHE.get("day_leader_rsi", 0.0)),
         "opta_rearm_ready": bool(_WHIPSAW_SIM_CACHE.get("day_opta_rearm_ready", True)),
         "pb_rearm_ready": bool(_WHIPSAW_SIM_CACHE.get("day_pb_rearm_ready", True)),
-        "swing_drop_SOXS": float(sw_s.get("swing_drop_pct", 0.0)),
-        "swing_drop_SOXL": float(sw_l.get("swing_drop_pct", 0.0)),
         "stat_total": tot,
         "stat_wins": wins,
         "stat_losses": losses,
         "stat_win_rate": round(wr, 1),
         "stat_cum_net_pct": float(_WHIPSAW_SIM_CACHE.get("stat_cum_net_pct", 0.0)),
-        "stat_piv10_cnt": int(_WHIPSAW_SIM_CACHE.get("stat_piv10_cnt", 0)),
-        "stat_piv10_wins": int(_WHIPSAW_SIM_CACHE.get("stat_piv10_wins", 0)),
     }
 
 
@@ -397,159 +357,6 @@ def _sync_daymarket_trend_leader_and_reset(
         _WHIPSAW_SIM_CACHE["day_pb_rearm_ready"] = True
 
 
-def _update_daymarket_10m_swing_wave(
-    symbol: str,
-    live_price: float,
-    live_rsi: float,
-    ewm_state: dict = None,
-) -> dict:
-    """
-    NEW: 초과 Case 101 — 데이장(19:00 ~ 03:57 EST) 10분봉 스윙 파동(Peak -> Trough) 추적기.
-    잔잔한 횡보장(진폭 < 1.80% / NQ 0.43%)을 100% 차단하고 10:20 / 12:20 KST 형 10분봉 꺾임목(PIV10)을 포착합니다.
-    """
-    key = f"day_swing_{symbol}"
-    if key not in _WHIPSAW_SIM_CACHE or not isinstance(_WHIPSAW_SIM_CACHE[key], dict):
-        _WHIPSAW_SIM_CACHE[key] = _default_day_swing_sym()
-
-    st = _WHIPSAW_SIM_CACHE[key]
-    if live_price <= 0.0:
-        return dict(st)
-
-    ewm = ewm_state if isinstance(ewm_state, dict) else {}
-    if float(st.get("swing_peak", 0.0)) <= 0.0:
-        seed_pk = float(ewm.get("sess_swing_peak", 0.0) or 0.0) or live_price
-        seed_tr = float(ewm.get("sess_swing_trough", 0.0) or 0.0) or live_price
-        seed_mr = float(ewm.get("sess_swing_min_rsi", 100.0) or 100.0)
-        if live_rsi > 0.0:
-            seed_mr = min(seed_mr, live_rsi)
-        st["swing_peak"] = seed_pk
-        st["swing_trough"] = min(seed_tr, live_price)
-        st["swing_min_rsi"] = seed_mr
-
-    cur_h = max(float(ewm.get("cur_bar_high", 0.0) or 0.0), live_price)
-    cur_l_raw = float(ewm.get("cur_bar_low", 0.0) or 0.0)
-    cur_l = min(cur_l_raw, live_price) if cur_l_raw > 0.0 else live_price
-
-    prev_pk = float(st.get("swing_peak", live_price))
-    prev_tr = float(st.get("swing_trough", live_price))
-
-    made_new_low = False
-    if cur_h >= prev_pk:
-        st["swing_peak"] = cur_h
-        st["swing_trough"] = cur_l
-        st["swing_min_rsi"] = live_rsi if live_rsi > 0.0 else 50.0
-        st["pivot_dispatched"] = False
-    else:
-        if cur_l <= prev_tr:
-            st["swing_trough"] = cur_l
-            made_new_low = True
-        if 0.0 < live_rsi < float(st.get("swing_min_rsi", 100.0)):
-            st["swing_min_rsi"] = round(live_rsi, 2)
-
-        tr_now = float(st.get("swing_trough", cur_l))
-        if tr_now > 0.0 and ((live_price - tr_now) / tr_now * 100.0) >= 1.50:
-            st["swing_peak"] = cur_h
-            st["swing_trough"] = cur_l
-            st["swing_min_rsi"] = live_rsi if live_rsi > 0.0 else 50.0
-            st["pivot_dispatched"] = False
-
-    pk_f = float(st.get("swing_peak", live_price))
-    tr_f = float(st.get("swing_trough", live_price))
-    drop_pct = ((pk_f - tr_f) / tr_f * 100.0) if tr_f > 0.0 else 0.0
-    reb_pct = ((live_price - tr_f) / tr_f * 100.0) if tr_f > 0.0 else 0.0
-
-    st["swing_drop_pct"] = round(drop_pct, 2)
-    st["rebound_pct"] = round(reb_pct, 2)
-    st["made_new_low"] = made_new_low
-    return dict(st)
-
-
-def _evaluate_daymarket_10m_pivot(
-    symbol: str,
-    live_price: float,
-    live_rsi: float,
-    opp_live_price: float,
-    opp_live_rsi: float,
-    shared_rsi_state: dict,
-    now_est: datetime,
-) -> tuple[bool, dict]:
-    """
-    NEW: 초과 Case 101 — 데이장 [모의] 스나이퍼 10분봉 스윙 진폭 & 10분봉 양/음봉 반전 꺾임목(🎯 PIV10) 판별기.
-    """
-    if symbol not in ("SOXS", "SOXL") or live_price <= 0.0 or not isinstance(shared_rsi_state, dict):
-        return False, {}
-
-    opp_sym = "SOXL" if symbol == "SOXS" else "SOXS"
-    my_dict = shared_rsi_state.get(symbol) or {}
-    opp_dict = shared_rsi_state.get(opp_sym) or {}
-    my_ewm = my_dict.get("ewm_state") or {}
-    opp_ewm = opp_dict.get("ewm_state") or {}
-
-    my_wave = _update_daymarket_10m_swing_wave(symbol, live_price, live_rsi, my_ewm)
-    opp_p_eff = opp_live_price if opp_live_price > 0.0 else float(opp_ewm.get("prev_close", 0.0) or 0.0)
-    opp_wave = _update_daymarket_10m_swing_wave(opp_sym, opp_p_eff, opp_live_rsi, opp_ewm)
-
-    my_10m = compute_realtime_tick_10m_state(live_price=live_price, ewm_state=my_ewm, now_est=now_est)
-    opp_10m = compute_realtime_tick_10m_state(live_price=opp_p_eff, ewm_state=opp_ewm, now_est=now_est)
-
-    swing_drop_pct = float(my_wave.get("swing_drop_pct", 0.0))
-    swing_min_rsi = float(my_wave.get("swing_min_rsi", 100.0))
-    rebound_pct = float(my_wave.get("rebound_pct", 0.0))
-    made_new_low = bool(my_wave.get("made_new_low", False))
-    pivot_dispatched = bool(my_wave.get("pivot_dispatched", False))
-
-    opp_peak = float(opp_wave.get("swing_peak", 0.0))
-    opp_drop_pct = (
-        ((opp_peak - opp_p_eff) / opp_peak * 100.0)
-        if (opp_peak > 0.0 and opp_p_eff > 0.0)
-        else 0.0
-    )
-
-    cur_bar_open = float(my_ewm.get("cur_bar_open", 0.0) or live_price)
-    is_ha_bull, _, _ = compute_realtime_tick_heikin_ashi(live_price, my_ewm)
-    is_1m_bull = bool((live_price > cur_bar_open) or is_ha_bull)
-
-    body_10m = float(my_10m.get("body_10m_pct", 0.0))
-    wick_10m = float(my_10m.get("wick_low_10m_pct", 0.0))
-    o_10m = float(my_10m.get("o_10m", live_price))
-
-    opp_body_10m = float(opp_10m.get("body_10m_pct", 0.0))
-    opp_o_10m = float(opp_10m.get("o_10m", opp_p_eff))
-
-    is_10m_bull_S_or_L = bool(
-        (body_10m >= DAY_PIVOT_10M_MIN_BODY_PCT)
-        or (wick_10m >= DAY_PIVOT_10M_MIN_BODY_PCT and live_price >= o_10m)
-    )
-    is_opp_10m_bear = bool(
-        (opp_body_10m <= -DAY_PIVOT_10M_MIN_BODY_PCT)
-        or (opp_p_eff > 0.0 and opp_p_eff < opp_o_10m)
-    )
-
-    piv_ok = bool(
-        not pivot_dispatched
-        and not made_new_low
-        and (swing_drop_pct >= DAY_PIVOT_10M_MIN_SWING_AMP_PCT)
-        and (swing_min_rsi <= DAY_PIVOT_10M_MAX_TROUGH_RSI)
-        and (DAY_PIVOT_10M_REBOUND_MIN_PCT <= rebound_pct <= DAY_PIVOT_10M_REBOUND_MAX_PCT)
-        and (opp_drop_pct >= DAY_PIVOT_10M_REBOUND_MIN_PCT * 0.85)
-        and (0.0 < live_rsi <= 48.0)
-        and is_1m_bull
-        and is_10m_bull_S_or_L
-        and is_opp_10m_bear
-    )
-
-    return piv_ok, {
-        "swing_peak": float(my_wave.get("swing_peak", 0.0)),
-        "swing_trough": float(my_wave.get("swing_trough", 0.0)),
-        "swing_drop_pct": swing_drop_pct,
-        "swing_min_rsi": swing_min_rsi,
-        "rebound_pct": rebound_pct,
-        "opp_drop_pct": round(opp_drop_pct, 2),
-        "body_10m_pct": round(body_10m, 2),
-        "opp_body_10m_pct": round(opp_body_10m, 2),
-    }
-
-
 async def settle_daymarket_sim_before_premarket(ctx, now_est: datetime = None):
     """
     초과 Case 78:
@@ -571,7 +378,7 @@ async def execute_daymarket_rsi_alert_plugin(
     vwap_val: float = 0.0,
 ):
     """
-    초과 Case 78, 93, 101:
+    초과 Case 78 & Case 93:
     데이장(19:00 ~ 03:57 EST) 100% [모의] 스나이퍼 전용 엔진 (실거래 매수 주문 create_order 절대 차단!).
     """
     if symbol not in ("SOXS", "SOXL"):
@@ -623,8 +430,6 @@ async def execute_daymarket_rsi_alert_plugin(
         opp_sym = "SOXL" if symbol == "SOXS" else "SOXS"
         opp_dict = ((ctx.shared_rsi_state or {}).get(opp_sym)) or {}
         opp_rsi_val = float(opp_dict.get("value", 0.0))
-        opp_ewm = opp_dict.get("ewm_state") or {}
-        opp_live_p = float(opp_ewm.get("prev_close", 0.0) or 0.0)
 
         _sync_daymarket_trend_leader_and_reset(
             symbol=symbol,
@@ -636,7 +441,6 @@ async def execute_daymarket_rsi_alert_plugin(
 
         my_dict = ((ctx.shared_rsi_state or {}).get(symbol)) or {}
         my_ewm = my_dict.get("ewm_state") or {}
-        _update_daymarket_10m_swing_wave(symbol, cur_p_fl, rsi_val, my_ewm)
 
         # =============================================================
         # [A] 데이장 [모의] 포지션 진행 중 (TRAP_WAIT 또는 HOLDING)
@@ -658,7 +462,7 @@ async def execute_daymarket_rsi_alert_plugin(
                 rebound_th = (
                     PRE_TREND_PULLBACK_RSI_THRESHOLD
                     if trig_mode == "PB35"
-                    else (42.0 if trig_mode == "PIV10" else PRE_SNIPER_RSI_THRESHOLD)
+                    else PRE_SNIPER_RSI_THRESHOLD
                 )
                 is_trap_filled = (cur_p_fl <= trap_p)
                 is_rebound_break = (rsi_val > rebound_th)
@@ -809,7 +613,7 @@ async def execute_daymarket_rsi_alert_plugin(
             return
 
         # =============================================================
-        # [B] 데이장 [모의] 미보유 감시 상태 -> 1막(개시 7분) & 2막(OPTA / PB35 / 🎯PIV10) 타점 포착
+        # [B] 데이장 [모의] 미보유 감시 상태 -> 1막(개시 7분) & 2막(OPTA / PB35) 타점 포착
         # =============================================================
         nq_c, nq_h, nq_l = await MacroDataCache.get_cached_nq_data()
         nq_amp = (((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0)
@@ -865,7 +669,7 @@ async def execute_daymarket_rsi_alert_plugin(
 
         # -------------------------------------------------------------
         # [제2막] 개시 7분 이후 (09:07 KST~ / 19:07 ~ 03:57 EST)
-        #         3대 [모의] 타격 게이트 : ① OPTA (대칭) | ② PB35 (상승장 35눌림) | ③ PIV10 (10분봉 꺾임목)
+        #         2대 [모의] 타격 게이트 : ① OPTA (대칭 <=30.0 & >=79.9) | ② PB35 (상승장 락온 종목 RSI<=35.0)
         # -------------------------------------------------------------
         is_opta_ok = bool(
             _WHIPSAW_SIM_CACHE.get("day_opta_rearm_ready", True)
@@ -877,30 +681,16 @@ async def execute_daymarket_rsi_alert_plugin(
             and (_WHIPSAW_SIM_CACHE.get("day_leader_sym") == symbol)
             and (0.0 < rsi_val <= PRE_TREND_PULLBACK_RSI_THRESHOLD)
         )
-        is_piv10_ok, piv_info = _evaluate_daymarket_10m_pivot(
-            symbol=symbol,
-            live_price=cur_p_fl,
-            live_rsi=rsi_val,
-            opp_live_price=opp_live_p,
-            opp_live_rsi=opp_rsi_val,
-            shared_rsi_state=ctx.shared_rsi_state,
-            now_est=now_est,
-        )
 
-        if not (is_opta_ok or is_pb35_ok or is_piv10_ok):
+        if not (is_opta_ok or is_pb35_ok):
             return
 
         if is_opta_ok:
             trig_mode_new = "OPTA"
             _WHIPSAW_SIM_CACHE["day_opta_rearm_ready"] = False
-        elif is_pb35_ok:
+        else:
             trig_mode_new = "PB35"
             _WHIPSAW_SIM_CACHE["day_pb_rearm_ready"] = False
-        else:
-            trig_mode_new = "PIV10"
-            sw_key = f"day_swing_{symbol}"
-            if sw_key in _WHIPSAW_SIM_CACHE and isinstance(_WHIPSAW_SIM_CACHE[sw_key], dict):
-                _WHIPSAW_SIM_CACHE[sw_key]["pivot_dispatched"] = True
 
         slip_disc = max(
             BUY_TRAP_MIN_DISC_USD,
@@ -928,17 +718,6 @@ async def execute_daymarket_rsi_alert_plugin(
             cond_line = (
                 f"▫️ 조건: 데이장 첫 상승종목 {sym_icon}{symbol} (<code>{ld_t} EST</code> RSI <code>{ld_r:.1f}</code> 락온) "
                 f"➡️ 현재 RSI <code>{rsi_val:.1f}</code> (≤35.0 눌림목 도달)"
-            )
-        elif trig_mode_new == "PIV10":
-            sw_drop = float(piv_info.get("swing_drop_pct", 0.0))
-            sw_low = float(piv_info.get("swing_trough", 0.0))
-            sw_reb = float(piv_info.get("rebound_pct", 0.0))
-            b10_m = float(piv_info.get("body_10m_pct", 0.0))
-            b10_o = float(piv_info.get("opp_body_10m_pct", 0.0))
-            title_line = f"🎯 <b>[데이장 모의 10분봉 꺾임목 포착] {sym_icon}{symbol} 대파동 반전 매수 덫 투하 (PIV10)</b>"
-            cond_line = (
-                f"▫️ 10분봉 파동: 선행 진폭 <code>-{sw_drop:.2f}%</code> 확정 후 바닥(<code>${sw_low:.2f}</code>) 대비 "
-                f"<code>+{sw_reb:.2f}%</code> 반등 (10분봉 {symbol} <code>{b10_m:+.2f}%</code> vs {opp_sym} <code>{b10_o:+.2f}%</code>)"
             )
         else:
             title_line = f"🔔 <b>[데이장 모의 대칭 클라이맥스 포착] {sym_icon}{symbol} 1차 매수 덫 투하 (OPTA)</b>"

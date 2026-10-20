@@ -1,22 +1,24 @@
 # =====================================================================
 # FILE: quant_engine.py
-# 목적: 나스닥 100 선물(NQ=F · 18:00 EST 신세션 + fast_info/1d 일봉 병합 단조 보존) &
-#       토스 Open API QQQ 0.0초 실시간 변화율/3차 역행 기준가 브릿지(MacroDataCache) 및
-#       SOXS/SOXL 듀얼 원자적 로컬 장부(AssassinLedger) 코어 엔진
-#       (quant_engine.py 2/2 분할본 · quant_indicators_plugin 100% 리익스포트 결속)
+# 목적: 나스닥 100 선물(NQ=F 18:00 EST 신세션 하드 컷오프 + fast_info/1d 고저가 강제 병합) &
+#       토스 Open API QQQ 0.0초 실시간 3차 역행 기준가/단기 변화율(±0.20% NQ_VEL_BYPASS) 브릿지(MacroDataCache),
+#       데이장 개시 1분 전(08:59 KST / 18:59 EST) NQ=F 10분봉 실시간 fast_info 병합 추세 판별기,
+#       통합 복리 시드 풀 원자적 듀얼 원장(AssassinLedger) 및 quant_indicators_plugin 리익스포트 코어
+#       (quant_engine.py 2/2 분할본)
 # =====================================================================
-# MODIFIED: 제1헌법 및 Case 05, 06, 30 의거 모든 파일 I/O 및 외부 시세 조회를 asyncio.to_thread + GlobalThrottle로 비동기 격리
-# MODIFIED: 초과 Case 62, 90, 91 — CME 18:00 EST 신세션 경계 절삭, fast_info + 1d 일봉 고/저가 강제 병합 및 17:00~17:59 EST 마감 시세 보존
-# MODIFIED: 초과 Case 89, 91, 92, 94 — 토스 Open API QQQ 0.0초 실시간 10분/3분 변화율 및 3차 역행 안전망 실시간 기준가(get_stage3_reference_price) 탑재
-# MODIFIED: 초과 Case 82, 95, 96 — lock_all_symbols_macro에서 MANUAL 수동 보유 및 03:58~04:06 WHIPSAW_1SH 보호, 04:07+ 미체결 buy_order_id 즉시 소각
-# NEW: 초과 Case 93 & Case 101 — 데이장 개시 1분 전 NQ=F 10분봉 추세 판별(get_nq_10m_candle_trend) 및 옵션 A 10분봉 스윙·꺾임목 상수/함수 리익스포트 결속
+# MODIFIED: 제1헌법 ~ 제6헌법 및 플러그인 분할 아키텍처 의거 지표 벡터 연산 코어를 quant_indicators_plugin.py로 분리하고 100% 리익스포트 결속
+# MODIFIED: 초과 Case 61, 62, 89, 90, 91, 92, 93, 94 — NQ=F 18:00 EST 신세션 컷오프, fast_info+1d 고/저가 단조 보존,
+#           토스 Open API QQQ 0.0초 실시간 현재가(1.5초 프로빙) 및 10m/3m 변화율 산출
+# NEW: _fetch_nq_10m_trend_sync 에서 yfinance NQ=F 1분봉의 10분 지연으로 인해 개장 직전 10분봉(08:50 KST 음봉 등)이
+#      누락되는 현상을 차단하기 위해 tkr.fast_info.last_price 실시간 시세를 현재 10분봉 종가(close_10m)에 강제 병합
 
 import os
 import json
-import time
 import math
+import time
 import asyncio
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 
@@ -44,6 +46,7 @@ from quant_indicators_plugin import (
     DAY_PIVOT_10M_REBOUND_MIN_PCT,
     DAY_PIVOT_10M_REBOUND_MAX_PCT,
     DAY_PIVOT_10M_MIN_BODY_PCT,
+    _AwaitableRsiTuple,
     normalize_target_rate,
     calc_compound_next_budget,
     get_cme_session_window_est,
@@ -58,236 +61,316 @@ from quant_indicators_plugin import (
 class MacroDataCache:
     """
     초과 Case 61, 62, 89, 90, 91, 92, 93, 94:
-    1) 나스닥 100 선물(NQ=F) 당일 고가·저가·현재가를 18:00 EST 신세션 기준으로 산출하고 동일 세션 내 단조 보존합니다.
-    2) 토스 Open API QQQ 0.0초 실시간 스냅샷을 결합하여 단기 10분/3분 변화율(nq_vel_10m, nq_vel_3m) 및
-       3차 역행 안전망 실시간 기준가(get_stage3_reference_price)를 제공합니다.
-    3) 데이장 개시 1분 전(08:59 KST / 18:59 EST) 나스닥 100 선물 10분봉 양/음봉 판별(get_nq_10m_candle_trend)을 수행합니다.
+    1) CME 나스닥 100 선물(NQ=F) 18:00 EST 신세션 하드 컷오프 + fast_info / 1d 일봉 당일 실제 고/저가 강제 병합 및 단조 보존
+    2) 토스 Open API QQQ 0.0초 실시간 현재가(3차 역행 안전망 기준가/비교가, 보유 중 1.5초 프로빙) 및 10분/3분 변화율(±0.20% HA음봉 바이패스)
+    3) 데이장 개시 1분 전(08:59 KST / 18:59 EST) NQ=F 10분봉 실시간 fast_info 병합 양/음봉 판별
     """
     _lock = asyncio.Lock()
-    _last_fetch_ts: float = 0.0
+    _qqq_lock = asyncio.Lock()
     _nq_session_id: str = ""
-    _nq_data: tuple[float, float, float] = (0.0, 0.0, 0.0)  # (curr, high, low)
-    _nq_vel: tuple[float, float] = (0.0, 0.0)               # (vel_10m, vel_3m)
-    _qqq_rt_price: float = 0.0
-    _qqq_rt_ts: float = 0.0
-    _nq_10m_trend_cache: dict = {
-        "ts": 0.0,
-        "trend_sym": "",
-        "open_10m": 0.0,
-        "close_10m": 0.0,
-        "body_pct": 0.0,
-    }
+    _last_fetch_ts: float = 0.0
+    _cached_close: float = 0.0
+    _cached_high: float = 0.0
+    _cached_low: float = 0.0
+    _cached_vel_10m: float = 0.0
+    _cached_vel_3m: float = 0.0
+
+    _qqq_last_price: float = 0.0
+    _qqq_last_ts: float = 0.0
+    _qqq_vel_ts: float = 0.0
+    _qqq_vel_10m: float = 0.0
+    _qqq_vel_3m: float = 0.0
+
+    _nq_10m_trend_ts: float = 0.0
+    _nq_10m_trend_sym: str = ""
+    _nq_10m_open: float = 0.0
+    _nq_10m_close: float = 0.0
+    _nq_10m_body_pct: float = 0.0
+
+    CACHE_TTL_SEC = 15.0
+    QQQ_PROBE_TTL_SEC = 1.5
+
+    @classmethod
+    def reset_session_cache(cls):
+        cls._nq_session_id = ""
+        cls._last_fetch_ts = 0.0
+        cls._cached_close = 0.0
+        cls._cached_high = 0.0
+        cls._cached_low = 0.0
+        cls._cached_vel_10m = 0.0
+        cls._cached_vel_3m = 0.0
+        cls._qqq_last_price = 0.0
+        cls._qqq_last_ts = 0.0
+        cls._qqq_vel_ts = 0.0
+        cls._qqq_vel_10m = 0.0
+        cls._qqq_vel_3m = 0.0
+        cls._nq_10m_trend_ts = 0.0
+        cls._nq_10m_trend_sym = ""
+        cls._nq_10m_open = 0.0
+        cls._nq_10m_close = 0.0
+        cls._nq_10m_body_pct = 0.0
 
     @staticmethod
-    def _fetch_yfinance_nq_sync(
+    def _fetch_nq_sync(
         nq_session_start_est: datetime,
         is_cme_open: bool,
-        prev_session_id: str,
-        prev_data: tuple[float, float, float],
-    ) -> tuple[str, float, float, float, float, float]:
-        session_id = nq_session_start_est.strftime("%Y-%m-%d_%H%M")
+        prev_h: float,
+        prev_l: float,
+        prev_c: float,
+    ) -> tuple[float, float, float, float, float]:
+        close_val, high_val, low_val = 0.0, 0.0, 0.0
+        vel_10m, vel_3m = 0.0, 0.0
         target_session_date = (nq_session_start_est + timedelta(hours=6)).date()
-        prev_c, prev_h, prev_l = prev_data if prev_session_id == session_id else (0.0, 0.0, 0.0)
 
-        tkr = yf.Ticker("NQ=F")
-
-        fast_last = 0.0
-        fast_day_high = 0.0
-        fast_day_low = 0.0
         try:
-            fi = tkr.fast_info
-            if fi is not None:
-                fast_last = float(getattr(fi, "last_price", 0.0) or fi.get("lastPrice", 0.0) or 0.0)
-                fast_day_high = float(getattr(fi, "day_high", 0.0) or fi.get("dayHigh", 0.0) or 0.0)
-                fast_day_low = float(getattr(fi, "day_low", 0.0) or fi.get("dayLow", 0.0) or 0.0)
-        except Exception:
-            pass
+            tkr = yf.Ticker("NQ=F")
 
-        daily_sess_high = 0.0
-        daily_sess_low = 0.0
-        daily_sess_close = 0.0
-        try:
-            df_1d = tkr.history(period="5d", interval="1d")
-            if df_1d is not None and not df_1d.empty:
-                for idx_dt, row_1d in df_1d.iterrows():
-                    r_date = idx_dt.date() if hasattr(idx_dt, "date") else pd.to_datetime(idx_dt).date()
-                    if r_date == target_session_date:
-                        daily_sess_high = float(row_1d.get("High", 0.0) or 0.0)
-                        daily_sess_low = float(row_1d.get("Low", 0.0) or 0.0)
-                        daily_sess_close = float(row_1d.get("Close", 0.0) or 0.0)
-        except Exception:
-            pass
+            # 1) fast_info 실시간 현재가 및 당일 고/저가 추출 (초과 Case 90, 91)
+            fast_last, fast_high, fast_low, fast_prev_close = 0.0, 0.0, 0.0, 0.0
+            try:
+                fi = tkr.fast_info
+                if fi is not None:
+                    fast_last = float(getattr(fi, "last_price", 0.0) or fi.get("lastPrice", 0.0) or 0.0)
+                    fast_high = float(getattr(fi, "day_high", 0.0) or fi.get("dayHigh", 0.0) or 0.0)
+                    fast_low = float(getattr(fi, "day_low", 0.0) or fi.get("dayLow", 0.0) or 0.0)
+                    fast_prev_close = float(
+                        getattr(fi, "previous_close", 0.0) or fi.get("previousClose", 0.0) or 0.0
+                    )
+            except Exception:
+                pass
 
-        df_1m = pd.DataFrame()
-        try:
+            # 2) 1분봉 시계열 조회 및 18:00:00 EST 신세션 경계 하드 컷오프 (초과 Case 62, 90)
             df_1m = tkr.history(period="5d", interval="1m")
-        except Exception:
-            pass
+            df_session = pd.DataFrame()
+            if df_1m is not None and not df_1m.empty:
+                if df_1m.index.tz is None:
+                    df_1m.index = df_1m.index.tz_localize("UTC").tz_convert(EST_TZ)
+                else:
+                    df_1m.index = df_1m.index.tz_convert(EST_TZ)
+                df_1m = df_1m[(df_1m["High"] > 0.0) & (df_1m["Low"] > 0.0) & (df_1m["Close"] > 0.0)]
 
-        curr_val = 0.0
-        high_val = 0.0
-        low_val = 0.0
-        vel_10m_yf = 0.0
-        vel_3m_yf = 0.0
-
-        now_est = datetime.now(EST_TZ)
-        est_hm = now_est.hour * 100 + now_est.minute
-        # 신세션 개장 직후 15분간(18:00 ~ 18:14 EST) 이전 세션의 낡은 fast_info 고/저가가 섞이는 것을 방어
-        is_fast_hl_stale = bool(is_cme_open and (1800 <= est_hm <= 1814))
-
-        if df_1m is not None and not df_1m.empty:
-            if df_1m.index.tz is None:
-                df_1m.index = df_1m.index.tz_localize("UTC").tz_convert(EST_TZ)
-            else:
-                df_1m.index = df_1m.index.tz_convert(EST_TZ)
-
-            df_1m = df_1m[~df_1m.index.duplicated(keep="last")].sort_index(ascending=True)
-            sess_end_est = nq_session_start_est + timedelta(hours=23)
-            df_session = df_1m[(df_1m.index >= nq_session_start_est) & (df_1m.index <= sess_end_est)].copy()
+                sess_end_est = nq_session_start_est + timedelta(hours=23)
+                df_session = df_1m[(df_1m.index >= nq_session_start_est) & (df_1m.index < sess_end_est)]
 
             if not df_session.empty:
-                df_session = df_session[df_session["Close"] > 0.0]
-                if not df_session.empty:
-                    curr_val = float(df_session["Close"].iloc[-1])
-                    high_val = float(df_session["High"].max())
-                    low_val = float(df_session["Low"].min())
+                close_val = float(df_session["Close"].iloc[-1])
+                high_val = float(df_session["High"].max())
+                low_val = float(df_session["Low"].min())
 
-                    closes = df_session["Close"].to_numpy()
-                    if len(closes) >= 11 and closes[-11] > 0.0:
-                        vel_10m_yf = float((closes[-1] - closes[-11]) / closes[-11] * 100.0)
-                    elif len(closes) >= 2 and closes[0] > 0.0:
-                        vel_10m_yf = float((closes[-1] - closes[0]) / closes[0] * 100.0)
+                closes = df_session["Close"]
+                cur_c = float(closes.iloc[-1])
+                if len(closes) >= 11:
+                    c_10m_ago = float(closes.iloc[-11])
+                else:
+                    c_10m_ago = float(closes.iloc[0])
+                if c_10m_ago > 0.0:
+                    vel_10m = (cur_c - c_10m_ago) / c_10m_ago * 100.0
 
-                    if len(closes) >= 4 and closes[-4] > 0.0:
-                        vel_3m_yf = float((closes[-1] - closes[-4]) / closes[-4] * 100.0)
-                    elif len(closes) >= 2 and closes[0] > 0.0:
-                        vel_3m_yf = float((closes[-1] - closes[0]) / closes[0] * 100.0)
+                if len(closes) >= 4:
+                    c_3m_ago = float(closes.iloc[-4])
+                else:
+                    c_3m_ago = float(closes.iloc[0])
+                if c_3m_ago > 0.0:
+                    vel_3m = (cur_c - c_3m_ago) / c_3m_ago * 100.0
 
-        # 초과 Case 91 [해법 1]: fast_info 및 1d 일봉 당일 실제 고/저가/마감가 강제 병합 + 동일 세션 단조 보존
-        if fast_last > 0.0:
-            curr_val = fast_last
-        elif curr_val <= 0.0 and daily_sess_close > 0.0:
-            curr_val = daily_sess_close
-        elif curr_val <= 0.0 and prev_c > 0.0:
-            curr_val = prev_c
+            # 3) 1d 공식 일봉에서 해당 세션 기준일(target_session_date)의 고가/저가 추출 (초과 Case 91)
+            daily_sess_high, daily_sess_low, daily_sess_close = 0.0, 0.0, 0.0
+            try:
+                df_1d = tkr.history(period="5d", interval="1d")
+                if df_1d is not None and not df_1d.empty:
+                    for idx_dt, row in df_1d.iterrows():
+                        r_date = idx_dt.date() if hasattr(idx_dt, "date") else pd.to_datetime(idx_dt).date()
+                        if r_date == target_session_date:
+                            dh = float(row.get("High", 0.0) or 0.0)
+                            dl = float(row.get("Low", 0.0) or 0.0)
+                            dc = float(row.get("Close", 0.0) or 0.0)
+                            if dh > 0.0 and dl > 0.0:
+                                daily_sess_high = dh
+                                daily_sess_low = dl
+                                daily_sess_close = dc
+                            break
+            except Exception:
+                pass
 
-        cand_highs = [v for v in (high_val, daily_sess_high, prev_h, curr_val) if v > 0.0]
-        cand_lows = [v for v in (low_val, daily_sess_low, prev_l, curr_val) if v > 0.0]
-        if not is_fast_hl_stale:
-            if fast_day_high > 0.0:
-                cand_highs.append(fast_day_high)
-            if fast_day_low > 0.0:
-                cand_lows.append(fast_day_low)
+            # 4) 18:00~18:15 EST 신세션 직후 fast_info 잔재 여부 검증 후 고/저가 강제 병합
+            now_est = datetime.now(EST_TZ)
+            mins_since_open = (now_est - nq_session_start_est).total_seconds() / 60.0
+            is_fast_hl_stale = False
+            if is_cme_open and (0.0 <= mins_since_open <= 20.0) and high_val > 0.0 and low_val > 0.0:
+                if fast_high > 0.0 and fast_low > 0.0:
+                    fast_amp = (fast_high - fast_low) / fast_low * 100.0
+                    bar_amp = (high_val - low_val) / low_val * 100.0
+                    if fast_amp > bar_amp + 0.50:
+                        is_fast_hl_stale = True
 
-        high_val = max(cand_highs) if cand_highs else 0.0
-        low_val = min(cand_lows) if cand_lows else 0.0
+            if fast_last > 0.0 and (is_cme_open or close_val <= 0.0):
+                close_val = fast_last
+            elif daily_sess_close > 0.0 and close_val <= 0.0:
+                close_val = daily_sess_close
 
-        return session_id, curr_val, high_val, low_val, round(vel_10m_yf, 4), round(vel_3m_yf, 4)
+            if not is_fast_hl_stale:
+                for cand_h in (fast_high, daily_sess_high, close_val):
+                    if cand_h > 0.0:
+                        high_val = max(high_val, cand_h) if high_val > 0.0 else cand_h
+                for cand_l in (fast_low, daily_sess_low, close_val):
+                    if cand_l > 0.0:
+                        low_val = min(low_val, cand_l) if low_val > 0.0 else cand_l
+            else:
+                if close_val > 0.0:
+                    high_val = max(high_val, close_val) if high_val > 0.0 else close_val
+                    low_val = min(low_val, close_val) if low_val > 0.0 else close_val
 
-    @staticmethod
-    def _compute_qqq_velocity_sync(q_price: float, q_candles: list) -> tuple[float, float]:
-        if not q_candles or not isinstance(q_candles, list):
-            return 0.0, 0.0
-        df = pd.DataFrame(q_candles)
-        if df.empty or "closePrice" not in df.columns or "timestamp" not in df.columns:
-            return 0.0, 0.0
-        df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True).dt.tz_convert(EST_TZ)
-        df.set_index("timestamp", inplace=True)
-        df = df[~df.index.duplicated(keep="last")].sort_index(ascending=True)
-        df["closePrice"] = pd.to_numeric(df["closePrice"], errors="coerce").fillna(0.0)
-        df = df[df["closePrice"] > 0.0]
-        if df.empty:
-            return 0.0, 0.0
+            # 5) 동일 CME 선물 세션(_nq_session_id) 내 누적 최고가/최저가 단조 보존 (초과 Case 62, 91)
+            if prev_h > 0.0:
+                high_val = max(high_val, prev_h) if high_val > 0.0 else prev_h
+            if prev_l > 0.0:
+                low_val = min(low_val, prev_l) if low_val > 0.0 else prev_l
+            if close_val <= 0.0 and prev_c > 0.0:
+                close_val = prev_c
 
-        closes = df["closePrice"].to_numpy()
-        live_c = float(q_price) if q_price > 0.0 else float(closes[-1])
+        except Exception as e:
+            print(f"🚨 [NQ=F 선물 시세 조회 방어] {e}", flush=True)
+            close_val, high_val, low_val = prev_c, prev_h, prev_l
 
-        if len(closes) >= 11 and closes[-11] > 0.0:
-            v10 = float((live_c - closes[-11]) / closes[-11] * 100.0)
-        elif len(closes) >= 2 and closes[0] > 0.0:
-            v10 = float((live_c - closes[0]) / closes[0] * 100.0)
-        else:
-            v10 = 0.0
+        return (
+            round(float(close_val or 0.0), 2),
+            round(float(high_val or 0.0), 2),
+            round(float(low_val or 0.0), 2),
+            round(float(vel_10m or 0.0), 4),
+            round(float(vel_3m or 0.0), 4),
+        )
 
-        if len(closes) >= 4 and closes[-4] > 0.0:
-            v3 = float((live_c - closes[-4]) / closes[-4] * 100.0)
-        elif len(closes) >= 2 and closes[0] > 0.0:
-            v3 = float((live_c - closes[0]) / closes[0] * 100.0)
-        else:
-            v3 = 0.0
+    @classmethod
+    async def _refresh_qqq_snapshot_if_needed(cls, force_refresh: bool = False, realtime_probing: bool = False):
+        client = getattr(GlobalThrottle, "active_client", None)
+        if client is None:
+            return
 
-        return round(v10, 4), round(v3, 4)
+        now_ts = time.time()
+        now_est = datetime.now(EST_TZ)
+        est_hm = now_est.hour * 100 + now_est.minute
+        wk = now_est.weekday()
+        if (wk == 4 and est_hm >= 1700) or (wk == 5) or (wk == 6 and est_hm < 1800) or (1700 <= est_hm <= 1859):
+            return
+
+        ttl_p = cls.QQQ_PROBE_TTL_SEC if realtime_probing else cls.CACHE_TTL_SEC
+        need_price = force_refresh or (now_ts - cls._qqq_last_ts >= ttl_p) or (cls._qqq_last_price <= 0.0)
+        need_vel = force_refresh or (now_ts - cls._qqq_vel_ts >= cls.CACHE_TTL_SEC)
+
+        if not need_price and not need_vel:
+            return
+
+        async with cls._qqq_lock:
+            now_ts = time.time()
+            need_price = force_refresh or (now_ts - cls._qqq_last_ts >= ttl_p) or (cls._qqq_last_price <= 0.0)
+            need_vel = force_refresh or (now_ts - cls._qqq_vel_ts >= cls.CACHE_TTL_SEC)
+            try:
+                if hasattr(client, "get_qqq_realtime_snapshot") and need_vel:
+                    snap = await asyncio.wait_for(client.get_qqq_realtime_snapshot(), timeout=3.5)
+                    if isinstance(snap, dict):
+                        qp = float(snap.get("price", 0.0) or 0.0)
+                        if qp > 0.0:
+                            cls._qqq_last_price = qp
+                            cls._qqq_last_ts = time.time()
+                        cls._qqq_vel_10m = float(snap.get("vel_10m", 0.0) or 0.0)
+                        cls._qqq_vel_3m = float(snap.get("vel_3m", 0.0) or 0.0)
+                        cls._qqq_vel_ts = time.time()
+                        return
+
+                if need_price:
+                    p_map = await asyncio.wait_for(client.get_current_prices_batch(("QQQ",)), timeout=2.5)
+                    qp = float((p_map or {}).get("QQQ", 0.0) or 0.0)
+                    if qp > 0.0:
+                        cls._qqq_last_price = qp
+                        cls._qqq_last_ts = time.time()
+
+                if need_vel:
+                    candles_q = await asyncio.wait_for(client.get_1m_candles("QQQ", count=25), timeout=3.0)
+                    if candles_q and isinstance(candles_q, list):
+                        df_q = pd.DataFrame(candles_q)
+                        if not df_q.empty and "closePrice" in df_q.columns and "timestamp" in df_q.columns:
+                            df_q["timestamp"] = pd.to_datetime(
+                                df_q["timestamp"], format="ISO8601", utc=True
+                            ).dt.tz_convert(EST_TZ)
+                            df_q.sort_values("timestamp", ascending=True, inplace=True)
+                            df_q["closePrice"] = pd.to_numeric(df_q["closePrice"], errors="coerce").fillna(0.0)
+                            df_q = df_q[df_q["closePrice"] > 0.0]
+                            if not df_q.empty:
+                                cur_q = cls._qqq_last_price if cls._qqq_last_price > 0.0 else float(df_q["closePrice"].iloc[-1])
+                                c10 = float(df_q["closePrice"].iloc[-11]) if len(df_q) >= 11 else float(df_q["closePrice"].iloc[0])
+                                c3 = float(df_q["closePrice"].iloc[-4]) if len(df_q) >= 4 else float(df_q["closePrice"].iloc[0])
+                                cls._qqq_vel_10m = round(((cur_q - c10) / c10 * 100.0), 4) if c10 > 0.0 else 0.0
+                                cls._qqq_vel_3m = round(((cur_q - c3) / c3 * 100.0), 4) if c3 > 0.0 else 0.0
+                                cls._qqq_vel_ts = time.time()
+            except Exception:
+                pass
 
     @classmethod
     async def get_cached_nq_data(cls, force_refresh: bool = False) -> tuple[float, float, float]:
-        now_ts = time.time()
         now_est = datetime.now(EST_TZ)
         is_cme_open, nq_sess_start = get_cme_session_window_est(now_est)
-        expected_sess_id = nq_sess_start.strftime("%Y-%m-%d_%H%M")
+        sess_id = nq_sess_start.strftime("%Y-%m-%d_%H%M")
 
+        now_ts = time.time()
         if (
             not force_refresh
-            and cls._nq_session_id == expected_sess_id
-            and (now_ts - cls._last_fetch_ts) < 15.0
-            and cls._nq_data[0] > 0.0
+            and cls._nq_session_id == sess_id
+            and (now_ts - cls._last_fetch_ts < cls.CACHE_TTL_SEC)
+            and cls._cached_high > 0.0
+            and cls._cached_low > 0.0
         ):
-            return cls._nq_data
+            return cls._cached_close, cls._cached_high, cls._cached_low
 
         async with cls._lock:
             now_ts = time.time()
-            if (
+            if cls._nq_session_id != sess_id:
+                cls._nq_session_id = sess_id
+                cls._cached_close = 0.0
+                cls._cached_high = 0.0
+                cls._cached_low = 0.0
+                cls._cached_vel_10m = 0.0
+                cls._cached_vel_3m = 0.0
+            elif (
                 not force_refresh
-                and cls._nq_session_id == expected_sess_id
-                and (now_ts - cls._last_fetch_ts) < 15.0
-                and cls._nq_data[0] > 0.0
+                and (now_ts - cls._last_fetch_ts < cls.CACHE_TTL_SEC)
+                and cls._cached_high > 0.0
+                and cls._cached_low > 0.0
             ):
-                return cls._nq_data
+                return cls._cached_close, cls._cached_high, cls._cached_low
 
             try:
-                sess_id, c_val, h_val, l_val, v10_yf, v3_yf = await asyncio.wait_for(
+                c_val, h_val, l_val, v10, v3 = await asyncio.wait_for(
                     asyncio.to_thread(
-                        cls._fetch_yfinance_nq_sync,
+                        cls._fetch_nq_sync,
                         nq_sess_start,
                         is_cme_open,
-                        cls._nq_session_id,
-                        cls._nq_data,
+                        cls._cached_high,
+                        cls._cached_low,
+                        cls._cached_close,
                     ),
                     timeout=8.0,
                 )
-                if c_val > 0.0 and h_val > 0.0 and l_val > 0.0:
-                    cls._nq_session_id = sess_id
-                    cls._nq_data = (c_val, h_val, l_val)
+                if h_val > 0.0 and l_val > 0.0:
+                    cls._cached_close = c_val
+                    cls._cached_high = h_val
+                    cls._cached_low = l_val
+                    cls._cached_vel_10m = v10
+                    cls._cached_vel_3m = v3
                     cls._last_fetch_ts = time.time()
-
-                # 초과 Case 91 [해법 2 방법 A]: 토스 Open API QQQ 0.0초 실시간 변화율 최우선 적용
-                est_hm = now_est.hour * 100 + now_est.minute
-                active_cli = getattr(GlobalThrottle, "active_client", None)
-                used_qqq_vel = False
-                if active_cli is not None and not (1700 <= est_hm <= 1859):
-                    q_price, q_candles = await active_cli.get_qqq_realtime_snapshot(count=25)
-                    if q_price > 0.0:
-                        cls._qqq_rt_price = q_price
-                        cls._qqq_rt_ts = time.time()
-                    if q_candles:
-                        v10_q, v3_q = await asyncio.to_thread(
-                            cls._compute_qqq_velocity_sync, q_price, q_candles
-                        )
-                        cls._nq_vel = (v10_q, v3_q)
-                        used_qqq_vel = True
-
-                if not used_qqq_vel:
-                    cls._nq_vel = (v10_yf, v3_yf)
-
             except Exception as e:
-                print(f"🚨 [MacroDataCache NQ/QQQ 갱신 방어] {e}", flush=True)
+                print(f"🚨 [MacroDataCache 갱신 타임아웃 방어] {e}", flush=True)
 
-            return cls._nq_data
+            return cls._cached_close, cls._cached_high, cls._cached_low
 
     @classmethod
     async def get_nq_short_velocity(cls, force_refresh: bool = False) -> tuple[float, float]:
-        """초과 Case 89 & 91: 보유 중 🚀 NQ_VEL_BYPASS 판별용 최근 10분/3분 변화율 반환."""
+        """초과 Case 89 & Case 91: 토스 Open API QQQ 0.0초 실시간 10분/3분 변화율 최우선 반환 (미수신 시 NQ=F 폴백)."""
+        await cls._refresh_qqq_snapshot_if_needed(force_refresh=force_refresh, realtime_probing=False)
+        if time.time() - cls._qqq_vel_ts < 60.0 and cls._qqq_last_price > 0.0:
+            return cls._qqq_vel_10m, cls._qqq_vel_3m
+
         await cls.get_cached_nq_data(force_refresh=force_refresh)
-        return cls._nq_vel
+        return cls._cached_vel_10m, cls._cached_vel_3m
 
     @classmethod
     async def get_stage3_reference_price(
@@ -295,84 +378,106 @@ class MacroDataCache:
     ) -> tuple[float, str]:
         """
         초과 Case 92 & Case 94:
-        3차 역행 안전망 전용 0.0초 실시간 QQQ 현재가 프로빙(보유 중 1.5초 TTL, 평시 15.0초 TTL).
-        QQQ 조회 성공 시 (qqq_price, "QQQ실시간")을 반환하고, 미수신 시 (nq_curr, "NQ선물폴백")으로 안전 폴백합니다.
+        3차 역행 안전망의 진입 기준가(nq_entry_price) 및 실시간 비교가(ref_curr)로
+        토스 Open API QQQ 0.0초 실시간 현재가를 최우선 반환합니다 (미수신 시 NQ=F 폴백).
         """
-        now_ts = time.time()
-        ttl = 1.5 if realtime_probing else 15.0
-        active_cli = getattr(GlobalThrottle, "active_client", None)
-
-        if not force_refresh and cls._qqq_rt_price > 0.0 and (now_ts - cls._qqq_rt_ts) < ttl:
-            return cls._qqq_rt_price, "QQQ실시간"
-
-        if active_cli is not None:
-            try:
-                q_p = await active_cli.get_current_price("QQQ")
-                if q_p > 0.0:
-                    cls._qqq_rt_price = float(q_p)
-                    cls._qqq_rt_ts = time.time()
-                    return cls._qqq_rt_price, "QQQ실시간"
-            except Exception:
-                pass
-
-        if cls._qqq_rt_price > 0.0 and (now_ts - cls._qqq_rt_ts) < 60.0:
-            return cls._qqq_rt_price, "QQQ실시간"
+        await cls._refresh_qqq_snapshot_if_needed(
+            force_refresh=force_refresh, realtime_probing=realtime_probing
+        )
+        if cls._qqq_last_price > 0.0 and (time.time() - cls._qqq_last_ts < 120.0):
+            return round(cls._qqq_last_price, 4), "QQQ실시간"
 
         nq_c, _, _ = await cls.get_cached_nq_data(force_refresh=force_refresh)
-        return float(nq_c or 0.0), "NQ선물폴백"
+        return round(nq_c, 2), "NQ선물"
 
     @staticmethod
     def _fetch_nq_10m_trend_sync() -> tuple[str, float, float, float]:
+        """
+        초과 Case 93:
+        데이장 개시 1분 전(08:59 KST / 18:59 EST) 나스닥 100 선물지수(NQ=F) 10분봉 양/음봉 판별.
+        yfinance 무료 1분봉의 10분 시세 지연으로 인해 08:50~08:59 KST 10분봉(예: 08:50 KST 음봉)이
+        누락되는 현상을 차단하기 위해 tkr.fast_info.last_price (0.0초 실시간 시세)를 현재 10분봉 종가에 강제 병합합니다.
+        """
         try:
             tkr = yf.Ticker("NQ=F")
+            fast_last = 0.0
+            try:
+                fi = tkr.fast_info
+                if fi is not None:
+                    fast_last = float(getattr(fi, "last_price", 0.0) or fi.get("lastPrice", 0.0) or 0.0)
+            except Exception:
+                pass
+
             df_1m = tkr.history(period="2d", interval="1m")
             if df_1m is None or df_1m.empty:
                 return "", 0.0, 0.0, 0.0
+
             if df_1m.index.tz is None:
                 df_1m.index = df_1m.index.tz_localize("UTC").tz_convert(EST_TZ)
             else:
                 df_1m.index = df_1m.index.tz_convert(EST_TZ)
-            df_1m = df_1m[~df_1m.index.duplicated(keep="last")].sort_index(ascending=True)
-            df_1m = df_1m[df_1m["Close"] > 0.0]
+
+            df_1m = df_1m[(df_1m["Open"] > 0.0) & (df_1m["Close"] > 0.0)].copy()
             if df_1m.empty:
                 return "", 0.0, 0.0, 0.0
 
-            df_10m = (
-                df_1m.resample("10min", label="left", closed="left")
-                .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"})
-                .dropna(subset=["Open", "Close"])
+            now_est = datetime.now(EST_TZ)
+            _, nq_sess_start = get_cme_session_window_est(now_est)
+            df_sess = df_1m[df_1m.index >= nq_sess_start].copy()
+            if df_sess.empty:
+                df_sess = df_1m.tail(30).copy()
+
+            df_sess["b10"] = df_sess.index.floor("10min")
+            df_10m = df_sess.groupby("b10", sort=True).agg(
+                o10=("Open", "first"),
+                h10=("High", "max"),
+                l10=("Low", "min"),
+                c10=("Close", "last"),
             )
             if df_10m.empty:
                 return "", 0.0, 0.0, 0.0
 
-            last_bar = df_10m.iloc[-1]
-            o_10 = float(last_bar["Open"])
-            c_10 = float(last_bar["Close"])
-            if len(df_10m) >= 2 and abs(c_10 - o_10) < 1e-6:
-                prev_bar = df_10m.iloc[-2]
-                o_10 = float(prev_bar["Open"])
-                c_10 = float(prev_bar["Close"])
+            # 개시 1분 전(18:59 EST / 08:59 KST)은 18:50~18:59 EST (08:50~08:59 KST) 10분봉이 대상
+            target_b10 = now_est.replace(hour=18, minute=50, second=0, microsecond=0)
+            if now_est.hour < 18:
+                target_b10 = (now_est - timedelta(days=1)).replace(hour=18, minute=50, second=0, microsecond=0)
 
-            if o_10 <= 0.0:
+            if target_b10 in df_10m.index:
+                o_10 = float(df_10m.loc[target_b10, "o10"])
+                c_10 = float(df_10m.loc[target_b10, "c10"])
+                if fast_last > 0.0 and (now_est.hour == 18 and now_est.minute >= 50):
+                    c_10 = fast_last
+            else:
+                # yfinance 10분 지연으로 인해 18:50 버킷(08:50 KST)이 아직 df_1m에 없을 때:
+                # 직전 18:40 버킷의 마지막 종가(18:49 종가 = 18:50 시가 근사치)를 시가로 삼고 fast_last를 실시간 종가로 병합!
+                last_b10_dt = df_10m.index[-1]
+                age_mins = (now_est - last_b10_dt).total_seconds() / 60.0
+                if fast_last > 0.0 and age_mins >= 10.0:
+                    o_10 = float(df_10m["c10"].iloc[-1])
+                    c_10 = fast_last
+                else:
+                    o_10 = float(df_10m["o10"].iloc[-1])
+                    c_10 = fast_last if fast_last > 0.0 else float(df_10m["c10"].iloc[-1])
+
+            if o_10 <= 0.0 or c_10 <= 0.0:
                 return "", 0.0, 0.0, 0.0
 
             body_pct = (c_10 - o_10) / o_10 * 100.0
             trend_sym = "SOXL" if c_10 >= o_10 else "SOXS"
-            return trend_sym, round(o_10, 2), round(c_10, 2), round(body_pct, 4)
-        except Exception:
+            return trend_sym, round(o_10, 2), round(c_10, 2), round(body_pct, 3)
+        except Exception as e:
+            print(f"🚨 [NQ=F 10분봉 추세 판별 방어] {e}", flush=True)
             return "", 0.0, 0.0, 0.0
 
     @classmethod
     async def get_nq_10m_candle_trend(cls, force_refresh: bool = False) -> tuple[str, float, float, float]:
-        """초과 Case 93: 데이장 개시 1분 전(08:59 KST / 18:59 EST) 나스닥 100 선물 10분봉 양/음봉 판별."""
         now_ts = time.time()
         if (
             not force_refresh
-            and cls._nq_10m_trend_cache.get("trend_sym")
-            and (now_ts - float(cls._nq_10m_trend_cache.get("ts", 0.0))) < 20.0
+            and cls._nq_10m_trend_sym in ("SOXL", "SOXS")
+            and (now_ts - cls._nq_10m_trend_ts < 20.0)
         ):
-            c = cls._nq_10m_trend_cache
-            return c["trend_sym"], c["open_10m"], c["close_10m"], c["body_pct"]
+            return cls._nq_10m_trend_sym, cls._nq_10m_open, cls._nq_10m_close, cls._nq_10m_body_pct
 
         try:
             t_sym, o_10, c_10, b_pct = await asyncio.wait_for(
@@ -380,263 +485,267 @@ class MacroDataCache:
                 timeout=6.0,
             )
             if t_sym in ("SOXL", "SOXS"):
-                cls._nq_10m_trend_cache.update({
-                    "ts": now_ts,
-                    "trend_sym": t_sym,
-                    "open_10m": o_10,
-                    "close_10m": c_10,
-                    "body_pct": b_pct,
-                })
-                return t_sym, o_10, c_10, b_pct
-        except Exception as e:
-            print(f"🚨 [NQ=F 10분봉 추세 판별 방어] {e}", flush=True)
-
-        c = cls._nq_10m_trend_cache
-        return (
-            str(c.get("trend_sym") or ""),
-            float(c.get("open_10m", 0.0)),
-            float(c.get("close_10m", 0.0)),
-            float(c.get("body_pct", 0.0)),
-        )
+                cls._nq_10m_trend_sym = t_sym
+                cls._nq_10m_open = o_10
+                cls._nq_10m_close = c_10
+                cls._nq_10m_body_pct = b_pct
+                cls._nq_10m_trend_ts = time.time()
+        except Exception:
+            pass
+        return cls._nq_10m_trend_sym, cls._nq_10m_open, cls._nq_10m_close, cls._nq_10m_body_pct
 
 
 class AssassinLedger:
     """
-    제1헌법, Case 02, 06, 09, 30, 54, 76, 82, 95, 96:
-    SOXS 및 SOXL 듀얼 스나이퍼 로컬 원장 원자적(Atomic) I/O 통제소.
+    제1헌법, Case 02, 06, 09, 41, 52, 54, 76, 82, 86, 94, 95, 96:
+    듀얼 스나이퍼(SOXS / SOXL) 허용 종목 화이트리스트 강제 및 원자적 로컬 JSON 원장 통제 코어.
     """
     ALLOWED_SYMBOLS = ("SOXS", "SOXL")
 
     @classmethod
-    def _validate_symbol(cls, symbol: str) -> str:
-        sym = str(symbol or "").strip().upper()
-        if sym not in cls.ALLOWED_SYMBOLS:
-            raise ValueError(f"🚨 [Case 09 위반] 허용되지 않은 종목({sym}) 원장 접근이 차단되었습니다.")
-        return sym
+    def _validate_symbol(cls, symbol: str):
+        if symbol not in cls.ALLOWED_SYMBOLS:
+            raise ValueError(f"🚨 [화이트리스트 위반 차단] 비허용 종목 접근 거부: {symbol}")
 
     @classmethod
     def _get_filepath(cls, symbol: str) -> str:
-        sym = cls._validate_symbol(symbol)
-        return os.path.abspath(f"assassin_ledger_{sym}.json")
+        cls._validate_symbol(symbol)
+        return f"assassin_ledger_{symbol}.json"
 
-    @staticmethod
-    def _default_dict() -> dict:
+    @classmethod
+    def _default_payload(cls) -> dict:
         return {
             "price": 0.0,
             "budget": 100.0,
             "target_profit_rate": SINGLE_TARGET_PROFIT_RATE,
-            "last_session_id": "",
+            "is_compound": True,
             "is_session_done": False,
             "is_active": True,
             "target_sell_price": 0.0,
             "buy_order_id": "",
             "sell_order_id": "",
             "entry_session": "",
-            "entry_trend": "",
             "entry_time": 0.0,
             "nq_entry_price": 0.0,
             "nq_entry_amp": 0.0,
-            "is_compound": True,
+            "entry_trend": "",
+            "last_session_id": "",
             "whipsaw_target_price": 0.0,
         }
 
     @classmethod
-    def _read_raw_sync(cls, filepath: str) -> dict:
-        base = cls._default_dict()
-        if not os.path.exists(filepath):
-            return base
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                base.update(loaded)
-        except Exception:
-            pass
-        base["target_profit_rate"] = normalize_target_rate(base.get("target_profit_rate", 1.0))
-        return base
+    def _read_sync(cls, symbol: str) -> dict:
+        filepath = cls._get_filepath(symbol)
+        with GlobalThrottle.get_file_lock(filepath):
+            if not os.path.exists(filepath):
+                return cls._default_payload()
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    return cls._default_payload()
+                base = cls._default_payload()
+                base.update(data)
+                base["target_profit_rate"] = normalize_target_rate(base.get("target_profit_rate", 1.0))
+                return base
+            except Exception as e:
+                print(f"🚨 [원장 읽기 방어 {symbol}] {e}", flush=True)
+                return cls._default_payload()
 
     @classmethod
-    def _write_raw_sync(cls, filepath: str, data: dict):
-        data["target_profit_rate"] = normalize_target_rate(data.get("target_profit_rate", 1.0))
-        tmp_path = f"{filepath}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, filepath)
+    def _write_sync(cls, symbol: str, updates: dict) -> dict:
+        filepath = cls._get_filepath(symbol)
+        with GlobalThrottle.get_file_lock(filepath):
+            cur = cls._default_payload()
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        cur.update(loaded)
+                except Exception:
+                    pass
 
-    @classmethod
-    async def _load_dict(cls, symbol: str) -> dict:
-        fp = cls._get_filepath(symbol)
-        async with GlobalThrottle.get_file_lock(fp):
-            return await asyncio.wait_for(asyncio.to_thread(cls._read_raw_sync, fp), timeout=5.0)
+            for k, v in updates.items():
+                if v is not None:
+                    cur[k] = v
+
+            cur["target_profit_rate"] = normalize_target_rate(cur.get("target_profit_rate", 1.0))
+            tmp_path = f"{filepath}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(cur, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, filepath)
+            return cur
 
     @classmethod
     async def get_state(cls, symbol: str) -> tuple:
-        d = await cls._load_dict(symbol)
+        data = await asyncio.to_thread(cls._read_sync, symbol)
         return (
-            float(d.get("price") or 0.0),
-            float(d.get("budget") or 100.0),
-            normalize_target_rate(d.get("target_profit_rate", 1.0)),
-            str(d.get("last_session_id") or ""),
-            bool(d.get("is_session_done", False)),
-            bool(d.get("is_active", True)),
-            float(d.get("target_sell_price") or 0.0),
-            str(d.get("sell_order_id") or ""),
-            str(d.get("entry_session") or ""),
-            float(d.get("entry_time") or 0.0),
-            float(d.get("nq_entry_price") or 0.0),
-            float(d.get("nq_entry_amp") or 0.0),
+            float(data.get("price") or 0.0),
+            float(data.get("budget") or 100.0),
+            normalize_target_rate(data.get("target_profit_rate", 1.0)),
+            bool(data.get("is_compound", True)),
+            bool(data.get("is_session_done", False)),
+            bool(data.get("is_active", True)),
+            float(data.get("target_sell_price") or 0.0),
+            str(data.get("sell_order_id") or ""),
+            str(data.get("entry_session") or ""),
+            float(data.get("entry_time") or 0.0),
+            float(data.get("nq_entry_price") or 0.0),
+            float(data.get("nq_entry_amp") or 0.0),
+            str(data.get("entry_trend") or ""),
+            float(data.get("whipsaw_target_price") or 0.0),
         )
 
     @classmethod
-    async def save_state(cls, symbol: str, **kwargs):
-        fp = cls._get_filepath(symbol)
-        async with GlobalThrottle.get_file_lock(fp):
-            cur = await asyncio.wait_for(asyncio.to_thread(cls._read_raw_sync, fp), timeout=5.0)
-            for k, v in kwargs.items():
-                if v is not None:
-                    cur[k] = v
-            cur["target_profit_rate"] = normalize_target_rate(cur.get("target_profit_rate", 1.0))
-            await asyncio.wait_for(asyncio.to_thread(cls._write_raw_sync, fp, cur), timeout=5.0)
+    async def get_raw_dict(cls, symbol: str) -> dict:
+        return await asyncio.to_thread(cls._read_sync, symbol)
+
+    @classmethod
+    async def save_state(cls, symbol: str, **kwargs) -> dict:
+        return await asyncio.to_thread(cls._write_sync, symbol, kwargs)
 
     @classmethod
     async def get_buy_order_id(cls, symbol: str) -> str:
-        d = await cls._load_dict(symbol)
-        return str(d.get("buy_order_id") or "")
+        data = await asyncio.to_thread(cls._read_sync, symbol)
+        return str(data.get("buy_order_id") or "")
 
     @classmethod
-    async def get_is_compound(cls, symbol: str = "SOXS") -> bool:
-        d = await cls._load_dict(symbol)
-        return bool(d.get("is_compound", True))
-
-    @classmethod
-    async def get_entry_trend(cls, symbol: str) -> str:
-        d = await cls._load_dict(symbol)
-        return str(d.get("entry_trend") or "")
+    async def get_sell_order_id(cls, symbol: str) -> str:
+        data = await asyncio.to_thread(cls._read_sync, symbol)
+        return str(data.get("sell_order_id") or "")
 
     @classmethod
     async def get_whipsaw_target_price(cls, symbol: str) -> float:
-        d = await cls._load_dict(symbol)
-        return float(d.get("whipsaw_target_price") or 0.0)
+        data = await asyncio.to_thread(cls._read_sync, symbol)
+        return float(data.get("whipsaw_target_price") or 0.0)
+
+    @classmethod
+    async def get_is_compound(cls, symbol: str = "SOXS") -> bool:
+        data = await asyncio.to_thread(cls._read_sync, symbol)
+        return bool(data.get("is_compound", True))
+
+    @classmethod
+    async def set_is_compound(cls, is_compound: bool):
+        for sym in cls.ALLOWED_SYMBOLS:
+            await asyncio.to_thread(cls._write_sync, sym, {"is_compound": bool(is_compound)})
 
     @classmethod
     async def sync_global_settings(
         cls,
         budget: float = None,
-        target_profit_rate: float = None,
         is_active: bool = None,
         is_compound: bool = None,
+        target_profit_rate: float = None,
     ):
-        """초과 Case 37 & 76: 통합 시드, 마스터 전원, 복리 모드를 SOXS와 SOXL 양쪽 원장에 동시 동기화."""
         updates = {}
         if budget is not None and math.isfinite(float(budget)) and float(budget) > 0.0:
             updates["budget"] = round(float(budget), 2)
-        if target_profit_rate is not None:
-            updates["target_profit_rate"] = normalize_target_rate(target_profit_rate)
         if is_active is not None:
             updates["is_active"] = bool(is_active)
         if is_compound is not None:
             updates["is_compound"] = bool(is_compound)
+        if target_profit_rate is not None:
+            updates["target_profit_rate"] = SINGLE_TARGET_PROFIT_RATE
 
-        if not updates:
-            return
-        for sym in cls.ALLOWED_SYMBOLS:
-            await cls.save_state(sym, **updates)
+        if updates:
+            for sym in cls.ALLOWED_SYMBOLS:
+                await asyncio.to_thread(cls._write_sync, sym, updates)
 
     @classmethod
-    async def lock_all_symbols_macro(cls, last_session_id: str = None):
-        """
-        초과 Case 82, 95, 96:
-        1·2차 매크로 과열 또는 08:15 EST 이후 3차 손절 시 SOXS/SOXL 양쪽 원장을 CANCELED_MACRO로 동기화 잠금하되,
-        수동 보유(MANUAL) 중인 종목과 03:58~04:06 EST 진행 중인 1주 휩소 작전(WHIPSAW_1SH)은 보존하며,
-        04:07 EST 이후에는 미체결 휩소 매수 주문 ID(buy_order_id)를 즉시 소각합니다.
-        """
-        now_est = datetime.now(EST_TZ)
-        est_hm = now_est.hour * 100 + now_est.minute
+    async def reset_ledger(cls, symbol: str):
+        cur = await asyncio.to_thread(cls._read_sync, symbol)
+        preserved_budget = float(cur.get("budget") or 100.0)
+        preserved_comp = bool(cur.get("is_compound", True))
+        preserved_active = bool(cur.get("is_active", True))
+        clean = cls._default_payload()
+        clean.update({
+            "budget": preserved_budget,
+            "is_compound": preserved_comp,
+            "is_active": preserved_active,
+        })
+        await asyncio.to_thread(cls._write_sync, symbol, clean)
+
+    @classmethod
+    async def reset_all_ledgers(cls):
         for sym in cls.ALLOWED_SYMBOLS:
-            d = await cls._load_dict(sym)
-            cur_es = str(d.get("entry_session") or "")
-            has_pos = float(d.get("price") or 0.0) > 0.0 or float(d.get("target_sell_price") or 0.0) > 0.0 or bool(d.get("sell_order_id"))
-            has_buy_id = bool(d.get("buy_order_id"))
-
-            if cur_es == "MANUAL" and has_pos:
-                upd = {"is_session_done": True}
-                if last_session_id is not None:
-                    upd["last_session_id"] = last_session_id
-                await cls.save_state(sym, **upd)
-                continue
-
-            if cur_es == "WHIPSAW_1SH":
-                if has_pos or (358 <= est_hm <= 406 and has_buy_id):
-                    upd = {"is_session_done": True}
-                    if last_session_id is not None:
-                        upd["last_session_id"] = last_session_id
-                    await cls.save_state(sym, **upd)
-                    continue
-
-            upd = {
-                "is_session_done": True,
-                "entry_session": "CANCELED_MACRO",
-                "buy_order_id": "",
-                "whipsaw_target_price": 0.0,
-            }
-            if last_session_id is not None:
-                upd["last_session_id"] = last_session_id
-            await cls.save_state(sym, **upd)
+            await cls.reset_ledger(sym)
 
     @classmethod
     async def unlock_all_symbols_for_reentry(cls):
         """
         초과 Case 52, 86, 95:
-        프리장 골든타임(04:00 ~ 08:14 EST) 내 청산 완료 후 당일 NQ=F 진폭이 2.0% 미만인 경우에 한해
-        양쪽 장부의 is_session_done 잠금을 해제하여 무한 재출동을 보장합니다.
+        프리장 골든타임(04:00 ~ 08:14 EST) 내 익절 또는 NQ<2.0% 3차 손절 후 재출동을 위해
+        양쪽 장부의 is_session_done을 해제하되, 당일 NQ>=2.0% 과열차단(CANCELED_MACRO) 상태는 보호합니다.
         """
         _, nq_h, nq_l = await MacroDataCache.get_cached_nq_data()
         nq_amp = (((nq_h - nq_l) / nq_l * 100.0) if nq_l > 0.0 else 0.0)
-        is_overheated = nq_amp >= 2.0
+        is_overheated = (nq_amp >= 2.0)
 
         for sym in cls.ALLOWED_SYMBOLS:
-            d = await cls._load_dict(sym)
-            has_pos = (
-                float(d.get("price") or 0.0) > 0.0
-                or float(d.get("target_sell_price") or 0.0) > 0.0
-                or bool(d.get("sell_order_id"))
-                or bool(d.get("buy_order_id"))
-            )
-            if has_pos:
-                continue
-
+            cur = await asyncio.to_thread(cls._read_sync, sym)
+            es = str(cur.get("entry_session") or "")
             if is_overheated:
-                await cls.save_state(
-                    sym,
-                    is_session_done=True,
-                    entry_session="CANCELED_MACRO",
-                    whipsaw_target_price=0.0,
-                )
+                if es != "MANUAL":
+                    await asyncio.to_thread(
+                        cls._write_sync,
+                        sym,
+                        {
+                            "is_session_done": True,
+                            "entry_session": "CANCELED_MACRO",
+                            "whipsaw_target_price": 0.0,
+                        },
+                    )
             else:
-                cur_es = str(d.get("entry_session") or "")
-                new_es = cur_es if cur_es == "STAGE3_STOP_TRACK" else ""
-                await cls.save_state(
+                new_es = es if es in ("MANUAL", "STAGE3_STOP_TRACK") else ""
+                await asyncio.to_thread(
+                    cls._write_sync,
                     sym,
-                    is_session_done=False,
-                    entry_session=new_es,
-                    whipsaw_target_price=0.0,
+                    {
+                        "is_session_done": False,
+                        "entry_session": new_es,
+                        "whipsaw_target_price": 0.0,
+                    },
                 )
 
     @classmethod
-    async def reset_all_ledgers(cls):
-        """Case 02: 통합 시드 금액(budget)과 복리/단리(is_compound), 가동 상태(is_active)만 보존하고 양쪽 원장 0점 소각."""
-        d_s = await cls._load_dict("SOXS")
-        preserved_budget = float(d_s.get("budget") or 100.0)
-        preserved_comp = bool(d_s.get("is_compound", True))
-        preserved_act = bool(d_s.get("is_active", True))
+    async def lock_all_symbols_macro(cls, last_session_id: str = None):
+        """
+        초과 Case 82, 94, 95, 96:
+        1·2차 매크로 과열 발생 시 양쪽 장부를 CANCELED_MACRO로 동기화 잠금하되,
+        수동 보유(MANUAL) 중인 종목과 03:58~04:06 EST 진행 중인 1주 휩소(WHIPSAW_1SH)는 보존하고,
+        04:07 EST 이후 미체결 WHIPSAW_1SH의 buy_order_id는 즉시 ""로 소각합니다.
+        """
+        now_est = datetime.now(EST_TZ)
+        est_hm = now_est.hour * 100 + now_est.minute
 
         for sym in cls.ALLOWED_SYMBOLS:
-            clean = cls._default_dict()
-            clean["budget"] = preserved_budget
-            clean["is_compound"] = preserved_comp
-            clean["is_active"] = preserved_act
-            fp = cls._get_filepath(sym)
-            async with GlobalThrottle.get_file_lock(fp):
-                await asyncio.wait_for(asyncio.to_thread(cls._write_raw_sync, fp, clean), timeout=5.0)
+            cur = await asyncio.to_thread(cls._read_sync, sym)
+            es = str(cur.get("entry_session") or "")
+            has_pos = float(cur.get("price") or 0.0) > 0.0 or float(cur.get("target_sell_price") or 0.0) > 0.0 or bool(cur.get("sell_order_id"))
+
+            if es == "MANUAL" and has_pos:
+                continue
+
+            if es == "WHIPSAW_1SH":
+                if 358 <= est_hm <= 406 or has_pos:
+                    continue
+                updates = {
+                    "buy_order_id": "",
+                    "is_session_done": True,
+                    "entry_session": "CANCELED_MACRO",
+                    "whipsaw_target_price": 0.0,
+                }
+                if last_session_id:
+                    updates["last_session_id"] = last_session_id
+                await asyncio.to_thread(cls._write_sync, sym, updates)
+                continue
+
+            updates = {
+                "is_session_done": True,
+                "entry_session": "CANCELED_MACRO",
+                "whipsaw_target_price": 0.0,
+            }
+            if last_session_id:
+                updates["last_session_id"] = last_session_id
+            await asyncio.to_thread(cls._write_sync, sym, updates)
