@@ -12,12 +12,13 @@
 # =====================================================================
 # MODIFIED: 제1 ~ 제6헌법 및 100대 엣지 케이스 방어망(Case 01 ~ Case 100) 완벽 준수
 # NEW: 1) `whipsaw_plugin` 동적 안전 바인딩(`import whipsaw_plugin as _whipsaw_mod` + 다중 별칭 `getattr`):
-#         `_reset_daymarket_sim_state` / `_reset_day_sim_state` 및 `execute_rsi_monitoring_plugin` 등
-#         어떠한 함수명 차이에서도 `ImportError` 가 절대 발생하지 않도록 원천 봉쇄
-#      2) 트레일링 스윕 정정 시 `[409 already-modified]` 에러가 발생하면 즉시 거래소 `OPEN` 매도 주문을 조회하여
+#         `_reset_daymarket_sim_state` / `_reset_day_sim_state` 및 `execute_rsi_monitoring_plugin` /
+#         `execute_daymarket_rsi_alert_plugin` 등 어떠한 함수명 차이에서도 `ImportError` 가 절대 발생하지 않도록 원천 봉쇄
+#      2) 78번 라인 `def _resolve_whipsaw_attr` 공백 오타 제거 및 `ctx.notify_tg` NoneType 호출 크래시 방어기 내장
+#      3) 트레일링 스윕 정정 시 `[409 already-modified]` 에러가 발생하면 즉시 거래소 `OPEN` 매도 주문을 조회하여
 #         새로 발급된 최신 `orderId` 로 정정을 완수하고, 2단계 취소 폴백 시 `holdings_qty` 를 명시 전달
-#      3) 수동 매수(`MANUAL`) 포지션을 `leader_sym` 여부나 시간대와 무관하게 100% `🚀 진성상승 추세추종(TREND_PULLBACK)` 고정
-#      4) `_EXIT_SNAPSHOT_CACHE` 를 통해 `REPLACED` 원주문 안전 캡($47.98) 오인 및 `1주 ➔ 4주` 수량 왜곡 영구 소각
+#      4) 수동 매수(`MANUAL`) 포지션을 `leader_sym` 여부나 시간대와 무관하게 100% `🚀 진성상승 추세추종(TREND_PULLBACK)` 고정
+#      5) `_EXIT_SNAPSHOT_CACHE` 를 통해 `REPLACED` 원주문 안전 캡($47.98) 오인 및 `1주 ➔ 4주` 수량 왜곡 영구 소각
 
 import math
 import time
@@ -99,9 +100,9 @@ KST_TZ = ZoneInfo("Asia/Seoul")
 
 
 # =====================================================================
-# NEW: whipsaw_plugin 다중 별칭 동적 안전 바인딩 (ImportError 100% 영구 소각)
+# MODIFIED: whipsaw_plugin 다중 별칭 동적 안전 바인딩 (SyntaxError 및 ImportError 100% 영구 소각)
 # =====================================================================
-def _ resolve_whipsaw_attr(*names, default_fn=None):
+def _resolve_whipsaw_attr(*names, default_fn=None):
     for nm in names:
         fn = getattr(_whipsaw_mod, nm, None)
         if fn is not None:
@@ -117,6 +118,39 @@ async def _noop_async(*args, **kwargs):
     return False
 
 
+def _ensure_ctx_notify_callable(ctx):
+    """
+    NEW: SniperPluginContext 의 notify_tg 또는 send_tg 가 None 으로 비어 있을 때
+    외부 플러그인에서 `await ctx.notify_tg(...)` 호출 시 발생하는
+    `TypeError: 'NoneType' object is not callable` 크래시를 100% 원천 차단합니다.
+    """
+    if ctx is None:
+        return
+    if not callable(getattr(ctx, "notify_tg", None)):
+        try:
+            setattr(ctx, "notify_tg", lambda msg: _send_tg_safe(ctx, msg))
+        except Exception:
+            pass
+    if not callable(getattr(ctx, "send_tg", None)):
+        try:
+            setattr(ctx, "send_tg", lambda msg: _send_tg_safe(ctx, msg))
+        except Exception:
+            pass
+
+
+def _extract_oid(ord_res: dict) -> str:
+    """
+    NEW: create_order / modify_order 응답이 언래핑된 {"orderId": "..."} 형태이든
+    래핑된 {"result": {"orderId": "..."}} 형태이든 100% 안전하게 orderId 를 추출합니다.
+    """
+    if not isinstance(ord_res, dict):
+        return ""
+    oid = ord_res.get("orderId")
+    if not oid and isinstance(ord_res.get("result"), dict):
+        oid = ord_res["result"].get("orderId")
+    return str(oid or "").strip()
+
+
 _reset_day_sim_state = _resolve_whipsaw_attr(
     "_reset_day_sim_state",
     "_reset_daymarket_sim_state",
@@ -124,6 +158,7 @@ _reset_day_sim_state = _resolve_whipsaw_attr(
     default_fn=_noop_sync,
 )
 _reset_daymarket_sim_state = _reset_day_sim_state
+reset_daymarket_sim_state = _reset_day_sim_state
 
 get_daymarket_sim_status = _resolve_whipsaw_attr(
     "get_daymarket_sim_status",
@@ -137,18 +172,21 @@ get_whipsaw_runtime_status = _resolve_whipsaw_attr(
     "get_whipsaw_status",
     default_fn=_noop_sync,
 )
+get_whipsaw_status = get_whipsaw_runtime_status
 
 settle_daymarket_sim_before_premarket = _resolve_whipsaw_attr(
     "settle_daymarket_sim_before_premarket",
     "settle_day_sim_before_premarket",
     default_fn=_noop_async,
 )
+settle_day_sim_before_premarket = settle_daymarket_sim_before_premarket
 
 execute_whipsaw_vwap_exposure_plugin = _resolve_whipsaw_attr(
     "execute_whipsaw_vwap_exposure_plugin",
     "execute_whipsaw_exposure_plugin",
     default_fn=_noop_async,
 )
+execute_whipsaw_exposure_plugin = execute_whipsaw_vwap_exposure_plugin
 
 enforce_0407_whipsaw_cutoff_plugin = _resolve_whipsaw_attr(
     "enforce_0407_whipsaw_cutoff_plugin",
@@ -163,12 +201,16 @@ if enforce_0407_whipsaw_cutoff_plugin is None:
 
 execute_rsi_monitoring_plugin = _resolve_whipsaw_attr(
     "execute_rsi_monitoring_plugin",
+    "execute_daymarket_rsi_alert_plugin",
     "execute_daymarket_sim_plugin",
     "execute_day_sim_plugin",
     "run_daymarket_sim_plugin",
     default_fn=_noop_async,
 )
+execute_daymarket_rsi_alert_plugin = execute_rsi_monitoring_plugin
 execute_daymarket_sim_plugin = execute_rsi_monitoring_plugin
+execute_day_sim_plugin = execute_rsi_monitoring_plugin
+run_daymarket_sim_plugin = execute_rsi_monitoring_plugin
 
 
 # =====================================================================
@@ -274,6 +316,7 @@ async def execute_post_stop_bottom_rebound_plugin(
     손절가(last_stop_price) 아래 최저점(post_stop_low)을 역트레일링 추적하다가
     신저가 경신이 멈추고 최저점 대비 +0.30% 이상 양봉 반등(RSI <= 38.0) 시 즉시 현재가 LIMIT 으로 재진입합니다.
     """
+    _ensure_ctx_notify_callable(ctx)
     if not is_active or int(holdings_qty) > 0 or bool(buy_order_id):
         return False
 
@@ -316,6 +359,7 @@ async def execute_post_stop_bottom_rebound_plugin(
         _BOTTOM_TRACK_CACHE["lowest_price"] = new_low
         _BOTTOM_TRACK_CACHE["low_price"] = new_low
         _BOTTOM_TRACK_CACHE["rebound_price"] = rebound_p
+        _BOTTOM_TRACK_CACHE["rebound_trig_price"] = rebound_p
         _BOTTOM_TRACK_CACHE["trigger_price"] = rebound_p
         if isinstance(_BOTTOM_TRACK_CACHE.get(symbol), dict):
             _BOTTOM_TRACK_CACHE[symbol].update({
@@ -323,6 +367,7 @@ async def execute_post_stop_bottom_rebound_plugin(
                 "lowest_price": new_low,
                 "low_price": new_low,
                 "rebound_price": rebound_p,
+                "rebound_trig_price": rebound_p,
                 "trigger_price": rebound_p,
             })
         return False
@@ -404,7 +449,7 @@ async def execute_post_stop_bottom_rebound_plugin(
                 time_in_force="DAY",
                 client_order_id=cid,
             )
-            new_buy_oid = str((ord_res or {}).get("orderId") or "")
+            new_buy_oid = _extract_oid(ord_res)
             if not new_buy_oid:
                 return False
 
@@ -469,6 +514,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
       조정을 받아 `0.0 < RSI <= 35.0` 에 도달 (`pb_rearm_ready == True`)
       ➔ `entry_session = "PRE_PULLBACK"`
     """
+    _ensure_ctx_notify_callable(ctx)
     est_hm = now_est.hour * 100 + now_est.minute
     if not (407 <= est_hm <= 814):
         return False
@@ -606,7 +652,7 @@ async def execute_premarket_rsi_sniper_strike_plugin(
                 time_in_force="DAY",
                 client_order_id=cid,
             )
-            buy_oid = str((ord_res or {}).get("orderId") or "")
+            buy_oid = _extract_oid(ord_res)
             if not buy_oid:
                 return False
 
@@ -677,15 +723,19 @@ async def rearm_premarket_buy_trap_after_30s_plugin(
     - `PRE_PULLBACK` 은 `RSI > 35.0` 반등 돌파 또는 30.0초 만료 시
     타임쉴드를 즉시 해제하고 실시간 현재가(rearm_price)로 상향 정정(modify_order, 실패 시 취소 후 재발사)합니다.
     """
+    _ensure_ctx_notify_callable(ctx)
     if not is_active or not buy_order_id or entry_session not in ("PRE_SNIPER", "PRE_PULLBACK"):
         return buy_order_id, entry_session
 
     elapsed_sec = 0.0
     if entry_time:
         try:
-            dt_naive = datetime.strptime(str(entry_time).strip(), "%Y-%m-%d %H:%M:%S")
-            dt_est = dt_naive.replace(tzinfo=EST_TZ)
-            elapsed_sec = max(0.0, (now_est - dt_est).total_seconds())
+            if isinstance(entry_time, (int, float)):
+                elapsed_sec = max(0.0, time.time() - float(entry_time))
+            else:
+                dt_naive = datetime.strptime(str(entry_time).strip(), "%Y-%m-%d %H:%M:%S")
+                dt_est = dt_naive.replace(tzinfo=EST_TZ)
+                elapsed_sec = max(0.0, (now_est - dt_est).total_seconds())
         except Exception:
             elapsed_sec = TRAP_SHIELD_WAIT_SEC + 1.0
     else:
@@ -733,7 +783,7 @@ async def rearm_premarket_buy_trap_after_30s_plugin(
                     price=rearm_price,
                     order_type="LIMIT",
                 )
-                new_buy_oid = str((mod_res or {}).get("orderId") or buy_order_id)
+                new_buy_oid = _extract_oid(mod_res) or buy_order_id
             except Exception as mod_e:
                 err_s = str(mod_e).lower()
                 if "already-filled" in err_s:
@@ -768,7 +818,7 @@ async def rearm_premarket_buy_trap_after_30s_plugin(
                 time_in_force="DAY",
                 client_order_id=cid,
             )
-            new_buy_oid = str((ord_res or {}).get("orderId") or "")
+            new_buy_oid = _extract_oid(ord_res)
 
         if new_buy_oid:
             now_str = now_est.strftime("%Y-%m-%d %H:%M:%S")
@@ -830,11 +880,12 @@ async def manage_mechanical_profit_trap_plugin(
        경유 최고가(peak_price)를 상시 기록하여 청산 직후 `1주 ➔ 4주` 수량 왜곡을 원천 봉쇄합니다.
     2) 진입 성격 판별(`is_trend_pb_regime`):
        - `PRE_PULLBACK`, `PRE_PULLBACK_REARM` 및 **모든 수동 매수(`MANUAL`)** 포지션은 `leader_sym` 여부나
-         시간대와 무관하게 **100% 무조건 `🚀 진성상승 추세추종 매도(TREND_PULLBACK)`** 로 고정합니다!
-       - 오직 양방향 대칭 클라이맥스 자동 진입(`PRE_SNIPER`, `PRE_SNIPER_REARM`)만 `⚡ 기술적반등 매도(TECH_BOUNCE)` 로 작동합니다.
+         시간대와 무관하게 **100% 무조건 `🚀 진성상승 추세추종 매도(TREND_PULLBACK / PEAK_LCK_130)`** 로 고정합니다!
+       - 오직 양방향 대칭 클라이맥스 자동 진입(`PRE_SNIPER`, `PRE_SNIPER_REARM`)만 `⚡ 기술적반등 매도(TECH_BOUNCE / OLD_IMM_CB)` 로 작동합니다.
     3) 스윕 정정(`modify_order`) 시 `[409 already-modified]` 에러가 반환되면 즉시 거래소의 살아있는 `OPEN` 매도 주문을
        스캔하여 최신 `orderId` 로 정정을 완수하고, 2단계 취소 폴백 시 `holdings_qty` 를 명시 전달합니다.
     """
+    _ensure_ctx_notify_callable(ctx)
     if not is_active or int(holdings_qty) <= 0 or float(avg_price or 0.0) <= 0.0:
         return False
 
@@ -847,9 +898,10 @@ async def manage_mechanical_profit_trap_plugin(
     eff_sess = es_clean if es_clean in _AUTO_ENTRY_SESSION_TAGS else "MANUAL"
 
     # MODIFIED: 수동 매수(MANUAL) 및 추세눌림목(PRE_PULLBACK / PRE_PULLBACK_REARM)은
-    #           leader_sym 여부나 시간대와 무관하게 100% 무조건 진성 상승종목 추세추종 레짐(TREND_PULLBACK)으로 고정!
+    #           leader_sym 여부나 시간대와 무관하게 100% 무조건 진성 상승종목 추세추종 레짐(TREND_PULLBACK / PEAK_LCK_130)으로 고정!
     is_trend_pb_regime = bool(eff_sess in ("PRE_PULLBACK", "PRE_PULLBACK_REARM", "MANUAL"))
     regime_code = "TREND_PULLBACK" if is_trend_pb_regime else "TECH_BOUNCE"
+    ui_exit_regime = "PEAK_LCK_130" if is_trend_pb_regime else "OLD_IMM_CB"
 
     # 1) 보유 중 매 틱 불변 정산 스냅샷(_EXIT_SNAPSHOT_CACHE) 및 트레일링 런타임 상태 갱신
     snap = _EXIT_SNAPSHOT_CACHE.get(symbol)
@@ -871,6 +923,7 @@ async def manage_mechanical_profit_trap_plugin(
         _TRAIL_RUNTIME_CACHE[symbol] = tr_state
     tr_state["last_known_qty"] = int(holdings_qty)
     tr_state["regime"] = regime_code
+    tr_state["exit_regime"] = ui_exit_regime
     tr_state["callback_pct"] = (TREND_PB_CALLBACK_PCT if is_trend_pb_regime else TRAIL_DROP_CALLBACK_PCT)
 
     # 초과 Case 64: 아직 미체결 매수 주문(분할 체결 중)이 살아 있는지 점검
@@ -936,7 +989,7 @@ async def manage_mechanical_profit_trap_plugin(
                     time_in_force="DAY",
                     client_order_id=cid,
                 )
-                sell_order_id = str((ord_res or {}).get("orderId") or "")
+                sell_order_id = _extract_oid(ord_res)
 
             if sell_order_id:
                 ref_qqq, ref_label = await MacroDataCache.get_stage3_reference_price(
@@ -1045,6 +1098,8 @@ async def manage_mechanical_profit_trap_plugin(
             "last_known_qty": int(holdings_qty),
             "bear_candle_seen": False,
             "regime": regime_code,
+            "exit_regime": ui_exit_regime,
+            "nq_vel_bypass": False,
             "active_sell_oid": str(tr_state.get("active_sell_oid") or snap.get("sell_order_id") or sell_order_id),
             "sweep_dispatched_ts": 0.0,
         })
@@ -1095,6 +1150,7 @@ async def manage_mechanical_profit_trap_plugin(
     else:
         nq_vel_bypass = bool(max(nq_vel_10m, nq_vel_3m) >= NQ_VELOCITY_SURGE_PCT)
 
+    tr_state["nq_vel_bypass"] = nq_vel_bypass
     effective_ha_bear = bool(is_ha_bear and not nq_vel_bypass)
 
     trigger_sweep = False
@@ -1190,7 +1246,7 @@ async def manage_mechanical_profit_trap_plugin(
                     price=sweep_price,
                     order_type="LIMIT",
                 )
-                new_sell_oid = str((mod_res or {}).get("orderId") or active_sell_oid)
+                new_sell_oid = _extract_oid(mod_res) or active_sell_oid
                 tr_state["active_sell_oid"] = new_sell_oid
                 swept_ok = True
             except Exception as mod_e:
@@ -1224,7 +1280,7 @@ async def manage_mechanical_profit_trap_plugin(
                                         price=sweep_price,
                                         order_type="LIMIT",
                                     )
-                                    new_sell_oid = str((mod_res2 or {}).get("orderId") or live_oid)
+                                    new_sell_oid = _extract_oid(mod_res2) or live_oid
                                     tr_state["active_sell_oid"] = new_sell_oid
                                     swept_ok = True
                                     break
@@ -1249,7 +1305,7 @@ async def manage_mechanical_profit_trap_plugin(
                             price=sweep_price,
                             order_type="LIMIT",
                         )
-                        new_sell_oid = str((mod_res or {}).get("orderId") or sv_oid)
+                        new_sell_oid = _extract_oid(mod_res) or str(sv_oid)
                         tr_state["active_sell_oid"] = new_sell_oid
                         swept_ok = True
                         break
@@ -1271,7 +1327,7 @@ async def manage_mechanical_profit_trap_plugin(
                         time_in_force="DAY",
                         client_order_id=cid,
                     )
-                    new_sell_oid = str((ord_res or {}).get("orderId") or "")
+                    new_sell_oid = _extract_oid(ord_res)
                     tr_state["active_sell_oid"] = new_sell_oid
                     swept_ok = bool(new_sell_oid)
 
@@ -1351,6 +1407,7 @@ async def reconcile_zero_holdings_exit_plugin(
     3) 체결 수량(`filled_qty`) 산출 시 `_EXIT_SNAPSHOT_CACHE[symbol]["last_holdings_qty"]` (`1주`) 및
        `tr_state["last_known_qty"]` 를 최우선 적용하여 `int(budget // entry_price)` (`4주`) 뻥튀기를 영구 소각합니다.
     """
+    _ensure_ctx_notify_callable(ctx)
     est_hm = now_est.hour * 100 + now_est.minute
     es_clean = str(entry_session or "").strip()
 
