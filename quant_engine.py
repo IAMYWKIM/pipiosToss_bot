@@ -2,7 +2,8 @@
 # FILE: quant_engine.py
 # 목적: 양방향 대칭 클라이맥스 + 07:00~08:14 선행 상승종목 추세눌림목(👑 HYB_35_1ST) 듀얼 스나이퍼(SOXS/SOXL) 통합 시드 원장,
 #       기술적 반등(⚡ OLD_IMM_CB) × 진성 상승종목(🚀 PEAK_LCK_130 / 📊 BAR_BEAR_020) 이원화 매도 상수(초과 Case 99),
-#       NQ=F 18:00 EST 신세션 하드 컷오프 + fast_info 및 1d 일봉 당일 실제 고/저가·마감가 3중 강제 병합 + 동일 세션 단조 보존
+#       NQ=F 18:00 EST 신세션 하드 컷오프 + 전일 1d 일봉 대조 3중 Stale 필터(구세션 2.59% 진폭 오염 원천 차단) +
+#       fast_info 및 1d 일봉 당일 실제 고/저가·마감가 강제 병합 + 동일 세션 단조 보존
 #       (개장 중은 물론 17:00~17:59 EST [06:00~06:59 KST] 마감 휴장 중에도 직전 마감 세션 시세·저가 100% 무결 보존 · 초과 Case 62, 90, 91),
 #       데이장(19:00~03:57 EST) 100% [모의] 전용 — 개시 1분 전 NQ=F 10분봉 추세 판별(get_nq_10m_candle_trend) ➔
 #       개시 7분간 RSI>=50.0 최종 판별 현재가 진입 · +1.30% 락온(-0.30% 콜백 시 +1.00% 보장) · 40.0<=RSI<=70.0 리셋 상수(초과 Case 78, 93),
@@ -17,9 +18,11 @@
 # MODIFIED: 초과 Case 62, Case 90 & Case 91 [해법 1] —
 #           1) CME 나스닥 100 선물(NQ=F) 18:00 EST 신세션 경계 하드 컷오프(get_cme_session_window_est) 후
 #              df_session 내부에서 야간 1분봉 누락(45분 갭)을 휴장으로 오인해 개장 직후 최저점(예: 29,226.00)을 잘라버리던 gaps_inner 절삭을 영구 소각!
-#           2) 개장 중(is_cme_open=True)뿐만 아니라 17:00~17:59 EST(06:00~06:59 KST) 일일 마감 휴장 및 주말 휴장 중(is_cme_open=False)에도
-#              fast_info의 마감가(last_price)·당일고가(day_high)·당일저가(day_low)와 해당 세션 기준일(target_session_date)의 1d 일봉 고/저가를 강제 병합하고,
-#              동일 세션(_nq_session_id) 내 이전 최고가(prev_h)·최저가(prev_l) 단조 보존 락을 걸어 마감 후 어제 시세 증발을 100% 원천 차단!
+#           2) 야후 파이낸스(yfinance) 분산 CDN 노드가 신세션 개장 중(is_cme_open=True)에 일시적으로 전일(예: 10-19)의 미초기화 fast_info(29,983.50 / 29,226.00 = 2.59%)를
+#              반환하여 당일 진폭을 오염시키던 현상을 막기 위해, 전일 1d 일봉 고/저가(prev_1d_highs / prev_1d_lows) 대조 + 고/저가 개별 Stale 분리 +
+#              당일 1분봉 범위 양방향 동시 이탈 가드의 '3중 Stale 필터'를 탑재하여 구세션 진폭 유입을 100% 원천 차단!
+#           3) 반면 17:00~17:59 EST(06:00~06:59 KST) 일일 마감 휴장 및 주말 휴장 중(is_cme_open=False)에는
+#              직전 마감 세션의 fast_info·1d 일봉·단조 보존 락을 유지하여 마감 후 시세 증발을 100% 원천 차단!
 # NEW: 초과 Case 91 [해법 2 방법 A] — 토스 Open API QQQ 실시간 현재가·1분봉으로 최근 10분/3분 변화율(±0.20% 동일 임계치)을 최우선 산출
 # NEW: 초과 Case 92 — 3차 역행 안전망의 진입 임계치 공식 max(nq_entry_amp * 0.5, 0.80%)은 NQ=F 선물 진폭(nq_entry_amp)을 기준으로 산출하고,
 #      해당 임계치를 적용하는 진입 기준가 및 실시간 역행 비교가는 토스 Open API QQQ 0.0초 실시간 현재가(get_stage3_reference_price, 보유중 1.5초 프로빙)로 전면 대체
@@ -57,7 +60,7 @@ AMP_BUFFER_LEVERAGE_MULT = 3.0
 AMP_BUFFER_PARTIAL_MULT = 2.1
 AMP_BUFFER_REBOUND_PCT = 0.30
 
-# NEW: 초과 Case 78 & Case 93 — 데이장(19:00 ~ 03:57 EST) 100% [모의] 스나이퍼 전용 추세·트레일링·리셋 전역 상수
+# 초과 Case 78 & Case 93 — 데이장(19:00 ~ 03:57 EST) 100% [모의] 스나이퍼 전용 추세·트레일링·리셋 전역 상수
 DAY_OPEN_7M_RSI_THRESHOLD = 50.0       # 데이장 개시 후 7분간(09:00~09:06:59 KST / 19:00~19:06:59 EST) 1차 락온 종목의 최종 상승 판별 RSI 기준 (>= 50.0)
 DAY_SIM_LOCK_PROFIT_RATE = 1.30        # 데이장 [모의] 추세추종 시 +1.30% 상승가 도달 시 트레일링 락온 (1.0130 * 0.9970 = +1.00% 보장)
 DAY_SIM_FLOOR_PROFIT_RATE = 1.00       # 데이장 [모의] +1.30% 락온 후 보장되는 최소 익절 보존선 (+1.00%)
@@ -528,9 +531,9 @@ def compute_realtime_tick_heikin_ashi(
 
 class MacroDataCache:
     # MODIFIED: 초과 Case 61, 62, 78, 89, 90, 91, 92, 93, 94 —
-    #           1) [해법 1] CME 18:00 EST 신세션 하드 컷오프 + fast_info 및 1d 일봉 당일 실제 고가/저가/마감가 3중 강제 병합 +
-    #              동일 세션 단조 보존 락으로 개장 중은 물론 17:00~17:59 EST(06:00~06:59 KST) 마감 휴장 중에도
-    #              직전 마감 세션(예: 어제 10월 19일 저가 29,226.00 / 마감가 29,722.50 / 진폭 2.59%)을 100% 무결하게 보존!
+    #           1) [해법 1 & 3중 Stale 필터] CME 18:00 EST 신세션 하드 컷오프 + 전일 1d 일봉 대조 3중 Stale 필터로
+    #              신세션 진행 중 야후 분산 CDN이 반환하는 어제 fast_info(예: 29,983.50 / 29,226.00 = 2.59%) 오염을 100% 원천 차단하고,
+    #              17:00~17:59 EST(06:00~06:59 KST) 마감 휴장 중에는 직전 마감 세션 시세를 100% 무결하게 보존!
     #           2) [해법 2 방법 A & Case 92, 94] 3차 역행 안전망의 진입 기준가·실시간 비교가(get_stage3_reference_price) 및
     #              10분/3분 변화율은 토스 Open API QQQ 0.0초 실시간 시세로 산출 (보유 중 1.5초 프로빙, 폴백 NQ=F)
     #           3) [Case 78 & Case 93] 데이장 개시 1분 전(08:59 KST / 18:59 EST) 나스닥 100 선물지수(NQ=F) 순수 10분봉
@@ -618,10 +621,14 @@ class MacroDataCache:
                 except Exception:
                     pass
 
-                # 초과 Case 91 — 1일봉(interval="1d")에서 해당 세션 기준일(target_session_date)의 공식 고가/저가/종가 추출
+                # MODIFIED: 초과 Case 91 — 1일봉(interval="1d")에서 당일 세션(target_session_date) 공식 고가/저가/종가뿐만 아니라,
+                # 이전 구세션(idx_dates < target_session_date, 예: 어제 10-19)의 공식 고가/저가 리스트(prev_1d_highs, prev_1d_lows)를 함께 추출하여
+                # 야후 분산 CDN이 신세션 중에 어제의 fast_info(29,983.50 / 29,226.00 = 2.59%)를 반환할 때 100% Stale로 식별!
                 daily_sess_high = 0.0
                 daily_sess_low = 0.0
                 daily_sess_close = 0.0
+                prev_1d_highs = []
+                prev_1d_lows = []
                 try:
                     df_1d = tkr.history(period="5d", interval="1d")
                     if df_1d is not None and not df_1d.empty:
@@ -640,6 +647,11 @@ class MacroDataCache:
                                 daily_sess_low = l_1d
                             if c_1d > 0.0:
                                 daily_sess_close = c_1d
+
+                        prev_1d_df = df_1d[idx_dates < target_session_date]
+                        if not prev_1d_df.empty:
+                            prev_1d_highs = [float(x) for x in prev_1d_df["High"].tolist() if float(x) > 0.0]
+                            prev_1d_lows = [float(x) for x in prev_1d_df["Low"].tolist() if float(x) > 0.0]
                 except Exception:
                     pass
 
@@ -658,8 +670,8 @@ class MacroDataCache:
                         h_init = max(seed_c, fast_day_high, daily_sess_high)
                         l_cands = [v for v in (seed_c, fast_day_low, daily_sess_low) if v > 0.0]
                         l_init = min(l_cands) if l_cands else seed_c
-                        return seed_c, h_init, l_init, 0.0, 0.0, seed_c
-                    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                        return seed_c, h_init, l_init, 0.0, 0.0, seed_c, prev_1d_highs, prev_1d_lows
+                    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, prev_1d_highs, prev_1d_lows
 
                 df.index = pd.to_datetime(df.index, utc=True).tz_convert(EST_TZ)
                 df = df[~df.index.duplicated(keep="last")]
@@ -673,15 +685,15 @@ class MacroDataCache:
                 if df.empty:
                     seed_c = fast_last_p or daily_sess_close
                     if seed_c > 0.0:
-                        return seed_c, seed_c, seed_c, 0.0, 0.0, seed_c
-                    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                        return seed_c, seed_c, seed_c, 0.0, 0.0, seed_c, prev_1d_highs, prev_1d_lows
+                    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, prev_1d_highs, prev_1d_lows
 
                 if "Open" in df.columns:
                     df["Open"] = np.where(df["Open"] > 0.0, df["Open"], df["Close"])
                 else:
                     df["Open"] = df["Close"]
 
-                # 직전 구세션(nq_session_start_est 이전 세션) 고가·저가 추출
+                # 직전 구세션(nq_session_start_est 이전 세션) 1분봉 고가·저가 추출
                 df_before = df[df.index < nq_session_start_est]
                 prev_sess_h, prev_sess_l = 0.0, 0.0
                 if not df_before.empty:
@@ -695,50 +707,85 @@ class MacroDataCache:
                 # 초과 Case 62 & Case 90 — 현재 대상 CME 선물 세션 시작 시각(18:00:00 EST) 이전의 전일/금요일 캔들 100% 절삭
                 df_session = df[df.index >= nq_session_start_est].copy()
 
-                is_fast_hl_stale = (
-                    prev_sess_h > 0.0
-                    and prev_sess_l > 0.0
-                    and abs(fast_day_high - prev_sess_h) < 0.01
-                    and abs(fast_day_low - prev_sess_l) < 0.01
+                # MODIFIED: 고가/저가 개별 Stale 판정 분리 + 전일 1d 일봉 고/저가(prev_1d_highs, prev_1d_lows) 교차 대조 (# NEW)
+                is_fast_high_stale = bool(
+                    (prev_sess_h > 0.0 and abs(fast_day_high - prev_sess_h) < 0.5)
+                    or (is_cme_open and any(abs(fast_day_high - ph) < 0.5 for ph in prev_1d_highs))
+                )
+                is_fast_low_stale = bool(
+                    (prev_sess_l > 0.0 and abs(fast_day_low - prev_sess_l) < 0.5)
+                    or (is_cme_open and any(abs(fast_day_low - pl) < 0.5 for pl in prev_1d_lows))
+                )
+
+                is_daily_high_stale = bool(
+                    is_cme_open and daily_sess_high > 0.0 and (
+                        (prev_sess_h > 0.0 and abs(daily_sess_high - prev_sess_h) < 0.5)
+                        or any(abs(daily_sess_high - ph) < 0.5 for ph in prev_1d_highs)
+                    )
+                )
+                is_daily_low_stale = bool(
+                    is_cme_open and daily_sess_low > 0.0 and (
+                        (prev_sess_l > 0.0 and abs(daily_sess_low - prev_sess_l) < 0.5)
+                        or any(abs(daily_sess_low - pl) < 0.5 for pl in prev_1d_lows)
+                    )
                 )
 
                 if df_session.empty:
                     seed_p = fast_last_p or daily_sess_close or float(df["Close"].iloc[-1])
                     h_seed, l_seed = seed_p, seed_p
-                    if daily_sess_high > 0.0 and abs(daily_sess_high - seed_p) / seed_p < 0.12:
+                    if not is_daily_high_stale and daily_sess_high > 0.0 and abs(daily_sess_high - seed_p) / seed_p < 0.12:
                         h_seed = max(h_seed, daily_sess_high)
-                    if daily_sess_low > 0.0 and abs(daily_sess_low - seed_p) / seed_p < 0.12:
+                    if not is_daily_low_stale and daily_sess_low > 0.0 and abs(daily_sess_low - seed_p) / seed_p < 0.12:
                         l_seed = min(l_seed, daily_sess_low)
-                    if not is_fast_hl_stale and seed_p > 0.0:
-                        if fast_day_high > 0.0 and abs(fast_day_high - seed_p) / seed_p < 0.12:
-                            h_seed = max(h_seed, fast_day_high)
-                        if fast_day_low > 0.0 and abs(fast_day_low - seed_p) / seed_p < 0.12:
-                            l_seed = min(l_seed, fast_day_low)
-                    return seed_p, h_seed, l_seed, 0.0, 0.0, seed_p
+                    if not is_fast_high_stale and fast_day_high > 0.0 and seed_p > 0.0 and abs(fast_day_high - seed_p) / seed_p < 0.12:
+                        h_seed = max(h_seed, fast_day_high)
+                    if not is_fast_low_stale and fast_day_low > 0.0 and seed_p > 0.0 and abs(fast_day_low - seed_p) / seed_p < 0.12:
+                        l_seed = min(l_seed, fast_day_low)
+                    return seed_p, h_seed, l_seed, 0.0, 0.0, seed_p, prev_1d_highs, prev_1d_lows
 
                 curr_val = float(df_session["Close"].iloc[-1])
-                high_val = float(df_session["High"].max())
-                low_val = float(df_session["Low"].min())
+                sess_1m_high = float(df_session["High"].max())
+                sess_1m_low = float(df_session["Low"].min())
+                high_val = sess_1m_high
+                low_val = sess_1m_low
 
-                # 1) 1일봉(interval="1d")의 해당 세션 공식 고가/저가 강제 병합
+                # NEW: 양방향 동시 이탈 Stale 판정 — 신세션 진행 중(is_cme_open == True)에
+                # fast_info의 고가가 당일 1분봉 최고가보다 10pt 이상 높으면서 동시에 저가도 당일 1분봉 최저가보다 10pt 이상 낮다면,
+                # 이는 개장 첫 틱 밑꼬리가 아니라 전일 24시간 범위(예: 29,983.50 ~ 29,226.00)가 미초기화된 것이므로 즉시 Stale 처리!
+                if (
+                    is_cme_open
+                    and fast_day_high > sess_1m_high + 10.0
+                    and 0.0 < fast_day_low < sess_1m_low - 10.0
+                ):
+                    is_fast_high_stale = True
+                    is_fast_low_stale = True
+
+                if (
+                    is_cme_open
+                    and daily_sess_high > sess_1m_high + 10.0
+                    and 0.0 < daily_sess_low < sess_1m_low - 10.0
+                ):
+                    is_daily_high_stale = True
+                    is_daily_low_stale = True
+
+                # 1) 1일봉(interval="1d")의 해당 세션 공식 고가/저가 병합 (Stale 아닌 경우에만)
                 if curr_val > 0.0:
-                    if daily_sess_high > 0.0 and abs(daily_sess_high - curr_val) / curr_val < 0.12:
+                    if not is_daily_high_stale and daily_sess_high > 0.0 and abs(daily_sess_high - curr_val) / curr_val < 0.12:
                         high_val = max(high_val, daily_sess_high)
-                    if daily_sess_low > 0.0 and abs(daily_sess_low - curr_val) / curr_val < 0.12:
+                    if not is_daily_low_stale and daily_sess_low > 0.0 and abs(daily_sess_low - curr_val) / curr_val < 0.12:
                         low_val = min(low_val, daily_sess_low) if low_val > 0.0 else daily_sess_low
 
-                # 2) 초과 Case 91 [해법 1] — 개장 중 및 마감 휴장 중 fast_info 마감가·고가·저가 강제 병합
+                # 2) 초과 Case 91 [해법 1] — 개장 중 및 마감 휴장 중 fast_info 마감가·고가·저가 병합 (3중 Stale 필터 통과 시에만!)
                 if curr_val > 0.0:
                     if fast_last_p > 0.0 and abs(fast_last_p - curr_val) / curr_val < 0.05:
                         curr_val = fast_last_p
                         high_val = max(high_val, fast_last_p)
                         low_val = min(low_val, fast_last_p) if low_val > 0.0 else fast_last_p
 
-                    if not is_fast_hl_stale:
-                        if fast_day_high > 0.0 and abs(fast_day_high - curr_val) / curr_val < 0.12:
-                            high_val = max(high_val, fast_day_high)
-                        if fast_day_low > 0.0 and abs(fast_day_low - curr_val) / curr_val < 0.12:
-                            low_val = min(low_val, fast_day_low) if low_val > 0.0 else fast_day_low
+                    if not is_fast_high_stale and fast_day_high > 0.0 and abs(fast_day_high - curr_val) / curr_val < 0.12:
+                        high_val = max(high_val, fast_day_high)
+                    if not is_fast_low_stale and fast_day_low > 0.0 and abs(fast_day_low - curr_val) / curr_val < 0.12:
+                        low_val = min(low_val, fast_day_low) if low_val > 0.0 else fast_day_low
 
                 # NQ=F 자체 10분봉 시가(ref_10m) 대비 현재가(curr_val) 변화율 및 3분 변화율 산출
                 first_open = float(df_session["Open"].iloc[0]) or float(df_session["Close"].iloc[0])
@@ -747,12 +794,12 @@ class MacroDataCache:
 
                 vel_10m = ((curr_val - ref_10m) / ref_10m * 100.0) if ref_10m > 0.0 else 0.0
                 vel_3m = ((curr_val - ref_3m) / ref_3m * 100.0) if ref_3m > 0.0 else 0.0
-                return curr_val, high_val, low_val, vel_10m, vel_3m, ref_10m
+                return curr_val, high_val, low_val, vel_10m, vel_3m, ref_10m, prev_1d_highs, prev_1d_lows
 
             try:
                 nq_task = asyncio.wait_for(asyncio.to_thread(_fetch_nq), timeout=5.0)
                 qqq_task = cls._fetch_qqq_velocity_async(now_est)
-                (c, h, l, nq_v10, nq_v3, nq_ref10), (qqq_ok, q_v10, q_v3, q_curr) = await asyncio.gather(
+                (c, h, l, nq_v10, nq_v3, nq_ref10, p1d_h_list, p1d_l_list), (qqq_ok, q_v10, q_v3, q_curr) = await asyncio.gather(
                     nq_task, qqq_task
                 )
 
@@ -772,10 +819,13 @@ class MacroDataCache:
 
                 if l > 0.0:
                     # 초과 Case 62, 90, 91 — 동일 선물 세션(not session_rolled) 내 누적 최고가(max)·최저가(min) 단조 보존 락!
+                    # (단, 이전 캐시 prev_h / prev_l 이 전일 1d 고/저가와 일치하는 오염 값이면 단조 보존에서 즉시 배제하여 자가 치유!)
                     if not session_rolled and prev_l > 0.0:
-                        if prev_h > 0.0 and h > 0.0 and abs(prev_h - c) / max(c, 1.0) < 0.12:
+                        prev_h_contaminated = is_cme_open and any(abs(prev_h - ph) < 0.5 for ph in (p1d_h_list or []))
+                        prev_l_contaminated = is_cme_open and any(abs(prev_l - pl) < 0.5 for pl in (p1d_l_list or []))
+                        if not prev_h_contaminated and prev_h > 0.0 and h > 0.0 and abs(prev_h - c) / max(c, 1.0) < 0.12:
                             h = max(h, prev_h)
-                        if prev_l > 0.0 and l > 0.0 and abs(prev_l - c) / max(c, 1.0) < 0.12:
+                        if not prev_l_contaminated and prev_l > 0.0 and l > 0.0 and abs(prev_l - c) / max(c, 1.0) < 0.12:
                             l = min(l, prev_l)
                     cls._nq_cache_data = (c, h, l, now, final_v10, final_v3)
                 else:
@@ -800,7 +850,7 @@ class MacroDataCache:
         cls, force_refresh: bool = False
     ) -> tuple[str, str, float, float, float]:
         """
-        NEW: 초과 Case 78 & Case 93 — 데이장 시작 1분 전(08:59 KST / 18:59 EST) 및 개시 7분 윈도우에서
+        초과 Case 78 & Case 93 — 데이장 시작 1분 전(08:59 KST / 18:59 EST) 및 개시 7분 윈도우에서
         나스닥 100 선물지수(NQ=F)의 직전 10분봉을 판별하여 상승(양봉)이면 ('LONG', 'SOXL'),
         하락(음봉)이면 ('SHORT', 'SOXS')를 반환합니다.
         반환값: (trend_dir, target_symbol, vel_10m_pct, open_10m_val, close_10m_val)
@@ -821,7 +871,6 @@ class MacroDataCache:
         if close_10m < open_10m or nq_v10_pure < 0.0:
             return "SHORT", "SOXS", float(nq_v10_pure), float(open_10m), float(close_10m)
 
-        # 만약 10분봉 시가와 종가가 정확히 0.00% 보합일 경우 3분 변화율 -> 당일 중간값 순으로 판별
         if nq_v3_pure > 0.0:
             return "LONG", "SOXL", float(nq_v3_pure), float(open_10m), float(close_10m)
         if nq_v3_pure < 0.0:
