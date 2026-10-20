@@ -16,6 +16,7 @@
 #      3) 03:58~03:59 EST 토스 장전환 공백(422 order-hours-closed) 시 텔레그램 사전 락온 알림 발송 및 고유 clientOrderId로 04:00:00 EST 즉시 발사 보장
 #      4) execute_rsi_monitoring_plugin / _reset_daymarket_sim_state 다중 별칭 100% 리익스포트 및
 #         ctx.notify_tg / cancel_helper_fn NoneType 호출 크래시('NoneType' object is not callable) 원천 차단 래퍼 결속
+#      5) 모바일 클립보드 LaTeX 수식 변환(\vert{}) 원천 차단을 위해 세로선 기호를 가운뎃점(·)으로 치환 및 단일 행 다중 달러($) 표기 물리적 분리
 
 import math
 import time
@@ -302,7 +303,8 @@ async def execute_whipsaw_vwap_exposure_plugin(
             calc_sell_tp = math.ceil(calc_buy_p * WHIPSAW_SELL_PROFIT_FACTOR * 100.0) / 100.0
             pos_rel_str = "상단 위치" if not is_fallback_mode else "최근접 상대강세"
             mode_desc = (
-                f"{chosen_sym} 현재가(${chosen_spot:.2f}) 데이장VWAP(${chosen_vwap:.2f}, {best_prem:+.2f}%) {pos_rel_str} "
+                f"{chosen_sym} 현재가(${chosen_spot:.2f}) "
+                f"데이장VWAP(${chosen_vwap:.2f}, {best_prem:+.2f}%) {pos_rel_str} "
                 f"➡️ {rev_basis_str} · 체결 시 +1.00% 익절 매도덫(${calc_sell_tp:.2f})"
             )
 
@@ -313,7 +315,7 @@ async def execute_whipsaw_vwap_exposure_plugin(
             _WHIPSAW_SIM_CACHE["whipsaw_sell_target"] = calc_sell_tp
             _WHIPSAW_SIM_CACHE["whipsaw_mode_desc"] = mode_desc
             print(
-                f"🌪️ [듀얼 휩소 매수덫 타점 락온 {chosen_sym}] {now_est.strftime('%H:%M:%S')} EST | {mode_desc}",
+                f"🌪️ [듀얼 휩소 매수덫 타점 락온 {chosen_sym}] {now_est.strftime('%H:%M:%S')} EST · {mode_desc}",
                 flush=True,
             )
 
@@ -368,7 +370,8 @@ async def execute_whipsaw_vwap_exposure_plugin(
                             ctx,
                             (
                                 f"⚠️ <b>[듀얼 휩소 노출 작전 보류] {target_sym} 1주 매수덫 예수금 부족</b>\n"
-                                f"▫️ 필요 금액: <code>${target_buy_p:.2f}</code> (1주) \vert{} USD 가능금액: <code>${current_bp:,.2f}</code>"
+                                f"▫️ 필요 금액: <code>${target_buy_p:.2f}</code> (1주) · "
+                                f"USD 가능금액: <code>${current_bp:,.2f}</code>"
                             ),
                         )
                         return False
@@ -426,10 +429,11 @@ async def execute_whipsaw_vwap_exposure_plugin(
                         (
                             f"🌪️ <b>[듀얼 휩소 노출 작전 개시] {sym_icon}{target_sym} 0.5% 역산 1주 매수 덫 투하 완료!</b>\n"
                             f"▫️ 작전 시간: <code>03:58 ~ 04:07 EST (9분간 유지{macro_indep_note})</code>\n"
-                            f"▫️ 선정 종목: <b>{sym_icon}{target_sym}</b> | 데이장 누적 VWAP: <code>${locked_vwap:.2f}</code>\n"
+                            f"▫️ 선정 종목: <b>{sym_icon}{target_sym}</b> · 데이장 누적 VWAP: <code>${locked_vwap:.2f}</code>\n"
                             f"▫️ 타점 판정: <code>{html.escape(mode_desc_str)}</code>\n"
-                            f"▫️ 주문 내역: <b>1주 고정(LIMIT)</b> 하단 매수덫 <code>${target_buy_p:.2f}</code> ➡️ 체결 시 +1.00\% 목표 매도덫 <code>${target_sell_p:.2f}</code> (기대 <code>+{exp_gross_pct:.2f}%</code>)\n"
-                            "▫️ 무비용 방어: <code>04:07 EST까지 덫 미체결 시 비용 $0 자동 취소 / 체결 후 미매도 시 현재가 즉시 매도</code>"
+                            f"▫️ 주문 내역: <b>1주 고정(LIMIT)</b> 하단 매수덫 <code>${target_buy_p:.2f}</code> ➡️ "
+                            f"체결 시 +1.00% 목표 매도덫 <code>${target_sell_p:.2f}</code> (기대 <code>+{exp_gross_pct:.2f}%</code>)\n"
+                            "▫️ 무비용 방어: <code>04:07 EST까지 덫 미체결 시 비용 0달러 자동 취소 / 체결 후 미매도 시 현재가 즉시 매도</code>"
                         ),
                     )
                     return True
@@ -438,7 +442,8 @@ async def execute_whipsaw_vwap_exposure_plugin(
                 sym_icon = "🐻" if target_sym == "SOXS" else "🐂"
                 if ("order-hours-closed" in err_str or "422" in err_str) and (358 <= est_hm <= 400):
                     print(
-                        f"⏳ [듀얼 휩소 매수덫 대기 {target_sym}] 장전환 공백 감지 -> 04:00:00 EST 프리장 개장 즉시 락온 타점(${target_buy_p:.2f})으로 자동 발사합니다.",
+                        f"⏳ [듀얼 휩소 매수덫 대기 {target_sym}] 장전환 공백 감지 -> "
+                        f"04:00:00 EST 프리장 개장 즉시 락온 타점(${target_buy_p:.2f})으로 자동 발사합니다.",
                         flush=True,
                     )
                     if not _WHIPSAW_SIM_CACHE.get("whipsaw_prelock_notified", False):
@@ -447,7 +452,8 @@ async def execute_whipsaw_vwap_exposure_plugin(
                             ctx,
                             (
                                 f"⏳ <b>[03:58 듀얼 휩소 타점 사전 락온 완료] {sym_icon}{target_sym} (04:00:00 EST 개장 발사 대기)</b>\n"
-                                f"▫️ 락온 타점: <b>{sym_icon}{target_sym} 1주 매수덫 <code>${target_buy_p:.2f}</code></b> ➡️ 목표 매도덫 <code>${target_sell_p:.2f} (+1.00%)</code>\n"
+                                f"▫️ 락온 타점: <b>{sym_icon}{target_sym} 1주 매수덫 <code>${target_buy_p:.2f}</code></b> ➡️ "
+                                f"목표 매도덫 <code>${target_sell_p:.2f} (+1.00%)</code>\n"
                                 f"▫️ 판정 근거: <code>{html.escape(mode_desc_str)}</code>\n"
                                 "▫️ 상태: 토스 데이장 마감(16:50 KST) ~ 프리장 개장(17:00 KST / 04:00 EST) 전환 대기 중이며, <b>04:00:00 EST 정각 첫 틱에 거래소로 즉시 발사됩니다!</b>"
                             ),
@@ -575,7 +581,7 @@ async def enforce_0407_whipsaw_cutoff_plugin(
                 await _notify_tg_safe(
                     ctx,
                     (
-                        f"⏱️ <b>[04:07 타임쉴드 해제 {sym_icon}{symbol}] 휩소 1주 매수 덫 미체결 취소 완료 (비용 $0)</b>\n"
+                        f"⏱️ <b>[04:07 타임쉴드 해제 {sym_icon}{symbol}] 휩소 1주 매수 덫 미체결 취소 완료 (비용 0달러)</b>\n"
                         "▫️ 사유: 03:58 ~ 04:07 EST (9분간) 듀얼 휩소 노출 작전 시간 만료\n"
                         f"▫️ 조치: {next_action_desc}"
                     ),
