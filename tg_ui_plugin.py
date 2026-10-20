@@ -10,6 +10,7 @@
 #           직전 마감된 선물 세션 기준일과 '(마감 시세 · 18:00 신세션 대기)' 라벨 및 마감가를 명확히 표출
 # MODIFIED: 초과 Case 78, 92, 93, 94, 97, 98, 99 — 데이장 개시 7분 추세·1.3% 락온·40~70 리셋·당일 모의 출격 승률,
 #           SOXS·SOXL 동시 수동 보유 시 3차 방어 라인 독립 표출, 선택지 B(👑HYB_35_1ST), 이원화 매도 및 15:00 VWAP 탈출 상태 표출
+# NEW: 초과 Case 101 — 옵션 A (🚀 08_HYB_PIVBRK & 데이장 🎯 PIV10) 10분봉 대파동 스윙·꺾임목(PRE_PIVOT_10M / PIV10) 상태 표출 결합
 
 import math
 import asyncio
@@ -29,6 +30,7 @@ from sniper_plugin import (
     get_trailing_runtime_status,
     get_bottom_track_status,
     get_pre_leader_status,
+    get_swing_10m_status,
 )
 from tg_ui_boards_plugin import (
     EST_TZ,
@@ -40,7 +42,7 @@ from tg_ui_boards_plugin import (
 )
 
 
-# MODIFIED: 메인 메뉴(/start 및 메인 복귀) 화면 불필요 설명 삭제 및 1줄 고정 슬림화 (Case 38, 77, 78, 93, 97, 98, 99)
+# MODIFIED: 메인 메뉴(/start 및 메인 복귀) 화면 불필요 설명 삭제 및 1줄 고정 슬림화 (Case 38, 77, 78, 93, 97, 98, 99, 101)
 async def get_main_menu_text() -> str:
     now_est = datetime.now(EST_TZ)
     is_dst = now_est.dst() is not None and now_est.dst().total_seconds() != 0
@@ -54,10 +56,10 @@ async def get_main_menu_text() -> str:
         f"▫️ 익절·복구: <b>🔥 +1.00% 점화 이원화 트레일링 ({comp_mode_str})</b>\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
         "🔹 18:00 ~ 18:59: 🌐 <b>선물 신세션 &amp; 10분봉 락온</b>\n"
-        "🔹 19:00 ~ 03:57: 🌙 <b>[모의] 데이장 (개시7분·반복출격)</b>\n"
+        "🔹 19:00 ~ 03:57: 🌙 <b>[모의] 데이장 (개시7분·반복·🎯PIV10)</b>\n"
         "🔹 03:58 ~ 03:59: 🔇 <b>휩소 묵음</b>\n"
         "🔹 03:58 ~ 04:07: 🌪️ <b>'휩소 노출 작전'</b>\n"
-        "🔹 04:07 ~ 08:14: 🔫 <b>프리장 본진 (👑HYB_35_1ST)</b>\n"
+        "🔹 04:07 ~ 08:14: 🔫 <b>프리장 본진 (👑HYB_35_1ST·🚀PIV10)</b>\n"
         "🔹 08:15 ~ 14:59: 🔒 <b>정규장 본장</b>\n"
         "🔹 15:00 ~ 15:58: 🛟 <b>미익절 VWAP 탈출</b>\n"
         "🔹 15:59 ~ 16:01: 🛑 <b>제로-오버나이트</b>\n"
@@ -193,8 +195,8 @@ async def _fetch_session_stats(api_client, symbol: str, now_est: datetime) -> di
     return await asyncio.to_thread(parse_session_data, all_candles, session_start_est)
 
 
-# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 78, 83, 84, 85, 86, 87, 89, 90, 91, 92, 93, 94, 97, 98, 99 —
-#           하단 종목 상태가 2줄을 넘어가지 않도록 간결화 및 데이장 개시 7분 추세·1.3% 락온·40~70 리셋·이원화 트레일링·15:00 VWAP 탈출 표시 반영
+# MODIFIED: Case 13 & 초과 Case 38, 50, 57, 78, 83, 84, 85, 86, 87, 89, 90, 91, 92, 93, 94, 97, 98, 99, 101 —
+#           하단 종목 상태가 2줄을 넘어가지 않도록 간결화 및 데이장 개시 7분 추세·1.3% 락온·40~70 리셋·10분봉 꺾임목·이원화 트레일링·15:00 VWAP 탈출 표시 반영
 def build_compact_status(
     symbol: str,
     state_tuple: tuple,
@@ -221,6 +223,7 @@ def build_compact_status(
     trail_st = get_trailing_runtime_status(symbol)
     bot_st = get_bottom_track_status(symbol)
     pre_ld = get_pre_leader_status()
+    sw_st = get_swing_10m_status(symbol)
     nq_bypass_on = bool(trail_st.get("nq_vel_bypass", False))
     exit_reg_str = str(trail_st.get("exit_regime", "OLD_IMM_CB"))
 
@@ -251,17 +254,22 @@ def build_compact_status(
                 state_text = "🌪️ 휩소보유(1주 · 장전중)"
         elif trail_st.get("armed", False):
             pk_p = float(trail_st.get("peak_price", 0.0))
-            st_p = float(trail_st.get("stop_price", target_sell_price))
-            reg_lbl = "🚀진성트레일링" if exit_reg_str == "PEAK_LCK_130" else "⚡반등트레일링"
+            st_p = float(tr_st_stop := trail_st.get("stop_price", target_sell_price))
+            reg_lbl = "🚀진성·10분트레일링" if exit_reg_str == "PEAK_LCK_130" else "⚡반등트레일링"
             prefix_tag = f"🔥 수동·{reg_lbl}" if is_manual_hold else reg_lbl
             state_text = f"{prefix_tag}({int(qty)}주 · 고점 ${pk_p:.2f} / 스탑 ${st_p:.2f})"
         elif (1500 <= est_time_int <= 1558) and reg_vwap > 0.0:
             vwap_fl = math.floor(reg_vwap * 100.0) / 100.0
             state_text = f"🛟 VWAP탈출감시({int(qty)}주 · VWAP ${vwap_fl:.2f})"
         elif target_sell_price > 0.0:
-            prefix_tag = "🎯 수동보유" if is_manual_hold else (
-                "🚀 추세보유" if entry_session in ("PRE_PULLBACK", "PRE_PULLBACK_REARM") else "🎯 대칭보유"
-            )
+            if is_manual_hold:
+                prefix_tag = "🎯 수동보유"
+            elif entry_session in ("PRE_PIVOT_10M", "PRE_PIVOT_10M_REARM"):
+                prefix_tag = "🎯 10분꺾임보유"
+            elif entry_session in ("PRE_PULLBACK", "PRE_PULLBACK_REARM"):
+                prefix_tag = "🚀 추세보유"
+            else:
+                prefix_tag = "🎯 대칭보유"
             state_text = f"{prefix_tag}({int(qty)}주 · 점화 ${target_sell_price:.2f} · {ha_badge})"
         else:
             prefix_tag = "🎯 수동보유" if is_manual_hold else "🎯 보유"
@@ -270,6 +278,10 @@ def build_compact_status(
         if entry_session == "WHIPSAW_1SH":
             w_bp = whip_st.get("buy_price", 0.0)
             state_text = f"🌪️ 휩소1주 매수덫(${w_bp:.2f})"
+        elif entry_session == "PRE_PIVOT_10M":
+            state_text = "🎯 10분꺾임 매수덫(30초 쉴드)"
+        elif entry_session == "PRE_PIVOT_10M_REARM":
+            state_text = "🎯 10분꺾임 재장전 대기"
         elif entry_session == "PRE_PULLBACK":
             state_text = "🚀 추세눌림 매수덫(30초 쉴드)"
         elif entry_session == "PRE_PULLBACK_REARM":
@@ -298,8 +310,9 @@ def build_compact_status(
             state_text = "🌪️ 휩소구간(04:07 쉴드)"
     elif current_session == "dayMarket" and (est_time_int >= 1900 or est_time_int <= 357):
         if day_sim.get("active", False) and day_sim.get("symbol") == symbol:
+            sim_mode = str(day_sim.get("trig_mode") or "OPTA")
             if day_sim.get("phase") == "TRAP_WAIT":
-                state_text = f"🪤 [모의] 1차덫(${day_sim['trap_price']:.2f})"
+                state_text = f"🪤 [모의·{sim_mode}] 1차덫(${day_sim['trap_price']:.2f})"
             elif day_sim.get("trail_armed", False):
                 pk_d = float(day_sim.get("max_price", 0.0))
                 st_d = float(day_sim.get("target_price", 0.0))
@@ -307,7 +320,7 @@ def build_compact_status(
             else:
                 ep_d = float(day_sim.get("entry_price", 0.0))
                 lk_d = float(day_sim.get("arm_price", 0.0))
-                state_text = f"🚀 [모의] 추격(진입 ${ep_d:.2f} ➔ 락온 ${lk_d:.2f})"
+                state_text = f"🚀 [모의·{sim_mode}] 추격(진입 ${ep_d:.2f} ➔ 락온 ${lk_d:.2f})"
         elif in_day_open_7m:
             if day_sim.get("prelock_sym") == symbol:
                 state_text = "🚀 [모의] 개시7분(10분봉락온 · RSI≥50 즉시진입)"
@@ -315,26 +328,29 @@ def build_compact_status(
                 state_text = "🛡️ [모의] 개시7분 쉴드(역추세 진입차단)"
         elif day_sim.get("leader_sym") == symbol:
             if day_sim.get("pb_rearm_ready", True):
-                state_text = "👑 [모의] 상승장락온(≤35 추세·대칭감시)"
+                state_text = "👑 [모의] 상승장락온(≤35·대칭·🎯PIV10)"
             else:
-                state_text = "🔄 [모의] 상승장 리셋대기(40≤RSI≤70)"
+                state_text = "🔄 [모의] 상승장 리셋대기(40≤RSI≤70·🎯PIV10)"
         elif not day_sim.get("opta_rearm_ready", True):
-            state_text = "🔄 [모의] 대칭 리셋대기(40≤RSI≤70)"
+            state_text = "🔄 [모의] 대칭 리셋대기(40≤RSI≤70·🎯PIV10)"
         else:
-            state_text = f"🔔 [모의] 대칭감시(≤30 &amp; {opp_sym}≥79.9)"
+            state_text = f"🔔 [모의] 감시(≤30&amp;{opp_sym}≥79.9 · 🎯PIV10)"
     elif 407 <= est_time_int <= 814:
         if bot_st.get("active", False):
             lp_v = float(bot_st.get("post_stop_low", 0.0))
             rp_v = float(bot_st.get("rebound_trig_price", 0.0))
             state_text = f"🪤 최저점추적(최저 ${lp_v:.2f} ➔ 반등 ${rp_v:.2f})"
         elif not is_done:
-            if pre_ld.get("leader_sym") == symbol:
+            if bool(sw_st.get("pivot_ready", False)):
+                drop_v = float(sw_st.get("swing_drop_pct", 0.0))
+                state_text = f"🎯 10분꺾임대기(진폭 -{drop_v:.1f}% · 돌파감시)"
+            elif pre_ld.get("leader_sym") == symbol:
                 if (700 <= est_time_int <= 814) and bool(pre_ld.get("pb_rearm_ready", True)):
-                    state_text = "👑 상승주도(RSI≤35 추세·대칭감시)"
+                    state_text = "👑 상승주도(RSI≤35 추세·대칭·🎯PIV10)"
                 else:
-                    state_text = "👑 상승각인(07:00 눌림대기·대칭감시)"
+                    state_text = "👑 상승각인(07:00 눌림대기·대칭·🎯PIV10)"
             else:
-                state_text = f"🔫 대칭감시(≤30 &amp; {opp_sym}≥79.9)"
+                state_text = f"🔫 감시(≤30&amp;{opp_sym}≥79.9 · 🎯PIV10)"
         else:
             state_text = "🔒 프리장 타격잠금"
     elif 815 <= est_time_int < 930:
@@ -349,9 +365,9 @@ def build_compact_status(
     return f"{sym_icon} <b>{symbol}</b> <code>[{state_flag}]</code> {state_text}"
 
 
-# MODIFIED: 초과 Case 38, 78, 90, 91, 92, 93, 94, 97, 98, 99 —
+# MODIFIED: 초과 Case 38, 78, 90, 91, 92, 93, 94, 97, 98, 99, 101 —
 #           관제탑(/avwap)에서 17:00~17:59 EST(06:00~06:59 KST) 선물 마감 휴장 시 직전 세션 마감 시세·기준일을 명확히 표시하고
-#           데이장 개시 7분 추세·1.3% 락온·40~70 리셋·당일 모의 출격 승률 및 선택지 B·이원화 매도·15:00 VWAP 탈출 상태 표출
+#           데이장 개시 7분 추세·1.3% 락온·40~70 리셋·10분봉 꺾임목·당일 모의 출격 승률 및 옵션 A(🚀08_HYB_PIVBRK)·이원화 매도·15:00 VWAP 탈출 상태 표출
 async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, InlineKeyboardMarkup]:
     now_est = datetime.now(EST_TZ)
     now_kst = now_est.astimezone(KST_TZ)
@@ -383,7 +399,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         market_header = "( <b>🌪️ 03:58 ~ 04:07 휩소작전</b> )"
     elif is_pre_sniper_time:
         session_name_ui = "preMarket"
-        market_header = "( <b>🌅 프리장 골든타임</b> )"
+        market_header = "( <b>🌅 프리장 골든타임 · 🚀08_HYB_PIVBRK</b> )"
     elif is_pre_cutoff_time:
         session_name_ui = "preMarket"
         market_header = "( <b>🔒 프리장 마감</b> )"
@@ -583,7 +599,8 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
     pre_leader_sym = str(pre_ld.get("leader_sym") or "")
     pre_pb_ready = bool(pre_ld.get("pb_rearm_ready", True))
 
-    # Case 17, 38, 44, 57, 78, 81, 83, 84, 85, 87, 89, 93, 97, 98: 실시간 RSI + 하이킨 아시 + 데이장 개시7분/반복출격 + VWAP 탈출 통합 렌더링
+    # Case 17, 38, 44, 57, 78, 81, 83, 84, 85, 87, 89, 93, 97, 98, 101:
+    # 실시간 RSI + 하이킨 아시 + 10분봉 스윙·꺾임목 + 데이장 개시7분/반복출격 + VWAP 탈출 통합 렌더링
     rsi_ui_lines = []
     if shared_rsi_state:
         r_s = float((shared_rsi_state.get("SOXS") or {}).get("value", 0.0))
@@ -597,6 +614,9 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
             r_qty = qty_s if r_sym == "SOXS" else qty_l
             r_reg_vwap = reg_vwap_s if r_sym == "SOXS" else reg_vwap_l
             tr_r = get_trailing_runtime_status(r_sym)
+            sw_r = get_swing_10m_status(r_sym)
+            day_sw_drop = float(day_sim.get(f"swing_drop_{r_sym}", 0.0))
+
             if is_ha_g:
                 ha_short = "🕯️HA양봉"
             elif (tr_r.get("armed", False) and tr_r.get("nq_vel_bypass", False)) or (
@@ -621,17 +641,23 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
                 rp_r = float(bot_r.get("rebound_trig_price", 0.0))
                 warn_str = f"🪤 최저점추적(${lp_r:.2f} ➡️ ${rp_r:.2f})"
             elif is_day_time and day_sim.get("active", False) and day_sim.get("symbol") == r_sym:
+                sim_m = str(day_sim.get("trig_mode") or "OPTA")
                 if day_sim.get("phase") == "TRAP_WAIT":
-                    warn_str = f"🪤 모의1차덫(${day_sim['trap_price']:.2f})"
+                    warn_str = f"🪤 모의1차덫·{sim_m}(${day_sim['trap_price']:.2f})"
                 elif day_sim.get("trail_armed", False):
                     warn_str = f"🔥 모의1.3%락온(스탑 ${day_sim['target_price']:.2f} · {ha_short})"
                 else:
-                    warn_str = f"🚀 모의추격(락온 ${day_sim['arm_price']:.2f} · {ha_short})"
+                    warn_str = f"🚀 모의추격·{sim_m}(락온 ${day_sim['arm_price']:.2f} · {ha_short})"
             elif is_day_open_7m:
                 if day_sim.get("prelock_sym") == r_sym:
                     warn_str = f"🚀 개시7분 10분봉락온(≥50 즉시진입 · {ha_short})"
                 else:
                     warn_str = f"🛡️ 개시7분 역추세차단({ha_short})"
+            elif is_pre_sniper_time and bool(sw_r.get("pivot_ready", False)):
+                drop_v = float(sw_r.get("swing_drop_pct", 0.0))
+                warn_str = f"🎯 10분꺾임대기(진폭 -{drop_v:.1f}% · {ha_short})"
+            elif is_day_time and day_sw_drop >= 1.80 and (0.0 < r_val <= 45.0):
+                warn_str = f"🎯 모의10분꺾임감시(진폭 -{day_sw_drop:.1f}% · {ha_short})"
             elif (
                 is_pre_sniper_time
                 and (700 <= t <= 814)
@@ -690,7 +716,7 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
 
     rsi_ui_str = "\n".join(rsi_ui_lines) + "\n" if rsi_ui_lines else ""
 
-    # 초과 Case 78 & Case 93 — 데이장 진행 중이거나 당일 데이장 [모의] 출격 기록이 있을 때 적중 승률 1줄 요약 표출
+    # 초과 Case 78, 93, 101 — 데이장 진행 중이거나 당일 데이장 [모의] 출격 기록이 있을 때 적중 승률 1줄 요약 표출
     day_stat_line = ""
     if is_day_time or int(day_sim.get("stat_total", 0)) > 0:
         d_tot = int(day_sim.get("stat_total", 0))
@@ -698,9 +724,12 @@ async def build_avwap_radar(api_client, shared_rsi_state=None) -> tuple[str, Inl
         d_loss = int(day_sim.get("stat_losses", 0))
         d_wr = float(day_sim.get("stat_win_rate", 0.0))
         d_net = float(day_sim.get("stat_cum_net_pct", 0.0))
+        d_pv_c = int(day_sim.get("stat_piv10_cnt", 0))
+        d_pv_w = int(day_sim.get("stat_piv10_wins", 0))
+        pv_tag = f" · 🎯PIV10 {d_pv_w}/{d_pv_c}" if d_pv_c > 0 else ""
         day_stat_line = (
             f"\n📊 <b>데이장 [모의] 전적:</b> <code>{d_tot}출격 {d_win}승 {d_loss}패 "
-            f"(승률 {d_wr:.1f}% · 세후 {d_net:+.2f}%)</code>"
+            f"(승률 {d_wr:.1f}% · 세후 {d_net:+.2f}%{pv_tag})</code>"
         )
 
     scan_time = now_est.strftime("%m-%d %H:%M:%S")
