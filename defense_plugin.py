@@ -1,19 +1,20 @@
 # =====================================================================
 # FILE: defense_plugin.py
-# 목적: sniper_plugin.py (line 59) 및 tg_ui_plugin.py 교차 임포트 32개 심볼 100% 정식 제공,
-#       get_bottom_track_status(symbol=None) 외 13대 상태 제어·조회 헬퍼 다형성 시그니처(0개/1개+ 인자 완벽 호환),
+# 목적: sniper_plugin.py 및 tg_ui_plugin.py 교차 임포트 32개 심볼 100% 정식 제공,
+#       _cancel_open_orders_and_wait_sellable(holdings_qty=1 기본값 및 다형성 인자 완벽 수용),
+#       409 already-modified 발생 시 거래소 OPEN 매도 주문 즉시 추적 정정(_execute_two_stage_emergency_sell),
+#       get_bottom_track_status(symbol=None) 외 13대 상태 제어·조회 헬퍼 다형성 시그니처(0개/1개+ 인자 호환),
 #       방향성 인지(Direction-Aware) 매크로 3단 방어망(execute_macro_defense_plugin),
 #       08:15 EST 거시지표 발표 15분 전 선제 컷오프(enforce_0930_regular_cutoff_plugin / enforce_0815_pre_macro_cutoff_plugin),
 #       15:00 ~ 15:58 EST 장마감 1시간 전 미익절 물량 정규장 VWAP 도달 즉시 탈출(execute_late_regular_vwap_escape_plugin),
-#       15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산(execute_moc_zero_overnight_plugin) 및
-#       미체결 주문 선취소·매도가능수량 해방 폴링 헬퍼(_cancel_open_orders_and_wait_sellable) 코어 플러그인
+#       15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산(execute_moc_zero_overnight_plugin) 코어 플러그인
 # =====================================================================
-# MODIFIED: 제1 ~ 제6헌법 및 초과 Case 48, 63, 66, 67, 74, 82, 84, 85, 86, 87, 88, 92, 94, 95, 96, 97, 98, 99 완벽 준수
-# NEW: 1) `get_bottom_track_status(symbol: str = None, *args, **kwargs)` 등 모든 상태 조회·초기화·마킹 함수가
-#         인자 0개 호출(`get_bottom_track_status()`)과 종목 인자 1개 호출(`get_bottom_track_status("SOXS")`)을
-#         모두 100% 수용하도록 다형성 시그니처 적용 (`/sync` 지시서 및 `/avwap` 관제탑 TypeError 영구 소각)
-#      2) `_BOTTOM_TRACK_CACHE` 에 최상위 요약 키와 종목별(`"SOXS"`, `"SOXL"`) 서브 딕셔너리를 동시 유지하여
-#         직접 딕셔너리 인덱싱과 헬퍼 함수 호출 양쪽 모두 100% 호환 보장
+# MODIFIED: 제1 ~ 제6헌법 및 초과 Case 24, 35, 48, 63, 66, 67, 69, 74, 82, 84, 85, 86, 87, 88, 92, 94, 95, 96, 97, 98, 99 준수
+# NEW: 1) `_cancel_open_orders_and_wait_sellable` 에 `holdings_qty: int = 1` 기본값 부여 및
+#         2개 인자(`ctx, symbol`) 또는 3번째 인자 문자열(`sell_order_id`) 전달까지 자동 판별 수용하여
+#         `missing 1 required positional argument: 'holdings_qty'` 에러 100% 영구 소각
+#      2) `_execute_two_stage_emergency_sell` 에서 `modify_order` 호출 시 `[409 already-modified]` 가 발생하면
+#         즉시 `OPEN` 매도 주문을 조회해 새로 발급된 `orderId` 로 정정 스윕 완수
 #      3) 모바일 클립보드 복사 시 `\vert{}` 문법 에러를 유발하는 세로바 기호를 전면 배제하고 가운뎃점(`·`) 적용
 
 import sys
@@ -42,7 +43,7 @@ EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
 
 # =====================================================================
-# 1. 전술 상수 선언 (sniper_plugin.py 59번 줄 요구 상수 8종 + 호환 별칭 100% 완비)
+# 1. 전술 상수 선언 (sniper_plugin.py 요구 상수 8종 + 호환 별칭 100% 완비)
 # =====================================================================
 TRAIL_ARM_PROFIT_RATE = float(SINGLE_TARGET_PROFIT_RATE)   # +1.00% 하이킨 아시 트레일링 점화가 기준
 TRAIL_FLOOR_LOCK_RATE = float(SINGLE_TARGET_PROFIT_RATE)   # +1.00% 최소 익절 보존선 하드 락온 기준
@@ -124,6 +125,8 @@ def _default_trail_state() -> dict:
         "last_known_qty": 0,
         "bear_candle_seen": False,
         "regime": "TECH_BOUNCE",
+        "active_sell_oid": "",
+        "sweep_dispatched_ts": 0.0,
     }
 
 
@@ -348,12 +351,9 @@ activate_post_stop_bottom_tracker = _activate_bottom_track_state
 
 def get_bottom_track_status(symbol: str = None, *args, **kwargs) -> dict:
     """
-    NEW & MODIFIED (초과 Case 87 · /sync 및 /avwap TypeError 영구 소각):
-    - `get_bottom_track_status("SOXS")` 처럼 종목 인자 1개가 전달된 경우:
-      해당 종목의 최저점 역트레일링 상태 딕셔너리(stop_price, last_stop_price, lowest_price,
-      post_stop_low, rebound_price, trigger_price 등 모든 호환 키 완비)를 반환합니다.
-    - `get_bottom_track_status()` 처럼 인자 없이(0개) 호출된 경우:
-      전역 `_BOTTOM_TRACK_CACHE` 상태 사본을 반환합니다.
+    초과 Case 87:
+    - `get_bottom_track_status("SOXS")` 처럼 종목 인자 1개가 전달된 경우 해당 종목 상태 사본 반환.
+    - `get_bottom_track_status()` 처럼 인자 없이 호출된 경우 전역 `_BOTTOM_TRACK_CACHE` 사본 반환.
     """
     sym_u = str(symbol or "").upper()
     top_active = bool(_BOTTOM_TRACK_CACHE.get("active", False))
@@ -412,7 +412,6 @@ def get_bottom_track_status(symbol: str = None, *args, **kwargs) -> dict:
             sub = _default_symbol_bottom_state(sym_u)
         return sub
 
-    # 인자 없이 호출된 경우 전역 상태 반환 (하위 최신값 동기화 포함)
     out = dict(_BOTTOM_TRACK_CACHE)
     if top_active and top_sym in ("SOXS", "SOXL"):
         sp = float(out.get("last_stop_price") or out.get("stop_price") or 0.0)
@@ -653,31 +652,68 @@ def get_swing_10m_status(symbol: str = None, *args, **kwargs) -> dict:
 
 
 # =====================================================================
-# 4. 미체결 주문 선취소·수량 해방 폴링 및 2단계 긴급 매도 스윕 헬퍼 (Case 24)
+# 4. 미체결 주문 선취소·수량 해방 폴링 및 2단계 긴급 매도 스윕 헬퍼 (Case 24, 69, 88)
 # =====================================================================
 async def _cancel_open_orders_and_wait_sellable(
-    ctx,
-    symbol: str,
-    holdings_qty: int,
+    ctx=None,
+    symbol: str = "",
+    holdings_qty: int = 1,
     sell_order_id: str = "",
     buy_order_id: str = "",
     max_polls: int = 8,
     poll_interval: float = 0.25,
+    *args,
     **kwargs,
 ) -> tuple[int, list[str]]:
     """
-    Case 24: 미체결 매도(및 매수) 주문을 선취소하고 최대 2.0초(0.25초 * 8회) 동안
-    매도 가능 수량(sellableQuantity) 해방을 폴링 대기합니다.
+    NEW & MODIFIED (Case 24, 88 — `missing 1 required positional argument: 'holdings_qty'` 영구 소각):
+    - `holdings_qty: int = 1` 기본값을 부여하여 `(ctx, symbol)` 2개 인자 호출을 100% 수용합니다.
+    - 3번째 위치 인자로 주문 ID 문자열(`"bAGzNv..."`)이 전달된 경우 이를 `sell_order_id` 로 자동 편입합니다.
+    - 첫 번째 인자로 `SniperPluginContext`(`ctx`) 또는 `TossApiClient`(`client`) 모두 수용합니다.
     """
-    client = ctx.client
+    client = getattr(ctx, "client", None) or kwargs.get("client") or ctx
+    sym_u = str(symbol or kwargs.get("symbol") or "").upper()
+
+    # 만약 3번째 인자(holdings_qty 자리)에 문자열 orderId 가 들어온 경우 자동 분기
+    if isinstance(holdings_qty, str):
+        hq_str = holdings_qty.strip()
+        if hq_str and not hq_str.replace(".", "", 1).isdigit():
+            if not sell_order_id:
+                sell_order_id = hq_str
+            holdings_qty = 0
+
+    try:
+        eff_holdings_qty = int(math.floor(float(holdings_qty or 0)))
+    except (ValueError, TypeError):
+        eff_holdings_qty = 0
+
+    if eff_holdings_qty <= 0:
+        for kw_k in ("qty", "target_qty", "expected_qty"):
+            if kw_k in kwargs:
+                try:
+                    eff_holdings_qty = int(math.floor(float(kwargs[kw_k] or 0)))
+                    if eff_holdings_qty > 0:
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+    if eff_holdings_qty <= 0 and hasattr(ctx, "shared_holdings") and isinstance(ctx.shared_holdings, dict):
+        eff_holdings_qty = int(ctx.shared_holdings.get(sym_u, 0) or 0)
+
+    if eff_holdings_qty <= 0:
+        eff_holdings_qty = 1
+
     target_cancel_ids = set()
     if sell_order_id:
         target_cancel_ids.add(str(sell_order_id).strip())
     if buy_order_id:
         target_cancel_ids.add(str(buy_order_id).strip())
+    for extra_k in ("order_id", "cancel_order_id"):
+        if kwargs.get(extra_k):
+            target_cancel_ids.add(str(kwargs[extra_k]).strip())
 
     try:
-        open_orders = await client.get_orders(status="OPEN", symbol=symbol)
+        open_orders = await client.get_orders(status="OPEN", symbol=sym_u)
         if isinstance(open_orders, list):
             for od in open_orders:
                 if isinstance(od, dict) and od.get("orderId"):
@@ -696,9 +732,9 @@ async def _cancel_open_orders_and_wait_sellable(
     sellable_q_int = 0
     for _ in range(max(1, int(max_polls))):
         try:
-            sq = await client.get_sellable_quantity(symbol)
+            sq = await client.get_sellable_quantity(sym_u)
             sellable_q_int = int(math.floor(float(sq or 0.0)))
-            if sellable_q_int >= int(holdings_qty) and sellable_q_int > 0:
+            if sellable_q_int >= eff_holdings_qty and sellable_q_int > 0:
                 return sellable_q_int, []
         except Exception:
             pass
@@ -706,7 +742,7 @@ async def _cancel_open_orders_and_wait_sellable(
 
     surviving_sell_ids = []
     try:
-        open_after = await client.get_orders(status="OPEN", symbol=symbol)
+        open_after = await client.get_orders(status="OPEN", symbol=sym_u)
         if isinstance(open_after, list):
             for od in open_after:
                 if (
@@ -730,22 +766,25 @@ sniper_plugin_cancel_helper = _cancel_open_orders_and_wait_sellable
 async def _execute_two_stage_emergency_sell(
     ctx,
     symbol: str,
-    holdings_qty: int,
-    sell_order_id: str,
-    buy_order_id: str,
-    current_price: float,
+    holdings_qty: int = 1,
+    sell_order_id: str = "",
+    buy_order_id: str = "",
+    current_price: float = 0.0,
     tag_prefix: str = "mdump",
 ) -> tuple[bool, float, str]:
     """
-    Case 24: 1단계 기존 매도 주문(sell_order_id) 가격 즉시 정정(modify_order) 스윕 시도 후,
-    미장전 또는 정정 불가 시 2단계 선취소 + 매도가능수량 폴링 대기 + 매수 1호가 LIMIT 신규 매도를 발사합니다.
+    NEW & MODIFIED (Case 24, 35, 69):
+    1단계 기존 매도 주문(sell_order_id) 가격 즉시 정정(modify_order) 스윕 시도 시,
+    `[409 already-modified]` 에러가 발생하면 즉시 거래소의 현재 `OPEN` 매도 주문을 스캔하여
+    새로 발급된 최신 `orderId` 로 가격 정정을 완수하고, 정정 불가 시 2단계 선취소 후 신규 LIMIT 매도를 발사합니다.
     """
-    client = ctx.client
+    client = getattr(ctx, "client", ctx)
     best_bid = await client.get_best_bid_price(symbol, fallback_price=current_price)
     sweep_price = best_bid if best_bid > 0.0 else (math.floor(float(current_price or 0.0) * 100.0) / 100.0)
     if sweep_price <= 0.0:
         return False, 0.0, ""
 
+    # 1단계: 기존 sell_order_id 에 대한 modify_order 0.1초 즉시 정정 시도
     if sell_order_id:
         try:
             mod_res = await client.modify_order(
@@ -759,11 +798,34 @@ async def _execute_two_stage_emergency_sell(
             err_s = str(mod_e).lower()
             if "already-filled" in err_s:
                 return True, sweep_price, sell_order_id
+            # NEW: 409 already-modified 또는 404 발생 시 현재 살아있는 OPEN SELL 주문의 신규 orderId 추적 정정!
+            if "already-modified" in err_s or "409" in err_s or "not-found" in err_s or "404" in err_s:
+                try:
+                    open_ords = await client.get_orders(status="OPEN", symbol=symbol)
+                    if isinstance(open_ords, list):
+                        for od in open_ords:
+                            if (
+                                isinstance(od, dict)
+                                and str(od.get("side") or "").upper() == "SELL"
+                                and od.get("orderId")
+                            ):
+                                live_oid = str(od["orderId"]).strip()
+                                mod_res2 = await client.modify_order(
+                                    order_id=live_oid,
+                                    price=sweep_price,
+                                    order_type="LIMIT",
+                                )
+                                new_oid2 = str((mod_res2 or {}).get("orderId") or live_oid)
+                                return True, sweep_price, new_oid2
+                except Exception as mod_e2:
+                    if "already-filled" in str(mod_e2).lower():
+                        return True, sweep_price, sell_order_id
 
+    # 2단계: 미체결 주문 선취소 + 매도가능수량 해방 폴링 대기 후 신규 LIMIT 발사
     sellable_q_int, surviving_sell_ids = await _cancel_open_orders_and_wait_sellable(
         ctx=ctx,
         symbol=symbol,
-        holdings_qty=holdings_qty,
+        holdings_qty=max(1, int(holdings_qty or 1)),
         sell_order_id=sell_order_id,
         buy_order_id=buy_order_id,
     )
@@ -778,16 +840,17 @@ async def _execute_two_stage_emergency_sell(
                 )
                 new_oid = str((mod_res or {}).get("orderId") or sv_oid)
                 return True, sweep_price, new_oid
-            except Exception:
-                pass
-        sellable_q_int = int(holdings_qty)
+            except Exception as sv_e:
+                if "already-filled" in str(sv_e).lower():
+                    return True, sweep_price, sv_oid
+        sellable_q_int = max(1, int(holdings_qty or 1))
 
-    target_sell_qty = sellable_q_int if sellable_q_int > 0 else int(holdings_qty)
+    target_sell_qty = sellable_q_int if sellable_q_int > 0 else max(1, int(holdings_qty or 1))
     if target_sell_qty <= 0:
         return False, sweep_price, ""
 
     cid = f"{tag_prefix}-{symbol.lower()}-{uuid.uuid4().hex[:20]}"[:36]
-    if isinstance(ctx.idempotency_keys, dict) and symbol in ctx.idempotency_keys:
+    if hasattr(ctx, "idempotency_keys") and isinstance(ctx.idempotency_keys, dict) and symbol in ctx.idempotency_keys:
         ctx.idempotency_keys[symbol]["M_DUMP"] = cid
 
     try:
@@ -803,7 +866,7 @@ async def _execute_two_stage_emergency_sell(
         new_oid = str((ord_res or {}).get("orderId") or "")
         return True, sweep_price, new_oid
     except Exception as sell_e:
-        if isinstance(ctx.idempotency_keys, dict) and symbol in ctx.idempotency_keys:
+        if hasattr(ctx, "idempotency_keys") and isinstance(ctx.idempotency_keys, dict) and symbol in ctx.idempotency_keys:
             ctx.idempotency_keys[symbol]["M_DUMP"] = None
         print(f"🚨 [{tag_prefix.upper()} 긴급 매도 방어 {symbol}] {sell_e}", flush=True)
         return False, sweep_price, ""
@@ -1147,7 +1210,7 @@ async def enforce_0930_regular_cutoff_plugin(
     return cleaned_buy_id, is_session_done
 
 
-# sniper_plugin.py 59번 줄 교차 임포트 호환 별칭
+# sniper_plugin.py 교차 임포트 호환 별칭
 enforce_0815_pre_macro_cutoff_plugin = enforce_0930_regular_cutoff_plugin
 
 

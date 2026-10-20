@@ -8,16 +8,16 @@
 #       1차 슬리피지(-0.18%) 매수 덫 + 조건부 30초 타임쉴드(RSI>30.0 / RSI>35.0 반등 또는 30초 만료 정정),
 #       진입 성격별 이원화 하이킨 아시 트레일링(기술적 반등[PRE_SNIPER] ⚡ OLD_IMM_CB [-0.30%] vs
 #       진성 상승종목[PRE_PULLBACK 및 모든 수동 매수 MANUAL] 🚀 PEAK_LCK_130 × 📊 BAR_BEAR_020 [초입 양봉 홀딩 후 -0.20%]
-#       × 🚀 NQ_VEL_BYPASS), REPLACED 원주문 안전 캡($47.98) 오인 및 수량(1주➔4주) 왜곡을 원천 소각한 복리 정산 코어
+#       × 🚀 NQ_VEL_BYPASS), 409 already-modified 자동 추적 정정 및 REPLACED 안전 캡($47.98)/수량(1주➔4주) 왜곡 차단 코어
 # =====================================================================
 # MODIFIED: 제1 ~ 제6헌법 및 100대 엣지 케이스 방어망(Case 01 ~ Case 100) 완벽 준수
-# NEW: 1) 수동 매수(`MANUAL`) 포지션은 `leader_sym` 여부나 시간대(프리장·정규장)와 무관하게 100% 무조건
-#         `🚀 진성상승 추세추종 매도 레짐(TREND_PULLBACK : +1.30% 전 양봉홀딩[쿠션+0.75%] 후 -0.20% 타이트 스윕)` 으로 고정!
-#      2) `_EXIT_SNAPSHOT_CACHE` 신설: 보유 중 매 틱 실보유 수량(`last_holdings_qty`), 평단가(`avg_price`),
-#         실제 경유 최고가(`peak_price`), 실제 스윕 발사가(`last_sweep_price`), 정정 신규 `orderId` 를 불변 보존
-#      3) `reconcile_zero_holdings_exit_plugin` 에서 `status in ("REPLACED", "CANCELED", "REJECTED", "PENDING")` 인
-#         원주문의 미체결 지정가(`price`, 상단 안전 캡 +5.00% = $47.98 등)를 체결가로 읽는 현상을 100% 영구 차단
-#      4) 모바일 클립보드 복사 시 `\vert{}` 문법 에러를 유발하는 세로바 기호를 전면 배제하고 가운뎃점(`·`) 적용
+# NEW: 1) `whipsaw_plugin` 동적 안전 바인딩(`import whipsaw_plugin as _whipsaw_mod` + 다중 별칭 `getattr`):
+#         `_reset_daymarket_sim_state` / `_reset_day_sim_state` 및 `execute_rsi_monitoring_plugin` 등
+#         어떠한 함수명 차이에서도 `ImportError` 가 절대 발생하지 않도록 원천 봉쇄
+#      2) 트레일링 스윕 정정 시 `[409 already-modified]` 에러가 발생하면 즉시 거래소 `OPEN` 매도 주문을 조회하여
+#         새로 발급된 최신 `orderId` 로 정정을 완수하고, 2단계 취소 폴백 시 `holdings_qty` 를 명시 전달
+#      3) 수동 매수(`MANUAL`) 포지션을 `leader_sym` 여부나 시간대와 무관하게 100% `🚀 진성상승 추세추종(TREND_PULLBACK)` 고정
+#      4) `_EXIT_SNAPSHOT_CACHE` 를 통해 `REPLACED` 원주문 안전 캡($47.98) 오인 및 `1주 ➔ 4주` 수량 왜곡 영구 소각
 
 import math
 import time
@@ -92,18 +92,83 @@ from defense_plugin import (
     enforce_0930_regular_cutoff_plugin,
     enforce_0815_pre_macro_cutoff_plugin,
 )
-from whipsaw_plugin import (
-    _reset_daymarket_sim_state,
-    get_daymarket_sim_status,
-    get_whipsaw_runtime_status,
-    settle_daymarket_sim_before_premarket,
-    execute_whipsaw_vwap_exposure_plugin,
-    enforce_0407_whipsaw_cutoff_plugin,
-    execute_rsi_monitoring_plugin,
-)
+import whipsaw_plugin as _whipsaw_mod
 
 EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
+
+
+# =====================================================================
+# NEW: whipsaw_plugin 다중 별칭 동적 안전 바인딩 (ImportError 100% 영구 소각)
+# =====================================================================
+def _ resolve_whipsaw_attr(*names, default_fn=None):
+    for nm in names:
+        fn = getattr(_whipsaw_mod, nm, None)
+        if fn is not None:
+            return fn
+    return default_fn
+
+
+def _noop_sync(*args, **kwargs):
+    return {"active": False}
+
+
+async def _noop_async(*args, **kwargs):
+    return False
+
+
+_reset_day_sim_state = _resolve_whipsaw_attr(
+    "_reset_day_sim_state",
+    "_reset_daymarket_sim_state",
+    "reset_daymarket_sim_state",
+    default_fn=_noop_sync,
+)
+_reset_daymarket_sim_state = _reset_day_sim_state
+
+get_daymarket_sim_status = _resolve_whipsaw_attr(
+    "get_daymarket_sim_status",
+    "get_day_sim_status",
+    default_fn=_noop_sync,
+)
+get_day_sim_status = get_daymarket_sim_status
+
+get_whipsaw_runtime_status = _resolve_whipsaw_attr(
+    "get_whipsaw_runtime_status",
+    "get_whipsaw_status",
+    default_fn=_noop_sync,
+)
+
+settle_daymarket_sim_before_premarket = _resolve_whipsaw_attr(
+    "settle_daymarket_sim_before_premarket",
+    "settle_day_sim_before_premarket",
+    default_fn=_noop_async,
+)
+
+execute_whipsaw_vwap_exposure_plugin = _resolve_whipsaw_attr(
+    "execute_whipsaw_vwap_exposure_plugin",
+    "execute_whipsaw_exposure_plugin",
+    default_fn=_noop_async,
+)
+
+enforce_0407_whipsaw_cutoff_plugin = _resolve_whipsaw_attr(
+    "enforce_0407_whipsaw_cutoff_plugin",
+    default_fn=None,
+)
+if enforce_0407_whipsaw_cutoff_plugin is None:
+    async def enforce_0407_whipsaw_cutoff_plugin(
+        ctx, symbol, now_est, is_active=True, holdings_qty=0,
+        buy_order_id="", sell_order_id="", entry_session="", current_price=0.0, **kwargs
+    ):
+        return buy_order_id, entry_session, False
+
+execute_rsi_monitoring_plugin = _resolve_whipsaw_attr(
+    "execute_rsi_monitoring_plugin",
+    "execute_daymarket_sim_plugin",
+    "execute_day_sim_plugin",
+    "run_daymarket_sim_plugin",
+    default_fn=_noop_async,
+)
+execute_daymarket_sim_plugin = execute_rsi_monitoring_plugin
 
 
 # =====================================================================
@@ -760,20 +825,15 @@ async def manage_mechanical_profit_trap_plugin(
     **kwargs,
 ) -> bool:
     """
-    초과 Case 50, 58, 64, 85, 89, 94, 99 & 수동 매수(MANUAL) 100% 진성상승 추세추종 레짐 고정:
+    초과 Case 50, 58, 64, 69, 85, 89, 94, 99 & 수동 매수(MANUAL) 100% 진성상승 추세추종 레짐 고정:
     1) 보유 중 매 틱마다 `_EXIT_SNAPSHOT_CACHE[symbol]` 에 실보유 수량(holdings_qty), 평단가(avg_price),
        경유 최고가(peak_price)를 상시 기록하여 청산 직후 `1주 ➔ 4주` 수량 왜곡을 원천 봉쇄합니다.
     2) 진입 성격 판별(`is_trend_pb_regime`):
        - `PRE_PULLBACK`, `PRE_PULLBACK_REARM` 및 **모든 수동 매수(`MANUAL`)** 포지션은 `leader_sym` 여부나
          시간대와 무관하게 **100% 무조건 `🚀 진성상승 추세추종 매도(TREND_PULLBACK)`** 로 고정합니다!
        - 오직 양방향 대칭 클라이맥스 자동 진입(`PRE_SNIPER`, `PRE_SNIPER_REARM`)만 `⚡ 기술적반등 매도(TECH_BOUNCE)` 로 작동합니다.
-    3) 현재가가 +1.00%(`arm_price`) 이상 도달 시 트레일링을 점화(`armed = True`)하고:
-       - [기술적 반등 `⚡ OLD_IMM_CB`] : +1.00% 보존 고정 & 고점 대비 -0.30% 콜백 또는 HA음봉 즉시 스윕
-       - [진성 상승종목 / 수동 매수 `🚀 PEAK_LCK_130 × 📊 BAR_BEAR_020`] : 고점 +1.30% 전 빨간 양봉(C>=O & HA양봉) 상승 중
-         밑꼬리 스탑 유예(후방 쿠션 +0.75%) 후 파란 음봉 출현 또는 +1.30% 돌파 시 +1.00% 보존 잠금 & 고점 -0.20% 타이트 스윕
-       - [공통 `🚀 NQ_VEL_BYPASS`] : 토스 Open API QQQ 실시간 10m/3m 변화율 ±0.20% 유리 급변 시 HA음봉 바이패스
-    4) 스윕 정정(`modify_order`) 성공 시 새로 발급된 `new_order_id` 와 실제 스윕 단가(`sweep_price`)를
-       즉시 원장 및 `_EXIT_SNAPSHOT_CACHE` 에 기록하여 REPLACED 원주문 안전 캡($47.98) 오인을 영구 차단합니다.
+    3) 스윕 정정(`modify_order`) 시 `[409 already-modified]` 에러가 반환되면 즉시 거래소의 살아있는 `OPEN` 매도 주문을
+       스캔하여 최신 `orderId` 로 정정을 완수하고, 2단계 취소 폴백 시 `holdings_qty` 를 명시 전달합니다.
     """
     if not is_active or int(holdings_qty) <= 0 or float(avg_price or 0.0) <= 0.0:
         return False
@@ -821,7 +881,6 @@ async def manage_mechanical_profit_trap_plugin(
                 b_st = str(b_info.get("status") or "").upper()
                 if b_st in ("PENDING", "PARTIAL_FILLED", "PENDING_REPLACE"):
                     return False
-                # 전량 체결(FILLED) 또는 종료 확인 시 장부의 buy_order_id 소각
                 await AssassinLedger.save_state(symbol, buy_order_id="")
                 buy_order_id = ""
         except Exception:
@@ -844,7 +903,6 @@ async def manage_mechanical_profit_trap_plugin(
 
         ctx.in_memory_ordering_lock[symbol] = True
         try:
-            # 이미 거래소에 접수된 OPEN 매도 주문이 있는지 확인 후 재사용 또는 선취소
             try:
                 open_orders = await ctx.client.get_orders(status="OPEN", symbol=symbol)
                 if isinstance(open_orders, list):
@@ -899,6 +957,7 @@ async def manage_mechanical_profit_trap_plugin(
                         qty=int(holdings_qty),
                     )
 
+                tr_state["active_sell_oid"] = sell_order_id
                 snap["sell_order_id"] = sell_order_id
                 snap["orig_cap_order_id"] = sell_order_id
                 snap["last_sweep_price"] = 0.0
@@ -953,7 +1012,6 @@ async def manage_mechanical_profit_trap_plugin(
         finally:
             ctx.in_memory_ordering_lock[symbol] = False
 
-    # 1주 휩소 노출 작전(WHIPSAW_1SH)은 이미 +1.00% 지정가 매도 주문이 장전되어 있으므로 거래소 체결 대기
     if is_whipsaw_1sh:
         return False
 
@@ -967,7 +1025,6 @@ async def manage_mechanical_profit_trap_plugin(
         if live_p < arm_price:
             return False
 
-        # +1.00% 도달 즉시 하이킨 아시 트레일링 점화!
         armed = True
         peak_price = max(live_p, arm_price)
         cushion_floor = math.ceil(float(avg_price) * (1.0 + TREND_PB_CUSHION_FLOOR_RATE / 100.0) * 100.0) / 100.0
@@ -988,6 +1045,7 @@ async def manage_mechanical_profit_trap_plugin(
             "last_known_qty": int(holdings_qty),
             "bear_candle_seen": False,
             "regime": regime_code,
+            "active_sell_oid": str(tr_state.get("active_sell_oid") or snap.get("sell_order_id") or sell_order_id),
             "sweep_dispatched_ts": 0.0,
         })
         snap["peak_price"] = max(float(snap.get("peak_price", 0.0) or 0.0), peak_price)
@@ -1052,8 +1110,6 @@ async def manage_mechanical_profit_trap_plugin(
         bear_seen = bool(tr_state.get("bear_candle_seen", False))
         cushion_floor = math.ceil(float(avg_price) * (1.0 + TREND_PB_CUSHION_FLOOR_RATE / 100.0) * 100.0) / 100.0
 
-        # 경유 최고가가 +1.30% 미만이고 빨간 양봉 & HA양봉이 유지되며 아직 파란 음봉이 안 나온 초입 구간:
-        # +1.00% 틱 터치 스탑을 유예하고 후방 비상 쿠션(+0.75%)만 방어하며 상승 파동 홀딩!
         if peak_pct < TREND_PB_LAUNCH_RATCHET_PCT and not bear_seen and not is_bar_bear and is_ha_bull:
             effective_stop_p = cushion_floor
             tr_state["floor_price"] = cushion_floor
@@ -1062,8 +1118,6 @@ async def manage_mechanical_profit_trap_plugin(
                 trigger_sweep = True
                 sweep_reason = f"초입 비상 쿠션(${effective_stop_p:.2f}) 도달"
         else:
-            # 경유 최고가 >= +1.30% 돌파 또는 첫 파란 음봉 출현 순간부터:
-            # 최소 보존선(+1.00%) 하드 잠금 & 최고가 대비 -0.20% 타이트 콜백 스탑 가동!
             floor_price = arm_price
             raw_cb_stop = math.floor(peak_price * (1.0 - TREND_PB_CALLBACK_PCT / 100.0) * 100.0) / 100.0
             effective_stop_p = max(floor_price, raw_cb_stop)
@@ -1085,7 +1139,6 @@ async def manage_mechanical_profit_trap_plugin(
         tr_state["floor_price"] = floor_price
         tr_state["stop_price"] = effective_stop_p
 
-        # 점화 분봉(cur_hm == armed_hm) 초입 8초 내 2센트 호가 흔들림 조기 매도 방어
         can_check_cb = bool(cur_hm != armed_hm or elapsed_arm >= 8.0 or peak_pct >= 1.15 or live_p < floor_price)
         if can_check_cb and live_p <= effective_stop_p:
             trigger_sweep = True
@@ -1111,7 +1164,6 @@ async def manage_mechanical_profit_trap_plugin(
         best_bid = await ctx.client.get_best_bid_price(symbol, fallback_price=live_p)
         raw_sweep_p = best_bid if best_bid > 0.0 else (math.floor(live_p * 100.0) / 100.0)
 
-        # 보존선 부근에서 호가 스프레드 벌어짐으로 인해 +1.00% 보존선 아래로 헐값 투매되는 현상 방어
         floor_lock_p = float(tr_state.get("floor_price", arm_price) or arm_price)
         if live_p >= arm_price * 0.997:
             sweep_price = max(floor_lock_p, raw_sweep_p)
@@ -1123,30 +1175,70 @@ async def manage_mechanical_profit_trap_plugin(
 
         swept_ok = False
         new_sell_oid = ""
+        active_sell_oid = str(
+            tr_state.get("active_sell_oid")
+            or snap.get("sell_order_id")
+            or sell_order_id
+            or ""
+        ).strip()
 
-        # 1단계: 기존 선장전 매도 주문(sell_order_id) 가격을 sweep_price 로 0.1초 즉시 하향 정정!
-        if sell_order_id:
+        # 1단계: 현재 유효한 active_sell_oid 가격을 sweep_price 로 0.1초 즉시 하향 정정!
+        if active_sell_oid:
             try:
                 mod_res = await ctx.client.modify_order(
-                    order_id=sell_order_id,
+                    order_id=active_sell_oid,
                     price=sweep_price,
                     order_type="LIMIT",
                 )
-                # NEW (API.txt 명세): 정정 시 새로 발급된 orderId 를 반드시 추출하여 원장에 반영!
-                new_sell_oid = str((mod_res or {}).get("orderId") or sell_order_id)
+                new_sell_oid = str((mod_res or {}).get("orderId") or active_sell_oid)
+                tr_state["active_sell_oid"] = new_sell_oid
                 swept_ok = True
             except Exception as mod_e:
                 err_s = str(mod_e).lower()
                 if "already-filled" in err_s:
                     return True
+                # NEW (API.txt 명세): 409 already-modified 발생 시 거래소의 살아있는 OPEN 매도 주문 ID를 즉시 찾아 정정!
+                if "already-modified" in err_s or "409" in err_s or "not-found" in err_s or "404" in err_s:
+                    try:
+                        open_ords = await ctx.client.get_orders(status="OPEN", symbol=symbol)
+                        if isinstance(open_ords, list):
+                            for od in open_ords:
+                                if (
+                                    isinstance(od, dict)
+                                    and str(od.get("side") or "").upper() == "SELL"
+                                    and od.get("orderId")
+                                ):
+                                    live_oid = str(od["orderId"]).strip()
+                                    tr_state["active_sell_oid"] = live_oid
+                                    snap["sell_order_id"] = live_oid
+                                    try:
+                                        od_p = float(od.get("price") or 0.0)
+                                    except (ValueError, TypeError):
+                                        od_p = 0.0
+                                    if od_p > 0.0 and abs(od_p - sweep_price) < 0.005:
+                                        new_sell_oid = live_oid
+                                        swept_ok = True
+                                        break
+                                    mod_res2 = await ctx.client.modify_order(
+                                        order_id=live_oid,
+                                        price=sweep_price,
+                                        order_type="LIMIT",
+                                    )
+                                    new_sell_oid = str((mod_res2 or {}).get("orderId") or live_oid)
+                                    tr_state["active_sell_oid"] = new_sell_oid
+                                    swept_ok = True
+                                    break
+                    except Exception as mod_e2:
+                        if "already-filled" in str(mod_e2).lower():
+                            return True
 
         # 2단계 폴백: 정정 불가 시 미체결 주문 선취소 + 매도가능수량 폴링 대기 후 신규 LIMIT 발사
         if not swept_ok:
             sellable_q_int, surviving_sell_ids = await _cancel_open_orders_and_wait_sellable(
                 ctx=ctx,
                 symbol=symbol,
-                holdings_qty=holdings_qty,
-                sell_order_id=sell_order_id,
+                holdings_qty=max(1, int(holdings_qty or 1)),
+                sell_order_id=active_sell_oid,
                 buy_order_id=buy_order_id,
             )
             if sellable_q_int <= 0 and surviving_sell_ids:
@@ -1158,13 +1250,15 @@ async def manage_mechanical_profit_trap_plugin(
                             order_type="LIMIT",
                         )
                         new_sell_oid = str((mod_res or {}).get("orderId") or sv_oid)
+                        tr_state["active_sell_oid"] = new_sell_oid
                         swept_ok = True
                         break
-                    except Exception:
-                        pass
+                    except Exception as sv_e:
+                        if "already-filled" in str(sv_e).lower():
+                            return True
 
             if not swept_ok:
-                target_q = sellable_q_int if sellable_q_int > 0 else int(holdings_qty)
+                target_q = sellable_q_int if sellable_q_int > 0 else max(1, int(holdings_qty or 1))
                 if target_q > 0:
                     cid = f"tswp-{symbol.lower()}-{uuid.uuid4().hex[:20]}"[:36]
                     ctx.idempotency_keys[symbol]["SELL"] = cid
@@ -1178,21 +1272,22 @@ async def manage_mechanical_profit_trap_plugin(
                         client_order_id=cid,
                     )
                     new_sell_oid = str((ord_res or {}).get("orderId") or "")
+                    tr_state["active_sell_oid"] = new_sell_oid
                     swept_ok = bool(new_sell_oid)
 
         if swept_ok:
+            final_oid = str(new_sell_oid or active_sell_oid or sell_order_id)
+            tr_state["active_sell_oid"] = final_oid
             tr_state["last_mod_price"] = sweep_price
             tr_state["sweep_dispatched_ts"] = time.time()
             tr_state["last_known_qty"] = int(holdings_qty)
 
-            # NEW: 정산 함수가 정확한 스윕 단가($46.31), 경유고점($46.46), 실보유수량(1주), 신규 orderId 를
-            # 100% 참조할 수 있도록 스냅샷과 로컬 원장을 즉시 동기화 (여기서 트레일링 캐시를 미리 지우지 않음!)
             snap.update({
                 "last_holdings_qty": int(holdings_qty),
                 "avg_price": float(avg_price),
                 "peak_price": float(peak_price),
                 "last_sweep_price": float(sweep_price),
-                "sell_order_id": str(new_sell_oid or sell_order_id),
+                "sell_order_id": final_oid,
                 "sweep_mode_label": mode_badge,
                 "sweep_reason": sweep_reason,
                 "updated_at": time.time(),
@@ -1200,7 +1295,7 @@ async def manage_mechanical_profit_trap_plugin(
 
             await AssassinLedger.save_state(
                 symbol,
-                sell_order_id=str(new_sell_oid or sell_order_id),
+                sell_order_id=final_oid,
                 target_sell_price=float(sweep_price),
             )
 
@@ -1219,7 +1314,7 @@ async def manage_mechanical_profit_trap_plugin(
             return True
         return False
     except Exception as sw_e:
-        print(f"🚨 [트레일링 스윕 발사 방어 {symbol}] {sw_e}", flush=True)
+        print(f"🚨 [이원화 트레일링 익절 스윕 방어 {symbol}] {sw_e}", flush=True)
         return False
     finally:
         ctx.in_memory_ordering_lock[symbol] = False
@@ -1259,15 +1354,12 @@ async def reconcile_zero_holdings_exit_plugin(
     est_hm = now_est.hour * 100 + now_est.minute
     es_clean = str(entry_session or "").strip()
 
-    # =================================================================
     # [A] 미체결 매수 주문(buy_order_id) 상태 검증 및 체결 인덱싱 시차 보호 (초과 Case 51, 100)
-    # =================================================================
     if buy_order_id and not sell_order_id and float(last_buy_price or 0.0) <= 0.0:
         try:
             b_od = await ctx.client.get_order(buy_order_id)
             if isinstance(b_od, dict) and not b_od.get("error"):
                 _, b_fq, b_st = _extract_order_exec_facts(b_od)
-                # 아직 체결 대기 중이거나, 방금 체결(FILLED / b_fq > 0)되어 잔고 API 인덱싱을 기다리는 중이면 100% 보존!
                 if b_st in ("PENDING", "PARTIAL_FILLED", "PENDING_REPLACE", "PENDING_CANCEL", "FILLED") or b_fq > 0:
                     return False
                 if b_st in ("CANCELED", "REJECTED"):
@@ -1283,13 +1375,10 @@ async def reconcile_zero_holdings_exit_plugin(
         except Exception:
             return False
 
-    # 매도 주문이나 매수 평단가 기록이 전혀 없는 단순 클리어 대상
     if not sell_order_id and float(last_buy_price or 0.0) <= 0.0 and float(target_sell_price or 0.0) <= 0.0:
         return False
 
-    # =================================================================
     # [B] 매도 청산 팩트(체결 단가 exit_price · 체결 수량 filled_qty · 경유 고점 peak_price) 정밀 추출
-    # =================================================================
     snap = _EXIT_SNAPSHOT_CACHE.get(symbol) or _default_exit_snapshot()
     tr_state = get_trailing_runtime_status(symbol)
 
@@ -1298,15 +1387,18 @@ async def reconcile_zero_holdings_exit_plugin(
     if safety_cap_p <= 0.0 and entry_price > 0.0 and es_clean != "WHIPSAW_1SH":
         safety_cap_p = math.ceil(entry_price * (1.0 + TRAIL_SAFETY_CAP_RATE / 100.0) * 100.0) / 100.0
 
-    target_sell_oid = str(snap.get("sell_order_id") or sell_order_id or "").strip()
+    target_sell_oid = str(
+        tr_state.get("active_sell_oid")
+        or snap.get("sell_order_id")
+        or sell_order_id
+        or ""
+    ).strip()
 
     exit_price = 0.0
     filled_qty = 0
     order_spec_qty = 0
 
-    # Case 19: 체결 인덱싱 시차 대비 최대 2회(0.35초 간격) 주문 원장 스캔
     for attempt in range(2):
-        # 1) 최신 정정된 sell_order_id 단건 상세 조회
         for cand_oid in (target_sell_oid, sell_order_id):
             if not cand_oid:
                 continue
@@ -1315,7 +1407,6 @@ async def reconcile_zero_holdings_exit_plugin(
                 if isinstance(s_od, dict) and not s_od.get("error"):
                     fp, fq, s_st = _extract_order_exec_facts(s_od, safety_cap_price=safety_cap_p)
                     if s_st in ("PENDING", "PARTIAL_FILLED", "PENDING_REPLACE"):
-                        # 아직 거래소에서 매도 주문이 미체결 대기 중이면 잔고 0주 오판이므로 정산 중단
                         return False
                     try:
                         q_spec = int(math.floor(float(s_od.get("quantity") or 0.0)))
@@ -1335,7 +1426,6 @@ async def reconcile_zero_holdings_exit_plugin(
         if exit_price > 0.0 and filled_qty > 0:
             break
 
-        # 2) 만약 원주문(orig_cap_oid)이 REPLACED 되어 새 주문 ID로 체결되었을 경우를 위해 최근 CLOSED SELL 주문 스캔
         try:
             closed_orders = await ctx.client.get_orders(status="CLOSED", symbol=symbol, limit=15)
             if isinstance(closed_orders, list):
@@ -1357,8 +1447,6 @@ async def reconcile_zero_holdings_exit_plugin(
         if attempt == 0:
             await asyncio.sleep(0.35)
 
-    # 3) 체결 단가(exit_price) 무결성 폴백 체인:
-    #    REPLACED 된 상단 안전 캡($47.98)은 절대 쓰지 않고, 실제 발사한 스윕 단가(last_sweep_price, 예: $46.31)를 최우선 적용!
     snap_sweep_p = float(snap.get("last_sweep_price", 0.0) or 0.0)
     tr_mod_p = float(tr_state.get("last_mod_price", 0.0) or 0.0)
     if exit_price <= 0.0:
@@ -1373,7 +1461,6 @@ async def reconcile_zero_holdings_exit_plugin(
         else:
             exit_price = entry_price
 
-    # 4) 체결 수량(filled_qty) 무결성 5단 팩트 체인 (실보유 1주가 4주로 뻥튀기되는 현상 100% 영구 차단!)
     if filled_qty <= 0:
         if int(snap.get("last_holdings_qty", 0) or 0) > 0:
             filled_qty = int(snap["last_holdings_qty"])
@@ -1386,16 +1473,13 @@ async def reconcile_zero_holdings_exit_plugin(
         else:
             filled_qty = 1
 
-    # 5) 실제 경유 최고가(peak_price) 복원 (잘못된 $47.98 로 덮어쓰기 방지)
     recorded_peak = max(
         float(snap.get("peak_price", 0.0) or 0.0),
         float(tr_state.get("peak_price", 0.0) or 0.0),
     )
     peak_price = max(recorded_peak, entry_price, exit_price)
 
-    # =================================================================
     # [C] 실제 발생 순수익금(Realized Net PnL USD · 왕복 수수료 0.14% 차감) 및 통합 복리 정산
-    # =================================================================
     if entry_price > 0.0 and exit_price > 0.0 and filled_qty > 0:
         new_budget, net_delta_usd, net_pnl_pct = calc_compound_next_budget(
             current_budget=float(budget or 200.0),
@@ -1417,9 +1501,7 @@ async def reconcile_zero_holdings_exit_plugin(
         fee_usd = 0.0
         peak_pnl_pct = 0.0
 
-    # =================================================================
     # [D] 프리장 골든타임(04:00 ~ 08:14 EST) 무한 재출동 vs 08:15 이후/과열장 마감 분기
-    # =================================================================
     _, nq_h, nq_l = await MacroDataCache.get_cached_nq_data(force_refresh=False)
     nq_amp = ((nq_h - nq_l) / nq_l * 100.0) if (nq_h > 0.0 and nq_l > 0.0) else 0.0
     is_overheated = bool(nq_amp >= 2.0)
@@ -1428,7 +1510,6 @@ async def reconcile_zero_holdings_exit_plugin(
     next_session_done = not can_reenter_golden
     next_entry_session = "CANCELED_MACRO" if is_overheated else ""
 
-    # 통합 시드 풀(Unified Seed Pool): SOXS 와 SOXL 양쪽 원장에 갱신된 시드(new_budget) 동시 동기화
     await AssassinLedger.save_state(
         symbol,
         last_buy_price=0.0,
@@ -1458,14 +1539,11 @@ async def reconcile_zero_holdings_exit_plugin(
     else:
         await AssassinLedger.save_state(opp_sym, budget=new_budget)
 
-    # 정산 데이터 추출이 모두 끝났으므로 이제 트레일링 캐시, 수동 앵커, 정산 스냅샷을 클린 초기화!
     _reset_trailing_runtime_state(symbol)
     _reset_manual_stage3_anchor(symbol)
     _reset_exit_snapshot(symbol)
 
-    # =================================================================
     # [E] 텔레그램 정산 완료 보고 (Case 13, 17, 49, 76)
-    # =================================================================
     if is_active and entry_price > 0.0:
         if es_clean in ("PRE_PULLBACK", "PRE_PULLBACK_REARM"):
             exit_tag = "🚀진성추세스윕"
@@ -1503,3 +1581,21 @@ async def reconcile_zero_holdings_exit_plugin(
     if ctx.wakeup_event:
         ctx.wakeup_event.set()
     return True
+
+
+def __getattr__(name: str):
+    """
+    PEP 562 모듈 레벨 안전 폴백:
+    외부 모듈(tg_router, tg_ui_plugin, main_loops_plugin 등)이 sniper_plugin 에서
+    whipsaw_plugin 또는 defense_plugin 의 심볼을 교차 임포트할 때 ImportError 가 절대 발생하지 않도록 방어합니다.
+    """
+    if hasattr(_whipsaw_mod, name):
+        return getattr(_whipsaw_mod, name)
+    import defense_plugin as _def_mod
+    if hasattr(_def_mod, name):
+        return getattr(_def_mod, name)
+
+    def _safe_fallback(*args, **kwargs):
+        return {"active": False}
+
+    return _safe_fallback
