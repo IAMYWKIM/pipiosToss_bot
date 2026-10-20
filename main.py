@@ -1,6 +1,7 @@
 # =====================================================================
 # FILE: main.py
 # 목적: 인피니트 스노우볼 듀얼 스나이퍼(SOXS & SOXL) 메인 엔트리포인트,
+#       서버 기동 및 /update 재기동 완료 즉시 "✅ 서버가 정상 작동 중입니다." 텔레그램 자동 브리핑(_send_boot_ready_notification),
 #       SIGTERM/SIGINT 0.1초 고속 하드 킬 핸들러(_install_fast_shutdown_handlers — 90초 재시작 멈춤 영구 소각),
 #       tg_router.inject_dependencies(api_client, chat_id, wakeup_event, shared_rsi_state) 최우선 직결,
 #       제2헌법 종합매매(BROKERAGE) 계좌 accountSeq 실전 헤더 검증 및 강제 바인딩(ensure_account_seq_locked),
@@ -9,11 +10,12 @@
 #       메인 전술 루프(assassin_loop) 통합 관제 코어
 # =====================================================================
 # MODIFIED: 제1 ~ 제6헌법 및 100대 엣지 케이스 방어망(Case 01 ~ Case 100) 100% 결속
-# NEW: 1) `_install_fast_shutdown_handlers()` 탑재로 `systemctl restart / stop` 시 발생하는
+# NEW: 1) `_send_boot_ready_notification(bot, chat_id, api_client)` 신설:
+#         /update 재기동 또는 systemctl restart 완료 직후 텔레그램으로
+#         "✅ 서버가 정상 작동 중입니다." 메시지와 현재 커밋 해시·accountSeq·전원·통합시드를 자동 전송
+#      2) `_install_fast_shutdown_handlers()` 탑재로 `systemctl restart / stop` 시 발생하는
 #         90초 타임아웃(`State 'stop-sigterm' timed out`)을 0.1초 즉시 종료(os._exit(0))로 영구 해결
-#      2) `_bind_telegram_router` 최상단에 `tg_router.inject_dependencies(api_client, chat_id, wakeup_event, shared_rsi_state)`
-#         명시적 직결로 `/start`, `/update`, `/avwap`, `/sync`, `/settlement` 무응답 현상 영구 소각
-#      3) `_call_plugin_adaptive(fn, **kwargs)` 및 `_start_candle_recorder_task` 듀얼 심볼 자동 매핑 탑재
+#      3) `_bind_telegram_router` 최상단에 `tg_router.inject_dependencies(api_client, chat_id, wakeup_event, shared_rsi_state)` 직결
 #      4) 초과 Case 97, 98, 99, 100 — 프리장 첫 RSI>=79.9 상승주도주(👑 leader_sym) 실시간 갱신,
 #         15:00~15:58 EST 미익절 정규장 VWAP 탈출, 이원화 매도 믹스, 30초 타임쉴드 정정 직후 실잔고 즉시 재조회 결속
 
@@ -21,10 +23,12 @@ import os
 import sys
 import math
 import time
+import html
 import signal
 import inspect
 import asyncio
 import logging
+import subprocess
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
@@ -135,6 +139,77 @@ def _install_fast_shutdown_handlers():
         signal.signal(signal.SIGINT, _fast_exit_handler)
     except Exception:
         pass
+
+
+def _get_current_git_commit_sync() -> str:
+    """제1헌법 및 Case 05: 백그라운드 스레드에서 현재 로컬 Git HEAD 커밋 해시(7자리)를 안전 조회합니다."""
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+        return out if out else "main"
+    except Exception:
+        return "main"
+
+
+async def _send_boot_ready_notification(
+    bot: Bot,
+    chat_id: int,
+    api_client: TossApiClient,
+):
+    """
+    NEW (Case 11, 13, 17):
+    `/update` 명령 재기동 또는 데몬 재시작 직후 모든 코어 루프와 계좌 락온이 완료되었을 때
+    사용자에게 "✅ 서버가 정상 작동 중입니다." 확인 메시지를 텔레그램으로 즉시 자동 전송합니다.
+    """
+    if not bot or not chat_id:
+        return
+    try:
+        commit_hash = await asyncio.wait_for(
+            asyncio.to_thread(_get_current_git_commit_sync),
+            timeout=5.0,
+        )
+        raw_state = await AssassinLedger.get_state("SOXS")
+        (
+            _,
+            budget,
+            _,
+            is_compound,
+            _,
+            is_active,
+            *_,
+        ) = _unpack_ledger_state_safe(raw_state)
+
+        acc_seq = (
+            getattr(api_client, "account_seq", None)
+            or getattr(api_client, "_account_seq", None)
+            or getattr(api_client, "accountSeq", None)
+            or 1
+        )
+        pwr_str = "🟢 ON" if is_active else "🔴 OFF"
+        mode_str = "통합 복리" if is_compound else "고정 단리"
+        now_kst_str = datetime.now(KST_TZ).strftime("%H:%M:%S")
+
+        boot_msg = (
+            f"🟢 <b>[듀얼 스나이퍼 서버 기동 완료]</b>\n"
+            f"✅ <b>서버가 정상 작동 중입니다.</b>\n"
+            f"▫️ 버전: <code>{html.escape(commit_hash)}</code> · 계좌: 🔒 <code>accountSeq={acc_seq}</code>\n"
+            f"▫️ 상태: {pwr_str} · 시드: <b>${budget:,.2f}</b> ({mode_str} · {now_kst_str} KST)"
+        )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=boot_msg,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        print(f"⚠️ [기동 완료 텔레그램 알림 방어] {e}", flush=True)
 
 
 async def _call_plugin_adaptive(fn, **kwargs):
@@ -859,8 +934,6 @@ def _bind_telegram_router(
     최우선 직결 호출하고, 기타 초기화 함수 시그니처(setup_telegram_router 등)와 router 등록까지
     100% 무결하게 Dispatcher에 바인딩합니다.
     """
-    setup_called = False
-
     # 1순위: 서버 tg_router.py 표준 의존성 주입 함수 `inject_dependencies` 직결
     if hasattr(tg_router, "inject_dependencies") and callable(tg_router.inject_dependencies):
         try:
@@ -870,7 +943,6 @@ def _bind_telegram_router(
                 wakeup_event,
                 shared_rsi_state,
             )
-            setup_called = True
             print("✅ [텔레그램 라우터 inject_dependencies 바인딩 완료]", flush=True)
         except Exception as e:
             print(f"🚨 [inject_dependencies 호출 방어] {e}", flush=True)
@@ -923,7 +995,6 @@ def _bind_telegram_router(
                         if k not in call_kwargs:
                             call_kwargs[k] = v
                 res = fn(*call_args, **call_kwargs)
-                setup_called = True
                 if hasattr(res, "message") and hasattr(res, "callback_query"):
                     try:
                         dp.include_router(res)
@@ -1088,6 +1159,13 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
+
+    # NEW: 서버 기동 및 /update 재기동 완료 즉시 텔레그램으로 "✅ 서버가 정상 작동 중입니다." 자동 타전
+    await _send_boot_ready_notification(
+        bot=bot,
+        chat_id=chat_id,
+        api_client=api_client,
+    )
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), handle_signals=False)
