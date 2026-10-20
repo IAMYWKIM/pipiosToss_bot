@@ -10,15 +10,21 @@
 # MODIFIED: 초과 Case 79, 80, 95, 96 & 98 — 03:58 ~ 04:07 EST 듀얼 1주 휩소 노출 작전(WHIPSAW_1SH)은 당일 NQ=F >= 2.0% 과열차단(CANCELED_MACRO)일에도
 #           차단되지 않고 본진과 별개로 데이장 VWAP(ewm_state["day_vwap"] 우선) 0.5% 역산 가격(VWAP / 1.005)에 1주 진입하여 매수 체결가 대비 +1.00%(avg_price * 1.01) 익절을 추구하며,
 #           04:07:00 EST 정리 직후 buy_order_id="" 원자적 소각 및 과열차단(CANCELED_MACRO)을 복원하여 본진 시드를 보호
+# NEW: 1) 장중 재기동/04:00 전환 시 ewm_state["day_vwap"] 결측(0.0)이면 즉시 1분봉 200개를 조회해 온디맨드(On-Demand) 복원
+#      2) 3파동 왕복장 등에서 SOXS·SOXL 양쪽 모두 현재가 <= 데이장 VWAP 인 날에도 포기하지 않고 괴리율 상위 종목을 100% 선정하되
+#         매수 덫 가격(calc_buy_p)이 항상 현재가 아래 하단(-0.5% 역산)에 걸리도록 보장
+#      3) 03:58~03:59 EST 토스 장전환 공백(422 order-hours-closed) 시 텔레그램 사전 락온 알림 발송 및 고유 clientOrderId로 04:00:00 EST 즉시 발사 보장
 
 import math
 import time
 import asyncio
+import html
 from datetime import datetime
 
 from quant_engine import (
     AssassinLedger,
     MacroDataCache,
+    calculate_rsi_1m,
 )
 from daymarket_sim_plugin import (
     EST_TZ,
@@ -55,7 +61,8 @@ from daymarket_sim_plugin import (
 
 
 # MODIFIED: 초과 Case 79, 92, 95, 96 & 98 — 03:58 ~ 04:06:59 EST (9분간) 듀얼(SOXS/SOXL) 데이장 누적 VWAP 비교 및
-#           현재가 > 데이장 VWAP 종목 기준 하단 0.5% 역산(VWAP / 1.005) 1주 지정가 매수 덫 ➔ 체결 시 매수가 대비 +1.00%(avg_price * 1.01) 익절 매도 덫 전용 플러그인
+#           VWAP 상단 종목(양쪽 모두 VWAP 하회 시 상대 괴리율 1위 종목 폴백) 기준 하단 0.5% 역산(VWAP / 1.005) 1주 지정가 매수 덫
+#           ➔ 체결 시 매수가 대비 +1.00%(avg_price * 1.01) 익절 매도 덫 전용 플러그인
 async def execute_whipsaw_vwap_exposure_plugin(
     ctx,
     symbol: str,
@@ -89,47 +96,103 @@ async def execute_whipsaw_vwap_exposure_plugin(
             _WHIPSAW_SIM_CACHE["whipsaw_order_fired"] = False
             _WHIPSAW_SIM_CACHE["whipsaw_cutoff_done"] = False
             _WHIPSAW_SIM_CACHE["whipsaw_last_dump_tick"] = 0.0
+            _WHIPSAW_SIM_CACHE["whipsaw_prelock_notified"] = False
+            _WHIPSAW_SIM_CACHE["whipsaw_skip_notified"] = False
+            _WHIPSAW_SIM_CACHE["whipsaw_last_err"] = ""
 
         if _WHIPSAW_SIM_CACHE.get("whipsaw_order_fired", False):
             return
 
         total_shared_hold = sum(int(v) for v in (ctx.shared_holdings or {}).values())
         if total_shared_hold > 0 or holdings_qty > 0 or bool(buy_order_id):
+            if not _WHIPSAW_SIM_CACHE.get("whipsaw_skip_notified", False):
+                _WHIPSAW_SIM_CACHE["whipsaw_skip_notified"] = True
+                await ctx.notify_tg(
+                    "⚠️ <b>[듀얼 휩소 노출 작전 보류] 계좌 내 기존 보유 물량 또는 미체결 주문 감지</b>\n"
+                    f"▫️ 현재 보유 수량 합계: <code>{max(total_shared_hold, holdings_qty)}주</code>\n"
+                    "▫️ 조치: 기존 포지션 보호를 위해 금일 03:58 ~ 04:07 EST 1주 휩소 신규 진입을 패스합니다."
+                )
             _WHIPSAW_SIM_CACHE["whipsaw_order_fired"] = True
             return
 
-        # 1단계: SOXS와 SOXL 중 현재가가 자신의 데이장 누적 VWAP보다 높은 종목(cur_p > day_vwap) 스냅샷 선정
+        # 1단계: SOXS와 SOXL의 실시간 현재가 및 데이장 누적 VWAP(결측 시 온디맨드 200분봉 즉시 산출) 비교 스냅샷 선정
         if not _WHIPSAW_SIM_CACHE.get("whipsaw_target_sym"):
             prices_map = await ctx.client.get_current_prices_batch(("SOXS", "SOXL"))
-            if current_price > 0.0:
+            if current_price > 0.0 and prices_map.get(symbol, 0.0) <= 0.0:
                 prices_map[symbol] = current_price
 
-            candidates = []
+            above_vwap_candidates = []
+            all_candidates = []
+
             for cand_sym in ("SOXS", "SOXL"):
                 c_p = float(prices_map.get(cand_sym, 0.0))
+                if c_p <= 0.0:
+                    c_p = await ctx.client.get_current_price(cand_sym)
+
                 cand_st = ((ctx.shared_rsi_state or {}).get(cand_sym)) or {}
                 cand_ewm = cand_st.get("ewm_state") or {}
-                c_vwap = float(cand_ewm.get("day_vwap", 0.0)) or float(cand_st.get("vwap", 0.0))
+                c_vwap = float(cand_ewm.get("day_vwap", 0.0))
+
+                # NEW: 재기동 직후이거나 04:00 전환으로 day_vwap이 0.0인 경우 즉시 1분봉 200개를 조회해 온디맨드 복원!
+                if c_vwap <= 0.0:
+                    try:
+                        candles_1m = await ctx.client.get_1m_candles(cand_sym, count=200)
+                        if candles_1m:
+                            r_calc, v_calc, ewm_calc = await calculate_rsi_1m(candles_1m)
+                            if ctx.shared_rsi_state is not None and cand_sym in ctx.shared_rsi_state:
+                                ctx.shared_rsi_state[cand_sym]["value"] = r_calc
+                                ctx.shared_rsi_state[cand_sym]["vwap"] = v_calc
+                                ctx.shared_rsi_state[cand_sym]["ewm_state"] = ewm_calc
+                            c_vwap = float(ewm_calc.get("day_vwap", 0.0)) or float(v_calc or 0.0)
+                    except Exception as ve:
+                        print(f"🚨 [휩소 온디맨드 VWAP 복원 방어 {cand_sym}] {ve}", flush=True)
+
+                if c_vwap <= 0.0:
+                    c_vwap = float(cand_st.get("vwap", 0.0))
                 if cand_sym == symbol and c_vwap <= 0.0 and day_vwap > 0.0:
                     c_vwap = float(day_vwap)
+                if c_vwap <= 0.0 and c_p > 0.0:
+                    c_vwap = c_p
 
                 c_p_fl = math.floor(c_p * 100.0) / 100.0
                 c_vwap_fl = round(c_vwap, 2)
-                if c_p_fl > 0.0 and c_vwap_fl > 0.0 and c_p_fl > c_vwap_fl:
+                if c_p_fl > 0.0 and c_vwap_fl > 0.0:
                     premium_ratio = (c_p_fl - c_vwap_fl) / c_vwap_fl * 100.0
-                    candidates.append((premium_ratio, cand_sym, c_p_fl, c_vwap_fl))
+                    item_tuple = (premium_ratio, cand_sym, c_p_fl, c_vwap_fl)
+                    all_candidates.append(item_tuple)
+                    if c_p_fl > c_vwap_fl:
+                        above_vwap_candidates.append(item_tuple)
 
-            if not candidates:
+            if not all_candidates:
                 return
 
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            best_prem, chosen_sym, chosen_spot, chosen_vwap = candidates[0]
+            # 1순위: 현재가 > 데이장 VWAP 종목 중 괴리율 1위 선정
+            # 2순위(W자 왕복장 폴백): 양쪽 모두 현재가 <= 데이장 VWAP일 경우 상대 괴리율 1위(VWAP 최근접) 종목 선정
+            if above_vwap_candidates:
+                above_vwap_candidates.sort(key=lambda x: x[0], reverse=True)
+                best_prem, chosen_sym, chosen_spot, chosen_vwap = above_vwap_candidates[0]
+                is_fallback_mode = False
+            else:
+                all_candidates.sort(key=lambda x: x[0], reverse=True)
+                best_prem, chosen_sym, chosen_spot, chosen_vwap = all_candidates[0]
+                is_fallback_mode = True
 
-            calc_buy_p = max(0.01, math.floor((chosen_vwap / WHIPSAW_BUY_REVERSE_FACTOR) * 100.0) / 100.0)
+            vwap_rev_p = max(0.01, math.floor((chosen_vwap / WHIPSAW_BUY_REVERSE_FACTOR) * 100.0) / 100.0)
+            spot_rev_p = max(0.01, math.floor((chosen_spot / WHIPSAW_BUY_REVERSE_FACTOR) * 100.0) / 100.0)
+
+            # 무비용 하단 매수 덫 원칙 사수: 역산 매수가가 현재가 이상이면 현재가 대비 -0.5% 역산가로 상한 캡 적용
+            if vwap_rev_p < chosen_spot:
+                calc_buy_p = vwap_rev_p
+                rev_basis_str = f"VWAP 0.5% 역산 하단 매수덫(${calc_buy_p:.2f})"
+            else:
+                calc_buy_p = spot_rev_p
+                rev_basis_str = f"양종목 VWAP하회 폴백 ➡️ 현재가 0.5% 역산 하단 매수덫(${calc_buy_p:.2f})"
+
             calc_sell_tp = math.ceil(calc_buy_p * WHIPSAW_SELL_PROFIT_FACTOR * 100.0) / 100.0
+            pos_rel_str = "상단 위치" if not is_fallback_mode else "최근접 상대강세"
             mode_desc = (
-                f"{chosen_sym} 현재가(${chosen_spot:.2f})가 데이장VWAP(${chosen_vwap:.2f}, +{best_prem:.2f}%) 상단 위치 "
-                f"➡️ VWAP 0.5% 역산 하단 매수덫(${calc_buy_p:.2f}) · 체결 시 +1.00% 익절 매도덫(${calc_sell_tp:.2f})"
+                f"{chosen_sym} 현재가(${chosen_spot:.2f}) 데이장VWAP(${chosen_vwap:.2f}, {best_prem:+.2f}%) {pos_rel_str} "
+                f"➡️ {rev_basis_str} · 체결 시 +1.00% 익절 매도덫(${calc_sell_tp:.2f})"
             )
 
             _WHIPSAW_SIM_CACHE["whipsaw_target_sym"] = chosen_sym
@@ -196,7 +259,10 @@ async def execute_whipsaw_vwap_exposure_plugin(
                 except Exception:
                     pass
 
-                idem_key = f"WHIP_{target_sym}_{today_str.replace('-', '')}_{est_hm}"[:36]
+                # NEW: 토스 서버의 clientOrderId 10분 결과 캐싱으로 인해 03:58~04:00 장전환 경계의 422 거절이
+                #      캐싱되는 현상을 원천 차단하기 위해 매 시도마다 고유 시퀀스를 부여합니다.
+                seq_tag = int(time.time() * 10) % 100000
+                idem_key = f"WHP_{target_sym}_{today_str.replace('-', '')}_{seq_tag}"[:36]
                 res = await ctx.client.create_order(
                     symbol=target_sym,
                     side="BUY",
@@ -238,7 +304,7 @@ async def execute_whipsaw_vwap_exposure_plugin(
                         else ""
                     )
                     await ctx.notify_tg(
-                        f"🌪️ <b>[듀얼 휩소 노출 작전 개시] {sym_icon}{target_sym} VWAP 0.5% 역산 1주 매수 덫 투하</b>\n"
+                        f"🌪️ <b>[듀얼 휩소 노출 작전 개시] {sym_icon}{target_sym} 0.5% 역산 1주 매수 덫 투하 완료!</b>\n"
                         f"▫️ 작전 시간: <code>03:58 ~ 04:07 EST (9분간 유지{macro_indep_note})</code>\n"
                         f"▫️ 선정 종목: <b>{sym_icon}{target_sym}</b> | 데이장 누적 VWAP: <code>${locked_vwap:.2f}</code>\n"
                         f"▫️ 타점 판정: <code>{mode_desc_str}</code>\n"
@@ -247,13 +313,29 @@ async def execute_whipsaw_vwap_exposure_plugin(
                     )
             except Exception as e:
                 err_str = str(e)
-                if (358 <= est_hm <= 359) and ("order-hours-closed" in err_str or "422" in err_str):
+                sym_icon = "🐻" if target_sym == "SOXS" else "🐂"
+                if ("order-hours-closed" in err_str or "422" in err_str) and (358 <= est_hm <= 400):
                     print(
-                        f"⏳ [듀얼 휩소 매수덫 대기 {target_sym}] 03:58~03:59 장전환 공백 감지 -> 04:00:00 EST 정각에 락온 타점(${target_buy_p:.2f})으로 자동 발사합니다.",
+                        f"⏳ [듀얼 휩소 매수덫 대기 {target_sym}] 장전환 공백 감지 -> 04:00:00 EST 프리장 개장 즉시 락온 타점(${target_buy_p:.2f})으로 자동 발사합니다.",
                         flush=True,
                     )
+                    if not _WHIPSAW_SIM_CACHE.get("whipsaw_prelock_notified", False):
+                        _WHIPSAW_SIM_CACHE["whipsaw_prelock_notified"] = True
+                        await ctx.notify_tg(
+                            f"⏳ <b>[03:58 듀얼 휩소 타점 사전 락온 완료] {sym_icon}{target_sym} (04:00:00 EST 개장 발사 대기)</b>\n"
+                            f"▫️ 락온 타점: <b>{sym_icon}{target_sym} 1주 매수덫 <code>${target_buy_p:.2f}</code></b> ➡️ 목표 매도덫 <code>${target_sell_p:.2f} (+1.00%)</code>\n"
+                            f"▫️ 판정 근거: <code>{mode_desc_str}</code>\n"
+                            "▫️ 상태: 토스 데이장 마감(16:50 KST) ~ 프리장 개장(17:00 KST / 04:00 EST) 전환 대기 중이며, <b>04:00:00 EST 정각 첫 틱에 거래소로 즉시 발사됩니다!</b>"
+                        )
                 else:
                     print(f"🚨 [듀얼 휩소 노출 작전 에러 {target_sym}] {err_str}", flush=True)
+                    if _WHIPSAW_SIM_CACHE.get("whipsaw_last_err") != err_str:
+                        _WHIPSAW_SIM_CACHE["whipsaw_last_err"] = err_str
+                        await ctx.notify_tg(
+                            f"🚨 <b>[듀얼 휩소 노출 작전 주문 에러 {sym_icon}{target_sym}]</b>\n"
+                            f"▫️ 목표 매수덫: <code>${target_buy_p:.2f}</code> (1주)\n"
+                            f"▫️ 사유: <code>{html.escape(err_str)}</code>"
+                        )
             finally:
                 ctx.in_memory_ordering_lock[target_sym] = False
 
@@ -347,7 +429,7 @@ async def enforce_0407_whipsaw_cutoff_plugin(
                 else:
                     next_action_desc = (
                         "미체결 1주 매수 덫 무비용 파기 ➡️ "
-                        "<b>04:07 ~ 08:14 EST 본진(대칭 클라이맥스 &amp; 07:00~ 추세눌림목) 정식 가동 개시</b>"
+                        "<b>04:07 ~ 08:14 EST 본진(대칭 클라이맥스 &amp; 07:00~ 추세눌림목 &amp; 10분봉 꺾임목) 정식 가동 개시</b>"
                     )
                 await ctx.notify_tg(
                     f"⏱️ <b>[04:07 타임쉴드 해제 {sym_icon}{symbol}] 휩소 1주 매수 덫 미체결 취소 완료 (비용 $0)</b>\n"
