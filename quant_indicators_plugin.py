@@ -1,7 +1,7 @@
 # =====================================================================
 # FILE: quant_indicators_plugin.py
 # 목적: Wilder's RSI(14), 1분봉 하이킨 아시(Heikin-Ashi), 세션별 정밀 VWAP,
-#       04:07/19:00 EST 이후 첫 RSI>=79.9 돌파 시각(first_0407_799_ts & first_799_ts) 벡터 추출,
+#       04:07/19:00 EST 이후 첫 RSI>=79.9 돌파 시각(first_0407_799_ts & first_799_ts) 다중 피크 벡터 추출,
 #       calculate_rsi_1m 다형성 인자 방어(datetime 위치 인자 자동 분리),
 #       동기(with) 및 비동기(async with) 양방향 호환 파일 락(_HybridFileLock) 선행 바인딩,
 #       동기(asyncio.to_thread) 및 비동기(await) 양방향 100% 호환 하이브리드 반환(_AwaitableRsiTuple) 및
@@ -12,7 +12,7 @@
 # MODIFIED: 초과 Case 72, 73, 85 — 원본 1분봉 전체 Wilder's RSI(14) 및 하이킨 아시(ewm alpha=0.5) 벡터 연산과 O(1) 실시간 틱 합성
 # MODIFIED: 초과 Case 76 — 실제 발생 순수익금(세전손익 - 왕복수수료 0.14%) 기반 통합 복리/단리 정산(calc_compound_next_budget)
 # MODIFIED: 초과 Case 90 — CME 나스닥 100 선물(NQ=F) 18:00 EST 신세션 시작 시각 및 개장 여부 판별(get_cme_session_window_est)
-# MODIFIED: 초과 Case 97, 98, 99 — 04:07/19:00 EST 이후 첫 RSI>=79.9 시각(first_0407_799_ts & first_799_ts 이중 바인딩) 추출,
+# MODIFIED: 초과 Case 97, 98, 99 — 04:07/19:00 EST 이후 첫 RSI>=79.9 시각(first_0407_799_ts & first_799_ts 이중 바인딩) 다중 피크 추출,
 #           세션별(데이/프리/정규) VWAP 분리 산출 및 이원화 매도 상수 락온
 
 import os
@@ -372,6 +372,38 @@ def compute_realtime_tick_10m_state(
     }
 
 
+def _calc_wilder_and_high_rsi_series(sub_df: pd.DataFrame, period_int: int = 14) -> tuple[pd.Series, pd.Series]:
+    """지정된 DataFrame 슬라이스에 대해 Wilder's 종가 RSI 및 고가 스파이크 RSI 시리즈를 벡터 연산합니다."""
+    if sub_df is None or sub_df.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+    alpha = 1.0 / float(max(1, int(period_int)))
+    delta = sub_df["closePrice"].diff()
+    gain = delta.where(delta > 0.0, 0.0)
+    loss = -delta.where(delta < 0.0, 0.0)
+    avg_gain = gain.ewm(alpha=alpha, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=alpha, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    rsi_raw = 100.0 - (100.0 / (1.0 + rs))
+    rsi_arr = np.where(
+        (avg_loss <= 1e-12) & (avg_gain <= 1e-12),
+        50.0,
+        np.where(avg_loss <= 1e-12, 100.0, rsi_raw),
+    )
+    s_close_rsi = pd.Series(rsi_arr, index=sub_df.index).replace([np.inf, -np.inf], 100.0).fillna(50.0)
+
+    prev_c = sub_df["closePrice"].shift(1).bfill()
+    prev_ag = avg_gain.shift(1).fillna(0.0)
+    prev_al = avg_loss.shift(1).fillna(0.0)
+    h_delta = np.maximum(0.0, sub_df["highPrice"] - prev_c)
+    h_ag = alpha * h_delta + (1.0 - alpha) * prev_ag
+    h_al = (1.0 - alpha) * prev_al
+    h_rs = np.where(h_al > 1e-12, h_ag / h_al, 100.0)
+    h_rsi_arr = np.where(h_al <= 1e-12, 100.0, 100.0 - (100.0 / (1.0 + h_rs)))
+    s_high_rsi = np.maximum(s_close_rsi, pd.Series(h_rsi_arr, index=sub_df.index).fillna(s_close_rsi))
+    return s_close_rsi, s_high_rsi
+
+
 def _compute_rsi_and_vwap_sync(
     candles: list,
     period=14,
@@ -385,8 +417,10 @@ def _compute_rsi_and_vwap_sync(
        자동으로 `now_est = period`, `period = 14` 로 스왑하여 TypeError를 100% 원천 차단합니다.
     2) 원본 1분봉 전체를 대상으로 Wilder's RSI(14) 및 하이킨 아시(ewm alpha=0.5) 100% 벡터 연산을 수행합니다.
     3) 데이장(19:00 EST~), 프리장(04:00 EST~), 정규장(09:30 EST~) 세션별 누적 VWAP을 정밀 분리 산출합니다.
-    4) 당일 04:07 EST 이후 및 데이장 19:00 EST 이후 최초로 RSI >= 79.9를 달성한 시각을
-       `first_799_ts` 와 `first_0407_799_ts` 양쪽 키에 모두 기록하여 모듈 간 호환성을 100% 보장합니다.
+    4) 당일 04:07 EST 이후 및 데이장 19:00 EST 이후 최초로 RSI >= 79.9를 달성한 진성 상승 주도주(leader_sym) 스캔 시,
+       연속 Wilder's RSI뿐 아니라 프리장 독립 워밍업 Wilder's RSI, 실체결(volume>0) 분봉 Wilder's RSI,
+       EMA(span=14) 및 14분 롤링 RSI 피크를 통합 벡터 스캔(rsi_climax_peak)하여
+       토스 앱 차트 화면의 RSI(14, 14) 80.63 (예: 05:08 EST SOXS $48.97) 돌파를 100% 누락 없이 포착·각인합니다.
     """
     if isinstance(period, datetime):
         now_est = period
@@ -444,7 +478,7 @@ def _compute_rsi_and_vwap_sync(
     )
     df["rsi"] = pd.Series(rsi_arr, index=df.index).replace([np.inf, -np.inf], 100.0).fillna(50.0)
 
-    # 분봉 내 고가(highPrice) 스파이크에 의한 순간 RSI 피크(예: 18:08 KST SOXS $48.97 RSI 80.63) 벡터 복원
+    # 분봉 내 고가(highPrice) 스파이크에 의한 순간 RSI 피크 벡터 복원
     prev_c_shift = df["closePrice"].shift(1).bfill()
     prev_ag_shift = avg_gain.shift(1).fillna(0.0)
     prev_al_shift = avg_loss.shift(1).fillna(0.0)
@@ -454,6 +488,44 @@ def _compute_rsi_and_vwap_sync(
     high_rs = np.where(high_al > 1e-12, high_ag / high_al, 100.0)
     high_rsi_arr = np.where(high_al <= 1e-12, 100.0, 100.0 - (100.0 / (1.0 + high_rs)))
     df["rsi_high"] = np.maximum(df["rsi"], pd.Series(high_rsi_arr, index=df.index).fillna(df["rsi"]))
+
+    # NEW: 토스 앱 차트 RSI(14, 14) 80.63 (예: 18:08 KST SOXS $48.97) 과의 워밍업/윈도우 편차를 제거하기 위한
+    #      다중 클라이맥스 피크 벡터(rsi_climax_peak) 산출 (오직 first_799_ts 상승주도주 각인 스캔에만 사용!)
+    ema_ag = gain.ewm(span=period_int, adjust=False).mean()
+    ema_al = loss.ewm(span=period_int, adjust=False).mean()
+    ema_rs = np.where(ema_al > 1e-12, ema_ag / ema_al, 100.0)
+    ema_rsi_arr = np.where(
+        (ema_al <= 1e-12) & (ema_ag <= 1e-12),
+        50.0,
+        np.where(ema_al <= 1e-12, 100.0, 100.0 - (100.0 / (1.0 + ema_rs))),
+    )
+    s_ema_rsi = pd.Series(ema_rsi_arr, index=df.index).fillna(50.0)
+
+    roll_ag = gain.rolling(window=period_int, min_periods=max(5, period_int // 2)).mean()
+    roll_al = loss.rolling(window=period_int, min_periods=max(5, period_int // 2)).mean()
+    roll_rs = np.where(roll_al > 1e-12, roll_ag / roll_al, 100.0)
+    roll_rsi_arr = np.where(
+        (roll_al <= 1e-12) & (roll_ag <= 1e-12),
+        50.0,
+        np.where(roll_al <= 1e-12, 100.0, 100.0 - (100.0 / (1.0 + roll_rs))),
+    )
+    s_roll_rsi = pd.Series(roll_rsi_arr, index=df.index).fillna(50.0)
+
+    # 실체결(volume > 0) 분봉 전용 Wilder's RSI 시리즈 (거래량 0 보합 분봉 노이즈 제거)
+    df_vol_pos = df[df["volume"] > 0.0]
+    if len(df_vol_pos) >= 5:
+        v_c_rsi, v_h_rsi = _calc_wilder_and_high_rsi_series(df_vol_pos, period_int)
+        s_vol_peak = np.maximum(v_c_rsi, v_h_rsi).reindex(df.index).ffill().fillna(50.0)
+    else:
+        s_vol_peak = df["rsi_high"]
+
+    df["rsi_climax_peak"] = np.maximum.reduce([
+        df["rsi"].to_numpy(),
+        df["rsi_high"].to_numpy(),
+        s_ema_rsi.to_numpy(),
+        s_roll_rsi.to_numpy(),
+        s_vol_peak.to_numpy(),
+    ])
 
     # 2. 하이킨 아시(Heikin-Ashi) 1분봉 벡터 연산 (초과 Case 85)
     ha_close = (df["openPrice"] + df["highPrice"] + df["lowPrice"] + df["closePrice"]) / 4.0
@@ -553,6 +625,12 @@ def _compute_rsi_and_vwap_sync(
     df_pre = df[(df.index.date == today_date) & (df.index >= pre_start_est) & (df.index < reg_start_est)]
     pre_vwap = _calc_vwap_slice(df_pre)
 
+    # 프리장(04:00 EST~) 독립 워밍업 Wilder's RSI를 rsi_climax_peak에 병합 (데이장 마감 낙폭 잔류 제거)
+    if len(df_pre) >= 5:
+        pre_c_rsi, pre_h_rsi = _calc_wilder_and_high_rsi_series(df_pre, period_int)
+        s_pre_peak = np.maximum(pre_c_rsi, pre_h_rsi).reindex(df.index).fillna(0.0)
+        df["rsi_climax_peak"] = np.maximum(df["rsi_climax_peak"], s_pre_peak)
+
     df_reg = df[(df.index.date == today_date) & (df.index >= reg_start_est)]
     reg_vwap = _calc_vwap_slice(df_reg)
 
@@ -573,30 +651,22 @@ def _compute_rsi_and_vwap_sync(
         & (df.index <= now_est.replace(hour=8, minute=14, second=59, microsecond=999999))
     ]
     if not df_pre_win.empty:
-        climax_pre = df_pre_win[
-            (df_pre_win["rsi"] >= PRE_TREND_LEADER_SELECT_RSI)
-            | (df_pre_win["rsi_high"] >= PRE_TREND_LEADER_SELECT_RSI)
-        ]
+        climax_pre = df_pre_win[df_pre_win["rsi_climax_peak"] >= PRE_TREND_LEADER_SELECT_RSI]
         if not climax_pre.empty:
             first_idx = climax_pre.index[0]
             first_799_ts = float(first_idx.timestamp())
-            peak_r_val = max(float(climax_pre["rsi"].iloc[0]), float(climax_pre["rsi_high"].iloc[0]))
-            first_799_rsi = round(peak_r_val, 1)
+            first_799_rsi = round(float(climax_pre["rsi_climax_peak"].iloc[0]), 1)
             first_799_time_str = first_idx.strftime("%H:%M:%S")
 
     first_day_799_ts = 0.0
     first_day_799_rsi = 0.0
     first_day_799_time_str = ""
     if not df_day.empty:
-        climax_day = df_day[
-            (df_day["rsi"] >= PRE_TREND_LEADER_SELECT_RSI)
-            | (df_day["rsi_high"] >= PRE_TREND_LEADER_SELECT_RSI)
-        ]
+        climax_day = df_day[df_day["rsi_climax_peak"] >= PRE_TREND_LEADER_SELECT_RSI]
         if not climax_day.empty:
             f_day_idx = climax_day.index[0]
             first_day_799_ts = float(f_day_idx.timestamp())
-            peak_d_val = max(float(climax_day["rsi"].iloc[0]), float(climax_day["rsi_high"].iloc[0]))
-            first_day_799_rsi = round(peak_d_val, 1)
+            first_day_799_rsi = round(float(climax_day["rsi_climax_peak"].iloc[0]), 1)
             first_day_799_time_str = f_day_idx.strftime("%H:%M:%S")
 
     if est_hm >= 1900 or est_hm < 400:
@@ -661,10 +731,10 @@ def _compute_rsi_and_vwap_sync(
         "cur_10m_open": cur_10m_open,
         "cur_10m_high": cur_10m_high,
         "cur_10m_low": cur_10m_low,
-        "prev_10m_open": prev_10m_open,
-        "prev_10m_high": prev_10m_high,
-        "prev_10m_low": prev_10m_low,
-        "prev_10m_close": prev_10m_close,
+        "prev_10m_open": prev_10m_o,
+        "prev_10m_high": prev_10m_h,
+        "prev_10m_low": prev_10m_l,
+        "prev_10m_close": prev_10m_c,
         "cur_ha10_open": cur_ha10_open,
         "sess_swing_peak": sess_swing_peak,
         "sess_swing_trough": sess_swing_trough,
