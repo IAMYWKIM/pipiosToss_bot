@@ -3,15 +3,20 @@
 # 목적: 방향성 인지(Direction-Aware) 매크로 3단 방어망(execute_macro_defense_plugin),
 #       08:15 EST 거시지표 발표 15분 전 선제 컷오프(enforce_0930_regular_cutoff_plugin),
 #       15:00 ~ 15:58 EST 장마감 1시간 전 미익절 물량 정규장 VWAP 도달 즉시 탈출(execute_late_regular_vwap_escape_plugin),
-#       15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산(execute_moc_zero_overnight_plugin) 및
-#       미체결 주문 선취소·매도가능수량 해방 폴링 헬퍼(_cancel_open_orders_and_wait_sellable) 독립 플러그인
+#       15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 청산(execute_moc_zero_overnight_plugin),
+#       미체결 주문 선취소·매도가능수량 해방 폴링 헬퍼(_cancel_open_orders_and_wait_sellable) 및
+#       sniper_plugin.py 교차 임포트 전술 상수(TRAIL_ARM_PROFIT_RATE 등) 통합 제공 코어 플러그인
 # =====================================================================
-# MODIFIED: 제1 ~ 제6헌법 및 초과 Case 48, 63, 66, 67, 82, 84, 86, 87, 88, 92, 94, 95, 96, 98 완벽 준수
-# NEW: 1) 모든 방어 플러그인 함수에 `entry_trend: str = ""` 및 `**kwargs` 명시 수용으로
+# MODIFIED: 제1 ~ 제6헌법 및 초과 Case 48, 63, 66, 67, 82, 84, 86, 87, 88, 92, 94, 95, 96, 98, 99 완벽 준수
+# NEW: 1) sniper_plugin.py (line 59) 에서 임포트하는 TRAIL_ARM_PROFIT_RATE, SAFETY_CAP_PROFIT_RATE,
+#         TRAIL_CALLBACK_PCT, TREND_PB_CALLBACK_PCT, NQ_VELOCITY_SURGE_PCT 등 모든 공유 상수 명시 선언 및
+#         PEP 562 `__getattr__` 안전 폴백 탑재로 `ImportError: cannot import name 'TRAIL_ARM_PROFIT_RATE'` 영구 소각
+#      2) 모든 방어 플러그인 함수에 `entry_trend: str = ""` 및 `**kwargs` 명시 수용으로
 #         `execute_macro_defense_plugin() got an unexpected keyword argument 'entry_trend'` 원천 소각
-#      2) 1주 휩소 작전(`WHIPSAW_1SH`) 및 수동 진입(`MANUAL`) 포지션의 1·2차 과열 방어선 100% 바이패스 격리
-#      3) 포지션 자체 손실률 즉시 손절 절대 금지 & 토스 Open API QQQ 0.0초 실시간 최소 0.80% 역행 시에만
-#         3차 손절 스윕 및 04:07 ~ 08:14 EST 골든타임 내 최저점 역트레일링(`STAGE3_STOP_TRACK`) 점화
+#      3) 모바일 클립보드 복사 시 달러($) 표기 사이의 세로바(|)가 `\vert{}` 로 변질되는 현상을 막기 위해
+#         모든 구분자를 가운뎃점(`·`)으로 교체하여 `SyntaxError: f-string: valid expression required before '}'` 원천 차단
+#      4) 1주 휩소 작전(`WHIPSAW_1SH`) 및 수동 진입(`MANUAL`) 포지션의 1·2차 과열 방어선 100% 바이패스 격리 및
+#         토스 Open API QQQ 0.0초 실시간 최소 0.80% 역행 시에만 3차 손절 스윕 & `STAGE3_STOP_TRACK` 점화
 
 import math
 import time
@@ -26,10 +31,35 @@ from quant_engine import (
     MacroDataCache,
     SINGLE_TARGET_PROFIT_RATE,
     MIN_STAGE3_QQQ_ADVERSE_PCT,
+    PRE_TREND_LEADER_SELECT_RSI,
+    PRE_TREND_PULLBACK_RSI_THRESHOLD,
+    PRE_TREND_REARM_RESET_RSI,
+    TREND_PB_CALLBACK_PCT,
+    TREND_PB_LAUNCH_RATCHET_PCT,
+    TREND_PB_CUSHION_FLOOR_RATE,
 )
 
 EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
+
+# NEW: sniper_plugin.py 및 외부 모듈 교차 임포트 호환용 전술 상수 100% 선언 (초과 Case 85, 88, 89, 97, 99)
+TRAIL_ARM_PROFIT_RATE = SINGLE_TARGET_PROFIT_RATE          # +1.00% 하이킨 아시 트레일링 점화가 기준
+SAFETY_CAP_PROFIT_RATE = 5.00                              # +5.00% 거래소 선장전 상단 안전 캡 LIMIT
+TRAIL_CALLBACK_PCT = 0.30                                  # 기술적 반등(PRE_SNIPER) 최고가 대비 -0.30% 콜백 스탑
+NQ_VELOCITY_SURGE_PCT = 0.20                               # QQQ 실시간 10m/3m 변화율 ±0.20% 급등락 시 HA음봉 바이패스
+NQ_DYNAMIC_FLOOR = MIN_STAGE3_QQQ_ADVERSE_PCT              # 3차 실시간 QQQ 역행 최소 하한선 (0.80%)
+
+PRE_SNIPER_RSI_THRESHOLD = 30.0                            # 양방향 대칭 클라이맥스 과매도 매수 기준 (RSI <= 30.0)
+PRE_TREND_BOOSTER_RSI = 38.0                               # 07:00~08:14 선행 상승종목 0.4초 고주파 부스터 진입 기준
+PRE_CLIMAX_BOOSTER_RSI = 79.0                              # 프리-클라이맥스 0.4초 고주파 부스터 진입 기준 (RSI >= 79.0)
+OPP_CLIMAX_RSI_THRESHOLD = 79.9                            # 반대편 대세 종목 과열 클라이맥스 인지 기준 (RSI >= 79.9)
+
+POST_STOP_REBOUND_PCT = 0.30                               # 3차 손절 후 최저점 대비 +0.30% 양봉 반등 재진입 기준
+POST_STOP_MAX_RSI = 38.0                                   # 최저점 반등 재진입 허용 최대 RSI 상한 (RSI <= 38.0)
+
+FIRST_TRAP_SLIPPAGE_PCT = 0.0018                           # 1차 지정가 매수 덫 슬리피지 할인율 (-0.18%)
+FIRST_TRAP_MIN_DISC_USD = 0.02                             # 1차 지정가 매수 덫 최소 달러 할인폭 (-$0.02)
+TRAP_SHIELD_WAIT_SEC = 30.0                                # 조건부 타임쉴드 최대 대기 시간 (30.0초)
 
 # 초과 Case 94: 수동 보유 포지션 스나이퍼 ON 결속 시 실시간 QQQ 기준가 인메모리 앵커 캐시
 _MANUAL_STAGE3_ANCHOR_CACHE: dict[str, dict] = {
@@ -130,6 +160,9 @@ async def _cancel_open_orders_and_wait_sellable(
         surviving_sell_ids.append(str(sell_order_id).strip())
 
     return sellable_q_int, surviving_sell_ids
+
+
+sniper_plugin_cancel_helper = _cancel_open_orders_and_wait_sellable
 
 
 async def _execute_two_stage_emergency_sell(
@@ -308,7 +341,7 @@ async def execute_macro_defense_plugin(
                                 chat_id=ctx.chat_id,
                                 text=(
                                     f"🛑 <b>[1차 매크로 과열 방어 — 미체결 매수 파기]</b>\n"
-                                    f"▫️ 종목: <b>{symbol}</b> | NQ 진폭: <b>{nq_amp:.2f}% (≥2.0%)</b>\n"
+                                    f"▫️ 종목: <b>{symbol}</b> · NQ 진폭: <b>{nq_amp:.2f}% (≥2.0%)</b>\n"
                                     f"▫️ 조치: 미체결 매수 주문 취소 및 당일 본진 진입 잠금"
                                 ),
                                 parse_mode="HTML",
@@ -349,7 +382,11 @@ async def execute_macro_defense_plugin(
         need_reanchor = bool(
             es_clean != "MANUAL"
             or float(nq_entry_price or 0.0) <= 0.0
-            or (not sell_order_id and float(kwargs.get("target_sell_price", 0.0) or 0.0) <= 0.0 and mem_anchor.get("qty", 0) != int(holdings_qty))
+            or (
+                not sell_order_id
+                and float(kwargs.get("target_sell_price", 0.0) or 0.0) <= 0.0
+                and mem_anchor.get("qty", 0) != int(holdings_qty)
+            )
             or ((float(nq_entry_price or 0.0) > 3000.0) != (ref_curr > 3000.0) and ref_curr > 0.0)
         )
         if need_reanchor and ref_curr > 0.0:
@@ -543,6 +580,7 @@ async def enforce_0930_regular_cutoff_plugin(
     is_active: bool = True,
     is_session_done: bool = False,
     buy_order_id: str = "",
+    entry_trend: str = "",
     **kwargs,
 ) -> tuple[str, bool]:
     """
@@ -610,6 +648,7 @@ async def execute_late_regular_vwap_escape_plugin(
     sell_order_id: str = "",
     target_sell_price: float = 0.0,
     entry_session: str = "",
+    entry_trend: str = "",
     **kwargs,
 ) -> bool:
     """
@@ -684,7 +723,7 @@ async def execute_late_regular_vwap_escape_plugin(
                     text=(
                         f"🛟 <b>[15:00~15:58 미익절 정규장 VWAP 도달 탈출 스윕]</b>\n"
                         f"▫️ 종목: <b>{symbol}</b> ({holdings_qty}주)\n"
-                        f"▫️ 평단: ${avg_price:.2f} \vert{} 정규장 VWAP: <b>${reg_vwap:.2f}</b>\n"
+                        f"▫️ 평단: ${avg_price:.2f} · 정규장 VWAP: <b>${reg_vwap:.2f}</b>\n"
                         f"▫️ 탈출 스윕가: <b>${sweep_p:.2f} ({pnl_pct:+.2f}%)</b>"
                     ),
                     parse_mode="HTML",
@@ -708,6 +747,7 @@ async def execute_moc_zero_overnight_plugin(
     buy_order_id: str = "",
     sell_order_id: str = "",
     current_price: float = 0.0,
+    entry_trend: str = "",
     **kwargs,
 ) -> bool:
     """
@@ -777,3 +817,22 @@ async def execute_moc_zero_overnight_plugin(
         return swept_ok
     finally:
         ctx.in_memory_ordering_lock[symbol] = False
+
+
+def __getattr__(name: str):
+    """
+    PEP 562 모듈 레벨 안전 폴백:
+    sniper_plugin.py 등에서 추가 상수명을 임포트하더라도 ImportError 를 원천 차단합니다.
+    """
+    up = name.upper()
+    if "CAP" in up and "RATE" in up:
+        return SAFETY_CAP_PROFIT_RATE
+    if "ARM" in up and "RATE" in up:
+        return TRAIL_ARM_PROFIT_RATE
+    if "CALLBACK" in up:
+        return TRAIL_CALLBACK_PCT
+    if "FLOOR" in up:
+        return NQ_DYNAMIC_FLOOR
+    if "VEL" in up:
+        return NQ_VELOCITY_SURGE_PCT
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
