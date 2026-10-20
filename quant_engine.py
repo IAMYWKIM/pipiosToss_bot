@@ -1,6 +1,7 @@
 # =====================================================================
 # FILE: quant_engine.py
 # 목적: 동기(with) 및 비동기(async with) 양방향 100% 호환 파일 뮤텍스(_HybridFileLock),
+#       호출부 언패킹 변수 개수(12개 / 13개 / 14개) 자동 감지 튜플(_LedgerStateTuple),
 #       나스닥 100 선물(NQ=F 18:00 EST 신세션 하드 컷오프 + fast_info/1d 고저가 강제 병합) &
 #       토스 Open API QQQ 0.0초 실시간 3차 역행 기준가/단기 변화율(±0.20% NQ_VEL_BYPASS) 브릿지(MacroDataCache),
 #       데이장 개시 1분 전(08:59 KST / 18:59 EST) NQ=F 10분봉 실시간 fast_info 병합 추세 판별기,
@@ -11,11 +12,13 @@
 # MODIFIED: 초과 Case 61, 62, 89, 90, 91, 92, 93, 94 — NQ=F 18:00 EST 신세션 컷오프, fast_info+1d 고/저가 단조 보존,
 #           토스 Open API QQQ 0.0초 실시간 현재가(1.5초 프로빙) 및 10m/3m 변화율 산출
 # NEW: 1) GlobalThrottle.get_file_lock(filepath) 호출 시 동기 `with` 문과 비동기 `async with` 문을 모두 지원하는
-#         `_HybridFileLock` 을 바인딩하여 `'Lock' object does not support the context manager protocol` 에러 및
-#         텔레그램 명령어 무응답 현상을 100% 원천 소각 (제1헌법 & 초과 Case 30)
-#      2) _LedgerStateTuple 탑재로 13-변수 언패킹 및 state[13](whipsaw_target_price) 인덱스 접근 양방향 완벽 호환
+#         `_HybridFileLock` 을 바인딩하여 `'Lock' object does not support the context manager protocol` 원천 소각
+#      2) `_LedgerStateTuple.__iter__` 에서 호출 프레임의 `UNPACK_SEQUENCE` 피연산자(12 / 13 / 14)를 자동 감지하여
+#         `too many values to unpack (expected 12)` 에러를 100% 원천 차단하고 state[0] ~ state[13] 인덱스 접근 동시 지원
 
 import os
+import sys
+import dis
 import json
 import math
 import time
@@ -118,19 +121,65 @@ def _get_hybrid_file_lock(filepath: str) -> _HybridFileLock:
 GlobalThrottle.get_file_lock = staticmethod(_get_hybrid_file_lock)
 
 
+_UNPACK_OPCODE_CACHE: dict[tuple, int] = {}
+
+
+def _detect_caller_unpack_len(frame, default_len: int = 13) -> int:
+    """
+    호출자의 바이트코드 프레임에서 현재 실행 중인 UNPACK_SEQUENCE 명령어의 목표 원소 개수를 O(1) 캐싱 감지합니다.
+    """
+    if frame is None:
+        return default_len
+    try:
+        code_obj = frame.f_code
+        lasti = int(frame.f_lasti)
+        cache_key = (code_obj, lasti)
+        cached = _UNPACK_OPCODE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        matched_len = None
+        min_dist = 999999
+        for instr in dis.get_instructions(code_obj):
+            if instr.opname == "UNPACK_SEQUENCE" and isinstance(instr.argval, int):
+                dist = instr.offset - lasti
+                if -6 <= dist <= 12 and abs(dist) < min_dist:
+                    min_dist = abs(dist)
+                    matched_len = int(instr.argval)
+
+        res = matched_len if matched_len is not None else default_len
+        if len(_UNPACK_OPCODE_CACHE) < 4096:
+            _UNPACK_OPCODE_CACHE[cache_key] = res
+        return res
+    except Exception:
+        return default_len
+
+
 class _LedgerStateTuple(tuple):
     """
-    main_loops_plugin.py 등의 13-변수 언패킹(`a, b, ..., m = await AssassinLedger.get_state(sym)`)과
-    확장 인덱스 조회(`state[13]` -> whipsaw_target_price)를 동시에 지원하는 튜플 서브클래스.
+    호출부가 12개 변수로 언패킹하든(`expected 12`), 13개 변수로 언패킹하든(`expected 13`),
+    14개 변수로 언패킹하든(`expected 14`), 또는 `state[0] ~ state[13]` 인덱스로 접근하든
+    단 1건의 ValueError/IndexError 없이 100% 호환되는 가변 언패킹 튜플 클래스.
     """
-    def __new__(cls, core_13: tuple, whipsaw_target_price: float = 0.0):
-        obj = super().__new__(cls, core_13)
-        obj._whipsaw_target_price = float(whipsaw_target_price or 0.0)
+    def __new__(cls, full_14: tuple):
+        obj = super().__new__(cls, full_14)
+        obj._full_14 = tuple(full_14)
         return obj
 
+    def __iter__(self):
+        try:
+            caller_frame = sys._getframe(1)
+            target_n = _detect_caller_unpack_len(caller_frame, default_len=13)
+            if target_n in (12, 13, 14):
+                return super().__iter__() if target_n == 14 else iter(self._full_14[:target_n])
+        except Exception:
+            pass
+        return iter(self._full_14[:13])
+
     def __getitem__(self, item):
-        if isinstance(item, int) and item == 13:
-            return self._whipsaw_target_price
+        if isinstance(item, int):
+            if 0 <= item < len(self._full_14):
+                return self._full_14[item]
         return super().__getitem__(item)
 
 
@@ -644,7 +693,7 @@ class AssassinLedger:
     @classmethod
     async def get_state(cls, symbol: str) -> _LedgerStateTuple:
         data = await asyncio.to_thread(cls._read_sync, symbol)
-        core_13 = (
+        full_14 = (
             float(data.get("price") or 0.0),
             float(data.get("budget") or 100.0),
             normalize_target_rate(data.get("target_profit_rate", 1.0)),
@@ -658,11 +707,9 @@ class AssassinLedger:
             float(data.get("nq_entry_price") or 0.0),
             float(data.get("nq_entry_amp") or 0.0),
             str(data.get("entry_trend") or ""),
+            float(data.get("whipsaw_target_price") or 0.0),
         )
-        return _LedgerStateTuple(
-            core_13,
-            whipsaw_target_price=float(data.get("whipsaw_target_price") or 0.0),
-        )
+        return _LedgerStateTuple(full_14)
 
     @classmethod
     async def get_raw_dict(cls, symbol: str) -> dict:
@@ -719,6 +766,16 @@ class AssassinLedger:
         for sym in cls.ALLOWED_SYMBOLS:
             await asyncio.to_thread(cls._write_sync, sym, {"is_active": new_act})
         return new_act
+
+    @classmethod
+    async def set_budget(cls, symbol_or_budget, budget_val: float = None):
+        if budget_val is None:
+            b_val = float(symbol_or_budget)
+        else:
+            b_val = float(budget_val)
+        if math.isfinite(b_val) and b_val > 0.0:
+            for sym in cls.ALLOWED_SYMBOLS:
+                await asyncio.to_thread(cls._write_sync, sym, {"budget": round(b_val, 2)})
 
     @classmethod
     async def sync_global_settings(

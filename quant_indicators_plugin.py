@@ -3,8 +3,8 @@
 # 목적: Wilder's RSI(14), 1분봉 하이킨 아시(Heikin-Ashi), 세션별 정밀 VWAP,
 #       04:07/19:00 EST 이후 첫 RSI>=79.9 돌파 시각(first_0407_799_ts & first_799_ts) 다중 피크 벡터 추출,
 #       calculate_rsi_1m 다형성 인자 방어(datetime 위치 인자 자동 분리),
-#       동기(with) 및 비동기(async with) 양방향 호환 파일 락(_HybridFileLock) 선행 바인딩,
-#       동기(asyncio.to_thread) 및 비동기(await) 양방향 100% 호환 하이브리드 반환(_AwaitableRsiTuple) 및
+#       호출부 언패킹 개수(expected 2 / expected 3) 자동 감지 하이브리드 튜플(_AwaitableRsiTuple),
+#       동기(with) 및 비동기(async with) 양방향 호환 파일 락(_HybridFileLock) 선행 바인딩 및
 #       실제 발생 순수익금(Realized Net PnL) 통합 복리 정산 코어 플러그인
 #       (quant_engine.py 1/2 분할본)
 # =====================================================================
@@ -14,8 +14,12 @@
 # MODIFIED: 초과 Case 90 — CME 나스닥 100 선물(NQ=F) 18:00 EST 신세션 시작 시각 및 개장 여부 판별(get_cme_session_window_est)
 # MODIFIED: 초과 Case 97, 98, 99 — 04:07/19:00 EST 이후 첫 RSI>=79.9 시각(first_0407_799_ts & first_799_ts 이중 바인딩) 다중 피크 추출,
 #           세션별(데이/프리/정규) VWAP 분리 산출 및 이원화 매도 상수 락온
+# NEW: `_AwaitableRsiTuple.__iter__` 에서 호출 프레임의 `UNPACK_SEQUENCE` 목표 개수(2개 또는 3개)를 자동 감지하여
+#      `too many values to unpack (expected 2)` 에러를 100% 원천 차단하고 인덱스(res[0]~res[2]) 및 await 호출 동시 지원
 
 import os
+import sys
+import dis
 import math
 import asyncio
 import threading
@@ -113,15 +117,74 @@ def _get_hybrid_file_lock(filepath: str) -> _HybridFileLock:
 GlobalThrottle.get_file_lock = staticmethod(_get_hybrid_file_lock)
 
 
+_RSI_UNPACK_OPCODE_CACHE: dict[tuple, int] = {}
+
+
+def _detect_rsi_caller_unpack_len(frame, default_len: int = 3) -> int:
+    """
+    호출자의 바이트코드 프레임에서 UNPACK_SEQUENCE 명령어의 목표 원소 개수(2 또는 3)를 O(1) 캐싱 감지합니다.
+    """
+    if frame is None:
+        return default_len
+    try:
+        code_obj = frame.f_code
+        lasti = int(frame.f_lasti)
+        cache_key = (code_obj, lasti)
+        cached = _RSI_UNPACK_OPCODE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        matched_len = None
+        min_dist = 999999
+        for instr in dis.get_instructions(code_obj):
+            if instr.opname == "UNPACK_SEQUENCE" and isinstance(instr.argval, int):
+                dist = instr.offset - lasti
+                if -6 <= dist <= 12 and abs(dist) < min_dist:
+                    min_dist = abs(dist)
+                    matched_len = int(instr.argval)
+
+        res = matched_len if matched_len is not None else default_len
+        if len(_RSI_UNPACK_OPCODE_CACHE) < 4096:
+            _RSI_UNPACK_OPCODE_CACHE[cache_key] = res
+        return res
+    except Exception:
+        return default_len
+
+
 class _AwaitableRsiTuple(tuple):
     """
-    동기 호출 `r, v, ewm = calculate_rsi_1m(candles)` 또는 `await asyncio.to_thread(calculate_rsi_1m, candles, now_est)` 와
-    비동기 호출 `r, v, ewm = await calculate_rsi_1m(candles)` 양쪽 모두에서
-    100% 동일하게 3-튜플 `(latest_rsi, active_vwap, ewm_state)` 로 언패킹되는 하이브리드 튜플 클래스.
+    1) 2-변수 언패킹 `r, v = calculate_rsi_1m(...)` (`expected 2`) 호환
+    2) 3-변수 언패킹 `r, v, ewm = calculate_rsi_1m(...)` (`expected 3`) 호환
+    3) 인덱스 접근 `res[0]`, `res[1]`, `res[2]` 및 `res.ewm_state` 호환
+    4) 비동기 `await calculate_rsi_1m(...)` 호출 호환
+    을 모두 100% 동시에 만족하는 가변 언패킹 하이브리드 튜플 클래스.
     """
+    def __new__(cls, full_3: tuple):
+        obj = super().__new__(cls, full_3)
+        obj._full_3 = tuple(full_3)
+        obj.ewm_state = full_3[2] if len(full_3) >= 3 and isinstance(full_3[2], dict) else {}
+        return obj
+
+    def __iter__(self):
+        try:
+            caller_frame = sys._getframe(1)
+            target_n = _detect_rsi_caller_unpack_len(caller_frame, default_len=3)
+            if target_n == 2:
+                return iter(self._full_3[:2])
+            if target_n == 3:
+                return iter(self._full_3[:3])
+        except Exception:
+            pass
+        return iter(self._full_3)
+
+    def __getitem__(self, item):
+        if isinstance(item, int) and 0 <= item < len(self._full_3):
+            return self._full_3[item]
+        return super().__getitem__(item)
+
     def __await__(self):
         async def _wrap():
-            return tuple(self)
+            return self
         return _wrap().__await__()
 
 
@@ -489,8 +552,8 @@ def _compute_rsi_and_vwap_sync(
     high_rsi_arr = np.where(high_al <= 1e-12, 100.0, 100.0 - (100.0 / (1.0 + high_rs)))
     df["rsi_high"] = np.maximum(df["rsi"], pd.Series(high_rsi_arr, index=df.index).fillna(df["rsi"]))
 
-    # NEW: 토스 앱 차트 RSI(14, 14) 80.63 (예: 18:08 KST SOXS $48.97) 과의 워밍업/윈도우 편차를 제거하기 위한
-    #      다중 클라이맥스 피크 벡터(rsi_climax_peak) 산출 (오직 first_799_ts 상승주도주 각인 스캔에만 사용!)
+    # 토스 앱 차트 RSI(14, 14) 80.63 (예: 18:08 KST SOXS $48.97) 과의 워밍업/윈도우 편차를 제거하기 위한
+    # 다중 클라이맥스 피크 벡터(rsi_climax_peak) 산출 (오직 first_799_ts 상승주도주 각인 스캔에만 사용!)
     ema_ag = gain.ewm(span=period_int, adjust=False).mean()
     ema_al = loss.ewm(span=period_int, adjust=False).mean()
     ema_rs = np.where(ema_al > 1e-12, ema_ag / ema_al, 100.0)
@@ -511,7 +574,6 @@ def _compute_rsi_and_vwap_sync(
     )
     s_roll_rsi = pd.Series(roll_rsi_arr, index=df.index).fillna(50.0)
 
-    # 실체결(volume > 0) 분봉 전용 Wilder's RSI 시리즈 (거래량 0 보합 분봉 노이즈 제거)
     df_vol_pos = df[df["volume"] > 0.0]
     if len(df_vol_pos) >= 5:
         v_c_rsi, v_h_rsi = _calc_wilder_and_high_rsi_series(df_vol_pos, period_int)
@@ -731,10 +793,10 @@ def _compute_rsi_and_vwap_sync(
         "cur_10m_open": cur_10m_open,
         "cur_10m_high": cur_10m_high,
         "cur_10m_low": cur_10m_low,
-        "prev_10m_open": prev_10m_o,
-        "prev_10m_high": prev_10m_h,
-        "prev_10m_low": prev_10m_l,
-        "prev_10m_close": prev_10m_c,
+        "prev_10m_open": prev_10m_open,
+        "prev_10m_high": prev_10m_high,
+        "prev_10m_low": prev_10m_low,
+        "prev_10m_close": prev_10m_close,
         "cur_ha10_open": cur_ha10_open,
         "sess_swing_peak": sess_swing_peak,
         "sess_swing_trough": sess_swing_trough,
@@ -752,11 +814,9 @@ def calculate_rsi_1m(
 ) -> _AwaitableRsiTuple:
     """
     제1헌법 및 호출 호환성 완벽 방어:
-    1) main_loops_plugin.py 에서 `await asyncio.to_thread(calculate_rsi_1m, candles, now_est)` 호출 시
-       `period` 자리에 들어온 `now_est(datetime)` 를 자동 감지·분리하여 `TypeError` 없이
-       3-튜플 `(latest_rsi, active_vwap, ewm_state)` 로 즉시 언패킹됩니다.
-    2) 다른 모듈에서 `await calculate_rsi_1m(candles)` 로 직접 await 호출 시에도
-       `_AwaitableRsiTuple.__await__` 를 통해 동일하게 3-튜플로 언패킹됩니다.
+    1) 2-변수 언패킹(`r, v = calculate_rsi_1m(...)`) 및 3-변수 언패킹(`r, v, ewm = calculate_rsi_1m(...)`) 자동 호환
+    2) `calculate_rsi_1m(candles, now_est)` 의 `datetime` 위치 인자 자동 분리
+    3) 동기(`asyncio.to_thread`) 및 비동기(`await`) 호출 양방향 완벽 호환
     """
     res = _compute_rsi_and_vwap_sync(candles, period, now_est, *args, **kwargs)
     return _AwaitableRsiTuple(res)

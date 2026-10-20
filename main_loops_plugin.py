@@ -1,16 +1,18 @@
 # =====================================================================
 # FILE: main_loops_plugin.py
-# 목적: 백그라운드 듀얼 캔들·VWAP·하이킨 아시·첫 RSI>=79.9 상승주도주 2페이지(400분봉) 레이더 루프(rsi_radar_loop),
+# 목적: main.py 임포트 호환 심볼(TRADE_SYMBOLS 등) 전수 제공,
+#       백그라운드 듀얼 캔들·VWAP·하이킨 아시·첫 RSI>=79.9 상승주도주 2페이지(400분봉) 레이더 루프(rsi_radar_loop),
 #       6대 0.4초 고주파 부스터 및 실시간 틱 RSI·HA 합성 메인 전술 루프(assassin_loop),
 #       17:00 EST 일일 가비지 컬렉션(run_daily_gc) 코어 플러그인
 #       (main.py 1/2 분할본)
 # =====================================================================
 # NEW: 제3헌법 및 플러그인 분할 아키텍처 의거 백그라운드 레이더 루프와 메인 스나이퍼 루프를 main_loops_plugin.py로 분리
-# MODIFIED: 초과 Case 28, 72, 73, 83, 85, 87, 93, 97, 98, 99, 100 —
-#           1) 04:07 ~ 08:14 EST 프리장 골든타임 및 12:50 ~ 15:58 EST 정규장 후반 보유 중 2페이지(최대 400분봉) 페이지네이션 조회로
-#              04:00 EST 개장 첫 봉 및 이전 워밍업 구간 단절을 원천 차단하여 첫 RSI>=79.9 상승 주도주(leader_sym) 100% 자동 복원
-#           2) 6대 0.4초 고주파 부스터(fast_shield_mode) 및 배치 현재가 O(1) 실시간 틱 RSI·하이킨 아시 양/음봉 합성
-#           3) 조건부 30초 타임쉴드 정정(rearm) 직후 즉시 잔고 재조회로 체결 직후 MANUAL 오분류 경합(Case 100) 원천 차단
+# MODIFIED: 1) main.py (line 73) 에서 임포트하는 TRADE_SYMBOLS, ALLOWED_SYMBOLS, REAL_ALLOWED_SYMBOLS,
+#              NQ_DYNAMIC_FLOOR 및 공유 상태 변수를 모듈 최상단에 100% 선언하여 ImportError 원천 차단
+#           2) AssassinLedger.get_state 및 calculate_rsi_1m 반환값 추출 시 고정 개수 언패킹 대신
+#              안전 인덱스 추출기(_unpack_ledger_state_safe / _unpack_rsi_calc_safe)를 적용하여
+#              `too many values to unpack (expected 12 / expected 2)` 예외를 물리적으로 0%로 소각
+#           3) 초과 Case 28, 72, 73, 83, 85, 87, 93, 97, 98, 99, 100 전술 스텝 100% 결속
 
 import os
 import glob
@@ -24,6 +26,7 @@ from toss_api import TossApiClient, GlobalThrottle
 from quant_engine import (
     AssassinLedger,
     MacroDataCache,
+    SINGLE_TARGET_PROFIT_RATE,
     MIN_STAGE3_QQQ_ADVERSE_PCT,
     PRE_TREND_LEADER_SELECT_RSI,
     PRE_TREND_PULLBACK_RSI_THRESHOLD,
@@ -66,12 +69,90 @@ from sniper_plugin import (
     execute_macro_defense_plugin,
     enforce_0930_regular_cutoff_plugin,
 )
+from defense_plugin import (
+    _cancel_open_orders_and_wait_sellable as sniper_plugin_cancel_helper,
+)
 
+# NEW: main.py 임포트 호환용 필수 상수 및 전역 공유 상태 객체 100% 선언 (Case 09, 11)
 EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
+
+TRADE_SYMBOLS = ("SOXS", "SOXL")
+ALLOWED_SYMBOLS = ("SOXS", "SOXL")
+REAL_ALLOWED_SYMBOLS = ("SOXS", "SOXL")
 NQ_DYNAMIC_FLOOR = MIN_STAGE3_QQQ_ADVERSE_PCT
+LOOP_INTERVAL_NORMAL = 1.5
+LOOP_INTERVAL_FAST = 0.4
+
+shared_rsi_state = {
+    "SOXS": {"value": 0.0, "vwap": 0.0, "ewm_state": {}},
+    "SOXL": {"value": 0.0, "vwap": 0.0, "ewm_state": {}},
+}
+shared_holdings = {"SOXS": 0, "SOXL": 0}
+wakeup_event = asyncio.Event()
+in_memory_ordering_lock = {"SOXS": False, "SOXL": False}
+dual_strike_mutex = asyncio.Lock()
+idempotency_keys = {
+    "SOXS": {"BUY": None, "SELL": None, "M_DUMP": None},
+    "SOXL": {"BUY": None, "SELL": None, "M_DUMP": None},
+}
 
 _LAST_GC_DATE_STR = ""
+LAST_GC_DATE = ""
+
+
+def _unpack_rsi_calc_safe(calc_res) -> tuple[float, float, dict]:
+    """
+    calculate_rsi_1m 반환값이 2-튜플(rsi, vwap)이든 3-튜플(rsi, vwap, ewm_state)이든
+    ValueError(too many values to unpack) 없이 100% 안전하게 추출합니다.
+    """
+    if not isinstance(calc_res, (tuple, list)):
+        return 50.0, 0.0, {}
+    n = len(calc_res)
+    r_val = float(calc_res[0] or 50.0) if n >= 1 else 50.0
+    v_val = float(calc_res[1] or 0.0) if n >= 2 else 0.0
+    ewm_st = calc_res[2] if (n >= 3 and isinstance(calc_res[2], dict)) else getattr(calc_res, "ewm_state", {})
+    if not isinstance(ewm_st, dict):
+        ewm_st = {}
+    return r_val, v_val, ewm_st
+
+
+def _unpack_ledger_state_safe(state_tuple) -> tuple:
+    """
+    AssassinLedger.get_state(symbol) 반환값이 12개, 13개, 14개 중 어느 길이이더라도
+    ValueError(too many values to unpack) 없이 13개 표준 필드로 안전하게 정규화 추출합니다.
+    """
+    if not isinstance(state_tuple, (tuple, list)):
+        return (0.0, 100.0, SINGLE_TARGET_PROFIT_RATE, True, False, True, 0.0, "", "", 0.0, 0.0, 0.0, "")
+    n = len(state_tuple)
+    last_buy_price = float(state_tuple[0] or 0.0) if n > 0 else 0.0
+    budget = float(state_tuple[1] or 100.0) if n > 1 else 100.0
+    target_profit_rate = float(state_tuple[2] or SINGLE_TARGET_PROFIT_RATE) if n > 2 else SINGLE_TARGET_PROFIT_RATE
+    is_compound = bool(state_tuple[3]) if n > 3 else True
+    is_session_done = bool(state_tuple[4]) if n > 4 else False
+    is_active = bool(state_tuple[5]) if n > 5 else True
+    target_sell_price = float(state_tuple[6] or 0.0) if n > 6 else 0.0
+    sell_order_id = str(state_tuple[7] or "") if n > 7 else ""
+    entry_session = str(state_tuple[8] or "") if n > 8 else ""
+    entry_time = float(state_tuple[9] or 0.0) if n > 9 else 0.0
+    nq_entry_price = float(state_tuple[10] or 0.0) if n > 10 else 0.0
+    nq_entry_amp = float(state_tuple[11] or 0.0) if n > 11 else 0.0
+    entry_trend = str(state_tuple[12] or "") if n > 12 else ""
+    return (
+        last_buy_price,
+        budget,
+        target_profit_rate,
+        is_compound,
+        is_session_done,
+        is_active,
+        target_sell_price,
+        sell_order_id,
+        entry_session,
+        entry_time,
+        nq_entry_price,
+        nq_entry_amp,
+        entry_trend,
+    )
 
 
 def _resolve_loop_dependencies(*args, **kwargs) -> dict:
@@ -82,12 +163,12 @@ def _resolve_loop_dependencies(*args, **kwargs) -> dict:
     api_client = kwargs.get("api_client") or kwargs.get("client")
     bot = kwargs.get("bot")
     chat_id = kwargs.get("chat_id")
-    shared_rsi_state = kwargs.get("shared_rsi_state")
-    shared_holdings = kwargs.get("shared_holdings")
-    wakeup_event = kwargs.get("wakeup_event")
-    in_memory_ordering_lock = kwargs.get("in_memory_ordering_lock")
-    dual_strike_mutex = kwargs.get("dual_strike_mutex")
-    idempotency_keys = kwargs.get("idempotency_keys")
+    rsi_st = kwargs.get("shared_rsi_state")
+    hold_st = kwargs.get("shared_holdings")
+    wake_ev = kwargs.get("wakeup_event")
+    ord_lock = kwargs.get("in_memory_ordering_lock")
+    strike_mtx = kwargs.get("dual_strike_mutex")
+    idem_map = kwargs.get("idempotency_keys")
 
     dict_args = []
     for arg in args:
@@ -98,9 +179,9 @@ def _resolve_loop_dependencies(*args, **kwargs) -> dict:
         elif hasattr(arg, "send_message"):
             bot = bot or arg
         elif isinstance(arg, asyncio.Event):
-            wakeup_event = wakeup_event or arg
+            wake_ev = wake_ev or arg
         elif isinstance(arg, asyncio.Lock):
-            dual_strike_mutex = dual_strike_mutex or arg
+            strike_mtx = strike_mtx or arg
         elif isinstance(arg, int) and not isinstance(arg, bool):
             if chat_id is None:
                 chat_id = arg
@@ -113,61 +194,58 @@ def _resolve_loop_dependencies(*args, **kwargs) -> dict:
     for d in dict_args:
         soxs_v = d.get("SOXS")
         if isinstance(soxs_v, dict) and ("value" in soxs_v or "vwap" in soxs_v or "ewm_state" in soxs_v):
-            if shared_rsi_state is None:
-                shared_rsi_state = d
+            if rsi_st is None:
+                rsi_st = d
         elif isinstance(soxs_v, dict) and ("BUY" in soxs_v or "SELL" in soxs_v):
-            if idempotency_keys is None:
-                idempotency_keys = d
+            if idem_map is None:
+                idem_map = d
         elif isinstance(soxs_v, bool):
-            if in_memory_ordering_lock is None:
-                in_memory_ordering_lock = d
+            if ord_lock is None:
+                ord_lock = d
         elif isinstance(soxs_v, (int, float)):
-            if shared_holdings is None:
-                shared_holdings = d
+            if hold_st is None:
+                hold_st = d
 
     if api_client is None:
         api_client = getattr(GlobalThrottle, "active_client", None)
     if chat_id is None:
         env_cid = os.getenv("TELEGRAM_CHAT_ID", "0").strip()
         chat_id = int(env_cid) if env_cid.lstrip("-").isdigit() else 0
-    if shared_rsi_state is None:
-        shared_rsi_state = {
-            "SOXS": {"value": 0.0, "vwap": 0.0, "ewm_state": {}},
-            "SOXL": {"value": 0.0, "vwap": 0.0, "ewm_state": {}},
-        }
-    if shared_holdings is None:
-        shared_holdings = {"SOXS": 0, "SOXL": 0}
-    if wakeup_event is None:
-        wakeup_event = asyncio.Event()
-    if in_memory_ordering_lock is None:
-        in_memory_ordering_lock = {"SOXS": False, "SOXL": False}
-    if dual_strike_mutex is None:
-        dual_strike_mutex = asyncio.Lock()
-    if idempotency_keys is None:
-        idempotency_keys = {
-            "SOXS": {"BUY": None, "SELL": None, "M_DUMP": None},
-            "SOXL": {"BUY": None, "SELL": None, "M_DUMP": None},
-        }
+    if rsi_st is None:
+        rsi_st = shared_rsi_state
+    if hold_st is None:
+        hold_st = shared_holdings
+    if wake_ev is None:
+        wake_ev = wakeup_event
+    if ord_lock is None:
+        ord_lock = in_memory_ordering_lock
+    if strike_mtx is None:
+        strike_mtx = dual_strike_mutex
+    if idem_map is None:
+        idem_map = idempotency_keys
 
     return {
         "api_client": api_client,
         "bot": bot,
         "chat_id": int(chat_id or 0),
-        "shared_rsi_state": shared_rsi_state,
-        "shared_holdings": shared_holdings,
-        "wakeup_event": wakeup_event,
-        "in_memory_ordering_lock": in_memory_ordering_lock,
-        "dual_strike_mutex": dual_strike_mutex,
-        "idempotency_keys": idempotency_keys,
+        "shared_rsi_state": rsi_st,
+        "shared_holdings": hold_st,
+        "wakeup_event": wake_ev,
+        "in_memory_ordering_lock": ord_lock,
+        "dual_strike_mutex": strike_mtx,
+        "idempotency_keys": idem_map,
     }
 
 
-async def run_daily_gc(shared_rsi_state: dict = None, shared_holdings: dict = None):
+async def run_daily_gc(rsi_state_dict: dict = None, holdings_dict: dict = None, *args, **kwargs):
     """
     Case 22: 17:00 EST 일일 마감 시 낡은 로그/임시 파일 소각 및
     미보유 종목의 장부 잠금·트레일링·최저점추적·상승주도주 캐시 초기화.
     """
     try:
+        target_rsi = rsi_state_dict if isinstance(rsi_state_dict, dict) else shared_rsi_state
+        target_hold = holdings_dict if isinstance(holdings_dict, dict) else shared_holdings
+
         def _clean_files_sync():
             now_ts = time.time()
             for pat in ("*.tmp", "*.log.*", "candles_*.bak"):
@@ -183,8 +261,8 @@ async def run_daily_gc(shared_rsi_state: dict = None, shared_holdings: dict = No
         _reset_bottom_track_state()
         _reset_pre_leader_state()
 
-        qty_s = int((shared_holdings or {}).get("SOXS", 0))
-        qty_l = int((shared_holdings or {}).get("SOXL", 0))
+        qty_s = int((target_hold or {}).get("SOXS", 0))
+        qty_l = int((target_hold or {}).get("SOXL", 0))
         if qty_s <= 0:
             _reset_trailing_runtime_state("SOXS")
             _reset_manual_stage3_anchor("SOXS")
@@ -206,20 +284,23 @@ async def run_daily_gc(shared_rsi_state: dict = None, shared_holdings: dict = No
                 whipsaw_target_price=0.0,
             )
 
-        if isinstance(shared_rsi_state, dict):
-            for sym in ("SOXS", "SOXL"):
-                if sym in shared_rsi_state and isinstance(shared_rsi_state[sym], dict):
-                    shared_rsi_state[sym]["ewm_state"] = {}
+        if isinstance(target_rsi, dict):
+            for sym in TRADE_SYMBOLS:
+                if sym in target_rsi and isinstance(target_rsi[sym], dict):
+                    target_rsi[sym]["ewm_state"] = {}
         print("🧹 [17:00 EST 일일 GC 완료] 캐시 및 미보유 장부 초기화 완료", flush=True)
     except Exception as e:
         print(f"🚨 [17:00 EST 일일 GC 방어] {e}", flush=True)
+
+
+execute_daily_garbage_collection = run_daily_gc
 
 
 async def _fetch_candles_for_radar(
     api_client: TossApiClient,
     symbol: str,
     now_est: datetime,
-    shared_holdings: dict,
+    holdings_map: dict,
 ) -> list:
     """
     초과 Case 72, 97, 98:
@@ -230,7 +311,7 @@ async def _fetch_candles_for_radar(
       최대 2페이지(400분봉)를 페이지네이션 조회하여 시계열 단절을 원천 봉쇄합니다.
     """
     est_hm = now_est.hour * 100 + now_est.minute
-    hold_qty = int((shared_holdings or {}).get(symbol, 0))
+    hold_qty = int((holdings_map or {}).get(symbol, 0))
 
     need_multi_page = (
         (407 <= est_hm <= 814)
@@ -242,8 +323,7 @@ async def _fetch_candles_for_radar(
 
     all_candles = []
     before_cursor = None
-    max_pages = 2
-    for _ in range(max_pages):
+    for _ in range(2):
         page_data = await api_client.get_1m_candles_pagination(symbol, count=200, before=before_cursor)
         c_list = (page_data or {}).get("candles", [])
         if not c_list:
@@ -265,24 +345,24 @@ async def rsi_radar_loop(*args, **kwargs):
     api_client: TossApiClient = deps["api_client"]
     bot = deps["bot"]
     chat_id: int = deps["chat_id"]
-    shared_rsi_state: dict = deps["shared_rsi_state"]
-    shared_holdings: dict = deps["shared_holdings"]
-    wakeup_event: asyncio.Event = deps["wakeup_event"]
-    in_memory_ordering_lock: dict = deps["in_memory_ordering_lock"]
-    dual_strike_mutex: asyncio.Lock = deps["dual_strike_mutex"]
-    idempotency_keys: dict = deps["idempotency_keys"]
+    rsi_state_map: dict = deps["shared_rsi_state"]
+    holdings_map: dict = deps["shared_holdings"]
+    wake_ev: asyncio.Event = deps["wakeup_event"]
+    ord_lock: dict = deps["in_memory_ordering_lock"]
+    strike_mtx: asyncio.Lock = deps["dual_strike_mutex"]
+    idem_map: dict = deps["idempotency_keys"]
 
     ctx = SniperPluginContext(
         client=api_client,
         bot=bot,
         chat_id=chat_id,
-        wakeup_event=wakeup_event,
-        in_memory_ordering_lock=in_memory_ordering_lock,
-        dual_strike_mutex=dual_strike_mutex,
-        shared_holdings=shared_holdings,
-        idempotency_keys=idempotency_keys,
+        wakeup_event=wake_ev,
+        in_memory_ordering_lock=ord_lock,
+        dual_strike_mutex=strike_mtx,
+        shared_holdings=holdings_map,
+        idempotency_keys=idem_map,
         nq_dynamic_floor=NQ_DYNAMIC_FLOOR,
-        shared_rsi_state=shared_rsi_state,
+        shared_rsi_state=rsi_state_map,
     )
 
     while True:
@@ -302,22 +382,21 @@ async def rsi_radar_loop(*args, **kwargs):
                 await asyncio.sleep(10.0)
                 continue
 
-            prices_map = await api_client.get_current_prices_batch(("SOXS", "SOXL"))
+            prices_map = await api_client.get_current_prices_batch(TRADE_SYMBOLS)
 
-            for sym in ("SOXS", "SOXL"):
+            for sym in TRADE_SYMBOLS:
                 try:
                     candles = await _fetch_candles_for_radar(
                         api_client=api_client,
                         symbol=sym,
                         now_est=now_est,
-                        shared_holdings=shared_holdings,
+                        holdings_map=holdings_map,
                     )
                     if not candles:
                         continue
 
-                    rsi_val, vwap_val, ewm_state = await asyncio.to_thread(
-                        calculate_rsi_1m, candles, now_est
-                    )
+                    calc_raw = await asyncio.to_thread(calculate_rsi_1m, candles, now_est)
+                    rsi_val, vwap_val, ewm_state = _unpack_rsi_calc_safe(calc_raw)
 
                     live_p = float((prices_map or {}).get(sym, 0.0) or 0.0)
                     if live_p <= 0.0 and ewm_state:
@@ -331,12 +410,12 @@ async def rsi_radar_loop(*args, **kwargs):
                         )
                         compute_realtime_tick_heikin_ashi(live_p, ewm_state)
 
-                    if sym not in shared_rsi_state or not isinstance(shared_rsi_state[sym], dict):
-                        shared_rsi_state[sym] = {"value": rsi_val, "vwap": vwap_val, "ewm_state": ewm_state}
+                    if sym not in rsi_state_map or not isinstance(rsi_state_map[sym], dict):
+                        rsi_state_map[sym] = {"value": rsi_val, "vwap": vwap_val, "ewm_state": ewm_state}
                     else:
-                        shared_rsi_state[sym]["value"] = rsi_val
-                        shared_rsi_state[sym]["vwap"] = vwap_val
-                        shared_rsi_state[sym]["ewm_state"] = ewm_state
+                        rsi_state_map[sym]["value"] = rsi_val
+                        rsi_state_map[sym]["vwap"] = vwap_val
+                        rsi_state_map[sym]["ewm_state"] = ewm_state
 
                     await execute_rsi_monitoring_plugin(
                         ctx=ctx,
@@ -350,18 +429,18 @@ async def rsi_radar_loop(*args, **kwargs):
 
             # 초과 Case 97: 04:07 ~ 08:14 EST 구간에는 양쪽 스캔 직후 즉시 상승 주도주(leader_sym) 비교·복원 수행
             if 407 <= est_hm <= 814:
-                for sym_ld in ("SOXS", "SOXL"):
-                    r_ld = float((shared_rsi_state.get(sym_ld) or {}).get("value", 0.0))
+                for sym_ld in TRADE_SYMBOLS:
+                    r_ld = float((rsi_state_map.get(sym_ld) or {}).get("value", 0.0))
                     update_premarket_trend_leader(
                         symbol=sym_ld,
                         live_rsi_val=r_ld,
                         now_est=now_est,
-                        shared_rsi_state=shared_rsi_state,
+                        shared_rsi_state=rsi_state_map,
                     )
 
-            total_hold = sum(int(v) for v in (shared_holdings or {}).values())
+            total_hold = sum(int(v) for v in (holdings_map or {}).values())
             any_trail_armed = any(
-                bool(_TRAIL_RUNTIME_CACHE.get(s, {}).get("armed", False)) for s in ("SOXS", "SOXL")
+                bool(_TRAIL_RUNTIME_CACHE.get(s, {}).get("armed", False)) for s in TRADE_SYMBOLS
             )
             bot_track_on = bool(_BOTTOM_TRACK_CACHE.get("active", False))
             day_sim_st = get_daymarket_sim_status()
@@ -394,24 +473,24 @@ async def assassin_loop(*args, **kwargs):
     api_client: TossApiClient = deps["api_client"]
     bot = deps["bot"]
     chat_id: int = deps["chat_id"]
-    shared_rsi_state: dict = deps["shared_rsi_state"]
-    shared_holdings: dict = deps["shared_holdings"]
-    wakeup_event: asyncio.Event = deps["wakeup_event"]
-    in_memory_ordering_lock: dict = deps["in_memory_ordering_lock"]
-    dual_strike_mutex: asyncio.Lock = deps["dual_strike_mutex"]
-    idempotency_keys: dict = deps["idempotency_keys"]
+    rsi_state_map: dict = deps["shared_rsi_state"]
+    holdings_map: dict = deps["shared_holdings"]
+    wake_ev: asyncio.Event = deps["wakeup_event"]
+    ord_lock: dict = deps["in_memory_ordering_lock"]
+    strike_mtx: asyncio.Lock = deps["dual_strike_mutex"]
+    idem_map: dict = deps["idempotency_keys"]
 
     ctx = SniperPluginContext(
         client=api_client,
         bot=bot,
         chat_id=chat_id,
-        wakeup_event=wakeup_event,
-        in_memory_ordering_lock=in_memory_ordering_lock,
-        dual_strike_mutex=dual_strike_mutex,
-        shared_holdings=shared_holdings,
-        idempotency_keys=idempotency_keys,
+        wakeup_event=wake_ev,
+        in_memory_ordering_lock=ord_lock,
+        dual_strike_mutex=strike_mtx,
+        shared_holdings=holdings_map,
+        idempotency_keys=idem_map,
         nq_dynamic_floor=NQ_DYNAMIC_FLOOR,
-        shared_rsi_state=shared_rsi_state,
+        shared_rsi_state=rsi_state_map,
     )
 
     while True:
@@ -430,7 +509,7 @@ async def assassin_loop(*args, **kwargs):
             # Case 22: 17:00 EST 일일 가비지 컬렉션(GC) 1회 실행
             if est_hm == 1700 and _LAST_GC_DATE_STR != today_str:
                 _LAST_GC_DATE_STR = today_str
-                await run_daily_gc(shared_rsi_state=shared_rsi_state, shared_holdings=shared_holdings)
+                await run_daily_gc(rsi_state_dict=rsi_state_map, holdings_dict=holdings_map)
 
             is_weekend_closed = (wk == 4 and est_hm >= 1700) or (wk == 5) or (wk == 6 and est_hm < 1800)
             if is_weekend_closed or (1700 <= est_hm <= 1759):
@@ -442,7 +521,7 @@ async def assassin_loop(*args, **kwargs):
                 await settle_daymarket_sim_before_premarket(ctx, now_est)
 
             # 1단계: SOXS & SOXL 다건 배치 실시간 현재가 조회 및 O(1) 실시간 틱 RSI·하이킨 아시 합성 (Case 73, 83, 85)
-            prices_batch = await api_client.get_current_prices_batch(("SOXS", "SOXL"))
+            prices_batch = await api_client.get_current_prices_batch(TRADE_SYMBOLS)
             live_prices = {
                 "SOXS": float((prices_batch or {}).get("SOXS", 0.0) or 0.0),
                 "SOXL": float((prices_batch or {}).get("SOXL", 0.0) or 0.0),
@@ -452,8 +531,8 @@ async def assassin_loop(*args, **kwargs):
             live_vwaps = {"SOXS": 0.0, "SOXL": 0.0}
             day_vwaps = {"SOXS": 0.0, "SOXL": 0.0}
 
-            for sym_t in ("SOXS", "SOXL"):
-                st_r = (shared_rsi_state.get(sym_t) or {}) if isinstance(shared_rsi_state, dict) else {}
+            for sym_t in TRADE_SYMBOLS:
+                st_r = (rsi_state_map.get(sym_t) or {}) if isinstance(rsi_state_map, dict) else {}
                 ewm_r = st_r.get("ewm_state") or {}
                 base_r = float(st_r.get("value", 0.0) or 0.0)
                 base_v = float(st_r.get("vwap", 0.0) or 0.0)
@@ -477,16 +556,16 @@ async def assassin_loop(*args, **kwargs):
                 day_vwaps[sym_t] = float(ewm_r.get("day_vwap", 0.0) or 0.0) or base_v
 
             if 407 <= est_hm <= 814:
-                for sym_ld in ("SOXS", "SOXL"):
+                for sym_ld in TRADE_SYMBOLS:
                     update_premarket_trend_leader(
                         symbol=sym_ld,
                         live_rsi_val=live_rsis[sym_ld],
                         now_est=now_est,
-                        shared_rsi_state=shared_rsi_state,
+                        shared_rsi_state=rsi_state_map,
                     )
 
             # 2단계: 종목별 원자적 전술 스텝 실행 (Case 70)
-            for symbol in ("SOXS", "SOXL"):
+            for symbol in TRADE_SYMBOLS:
                 try:
                     opp_sym = "SOXL" if symbol == "SOXS" else "SOXS"
                     current_price = live_prices[symbol]
@@ -495,7 +574,7 @@ async def assassin_loop(*args, **kwargs):
                     vwap_val = live_vwaps[symbol]
                     day_vwap_val = day_vwaps[symbol]
 
-                    state_tuple = await AssassinLedger.get_state(symbol)
+                    raw_state = await AssassinLedger.get_state(symbol)
                     (
                         last_buy_price,
                         budget,
@@ -510,13 +589,13 @@ async def assassin_loop(*args, **kwargs):
                         nq_entry_price,
                         nq_entry_amp,
                         entry_trend,
-                    ) = state_tuple
+                    ) = _unpack_ledger_state_safe(raw_state)
                     buy_order_id = await AssassinLedger.get_buy_order_id(symbol)
 
                     # 초과 Case 52 & Case 90: 신규 논리 세션 진입 또는 프리장 골든타임 미보유·비과열 잠금 잔재 자가 치유
                     last_sess_id = await AssassinLedger.get_last_session_id(symbol)
                     if last_sess_id and last_sess_id != current_session_id:
-                        if int(shared_holdings.get(symbol, 0)) <= 0 and not buy_order_id:
+                        if int(holdings_map.get(symbol, 0)) <= 0 and not buy_order_id:
                             await AssassinLedger.save_state(
                                 symbol,
                                 is_session_done=False,
@@ -534,7 +613,7 @@ async def assassin_loop(*args, **kwargs):
 
                     holdings_qty = int(math.floor(float(hold_detail.get("qty", 0.0) or 0.0)))
                     avg_price = float(hold_detail.get("avg_price", 0.0) or 0.0)
-                    shared_holdings[symbol] = holdings_qty
+                    holdings_map[symbol] = holdings_qty
 
                     if current_price <= 0.0:
                         current_price = float(hold_detail.get("current_price", 0.0) or 0.0)
@@ -596,7 +675,7 @@ async def assassin_loop(*args, **kwargs):
                             is_compound=is_compound,
                         )
                         if cleared:
-                            state_tuple = await AssassinLedger.get_state(symbol)
+                            raw_state = await AssassinLedger.get_state(symbol)
                             (
                                 last_buy_price,
                                 budget,
@@ -611,7 +690,7 @@ async def assassin_loop(*args, **kwargs):
                                 nq_entry_price,
                                 nq_entry_amp,
                                 entry_trend,
-                            ) = state_tuple
+                            ) = _unpack_ledger_state_safe(raw_state)
                             buy_order_id = await AssassinLedger.get_buy_order_id(symbol)
 
                     # [Step C] 방향성 인지 매크로 3단 방어망 (1·2차 NQ=F 과열 & 3차 토스 QQQ 0.0초 실시간 역행 방어 — Case 66, 67, 86, 92, 94, 95, 96)
@@ -704,7 +783,7 @@ async def assassin_loop(*args, **kwargs):
                         if not hold_recheck.get("error"):
                             holdings_qty = int(math.floor(float(hold_recheck.get("qty", 0.0) or 0.0)))
                             avg_price = float(hold_recheck.get("avg_price", 0.0) or avg_price)
-                            shared_holdings[symbol] = holdings_qty
+                            holdings_map[symbol] = holdings_qty
 
                     # [Step H] 보유 물량 상단 안전 캡(+5.00% LIMIT) 선장전 및 이원화 하이킨 아시 트레일링 스윕 (Case 58, 85, 89, 99)
                     if holdings_qty > 0:
@@ -806,13 +885,9 @@ async def assassin_loop(*args, **kwargs):
         except Exception as outer_e:
             print(f"🚨 [메인 스나이퍼 루프 외곽 방어] {outer_e}", flush=True)
 
-        loop_timeout = 0.4 if fast_shield_mode else 1.5
+        loop_timeout = LOOP_INTERVAL_FAST if fast_shield_mode else LOOP_INTERVAL_NORMAL
         try:
-            await asyncio.wait_for(wakeup_event.wait(), timeout=loop_timeout)
-            wakeup_event.clear()
+            await asyncio.wait_for(wake_ev.wait(), timeout=loop_timeout)
+            wake_ev.clear()
         except asyncio.TimeoutError:
             pass
-
-
-# enforce_0407_whipsaw_cutoff_plugin 에 주입할 선취소·수량 해방 폴링 헬퍼 바인딩
-from defense_plugin import _cancel_open_orders_and_wait_sellable as sniper_plugin_cancel_helper
