@@ -3,10 +3,11 @@
 # MODIFIED: sniper_plugin.py
 프리장 본진 골든타임 (04:07 ~ 08:15 EST) 04:00 ~ 04:07 누적 프리장 VWAP 기준 추세 주도주 선정,
 실시간 동적 프리장 VWAP -0.50% 언더슈팅 매수 덫(PRE_VWAP_M050) 투하,
-15초/$0.03 동적 추적 정정 및 07:45 EST 이전 다회전(Multi-Cycle) 재출동 전술 플러그인 (Step 01 / 05)
-- MODIFIED: 제3헌법 및 최신 프롬프트.txt에 의거하여 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL),
-  activate_bottom_rebound_tracker, execute_post_stop_bottom_rebound_plugin 및 bottom_track_cache
-  참조를 100% 영구 소각하고 오직 동적 VWAP -0.50% 매수 덫(DYN_VWAP_M050) 단일 엔진으로 일원화
+15초/$0.03 동적 추적 정정 및 07:45 EST 이전 다회전(Multi-Cycle) 재출동 전술 플러그인 (Step 03 / 04)
+- MODIFIED: 04:07 EST 프리장 추세 주도주(pre_leader_cache) 락온 시 day_sim_state.json 디스크 파일에
+  즉시 영구 각인(persist_leader_caches_async)하고, 장중 재기동 시 디스크 불변 복원 및
+  600분봉 딥스캔(_deep_scan_candles_for_leader_recovery)을 연동하여 당일 주도주 변경 및 중복 알림 원천 차단
+- MODIFIED: 제3헌법 및 최신 프롬프트.txt에 의거하여 RE_BOT_TRAIL 데드코드 100% 영구 소각 상태 유지
 - 제3헌법: 프리장 본진 주도주 선정 / 매수 덫 투하 / 동적 추적 정정 상태 머신 전담 분리
 - 제4헌법: 모든 타임라인 판단 ZoneInfo('America/New_York') 단일 소스 락온
 - 제5헌법: 지정가 매수 주문 발사 시 고유 clientOrderId 주입
@@ -21,6 +22,12 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
+from daymarket_sim_plugin import (
+    LEADER_RECOVERY_DEEP_SCAN_COUNT,
+    _deep_scan_candles_for_leader_recovery,
+    _ensure_day_sim_caches,
+    persist_leader_caches_async,
+)
 from quant_engine import NQ_OVERHEAT_THRESHOLD
 from quant_indicators_plugin import (
     get_logical_trading_date_str,
@@ -133,7 +140,7 @@ def mark_auto_fill_grace_shield(
 
 
 # ---------------------------------------------------------------------------
-# [Step 1] 04:07 EST 프리장 추세추종 주도주(👑 vwap_leader_sym) 선정 및 재기동 복원
+# [Step 1] 04:07 EST 프리장 추세추종 주도주(👑 vwap_leader_sym) 선정 및 디스크 불변 복원
 # ---------------------------------------------------------------------------
 async def update_premarket_trend_leader(
     context: Any,
@@ -142,18 +149,25 @@ async def update_premarket_trend_leader(
 ) -> Dict[str, Any]:
     """
     🎯 3 [Step 1] & Case 97:
+    - 기동 직후 디스크(day_sim_state.json)에 저장된 당일 프리장 추세 주도주(pre_leader_cache)가 있으면
+      즉시 불변 복원한다.
     - 04:07:00 ~ 08:14:59 EST 구간에 진입하면 SOXL 과 SOXS 의 04:00 ~ 04:07 EST 누적 VWAP_0407 대비
       04:07 EST 기준 가격(C_0407)을 비교하여 C_0407 > VWAP_0407 (disp_0407 > 0.0%) 조건을 만족하는
-      종목을 당일 프리장 추세추종 주도주(_PRE_LEADER_CACHE["leader_sym"])로 불변 각인한다.
+      종목을 당일 프리장 추세추종 주도주(_PRE_LEADER_CACHE["leader_sym"])로 불변 각인하고
+      즉시 디스크(day_sim_state.json)에 영구 저장한다.
     - 양쪽 모두 disp_0407 > 0.0% 이면 초기 이격도 disp_0407 상위 1위 종목을 선정한다.
-    - 장중 프로세스 재기동 시에도 1분봉 시계열로부터 leader_sym, vwap_0407, disp_0407 을 100% 자동 복원한다.
+    - 장중 프로세스 재기동 시에도 디스크 복원 및 600분봉 딥스캔으로 당일 04:07 주도주가 절대 바뀌지 않도록 보장한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
     logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
 
+    # 디스크(day_sim_state.json)로부터 당일 주도주 캐시 복원 보장
+    await _ensure_day_sim_caches(context, logical_date)
+
     leader_cache: Dict[str, Any] = getattr(context, "pre_leader_cache", {})
     if leader_cache.get("logical_date") != logical_date:
+        hybrid_keep = bool(leader_cache.get("hybrid_mode", False))
         leader_cache.clear()
         leader_cache.update(
             {
@@ -164,7 +178,7 @@ async def update_premarket_trend_leader(
                 "c_0407": 0.0,
                 "disp_0407": 0.0,
                 "notified": False,
-                "hybrid_mode": bool(leader_cache.get("hybrid_mode", False)),
+                "hybrid_mode": hybrid_keep,
             }
         )
 
@@ -172,6 +186,7 @@ async def update_premarket_trend_leader(
     if not (407 <= hm <= 814):
         return leader_cache
 
+    # 이미 당일 프리장 추세 주도주가 락온되어 있으면 08:14 마감까지 절대 변경하지 않고 즉시 반환!
     if (
         leader_cache.get("locked")
         and str(leader_cache.get("leader_sym") or "") in REAL_ALLOWED_SYMBOLS
@@ -181,23 +196,25 @@ async def update_premarket_trend_leader(
     soxs_met = _get_live_symbol_metrics(context, "SOXS", prices, dt_now)
     soxl_met = _get_live_symbol_metrics(context, "SOXL", prices, dt_now)
 
-    # 기동 직후 캔들 캐시에 vwap_0407 이 아직 계산되지 않았다면 즉시 1분봉 조회 후 산출
+    # 기동 직후 캔들 캐시에 vwap_0407 이 아직 계산되지 않았다면 즉시 600분봉 딥스캔으로 04:00~04:07 봉 확보
     if (
         safe_float(soxs_met.get("vwap_0407"), 0.0) <= 0.0
         and safe_float(soxl_met.get("vwap_0407"), 0.0) <= 0.0
-        and hasattr(context, "refresh_symbol_candles_once")
     ):
-        try:
-            await context.refresh_symbol_candles_once(("SOXS", "SOXL"))
-            soxs_met = _get_live_symbol_metrics(context, "SOXS", prices, dt_now)
-            soxl_met = _get_live_symbol_metrics(context, "SOXL", prices, dt_now)
-        except Exception as exc:
-            logger.warning("⚠️ 04:07 주도주 복원용 캔들 즉시 갱신 실패: %s", exc)
+        await _deep_scan_candles_for_leader_recovery(
+            context,
+            prices=prices,
+            now_est=dt_now,
+            total_count=LEADER_RECOVERY_DEEP_SCAN_COUNT,
+        )
+        soxs_met = _get_live_symbol_metrics(context, "SOXS", prices, dt_now)
+        soxl_met = _get_live_symbol_metrics(context, "SOXL", prices, dt_now)
 
     res = select_vwap_trend_leader(soxs_met, soxl_met, session_mode="PRE")
     win_sym = str(res.get("leader_sym") or "").upper().strip()
 
     if win_sym in REAL_ALLOWED_SYMBOLS:
+        was_notified = bool(leader_cache.get("notified", False))
         leader_cache.update(
             {
                 "logical_date": logical_date,
@@ -206,12 +223,13 @@ async def update_premarket_trend_leader(
                 "vwap_0407": safe_float(res.get("vwap_init"), 0.0),
                 "c_0407": safe_float(res.get("c_init"), 0.0),
                 "disp_0407": safe_float(res.get("disp_init"), 0.0),
+                "notified": True,
             }
         )
-        if not leader_cache.get("notified") and hasattr(
-            context, "send_slim_alert"
-        ):
-            leader_cache["notified"] = True
+        # 프리장 주도주 확정 즉시 디스크(day_sim_state.json)에 영구 각인!
+        await persist_leader_caches_async(context)
+
+        if not was_notified and hasattr(context, "send_slim_alert"):
             await context.send_slim_alert(
                 title=f"👑 [프리장 추세 주도주 락온] {win_sym}",
                 body=(

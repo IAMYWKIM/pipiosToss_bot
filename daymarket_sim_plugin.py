@@ -1,27 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: daymarket_sim_plugin.py
-데이장 (19:00 ~ 03:57 EST) 100% [모의] 전용 프리장 동형(Isomorphic) 스나이퍼 플러그인 (Step 03 / 05)
+데이장 (19:00 ~ 03:57 EST) 100% [모의] 전용 프리장 동형(Isomorphic) 스나이퍼 플러그인 (Step 02 / 04)
 - 🚨 데이장 실거래 매수 100% 물리적 절대 차단 (create_order 호출 0건!)
-- MODIFIED: 제3헌법 및 최신 프롬프트.txt에 의거하여 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL / BOTTOM_TRACK)
-  관련 필드 및 분기를 100% 영구 소각하고, 3차 QQQ 역행 손절 시 즉시 당일 데이장 모의 세션 안전 마감(DONE_STAGE3_STOP)
-- NEW: 서버 재기동(/update 등) 시에도 데이장 [모의] 보유 포지션과 당일 출격/승패/세후수익률 전적이 휘발되지 않도록
-  제1헌법 및 Case 05, 06 준수 원자적 로컬 상태 파일(day_sim_state.json) 백업/복원 엔진 탑재
-- 🎯 1 & Case 02, 05, 06, 60, 77 ~ 94, 97 ~ 100 완벽 구현:
-  1) [Step 1] 19:00 ~ 19:07 EST 누적 데이장 VWAP(VWAP_1907) 산출 후 19:07 EST 기준
-     현재가 > VWAP_1907 (disp_1907 > 0.0%, 양쪽 상회 시 이격도 상위 1위) 데이장 추세 주도주 자동 선정/복원
-  2) [Step 2] 19:07 ~ 03:35 EST 실시간 동적 데이장 VWAP_day_t 대비 -0.50% 언더슈팅 하단가
-     (VWAP_day_t * 0.9950 또는 하이브리드 min(VWAP_1907, VWAP_day_t * 0.9950))에 [모의] 매수 덫 장전,
-     15초 & $0.03 괴리 시 자동 추적 정정, 현재가 도달 시 즉시 [모의] 체결 및 QQQ 0.00% 기준가 락온,
-     03:25 EST 이전 익절/탈출 완료 시 다회전(Multi-Cycle) 무한 [모의] 재출동
-  3) [Step 3] [모의] 체결 즉시 +5.00% 상단 안전 캡 & +1.00% 점화 하드보존 하이킨 아시 트레일링
-     (HARD_TRAIL_100 : +1.30% 전 +0.75% 비상 쿠션 / +1.30% 돌파 시 +1.00% 하드 잠금,
-     🕯️HA양봉 홀딩 & 🌑HA음봉 + 최고가 대비 -0.20% 콜백 스윕 × 실시간 QQQ ±0.20% NQ_VEL_BYPASS)
-  4) [Step 4] 데이장 후반(02:45 ~ 03:57 EST) 진입 25분 경과 미익절 표류 물량 동적 데이장 VWAP
-     (최소 평단 +0.20% 수수료 보전선) 도달 즉시 [모의] 선제 탈출(DAY_VWAP_ESC)
-  5) [Step 5] 1·2차 NQ=F >= 2.0% 과열 차단/덤핑 & 3차 실시간 QQQ 최소 0.80% 역행 [모의] 손절 마감
-     및 실시간 승률/세후수익률 집계 영속화
-  6) 03:58 ~ 03:59 EST 데이장 마감 2분 전 묵음 바이패스 및 미결 모의 포지션 자동 클리어
+- MODIFIED: 데이장 추세 주도주(day_leader_cache) 및 프리장 추세 주도주(pre_leader_cache)를
+  day_sim_state.json 디스크 파일에 함께 원자적으로 영속화(persist_leader_caches_async)하여,
+  장 후반(400분 경과 후) 서버 재기동 시에도 이미 확정된 주도주가 절대 바뀌지 않고 중복 알림도 차단되도록 결속
+- NEW: 디스크 캐시 없이 데이장 후반(01:40 ~ 03:57 EST, 개장 후 400 ~ 537분 경과)에 최초 기동될 경우,
+  자동으로 600분봉(10시간 분량) 다중 페이지 딥스캔(_deep_scan_candles_for_leader_recovery)을 수행하여
+  19:00 ~ 19:07 EST 실제 개장 초기 분봉으로부터 정통 주도주를 100% 복원
+- 제1헌법 & 제3헌법 & 제4헌법 & 🎯 1 & Case 02, 05, 06, 60, 77 ~ 94, 97 ~ 100 완벽 준수
 """
 
 from __future__ import annotations
@@ -37,6 +25,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from quant_engine import NQ_OVERHEAT_THRESHOLD, calc_qqq_adverse_status
 from quant_indicators_plugin import (
+    compute_session_vwap_metrics,
     get_logical_trading_date_str,
     refresh_metrics_with_live_tick,
     select_vwap_trend_leader,
@@ -51,11 +40,6 @@ from sniper_exit_plugin import (
     TRAIL_DEFAULT_CALLBACK_PCT,
     TRAIL_RATCHET_LOCK_PCT,
 )
-from sniper_plugin import (
-    TRAP_MODIFY_COOLDOWN_SEC,
-    TRAP_MODIFY_MIN_DIFF_PCT,
-    TRAP_MODIFY_MIN_DIFF_USD,
-)
 from toss_api import (
     EST_TZ,
     REAL_ALLOWED_SYMBOLS,
@@ -67,6 +51,14 @@ from toss_api import (
 logger = logging.getLogger("toss_sniper.daymarket_sim_plugin")
 
 DAY_SIM_STATE_FILENAME: str = "day_sim_state.json"
+
+# 동적 VWAP 매수 덫 자동 정정 최소 가격 괴리($0.03 및 0.05%) 및 최소 쿨다운(15.0초) 상수 (🎯 1 & 🎯 3)
+SIM_TRAP_MODIFY_MIN_DIFF_USD: float = 0.03
+SIM_TRAP_MODIFY_MIN_DIFF_PCT: float = 0.05
+SIM_TRAP_MODIFY_COOLDOWN_SEC: float = 15.0
+
+# 데이장 후반(19:00 개장 후 400분 초과 경과 시) 초기 7분 봉 복원을 위한 딥스캔 분봉 수 (600분 = 10시간)
+LEADER_RECOVERY_DEEP_SCAN_COUNT: int = 600
 
 
 def _resolve_day_sim_filepath() -> str:
@@ -120,15 +112,15 @@ def is_daymarket_late_vwap_esc_window(hm: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 데이장 [모의] 상태 초기화 · 디스크 영속화(Save/Load) 헬퍼 (제1헌법 & Case 02, 05, 06, 77)
+# 데이장 [모의] 상태 및 주도주 캐시 초기화 · 디스크 영속화(Save/Load) 헬퍼 (제1헌법 & Case 02, 05, 06, 77)
 # ---------------------------------------------------------------------------
 def create_default_day_sim_state(logical_date: str = "") -> Dict[str, Any]:
     """
-    데이장 100% [모의] 전용 상태 머신 기본 딕셔너리를 생성한다.
-    (MODIFIED: 폐기된 RE_BOT_TRAIL / BOTTOM_TRACK 필드 영구 소각 완료)
+    데이장 100% [모의] 전용 상태 머신 및 당일 주도주 영속 백업 기본 딕셔너리를 생성한다.
     """
+    ld_str = str(logical_date or "")
     return {
-        "logical_date": str(logical_date or ""),
+        "logical_date": ld_str,
         "phase": "IDLE",  # IDLE | TRAP_WAITING | HOLDING | DONE_OVERHEAT | DONE_STAGE3_STOP | DONE_SESSION | CLEARED
         "symbol": "",
         "trig_mode": "",  # DAY_VWAP_M050
@@ -159,6 +151,27 @@ def create_default_day_sim_state(logical_date: str = "") -> Dict[str, Any]:
         "sim_last_exit_tag": "",
         "sim_last_exit_rate_pct": 0.0,
         "cleared_before_premarket": False,
+        # NEW: 재기동 시 주도주 불변 유지를 위한 데이장/프리장 추세 주도주 영속 슬롯
+        "day_leader_cache": {
+            "logical_date": ld_str,
+            "locked": False,
+            "leader_sym": "",
+            "vwap_1907": 0.0,
+            "c_1907": 0.0,
+            "disp_1907": 0.0,
+            "notified": False,
+            "hybrid_mode": False,
+        },
+        "pre_leader_cache": {
+            "logical_date": ld_str,
+            "locked": False,
+            "leader_sym": "",
+            "vwap_0407": 0.0,
+            "c_0407": 0.0,
+            "disp_0407": 0.0,
+            "notified": False,
+            "hybrid_mode": False,
+        },
         "_disk_loaded": True,
     }
 
@@ -199,12 +212,26 @@ def _save_day_sim_state_sync(state_dict: Dict[str, Any]) -> None:
             logger.debug("day_sim_state.json 저장 예외: %s", exc)
 
 
-async def persist_day_sim_state_async(day_sim_state: Dict[str, Any]) -> None:
+async def persist_day_sim_state_async(
+    day_sim_state: Dict[str, Any],
+    context: Optional[Any] = None,
+) -> None:
     """
-    제1헌법 & Case 05, 06: 데이장 [모의] 상태를 백그라운드 스레드에서 원자적으로 디스크에 기록한다.
+    제1헌법 & Case 05, 06:
+    데이장 [모의] 상태 및 현재 확정된 데이장/프리장 추세 주도주 캐시(day_leader_cache, pre_leader_cache)를
+    백그라운드 스레드에서 원자적으로 디스크(day_sim_state.json)에 기록한다.
     """
     if not isinstance(day_sim_state, dict):
         return
+
+    if context is not None:
+        day_ldr = getattr(context, "day_leader_cache", None)
+        if isinstance(day_ldr, dict) and day_ldr:
+            day_sim_state["day_leader_cache"] = dict(day_ldr)
+        pre_ldr = getattr(context, "pre_leader_cache", None)
+        if isinstance(pre_ldr, dict) and pre_ldr:
+            day_sim_state["pre_leader_cache"] = dict(pre_ldr)
+
     try:
         await asyncio.wait_for(
             asyncio.to_thread(_save_day_sim_state_sync, dict(day_sim_state)),
@@ -214,31 +241,70 @@ async def persist_day_sim_state_async(day_sim_state: Dict[str, Any]) -> None:
         logger.debug("persist_day_sim_state_async 예외: %s", exc)
 
 
+async def persist_leader_caches_async(context: Any) -> None:
+    """
+    NEW: 데이장(19:07 EST) 또는 프리장(04:07 EST) 추세 주도주가 락온된 즉시
+    day_sim_state.json 에 주도주 캐시를 영구 각인하는 헬퍼 함수.
+    """
+    day_sim_state = getattr(context, "day_sim_state", None)
+    if not isinstance(day_sim_state, dict):
+        return
+    await persist_day_sim_state_async(day_sim_state, context=context)
+
+
+def _inject_restored_leader_into_candle_cache(
+    context: Any,
+    logical_date: str,
+    day_leader_cache: Dict[str, Any],
+    pre_leader_cache: Dict[str, Any],
+) -> None:
+    """
+    디스크에서 복원된 19:07 / 04:07 초기 기준가 및 초기 VWAP 값을
+    context.candle_metrics_cache 내 해당 주도주 슬롯에도 주입하여,
+    5.0초 캔들 갱신 시 prev_metrics 불변 계승이 끊기지 않도록 보장한다.
+    """
+    raw_cache = getattr(context, "candle_metrics_cache", None)
+    if not isinstance(raw_cache, dict):
+        return
+
+    d_sym = str(day_leader_cache.get("leader_sym") or "").upper().strip()
+    if (
+        day_leader_cache.get("locked")
+        and d_sym in REAL_ALLOWED_SYMBOLS
+        and safe_float(day_leader_cache.get("vwap_1907"), 0.0) > 0.0
+    ):
+        met = raw_cache.get(d_sym)
+        if isinstance(met, dict) and str(met.get("logical_date") or "") == logical_date:
+            met["vwap_1907"] = safe_float(day_leader_cache.get("vwap_1907"), 0.0)
+            met["c_1907"] = safe_float(day_leader_cache.get("c_1907"), 0.0)
+            met["disp_1907"] = safe_float(day_leader_cache.get("disp_1907"), 0.0)
+
+    p_sym = str(pre_leader_cache.get("leader_sym") or "").upper().strip()
+    if (
+        pre_leader_cache.get("locked")
+        and p_sym in REAL_ALLOWED_SYMBOLS
+        and safe_float(pre_leader_cache.get("vwap_0407"), 0.0) > 0.0
+    ):
+        met = raw_cache.get(p_sym)
+        if isinstance(met, dict) and str(met.get("logical_date") or "") == logical_date:
+            met["vwap_0407"] = safe_float(pre_leader_cache.get("vwap_0407"), 0.0)
+            met["c_0407"] = safe_float(pre_leader_cache.get("c_0407"), 0.0)
+            met["disp_0407"] = safe_float(pre_leader_cache.get("disp_0407"), 0.0)
+
+
 async def _ensure_day_sim_caches(
     context: Any, logical_date: str
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    context.day_leader_cache 및 context.day_sim_state 의 논리적 거래일 롤오버(18:00 EST)를 점검하고,
-    기동 직후 디스크(day_sim_state.json)에 저장된 당일 데이장 [모의] 상태가 있으면 100% 복원한다.
+    context.day_leader_cache, context.pre_leader_cache 및 context.day_sim_state 의
+    논리적 거래일 롤오버(18:00 EST)를 점검하고,
+    기동 직후 디스크(day_sim_state.json)에 저장된 당일 데이장 [모의] 상태 및
+    추세 주도주(day_leader_cache / pre_leader_cache)가 있으면 100% 불변 복원한다!
     """
     day_leader_cache: Dict[str, Any] = getattr(context, "day_leader_cache", {})
-    if day_leader_cache.get("logical_date") != logical_date:
-        hybrid_keep = bool(day_leader_cache.get("hybrid_mode", False))
-        day_leader_cache.clear()
-        day_leader_cache.update(
-            {
-                "logical_date": logical_date,
-                "locked": False,
-                "leader_sym": "",
-                "vwap_1907": 0.0,
-                "c_1907": 0.0,
-                "disp_1907": 0.0,
-                "notified": False,
-                "hybrid_mode": hybrid_keep,
-            }
-        )
-
+    pre_leader_cache: Dict[str, Any] = getattr(context, "pre_leader_cache", {})
     day_sim_state: Dict[str, Any] = getattr(context, "day_sim_state", {})
+
     if not day_sim_state.get("_disk_loaded"):
         try:
             loaded = await asyncio.wait_for(
@@ -257,20 +323,97 @@ async def _ensure_day_sim_caches(
                 if k in loaded and k != "_disk_loaded":
                     base_state[k] = loaded[k]
             base_state["last_modify_mono"] = time.monotonic()
+            base_state["_disk_loaded"] = True
             day_sim_state.clear()
             day_sim_state.update(base_state)
-            if str(day_sim_state.get("phase") or "") == "HOLDING":
-                # 재기동 시 이미 [모의] 포지션을 보유 중이면 주도주 중복 알림 억제
-                day_leader_cache["notified"] = True
+
+            # 1) 디스크에 저장된 당일 데이장 추세 주도주(day_leader_cache) 복원
+            saved_d_ldr = loaded.get("day_leader_cache")
+            if (
+                isinstance(saved_d_ldr, dict)
+                and str(saved_d_ldr.get("logical_date") or "") == logical_date
+                and bool(saved_d_ldr.get("locked"))
+                and str(saved_d_ldr.get("leader_sym") or "").upper() in REAL_ALLOWED_SYMBOLS
+            ):
+                day_leader_cache.clear()
+                day_leader_cache.update(
+                    {
+                        "logical_date": logical_date,
+                        "locked": True,
+                        "leader_sym": str(saved_d_ldr.get("leader_sym")).upper(),
+                        "vwap_1907": safe_float(saved_d_ldr.get("vwap_1907"), 0.0),
+                        "c_1907": safe_float(saved_d_ldr.get("c_1907"), 0.0),
+                        "disp_1907": safe_float(saved_d_ldr.get("disp_1907"), 0.0),
+                        "notified": True,
+                        "hybrid_mode": bool(saved_d_ldr.get("hybrid_mode", False)),
+                    }
+                )
+                logger.info(
+                    "🔒 [데이장 추세 주도주 디스크 불변 복원 완료] 👑 %s (19:07가 $%.2f > VWAP_1907 $%.2f, +%0.2f%%)",
+                    day_leader_cache["leader_sym"],
+                    day_leader_cache["c_1907"],
+                    day_leader_cache["vwap_1907"],
+                    day_leader_cache["disp_1907"],
+                )
+
+            # 2) 디스크에 저장된 당일 프리장 추세 주도주(pre_leader_cache) 복원
+            saved_p_ldr = loaded.get("pre_leader_cache")
+            if (
+                isinstance(saved_p_ldr, dict)
+                and str(saved_p_ldr.get("logical_date") or "") == logical_date
+                and bool(saved_p_ldr.get("locked"))
+                and str(saved_p_ldr.get("leader_sym") or "").upper() in REAL_ALLOWED_SYMBOLS
+            ):
+                pre_leader_cache.clear()
+                pre_leader_cache.update(
+                    {
+                        "logical_date": logical_date,
+                        "locked": True,
+                        "leader_sym": str(saved_p_ldr.get("leader_sym")).upper(),
+                        "vwap_0407": safe_float(saved_p_ldr.get("vwap_0407"), 0.0),
+                        "c_0407": safe_float(saved_p_ldr.get("c_0407"), 0.0),
+                        "disp_0407": safe_float(saved_p_ldr.get("disp_0407"), 0.0),
+                        "notified": True,
+                        "hybrid_mode": bool(saved_p_ldr.get("hybrid_mode", False)),
+                    }
+                )
+                logger.info(
+                    "🔒 [프리장 추세 주도주 디스크 불변 복원 완료] 👑 %s (04:07가 $%.2f > VWAP_0407 $%.2f, +%0.2f%%)",
+                    pre_leader_cache["leader_sym"],
+                    pre_leader_cache["c_0407"],
+                    pre_leader_cache["vwap_0407"],
+                    pre_leader_cache["disp_0407"],
+                )
+
+            _inject_restored_leader_into_candle_cache(
+                context, logical_date, day_leader_cache, pre_leader_cache
+            )
         else:
             day_sim_state.clear()
             day_sim_state.update(create_default_day_sim_state(logical_date))
-            await persist_day_sim_state_async(day_sim_state)
+            await persist_day_sim_state_async(day_sim_state, context=context)
 
-    elif day_sim_state.get("logical_date") != logical_date:
+    # 18:00 EST 논리적 거래일 롤오버 발생 시 초기화
+    if day_leader_cache.get("logical_date") != logical_date:
+        hybrid_keep = bool(day_leader_cache.get("hybrid_mode", False))
+        day_leader_cache.clear()
+        day_leader_cache.update(
+            {
+                "logical_date": logical_date,
+                "locked": False,
+                "leader_sym": "",
+                "vwap_1907": 0.0,
+                "c_1907": 0.0,
+                "disp_1907": 0.0,
+                "notified": False,
+                "hybrid_mode": hybrid_keep,
+            }
+        )
+
+    if day_sim_state.get("logical_date") != logical_date:
         day_sim_state.clear()
         day_sim_state.update(create_default_day_sim_state(logical_date))
-        await persist_day_sim_state_async(day_sim_state)
+        await persist_day_sim_state_async(day_sim_state, context=context)
 
     return day_leader_cache, day_sim_state
 
@@ -290,8 +433,44 @@ def _get_live_day_metrics(
     return refresh_metrics_with_live_tick(base_met, live_p, now_est=now_est)
 
 
+async def _deep_scan_candles_for_leader_recovery(
+    context: Any,
+    prices: Dict[str, float],
+    now_est: datetime,
+    total_count: int = LEADER_RECOVERY_DEEP_SCAN_COUNT,
+) -> None:
+    """
+    NEW: 데이장 개장(19:00 EST) 후 400분이 경과한 시점(01:40 ~ 03:57 EST)에
+    디스크 락온 기록 없이 최초 기동되었을 때, 최대 600분봉(10시간 분량) 다중 페이지 조회를 통해
+    19:00 ~ 19:07 EST 실제 개장 초기 1분봉을 역추적 복원한다.
+    """
+    raw_cache = getattr(context, "candle_metrics_cache", None)
+    if not isinstance(raw_cache, dict):
+        return
+
+    for sym in REAL_ALLOWED_SYMBOLS:
+        try:
+            candles = await context.api.get_candles_multi_page(
+                symbol=sym,
+                interval="1m",
+                total_count=max(400, int(total_count)),
+                adjusted=True,
+            )
+            live_p = safe_float((prices or {}).get(sym), 0.0)
+            prev_met = raw_cache.get(sym) if isinstance(raw_cache.get(sym), dict) else None
+            metrics = compute_session_vwap_metrics(
+                candles=candles,
+                live_price=live_p,
+                now_est=now_est,
+                prev_metrics=prev_met,
+            )
+            raw_cache[sym] = metrics
+        except Exception as exc:
+            logger.warning("⚠️ [%s] 600분봉 주도주 딥스캔 복원 예외: %s", sym, exc)
+
+
 # ---------------------------------------------------------------------------
-# [Step 1] 19:07 EST 데이장 추세추종 주도주(👑 day_vwap_leader_sym) 선정 및 재기동 복원
+# [Step 1] 19:07 EST 데이장 추세추종 주도주(👑 day_vwap_leader_sym) 선정 및 불변 복원
 # ---------------------------------------------------------------------------
 async def update_daymarket_trend_leader(
     context: Any,
@@ -302,18 +481,23 @@ async def update_daymarket_trend_leader(
     🎯 1 [Step 1] & Case 77, 97:
     - 19:00:00 ~ 19:07:59 EST 구간 동안 SOXL 과 SOXS 의 데이장 초기 누적 VWAP_1907 을 산출하고,
     - 19:07:00 ~ 03:57:59 EST 구간 진입 시 C_1907 > VWAP_1907 (disp_1907 > 0.0%, 양쪽 상회 시 이격도 1위)
-      종목을 당일 데이장 추세추종 주도주(_DAY_LEADER_CACHE["leader_sym"])로 불변 각인한다.
-    - 데이장 도중 프로세스 재기동 시에도 19:00 ~ 19:07 EST 1분봉 벡터 스캔으로 100% 자동 복원한다.
+      종목을 당일 데이장 추세추종 주도주(_DAY_LEADER_CACHE["leader_sym"])로 불변 각인하고
+      즉시 day_sim_state.json 에 영구 저장한다.
+    - 데이장 후반(400분 경과 후) 재기동 시에도 디스크 복원 및 600분봉 딥스캔으로
+      당일 19:07 주도주가 절대 바뀌지 않도록 100% 보장한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
     logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
 
-    day_leader_cache, _ = await _ensure_day_sim_caches(context, logical_date)
+    day_leader_cache, day_sim_state = await _ensure_day_sim_caches(
+        context, logical_date
+    )
 
     if not is_daymarket_leader_lock_window(hm):
         return day_leader_cache
 
+    # 이미 당일 주도주가 락온되어 있으면 장 마감까지 절대 변경하지 않고 즉시 반환!
     if (
         day_leader_cache.get("locked")
         and str(day_leader_cache.get("leader_sym") or "") in REAL_ALLOWED_SYMBOLS
@@ -323,23 +507,25 @@ async def update_daymarket_trend_leader(
     soxs_met = _get_live_day_metrics(context, "SOXS", prices, dt_now)
     soxl_met = _get_live_day_metrics(context, "SOXL", prices, dt_now)
 
-    # 기동 직후 캔들 캐시가 비어 있으면 1회 즉시 캔들 갱신 후 복원
+    # 만약 400분봉 슬라이딩으로 인해 vwap_1907 이 0.0 이라면 즉시 600분봉 딥스캔으로 19:00~19:07 봉 확보!
     if (
         safe_float(soxs_met.get("vwap_1907"), 0.0) <= 0.0
         and safe_float(soxl_met.get("vwap_1907"), 0.0) <= 0.0
-        and hasattr(context, "refresh_symbol_candles_once")
     ):
-        try:
-            await context.refresh_symbol_candles_once(("SOXS", "SOXL"))
-            soxs_met = _get_live_day_metrics(context, "SOXS", prices, dt_now)
-            soxl_met = _get_live_day_metrics(context, "SOXL", prices, dt_now)
-        except Exception as exc:
-            logger.warning("⚠️ 19:07 데이장 주도주 복원용 캔들 갱신 실패: %s", exc)
+        await _deep_scan_candles_for_leader_recovery(
+            context,
+            prices=prices,
+            now_est=dt_now,
+            total_count=LEADER_RECOVERY_DEEP_SCAN_COUNT,
+        )
+        soxs_met = _get_live_day_metrics(context, "SOXS", prices, dt_now)
+        soxl_met = _get_live_day_metrics(context, "SOXL", prices, dt_now)
 
     res = select_vwap_trend_leader(soxs_met, soxl_met, session_mode="DAY")
     win_sym = str(res.get("leader_sym") or "").upper().strip()
 
     if win_sym in REAL_ALLOWED_SYMBOLS:
+        was_notified = bool(day_leader_cache.get("notified", False))
         day_leader_cache.update(
             {
                 "logical_date": logical_date,
@@ -348,15 +534,18 @@ async def update_daymarket_trend_leader(
                 "vwap_1907": safe_float(res.get("vwap_init"), 0.0),
                 "c_1907": safe_float(res.get("c_init"), 0.0),
                 "disp_1907": safe_float(res.get("disp_init"), 0.0),
+                "notified": True,
             }
         )
-        # 03:58 ~ 03:59 묵음 구간이 아닐 때만 1회 알림
+        # 주도주 확정 즉시 디스크(day_sim_state.json)에 원자적 영구 저장!
+        await persist_day_sim_state_async(day_sim_state, context=context)
+
+        # 03:58 ~ 03:59 묵음 구간이 아니고 당일 최초 락온일 때만 단 1회 알림 발송
         if (
-            not day_leader_cache.get("notified")
+            not was_notified
             and is_daymarket_sim_active_window(hm)
             and hasattr(context, "send_slim_alert")
         ):
-            day_leader_cache["notified"] = True
             await context.send_slim_alert(
                 title=f"👑 [데이장 [모의] 추세 주도주 락온] {win_sym}",
                 body=(
@@ -446,7 +635,6 @@ async def _finalize_daymarket_sim_exit(
     if nq_amp >= NQ_OVERHEAT_THRESHOLD or exit_tag == "STAGE2_OVERHEAT_DUMP":
         day_sim_state["phase"] = "DONE_OVERHEAT"
     elif exit_tag == "STAGE3_QQQ_STOP":
-        # MODIFIED: 폐기된 RE_BOT_TRAIL 없이 즉시 당일 데이장 모의 세션 안전 마감
         day_sim_state["phase"] = "DONE_STAGE3_STOP"
         reentry_note = " · 🔒당일 데이장 [모의] 마감"
     elif exit_tag in (
@@ -459,7 +647,7 @@ async def _finalize_daymarket_sim_exit(
     else:
         day_sim_state["phase"] = "DONE_SESSION"
 
-    await persist_day_sim_state_async(day_sim_state)
+    await persist_day_sim_state_async(day_sim_state, context=context)
 
     tot_cnt = safe_int(day_sim_state.get("sim_trade_count"), 0)
     win_cnt = safe_int(day_sim_state.get("sim_win_count"), 0)
@@ -504,7 +692,7 @@ async def execute_daymarket_sim_plugin(
     """
     🎯 1 [Step 1 ~ Step 5] & Case 77 ~ 94, 97 ~ 100:
     19:00:00 ~ 03:57:59 EST 데이장 구간에서 실거래 매수 없이 100% [모의]로
-    프리장 본진과 완전히 동일한 5단계 전략을 실행한다 (폐기된 RE_BOT_TRAIL 완전 소각 완료).
+    프리장 본진과 완전히 동일한 5단계 전략을 실행한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
@@ -521,7 +709,7 @@ async def execute_daymarket_sim_plugin(
     if not is_daymarket_leader_lock_window(hm):
         return {"status": "COLLECTING_1907_VWAP"}
 
-    # [Step 1] 19:07 EST 데이장 추세추종 주도주 선정/복원
+    # [Step 1] 19:07 EST 데이장 추세추종 주도주 선정/복원 (불변 각인)
     await update_daymarket_trend_leader(context, prices, dt_now)
     leader_sym = str(day_leader_cache.get("leader_sym") or "").upper().strip()
     nq_amp = safe_float((macro or {}).get("nq_amp"), 0.0)
@@ -544,7 +732,7 @@ async def execute_daymarket_sim_plugin(
         if phase == "TRAP_WAITING":
             day_sim_state["sim_trap_buy_price"] = 0.0
             day_sim_state["phase"] = "DONE_OVERHEAT"
-            await persist_day_sim_state_async(day_sim_state)
+            await persist_day_sim_state_async(day_sim_state, context=context)
             if hasattr(context, "send_slim_alert"):
                 await context.send_slim_alert(
                     title=f"🧪🛑 [데이장 [모의] 1차 과열방어] {day_sim_state.get('symbol')}",
@@ -569,7 +757,7 @@ async def execute_daymarket_sim_plugin(
                 )
         elif phase != "HOLDING":
             day_sim_state["phase"] = "DONE_OVERHEAT"
-            await persist_day_sim_state_async(day_sim_state)
+            await persist_day_sim_state_async(day_sim_state, context=context)
             return {"status": "SIM_BLOCKED_OVERHEAT", "nq_amp": nq_amp}
 
     # -----------------------------------------------------------------------
@@ -615,7 +803,7 @@ async def execute_daymarket_sim_plugin(
                     "last_modify_mono": time.monotonic(),
                 }
             )
-            await persist_day_sim_state_async(day_sim_state)
+            await persist_day_sim_state_async(day_sim_state, context=context)
             logger.info(
                 "🧪🪤 [데이장 [모의] 매수덫 장전] %s @ $%.2f (데이장VWAP $%.2f, 현가 $%.2f)",
                 leader_sym,
@@ -624,7 +812,14 @@ async def execute_daymarket_sim_plugin(
                 live_p,
             )
 
-        # 2) TRAP_WAITING 상태에서 동적 VWAP_day_t 변화 반영 자동 추적 정정 (15초 & $0.03 괴리)
+        # 2) TRAP_WAITING 상태에서 혹시 이전 기동 시 잘못된 심볼이 들어있었다면 당일 불변 주도주로 즉시 교정
+        if str(day_sim_state.get("symbol") or "") != leader_sym:
+            day_sim_state["symbol"] = leader_sym
+            day_sim_state["sim_trap_buy_price"] = target_trap_p
+            day_sim_state["last_modify_mono"] = time.monotonic()
+            await persist_day_sim_state_async(day_sim_state, context=context)
+
+        # 3) 동적 VWAP_day_t 변화 반영 자동 추적 정정 (15초 & $0.03 괴리)
         sim_trap_p = safe_float(day_sim_state.get("sim_trap_buy_price"), 0.0)
         if (
             is_daymarket_trap_entry_window(hm)
@@ -637,16 +832,18 @@ async def execute_daymarket_sim_plugin(
             diff_usd = abs(raw_trap_p - sim_trap_p)
             diff_pct = (diff_usd / sim_trap_p) * 100.0
             if (
-                elapsed_mod >= TRAP_MODIFY_COOLDOWN_SEC
-                and diff_usd >= TRAP_MODIFY_MIN_DIFF_USD
-                and diff_pct >= TRAP_MODIFY_MIN_DIFF_PCT
+                elapsed_mod >= SIM_TRAP_MODIFY_COOLDOWN_SEC
+                and diff_usd >= SIM_TRAP_MODIFY_MIN_DIFF_USD
+                and diff_pct >= SIM_TRAP_MODIFY_MIN_DIFF_PCT
             ):
                 sim_trap_p = raw_trap_p
                 day_sim_state["sim_trap_buy_price"] = sim_trap_p
                 day_sim_state["last_modify_mono"] = time.monotonic()
-                await persist_day_sim_state_async(day_sim_state)
+                await persist_day_sim_state_async(
+                    day_sim_state, context=context
+                )
 
-        # 3) 현재가(cur_p_fl)가 장전된 [모의] 매수 덫 단가 이하 도달 시 즉시 [모의] 체결 확정!
+        # 4) 현재가(cur_p_fl)가 장전된 [모의] 매수 덫 단가 이하 도달 시 즉시 [모의] 체결 확정!
         if sim_trap_p > 0.0 and cur_p_fl <= sim_trap_p:
             fill_p = min(cur_p_fl, sim_trap_p)
             arm_p = (
@@ -680,7 +877,7 @@ async def execute_daymarket_sim_plugin(
                     "nq_entry_amp": nq_amp,
                 }
             )
-            await persist_day_sim_state_async(day_sim_state)
+            await persist_day_sim_state_async(day_sim_state, context=context)
 
             if hasattr(context, "send_slim_alert"):
                 await context.send_slim_alert(
@@ -713,7 +910,7 @@ async def execute_daymarket_sim_plugin(
         ent_p = safe_float(day_sim_state.get("entry_price"), 0.0)
         if sym not in REAL_ALLOWED_SYMBOLS or ent_p <= 0.0:
             day_sim_state["phase"] = "IDLE"
-            await persist_day_sim_state_async(day_sim_state)
+            await persist_day_sim_state_async(day_sim_state, context=context)
             return {"status": "INVALID_SIM_HOLDING_RESET"}
 
         met = _get_live_day_metrics(context, sym, prices, dt_now)
@@ -750,7 +947,7 @@ async def execute_daymarket_sim_plugin(
             day_sim_state["peak_price"] = max(
                 safe_float(day_sim_state.get("peak_price"), live_p), live_p
             )
-            await persist_day_sim_state_async(day_sim_state)
+            await persist_day_sim_state_async(day_sim_state, context=context)
             if hasattr(context, "send_slim_alert"):
                 await context.send_slim_alert(
                     title=f"🧪🔥 [데이장 [모의] +1.00% HA 트레일링 점화] {sym}",
@@ -787,7 +984,9 @@ async def execute_daymarket_sim_plugin(
             day_sim_state["floor_price"] = floor_p
             day_sim_state["effective_stop_p"] = eff_stop_p
             if peak_p > prev_peak:
-                await persist_day_sim_state_async(day_sim_state)
+                await persist_day_sim_state_async(
+                    day_sim_state, context=context
+                )
 
             is_ha_bull = bool(met.get("is_ha_bull", False))
             nq_vel_bypass = bool(
@@ -856,7 +1055,9 @@ async def execute_daymarket_sim_plugin(
             )
             if not adv.get("scale_valid"):
                 day_sim_state["nq_entry_price"] = qqq_curr
-                await persist_day_sim_state_async(day_sim_state)
+                await persist_day_sim_state_async(
+                    day_sim_state, context=context
+                )
             elif adv.get("should_stop"):
                 return await _finalize_daymarket_sim_exit(
                     context=context,
@@ -918,7 +1119,7 @@ async def settle_daymarket_sim_before_premarket(
             "cleared_before_premarket": True,
         }
     )
-    await persist_day_sim_state_async(day_sim_state)
+    await persist_day_sim_state_async(day_sim_state, context=context)
     logger.info(
         "🧹 [03:58 EST 데이장 [모의] 묵음 클리어] 미결 모의 상태 초기화 완료 (통계 보존)"
     )

@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: main.py
-인피니트 스노우볼 듀얼 스나이퍼 메인 오케스트레이터 및 비동기 스케줄러 (Step 05 / 05)
-- MODIFIED: 제3헌법 및 최신 프롬프트.txt(Case 02)에 의거하여 SniperContext 내 bottom_track_cache,
-  프리장 루프 내 execute_post_stop_bottom_rebound_plugin(RE_BOT_TRAIL) 임포트/호출,
-  0.4초 부스터 내 최저점 반등 조건을 100% 영구 소각하고 5대 인메모리 캐시 및 5대 고주파 부스터로 일원화
-- MODIFIED: 제3헌법에 의거하여 plugin_updater.py 의 verify_all_modules_compile 및
-  is_update_lockdown_window 를 직접 임포트하여 중복 선언을 제거하고 기동 시 11개 코어 모듈 전수 검증
-- NEW: 기동 직후 day_sim_state["_disk_loaded"] = False 초기화를 통해 첫 틱에서 day_sim_state.json
-  디스크 파일로부터 당일 데이장 [모의] 보유 포지션과 전적을 자동 복원하도록 결속
+인피니트 스노우볼 듀얼 스나이퍼 메인 오케스트레이터 및 비동기 스케줄러 (Step 04 / 04)
+- MODIFIED: refresh_symbol_candles_once 에 가변 total_count(기본 400 / 딥스캔 시 600분봉) 파라미터를 추가하고,
+  compute_session_vwap_metrics 호출 시 prev_metrics 를 주입하여 400분 경과 후에도
+  19:07 / 04:07 초기 기준가 및 초기 VWAP 이 절대 휘발되지 않도록 불변 계승 결속
+- NEW: async_main 기동 직후 _ensure_day_sim_caches 를 선행 호출하여 day_sim_state.json 디스크 파일에
+  영속화된 당일 데이장/프리장 추세 주도주(day_leader_cache, pre_leader_cache) 및 데이장 [모의] 포지션을
+  즉시 복원하고, 장 후반 미락온 기동 시 600분봉 딥스캔으로 초기 분봉을 확보하도록 완결
 - 제1헌법 ~ 제6헌법 및 102대 엣지 케이스 방어망 완벽 준수
 """
 
@@ -26,6 +25,8 @@ from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from daymarket_sim_plugin import (
+    LEADER_RECOVERY_DEEP_SCAN_COUNT,
+    _ensure_day_sim_caches,
     create_default_day_sim_state,
     execute_daymarket_sim_plugin,
     is_daymarket_late_vwap_esc_window,
@@ -50,7 +51,7 @@ from quant_indicators_plugin import (
     refresh_metrics_with_live_tick,
 )
 from sniper_exit_plugin import (
-     is_premarket_late_vwap_esc_window,
+    is_premarket_late_vwap_esc_window,
     manage_mechanical_profit_trap_plugin,
     reconcile_zero_holdings_exit_plugin,
 )
@@ -164,7 +165,6 @@ class SniperContext:
     듀얼 스나이퍼의 API 클라이언트, 로컬 원장(AssassinLedger), 매크로 캐시(MacroDataCache),
     5대 핵심 인메모리 캐시(_TRAIL_RUNTIME_CACHE, _EXIT_SNAPSHOT_CACHE, _PRE_LEADER_CACHE,
     _DAY_LEADER_CACHE, _DAY_SIM_STATE) 및 비동기 타격 뮤텍스를 통합 관리하는 컨텍스트.
-    (MODIFIED: 폐기된 bottom_track_cache 영구 소각 완료)
     """
 
     def __init__(self) -> None:
@@ -182,7 +182,7 @@ class SniperContext:
         now_est = datetime.now(EST_TZ)
         logical_date = get_logical_trading_date_str(now_est, rollover_hour=18)
 
-        # Case 02: 5대 핵심 인메모리 캐시 (bottom_track_cache 영구 제거 완료)
+        # Case 02: 5대 핵심 인메모리 캐시
         self.trail_runtime_cache: Dict[str, Dict[str, Any]] = {}
         self.exit_snapshot_cache: Dict[str, Dict[str, Any]] = {}
         self.pre_leader_cache: Dict[str, Any] = {
@@ -208,7 +208,7 @@ class SniperContext:
         self.day_sim_state: Dict[str, Any] = create_default_day_sim_state(
             logical_date
         )
-        # 기동 직후 첫 루프에서 day_sim_state.json 디스크 파일 복원을 수행하도록 플래그 설정
+        # 기동 직후 디스크(day_sim_state.json)로부터 주도주 및 모의 상태를 복원하도록 플래그 설정
         self.day_sim_state["_disk_loaded"] = False
 
         # 보조 런타임 캐시 (5.0초 1분봉 지표 캐시, 체결 인덱싱 그레이스 쉴드, 1주 휩소 캐시)
@@ -239,31 +239,42 @@ class SniperContext:
             )
 
     async def refresh_symbol_candles_once(
-        self, symbols: Iterable[str] = REAL_ALLOWED_SYMBOLS
+        self,
+        symbols: Iterable[str] = REAL_ALLOWED_SYMBOLS,
+        total_count: int = 400,
     ) -> None:
         """
-        🎯 3: 다중 페이지 최대 400분봉 조회로 19:00 EST 데이장 및 04:00 EST 프리장 개장 첫 봉부터
-        누락 없는 시계열을 확보하여 동적 VWAP_t, VWAP_1907, VWAP_0407, 하이킨 아시 기저를 갱신한다.
+        # MODIFIED:
+        다중 페이지(기본 400분봉 / 딥스캔 복원 시 600분봉) 조회로 19:00 EST 데이장 및
+        04:00 EST 프리장 시계열을 확보하고, prev_metrics 를 주입하여 이미 확정된
+        19:07 / 04:07 초기 기준가와 초기 VWAP 이 400분 경과 후에도 절대 휘발되지 않도록 보존한다.
         """
         now_est = datetime.now(EST_TZ)
         sym_tuple = tuple(str(s).upper().strip() for s in symbols if s)
         if not sym_tuple:
             return
 
+        req_count = max(100, min(800, int(total_count)))
         prices = await self.api.get_current_prices_batch(sym_tuple)
         for sym in sym_tuple:
             try:
                 candles = await self.api.get_candles_multi_page(
                     symbol=sym,
                     interval="1m",
-                    total_count=400,
+                    total_count=req_count,
                     adjusted=True,
                 )
                 live_p = safe_float(prices.get(sym), 0.0)
+                prev_met = (
+                    self.candle_metrics_cache.get(sym)
+                    if isinstance(self.candle_metrics_cache.get(sym), dict)
+                    else None
+                )
                 metrics = compute_session_vwap_metrics(
                     candles=candles,
                     live_price=live_p,
                     now_est=now_est,
+                    prev_metrics=prev_met,
                 )
                 self.candle_metrics_cache[sym] = metrics
             except Exception as exc:
@@ -289,7 +300,6 @@ def _evaluate_fast_shield_mode(
        동적 VWAP 선제 탈출(PRE_VWAP_ESC / DAY_VWAP_ESC)을 감시 중일 때
     ④ 정규장 마감 1시간 전(15:00 ~ 15:58 EST) 미익절 보유 포지션이 당일 정규장 VWAP 탈출(VWAP_ESCAPE) 감시 중일 때
     ⑤ 03:58 ~ 04:07 EST 1주 휩소 노출 작전 가동 중일 때
-    (MODIFIED: 폐기된 최저점 역트레일링 반등 조건 영구 제거 완료)
     """
     hm = now_est.hour * 100 + now_est.minute
 
@@ -406,7 +416,9 @@ async def candle_radar_loop(context: SniperContext) -> None:
         )
 
         try:
-            await context.refresh_symbol_candles_once(REAL_ALLOWED_SYMBOLS)
+            await context.refresh_symbol_candles_once(
+                REAL_ALLOWED_SYMBOLS, total_count=400
+            )
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -450,8 +462,9 @@ async def daily_gc_and_rollover_loop(context: SniperContext) -> None:
                 holdings = await context.api.get_holdings_all()
 
                 for sym in REAL_ALLOWED_SYMBOLS:
-                    h_qty = safe_int((holdings or {}).get(sym, {}).get("qty"), 0)
-                    st = context.ledger.get_state(sym)
+                    h_qty = safe_int(
+                        (holdings or {}).get(sym, {}).get("qty"), 0
+                    )
                     if h_qty == 0:
                         await context.ledger.update_state(
                             sym,
@@ -471,11 +484,41 @@ async def daily_gc_and_rollover_loop(context: SniperContext) -> None:
                             is_session_done=True,
                         )
 
+                hyb_d = bool(context.day_leader_cache.get("hybrid_mode", False))
+                context.day_leader_cache.clear()
+                context.day_leader_cache.update(
+                    {
+                        "logical_date": logical_date,
+                        "locked": False,
+                        "leader_sym": "",
+                        "vwap_1907": 0.0,
+                        "c_1907": 0.0,
+                        "disp_1907": 0.0,
+                        "notified": False,
+                        "hybrid_mode": hyb_d,
+                    }
+                )
+                hyb_p = bool(context.pre_leader_cache.get("hybrid_mode", False))
+                context.pre_leader_cache.clear()
+                context.pre_leader_cache.update(
+                    {
+                        "logical_date": logical_date,
+                        "locked": False,
+                        "leader_sym": "",
+                        "vwap_0407": 0.0,
+                        "c_0407": 0.0,
+                        "disp_0407": 0.0,
+                        "notified": False,
+                        "hybrid_mode": hyb_p,
+                    }
+                )
                 context.day_sim_state.clear()
                 context.day_sim_state.update(
                     create_default_day_sim_state(logical_date)
                 )
-                await persist_day_sim_state_async(context.day_sim_state)
+                await persist_day_sim_state_async(
+                    context.day_sim_state, context=context
+                )
                 await context.macro_cache.ensure_qqq_live_price()
                 logger.info(
                     "🌐 [18:00 EST 신세션 롤오버 완료] %s -> %s",
@@ -615,7 +658,7 @@ async def main_sniper_loop(context: SniperContext) -> None:
                     macro=macro,
                     now_est=now_est,
                 )
-                # 04:07 EST 추세 주도주(C_0407 > VWAP_0407) 선정 및 복원
+                # 04:07 EST 추세 주도주(C_0407 > VWAP_0407) 선정 및 불변 복원
                 await _call_plugin_adaptive(
                     update_premarket_trend_leader,
                     context=context,
@@ -699,7 +742,7 @@ async def main_sniper_loop(context: SniperContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 엔트리포인트 : 프리플라이트 검증 ➔ AccountSeq 락온 ➔ 초기 캔들 동기화 ➔ 4대 태스크 가동
+# 엔트리포인트 : 프리플라이트 검증 ➔ AccountSeq 락온 ➔ 디스크 주도주 복원 ➔ 4대 태스크 가동
 # ---------------------------------------------------------------------------
 async def async_main() -> None:
     _install_fast_kill_signal_handlers()
@@ -723,11 +766,31 @@ async def async_main() -> None:
         acc_seq = await context.api.ensure_account_seq()
         logger.info("🏛️ [제2헌법 AccountSeq 락온 완료] accountSeq=%s", acc_seq)
     except Exception as exc:
-        logger.warning("⚠️ 기동 시 AccountSeq 초기 락온 대기 (재시도 예정): %s", exc)
+        logger.warning(
+            "⚠️ 기동 시 AccountSeq 초기 락온 대기 (재시도 예정): %s", exc
+        )
 
-    # 기동 직후 SOXS / SOXL 400분봉 1회 선행 동기화 및 QQQ 초기 시세 확보
+    # 기동 직후 디스크(day_sim_state.json)에 저장된 당일 주도주 및 모의 상태 선행 복원
+    now_est = datetime.now(EST_TZ)
+    logical_date = get_logical_trading_date_str(now_est, rollover_hour=18)
+    hm = now_est.hour * 100 + now_est.minute
     try:
-        await context.refresh_symbol_candles_once(REAL_ALLOWED_SYMBOLS)
+        await _ensure_day_sim_caches(context, logical_date)
+    except Exception as exc:
+        logger.warning("⚠️ 기동 시 디스크 모의/주도주 캐시 복원 예외: %s", exc)
+
+    # 데이장 후반(01:30 ~ 03:57 EST)에 주도주가 아직 미락온 상태이면 600분봉 딥스캔으로 초기 동기화
+    need_deep_scan = bool(
+        (130 <= hm <= 357) and not bool(context.day_leader_cache.get("locked"))
+    )
+    init_candle_count = (
+        LEADER_RECOVERY_DEEP_SCAN_COUNT if need_deep_scan else 400
+    )
+
+    try:
+        await context.refresh_symbol_candles_once(
+            REAL_ALLOWED_SYMBOLS, total_count=init_candle_count
+        )
         await context.macro_cache.ensure_qqq_live_price()
     except Exception as exc:
         logger.warning("⚠️ 초기 캔들/QQQ 시세 선행 동기화 예외: %s", exc)
@@ -749,7 +812,7 @@ async def async_main() -> None:
     ]
 
     logger.info(
-        "🚀 [인피니트 스노우볼 듀얼 스나이퍼 가동 완료] 전략=👑VWAP_TREND_M050 (RE_BOT_TRAIL 영구 소각 완료)"
+        "🚀 [인피니트 스노우볼 듀얼 스나이퍼 가동 완료] 전략=👑VWAP_TREND_M050 (추세 주도주 불변 각인 & 600분봉 복원 탑재)"
     )
     try:
         await asyncio.gather(*tasks)
