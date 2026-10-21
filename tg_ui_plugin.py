@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: tg_ui_plugin.py
-텔레그램 비동기 롱폴링 라우터, 스크린샷(1000031235.jpg) 100% 동기화 전술 제어반(/settlement),
-대화형 통합 시드 숫자 입력기, 메인 메뉴(/menu), 듀얼 지시서(/sync), 스나이퍼 레이더(/avwap, RSI 제거),
-/reset 원자적 0점 소각 및 /update 자가 업데이트 통합 플러그인 (Step 04 / 04)
-- MODIFIED: RSI(1m) 전면 폐기에 따라 /avwap 레이더 보드 내 모든 RSI 표출을 완전 제거하고
-  실시간 하이킨 아시(🕯️HA양봉 / 🌑HA음봉) 및 동적 VWAP 이격도 중심으로 재편
-- MODIFIED: /settlement 전술 제어반 레이아웃 및 인라인 버튼을 스크린샷(1000031235.jpg)과 100% 동일하게 구현하고,
-  [💵 통합 시드 설정] 클릭 후 채팅창에 숫자(예: 200) 입력 시 즉시 양쪽 시드 동기화 및 제어반 자동 팝업 결속
-- NEW: /menu (/start) 9단계 타임라인 메인 메뉴, /sync 실시간 USD 주문가능금액 및 USD/KRW 환율 연동 원화 손익 표출,
-  /update 깃허브 최신 코드 Pull + 10대 코어 모듈 py_compile 검증 + "🚀 탑재 성공. 재기동 격발." 구현
-- 제1헌법: 모든 텔레그램/환율 HTTP 요청 및 서브프로세스의 asyncio.to_thread 비동기 격리 및 GlobalThrottle 통제
+텔레그램 비동기 롱폴링 라우터, /update 무한 재기동 원천 차단 4중 방어벽,
+스크린샷(1000031235.jpg) 100% 동기화 전술 제어반(/settlement), 대화형 통합 시드 숫자 입력기,
+메인 메뉴(/menu), 듀얼 지시서(/sync), 스나이퍼 레이더(/avwap) 및 /reset 원자적 소각 플러그인 (Step 01 / 04)
+- MODIFIED: /update 실행 후 os._exit(0) 재기동 시 텔레그램 서버 큐에 미커밋된 /update 가 재수신되어
+  무한 재기동 루프에 빠지는 현상을 막기 위해 4중 오프셋/타임스탬프/update_id 멱등성 방어벽 탑재
+  1) 기동 직후 _flush_stale_updates_on_startup() 으로 과거 잔류 업데이트 큐 즉시 소각
+  2) /update 수신 즉시 _commit_offset_to_telegram_server() 로 텔레그램 본사 서버에 offset=uid+1 강제 확정
+  3) message.date < _boot_epoch 과거 타임스탬프 /update 명령 무시
+  4) /tmp/toss_sniper_last_update_id.txt 에 처리된 update_id 를 원자적 기록하여 동일 ID 재실행 영구 차단
+- 제1헌법: 모든 텔레그램/환율 HTTP 요청 및 파일/서브프로세스 I/O의 asyncio.to_thread 격리 및 GlobalThrottle 통제
 - 제4헌법: 모든 논리 판단은 EST_TZ(America/New_York) 100% 락온
-- Case 02, 07, 11, 13, 17, 18, 26, 38, 39, 40, 42, 47, 50, 55, 56, 68, 93 완벽 준수
+- Case 02, 06, 07, 11, 13, 17, 18, 26, 38, 39, 40, 42, 47, 50, 55, 56, 68, 93 완벽 준수
 """
 
 from __future__ import annotations
@@ -29,10 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from daymarket_sim_plugin import (
-    create_default_day_sim_state,
-    is_daymarket_sim_active_window,
-)
+from daymarket_sim_plugin import create_default_day_sim_state
 from defense_plugin import relock_qqq_baseline_on_bot_resume
 from plugin_updater import (
     has_active_orders_in_ledger,
@@ -49,7 +46,6 @@ from quant_indicators_plugin import (
 )
 from toss_api import (
     EST_TZ,
-    KST_TZ,
     REAL_ALLOWED_SYMBOLS,
     GlobalThrottle,
     _autoload_dotenv_files,
@@ -62,9 +58,12 @@ logger = logging.getLogger("toss_sniper.tg_ui_plugin")
 # 모듈 임포트 시점 /home/pipiosToss/.env 단일 경로 자동 로드 확인
 _autoload_dotenv_files(override=False)
 
-# 전략 공식 코드명 상수
+# 전략 공식 코드명 및 구분선 상수
 STRATEGY_CODE_LABEL: str = "👑VWAP_TREND_M050"
 DIVIDER_LINE: str = "➖➖➖➖➖➖➖➖➖➖➖➖➖➖"
+
+# /update 명령 중복 실행 방지용 마지막 처리 update_id 기록 파일 경로
+LAST_UPDATE_ID_FILE: str = "/tmp/toss_sniper_last_update_id.txt"
 
 # USD -> KRW 환율 60초 인메모리 캐시 (API.txt GET /api/v1/exchange-rate 연동용)
 _FX_CACHE_LOCK = threading.Lock()
@@ -83,6 +82,35 @@ def sanitize_tg_text(text: Any) -> str:
     raw = str(text if text is not None else "")
     cleaned = raw.replace("|", "·")
     return html.escape(cleaned, quote=False)
+
+
+# ---------------------------------------------------------------------------
+# NEW: /update 무한 재기동 방지용 update_id 원자적 파일 기록/조회 헬퍼 (제1헌법 & Case 06)
+# ---------------------------------------------------------------------------
+def _read_last_processed_update_id_sync() -> int:
+    lock = GlobalThrottle.get_file_lock(LAST_UPDATE_ID_FILE)
+    with lock:
+        if not os.path.isfile(LAST_UPDATE_ID_FILE):
+            return 0
+        try:
+            with open(LAST_UPDATE_ID_FILE, "r", encoding="utf-8") as fp:
+                return safe_int(fp.read().strip(), 0)
+        except Exception:
+            return 0
+
+
+def _write_last_processed_update_id_sync(update_id: int) -> None:
+    lock = GlobalThrottle.get_file_lock(LAST_UPDATE_ID_FILE)
+    with lock:
+        tmp_path = f"{LAST_UPDATE_ID_FILE}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fp:
+                fp.write(str(int(update_id)))
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp_path, LAST_UPDATE_ID_FILE)
+        except Exception as exc:
+            logger.debug("last_update_id 기록 예외: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +371,6 @@ async def render_settlement_control_board(
     budget = safe_float(st_soxs.get("budget"), 1000.0)
     target_rate = safe_float(st_soxs.get("target_profit_rate"), 1.0)
 
-    # 보유 종목이 있을 경우 출동 상태에 반영
     soxs_qty = safe_int(holdings.get("SOXS", {}).get("qty"), 0)
     soxl_qty = safe_int(holdings.get("SOXL", {}).get("qty"), 0)
     if not is_active:
@@ -468,7 +495,9 @@ async def render_sync_session_board(
 
         st = context.ledger.get_state(sym)
         budget = safe_float(st.get("budget"), 1000.0)
-        comp_prefix = "📈 통합복리시드" if st.get("is_compound", True) else "📌 고정단리시드"
+        comp_prefix = (
+            "📈 통합복리시드" if st.get("is_compound", True) else "📌 고정단리시드"
+        )
         other_qty = soxl_qty if sym == "SOXS" else soxs_qty
         status_txt = _format_symbol_directive_status(
             context, sym, h_qty, avg_p, other_qty
@@ -524,16 +553,15 @@ async def render_sync_session_board(
 
 
 # ---------------------------------------------------------------------------
-# [보드 4] /avwap 듀얼 스나이퍼 레이더 관제탑 (RSI(1m) 전면 제거 완결판)
+# [보드 4] /avwap 듀얼 스나이퍼 레이더 관제탑
 # ---------------------------------------------------------------------------
 async def render_avwap_radar_board(
     context: Any,
     now_est: Optional[datetime] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
-    📡 [듀얼 스나이퍼 레이더] — RSI(1m) 표출을 완전 폐기하고
-    선물 진폭/3단 방어망, 5MA(어제 진폭) & HA(1m), 프리장/정규장 VWAP 팩트·예상 밴드,
-    보유 상태 및 데이장 [모의] 전적을 표출하는 관제 보드 렌더러.
+    📡 [듀얼 스나이퍼 레이더] — 선물 진폭/3단 방어망, 5MA(어제 진폭) & HA(1m),
+    프리장/정규장 VWAP 팩트·예상 밴드, 보유 상태 및 데이장 [모의] 전적을 표출하는 관제 보드 렌더러.
     """
     dt_est = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     banners = get_market_session_banners(dt_est)
@@ -558,7 +586,6 @@ async def render_avwap_radar_board(
     soxl_qty = safe_int(holdings.get("SOXL", {}).get("qty"), 0)
     active_sym = "SOXS" if soxs_qty > 0 else ("SOXL" if soxl_qty > 0 else "")
 
-    # 1·2차 방어 및 3차 방어 상태 라인 구성
     if active_sym:
         st_act = context.ledger.get_state(active_sym)
         ent_sess = str(st_act.get("entry_session") or "MANUAL")
@@ -597,7 +624,6 @@ async def render_avwap_radar_board(
             f"▫️ 3차 방어(QQQ): 대기 (현가 ${qqq_p:.2f} / 한도 +{dyn_thresh:.2f}%)"
         )
 
-    # 종목별 지표 및 5MA 일봉 정보 수집
     raw_cache = getattr(context, "candle_metrics_cache", {})
     sym_data: Dict[str, Dict[str, Any]] = {}
     for sym in REAL_ALLOWED_SYMBOLS:
@@ -646,7 +672,6 @@ async def render_avwap_radar_board(
             f"{icon} {sym} ${lp:.2f} · {amp_5ma:.1f}%({yest_amp:.1f}%) · {ha_badge}"
         )
 
-    # 🌅 프리장 섹션
     pre_leader_sym = str(
         getattr(context, "pre_leader_cache", {}).get("leader_sym") or ""
     )
@@ -669,14 +694,9 @@ async def render_avwap_radar_board(
         trap_note = f" (덫 ${trap_m050:.2f})" if pre_vwap > 0.0 else ""
 
         lines.append(f"{icon} {sym} [VWAP] ${pre_vwap:.2f}{trap_note}")
-        lines.append(
-            f"  ⤷ 팩트: ${pl:.2f} ~ ${ph:.2f} ({p_amp:.1f}%)"
-        )
-        lines.append(
-            f"      · 예상: ${p_exp_l:.2f} ~ ${p_exp_h:.2f}"
-        )
+        lines.append(f"  ⤷ 팩트: ${pl:.2f} ~ ${ph:.2f} ({p_amp:.1f}%)")
+        lines.append(f"      · 예상: ${p_exp_l:.2f} ~ ${p_exp_h:.2f}")
 
-    # 🔥 정규장 섹션
     lines.extend(["", "🔥 <b>정규장</b>"])
     for sym in REAL_ALLOWED_SYMBOLS:
         icon = "🐻" if sym == "SOXS" else "🐂"
@@ -689,16 +709,11 @@ async def render_avwap_radar_board(
         r_exp_l, r_exp_h = calc_session_expected_band(rh, rl, amp_5ma)
 
         lines.append(f"{icon} {sym} [VWAP] ${reg_vwap:.2f}")
-        lines.append(
-            f"  ⤷ 팩트: ${rl:.2f} ~ ${rh:.2f} ({r_amp:.1f}%)"
-        )
-        lines.append(
-            f"      · 예상: ${r_exp_l:.2f} ~ ${r_exp_h:.2f}"
-        )
+        lines.append(f"  ⤷ 팩트: ${rl:.2f} ~ ${rh:.2f} ({r_amp:.1f}%)")
+        lines.append(f"      · 예상: ${r_exp_l:.2f} ~ ${r_exp_h:.2f}")
 
     lines.append(DIVIDER_LINE)
 
-    # 하단 SOXS / SOXL 운용 요약 + 데이장 [모의] 전적 + 통합 시드
     for sym in REAL_ALLOWED_SYMBOLS:
         icon = "🐻" if sym == "SOXS" else "🐂"
         st = context.ledger.get_state(sym)
@@ -724,7 +739,9 @@ async def render_avwap_radar_board(
             status_short = _format_symbol_directive_status(
                 context, sym, h_qty, avg_p, other_qty
             )
-            lines.append(f"{icon} {sym} [{on_badge}] {sanitize_tg_text(status_short)}")
+            lines.append(
+                f"{icon} {sym} [{on_badge}] {sanitize_tg_text(status_short)}"
+            )
 
     day_sim = getattr(context, "day_sim_state", {})
     d_tot = safe_int(day_sim.get("sim_trade_count"), 0)
@@ -736,7 +753,9 @@ async def render_avwap_radar_board(
 
     st_soxs = context.ledger.get_state("SOXS")
     budget_val = safe_float(st_soxs.get("budget"), 1000.0)
-    seed_label = "통합복리 시드" if st_soxs.get("is_compound", True) else "고정단리 시드"
+    seed_label = (
+        "통합복리 시드" if st_soxs.get("is_compound", True) else "고정단리 시드"
+    )
 
     lines.extend(
         [
@@ -870,7 +889,7 @@ async def handle_reset_command(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 행정 2] /update 시스템 자가 업데이트 핸들러 (스크린샷 하단 블록 완벽 재현)
+# [핵심 행정 2] /update 시스템 자가 업데이트 핸들러
 # ---------------------------------------------------------------------------
 def _run_git_update_and_compile_sync(force: bool = False) -> Tuple[bool, str]:
     """
@@ -933,11 +952,11 @@ def _run_git_update_and_compile_sync(force: bool = False) -> Tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# TelegramBotRouter : 비동기 롱폴링 · 대화형 시드 설정 · 인플레이스 버튼 편집
+# TelegramBotRouter : 비동기 롱폴링 · 무한 재기동 4중 방어벽 · 인플레이스 제어반
 # ---------------------------------------------------------------------------
 class TelegramBotRouter:
     """
-    제1헌법 & Case 02, 07, 11, 13, 17, 18, 26, 38:
+    제1헌법 & Case 02, 06, 07, 11, 13, 17, 18, 26, 38:
     텔레그램 봇 폴링 라우터 및 4대 관제 보드 / 대화형 시드 입력 / 자가 업데이트 전담 클래스.
     """
 
@@ -957,7 +976,9 @@ class TelegramBotRouter:
         ).strip()
         self._session = requests.Session()
         self._offset: int = 0
+        self._boot_epoch: float = time.time()
         self._startup_sent: bool = False
+        self._stale_flushed: bool = False
         self._awaiting_seed_input: bool = False
         self._hold_alert_lock = threading.Lock()
         self._hold_alert_sent_keys: Dict[str, str] = {}
@@ -1005,6 +1026,64 @@ class TelegramBotRouter:
         except Exception as exc:
             logger.debug("텔레그램 API 호출 예외 (%s): %s", method, exc)
             return {"ok": False, "error": str(exc)}
+
+    async def _commit_offset_to_telegram_server(self) -> None:
+        """
+        # NEW [2차 방어벽]: 현재 self._offset 을 텔레그램 본사 서버에 즉시 커밋하여
+        처리 완료된 메시지(/update 등)가 재기동 후 다시 내려오는 현상을 원천 차단한다.
+        """
+        if self._offset <= 0:
+            return
+        try:
+            await self._tg_post_async(
+                "getUpdates",
+                {
+                    "offset": self._offset,
+                    "limit": 1,
+                    "timeout": 0,
+                },
+                timeout=5.0,
+            )
+        except Exception as exc:
+            logger.debug("텔레그램 오프셋 커밋 예외: %s", exc)
+
+    async def _flush_stale_updates_on_startup(self) -> None:
+        """
+        # NEW [1차 방어벽]: 프로세스 기동 직후 롱폴링에 들어가기 전에
+        텔레그램 큐의 마지막(offset=-1) 업데이트를 확인하여 부팅 이전에 쌓인
+        구버전 메시지(특히 직전 /update)를 모두 스킵하고 서버 큐를 깨끗이 비운다.
+        """
+        if self._stale_flushed:
+            return
+        try:
+            last_saved_uid = await asyncio.to_thread(
+                _read_last_processed_update_id_sync
+            )
+            if last_saved_uid > 0 and (last_saved_uid + 1) > self._offset:
+                self._offset = last_saved_uid + 1
+
+            res = await self._tg_post_async(
+                "getUpdates",
+                {
+                    "offset": -1,
+                    "limit": 5,
+                    "timeout": 0,
+                },
+                timeout=6.0,
+            )
+            updates = res.get("result") if isinstance(res, dict) else []
+            if isinstance(updates, list) and updates:
+                for upd in updates:
+                    if not isinstance(upd, dict):
+                        continue
+                    uid = safe_int(upd.get("update_id"), 0)
+                    if uid >= self._offset:
+                        self._offset = uid + 1
+                await self._commit_offset_to_telegram_server()
+            self._stale_flushed = True
+        except Exception as exc:
+            logger.debug("기동 시 텔레그램 큐 플러시 예외: %s", exc)
+            self._stale_flushed = True
 
     async def send_raw_html(
         self,
@@ -1058,12 +1137,10 @@ class TelegramBotRouter:
         """
         🚨 Case 13: 서버 기동 완료 시 "✅ 서버가 정상 작동 중입니다." 단일 문구를 타전한다.
         """
-        if not self.is_configured:
+        if not self.is_configured or self._startup_sent:
             return {"ok": False}
-        res = await self.send_raw_html("✅ 서버가 정상 작동 중입니다.")
-        if isinstance(res, dict) and res.get("ok"):
-            self._startup_sent = True
-        return res
+        self._startup_sent = True
+        return await self.send_raw_html("✅ 서버가 정상 작동 중입니다.")
 
     async def send_slim_alert(self, title: str, body: str = "") -> Dict[str, Any]:
         """
@@ -1116,7 +1193,13 @@ class TelegramBotRouter:
             board_html, reply_markup=markup, chat_id=chat_id
         )
 
-    async def _handle_incoming_message(self, chat_id: str, text: str) -> None:
+    async def _handle_incoming_message(
+        self,
+        chat_id: str,
+        text: str,
+        update_id: int = 0,
+        msg_date: int = 0,
+    ) -> None:
         raw_txt = str(text or "").strip()
         if not raw_txt:
             return
@@ -1125,7 +1208,11 @@ class TelegramBotRouter:
         cleaned_num = raw_txt.replace("$", "").replace(",", "").strip()
         try:
             num_val = float(cleaned_num)
-            if not math.isnan(num_val) and not math.isinf(num_val) and num_val >= 10.0:
+            if (
+                not math.isnan(num_val)
+                and not math.isinf(num_val)
+                and num_val >= 10.0
+            ):
                 await self._apply_new_seed_and_reply(chat_id, num_val)
                 return
         except ValueError:
@@ -1178,13 +1265,50 @@ class TelegramBotRouter:
 
         if cmd == "/reset":
             self._awaiting_seed_input = False
+            if msg_date > 0 and float(msg_date) < (self._boot_epoch - 5.0):
+                logger.info("ℹ️ 부팅 이전 과거 /reset 메시지 무시 (msg_date=%s)", msg_date)
+                await self._commit_offset_to_telegram_server()
+                return
             msg = await handle_reset_command(self.context)
             await self.send_raw_html(msg, chat_id=chat_id)
             return
 
         if cmd == "/update":
             self._awaiting_seed_input = False
-            # 사용자가 텔레그램에서 직접 /update 를 입력한 경우 강제 업데이트 허용 (스크린샷 동일 동작)
+
+            # [3차 & 4차 방어벽] 부팅 이전 과거 메시지이거나 이미 처리된 update_id 이면 즉시 스킵!
+            last_done_uid = await asyncio.to_thread(
+                _read_last_processed_update_id_sync
+            )
+            if update_id > 0 and update_id <= last_done_uid:
+                logger.info(
+                    "🛡️ 이미 처리 완료된 /update 명령 재수신 차단 (update_id=%d <= %d)",
+                    update_id,
+                    last_done_uid,
+                )
+                await self._commit_offset_to_telegram_server()
+                return
+
+            if msg_date > 0 and float(msg_date) < (self._boot_epoch - 3.0):
+                logger.info(
+                    "🛡️ 부팅 이전 과거 /update 명령 재수신 차단 (msg_date=%d < boot=%.0f)",
+                    msg_date,
+                    self._boot_epoch,
+                )
+                if update_id > 0:
+                    await asyncio.to_thread(
+                        _write_last_processed_update_id_sync, update_id
+                    )
+                await self._commit_offset_to_telegram_server()
+                return
+
+            # [2차 & 4차 방어벽] 업데이트 실행 직전 update_id 파일 기록 및 텔레그램 서버 오프셋 즉시 커밋!
+            if update_id > 0:
+                await asyncio.to_thread(
+                    _write_last_processed_update_id_sync, update_id
+                )
+            await self._commit_offset_to_telegram_server()
+
             ok, summary = await asyncio.to_thread(
                 _run_git_update_and_compile_sync, True
             )
@@ -1200,6 +1324,8 @@ class TelegramBotRouter:
                 f"🚀 <b>탑재 성공. 재기동 격발.</b>\n<blockquote>업데이트 성공:\n{safe_sum}</blockquote>",
                 chat_id=chat_id,
             )
+            # os._exit(0) 직전 텔레그램 서버에 오프셋 최종 재커밋
+            await self._commit_offset_to_telegram_server()
             await asyncio.sleep(0.5)
             os._exit(0)
 
@@ -1338,6 +1464,10 @@ class TelegramBotRouter:
                 )
                 logged_wait = False
 
+            # 기동 직후 잔류 구버전 업데이트 큐를 먼저 비운 뒤 기동 메시지 전송
+            if not self._stale_flushed:
+                await self._flush_stale_updates_on_startup()
+
             if not self._startup_sent:
                 await self.send_startup_message()
 
@@ -1369,10 +1499,16 @@ class TelegramBotRouter:
                             )
                             cid = str(chat_obj.get("id") or "")
                             txt = str(msg.get("text") or "").strip()
+                            msg_date = safe_int(msg.get("date"), 0)
                             if txt and (
                                 not self.chat_id or cid == self.chat_id
                             ):
-                                await self._handle_incoming_message(cid, txt)
+                                await self._handle_incoming_message(
+                                    chat_id=cid,
+                                    text=txt,
+                                    update_id=uid,
+                                    msg_date=msg_date,
+                                )
 
                         elif isinstance(upd.get("callback_query"), dict):
                             await self._handle_callback_query(
