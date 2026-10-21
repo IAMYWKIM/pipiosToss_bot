@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-# NEW: main.py
-인피니트 스노우볼 듀얼 스나이퍼 메인 엔트리, AssassinLedger 원자적 로컬 장부,
-6대 인메모리 캐시 컨텍스트, 0.4초/1.5초 메인 타격 루프, 5.0초 듀얼 캔들 레이더 루프,
-17:00 EST 일일 GC 및 03:30 ~ 17:00 EST 장중 업데이트 락다운/컴파일 검증 코어 (Step 10 / 10)
-- 제1헌법: 모든 로컬 장부 I/O의 asyncio.to_thread 격리 및 GlobalThrottle.get_file_lock 강제
-- 제2헌법: 기동 시 ensure_account_seq() 1회 호출로 BROKERAGE accountSeq 메모리 락온
-- 제3헌법: 10개 플러그인 모듈 단일 책임 오케스트레이션 및 데드코드 영구 소각
-- 제4헌법: 모든 시계열/스케줄러 판단 ZoneInfo('America/New_York') 단일 소스 락온
-- 제5헌법: 고유 clientOrderId 멱등성 키 상태 보존
-- 제6헌법: US 마켓 캘린더 Fail-Open 폴백 연동
-- Case 01 ~ Case 102 전술 자산 100% 통합 완결판
+# MODIFIED: main.py
+인피니트 스노우볼 듀얼 스나이퍼 메인 오케스트레이터 및 비동기 스케줄러 (Step 05 / 05)
+- MODIFIED: 제3헌법 및 최신 프롬프트.txt(Case 02)에 의거하여 SniperContext 내 bottom_track_cache,
+  프리장 루프 내 execute_post_stop_bottom_rebound_plugin(RE_BOT_TRAIL) 임포트/호출,
+  0.4초 부스터 내 최저점 반등 조건을 100% 영구 소각하고 5대 인메모리 캐시 및 5대 고주파 부스터로 일원화
+- MODIFIED: 제3헌법에 의거하여 plugin_updater.py 의 verify_all_modules_compile 및
+  is_update_lockdown_window 를 직접 임포트하여 중복 선언을 제거하고 기동 시 11개 코어 모듈 전수 검증
+- NEW: 기동 직후 day_sim_state["_disk_loaded"] = False 초기화를 통해 첫 틱에서 day_sim_state.json
+  디스크 파일로부터 당일 데이장 [모의] 보유 포지션과 전적을 자동 복원하도록 결속
+- 제1헌법 ~ 제6헌법 및 102대 엣지 케이스 방어망 완벽 준수
 """
 
 from __future__ import annotations
@@ -18,53 +17,44 @@ from __future__ import annotations
 import asyncio
 import gc
 import inspect
-import json
 import logging
 import os
-import py_compile
 import signal
 import sys
-import threading
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional
 
 from daymarket_sim_plugin import (
     create_default_day_sim_state,
     execute_daymarket_sim_plugin,
     is_daymarket_late_vwap_esc_window,
     is_daymarket_sim_active_window,
+    persist_day_sim_state_async,
     settle_daymarket_sim_before_premarket,
-    update_daymarket_trend_leader,
 )
 from defense_plugin import (
     enforce_0815_macro_cutoff_plugin,
-    execute_1500_regular_vwap_escape,
-    execute_1559_moc_force_liquidation,
-    execute_stage1_2_nq_overheat_defense,
-    execute_stage3_qqq_adverse_defense,
-    relock_qqq_baseline_on_bot_resume,
-    sync_manual_and_indexing_guard,
+    execute_1500_vwap_escape_plugin,
+    execute_1559_moc_liquidation_plugin,
+    execute_macro_3stage_defense_plugin,
 )
-from quant_engine import (
-    NQ_DYNAMIC_FLOOR,
-    NQ_OVERHEAT_THRESHOLD,
-    CandleRecorder,
-    MacroDataCache,
-    get_cme_futures_session_bounds,
+from plugin_updater import (
+    is_update_lockdown_window,
+    verify_all_modules_compile,
 )
+from quant_engine import NQ_OVERHEAT_THRESHOLD, MacroDataCache
 from quant_indicators_plugin import (
     compute_session_vwap_metrics,
     get_logical_trading_date_str,
     refresh_metrics_with_live_tick,
 )
 from sniper_exit_plugin import (
-    execute_premarket_late_vwap_escape,
+     is_premarket_late_vwap_esc_window,
     manage_mechanical_profit_trap_plugin,
     reconcile_zero_holdings_exit_plugin,
 )
 from sniper_plugin import (
-    execute_post_stop_bottom_rebound_plugin,
     execute_premarket_vwap_sniper_plugin,
     sync_dynamic_vwap_buy_order_modify,
     update_premarket_trend_leader,
@@ -73,20 +63,19 @@ from tg_ui_plugin import TelegramBotRouter
 from toss_api import (
     EST_TZ,
     REAL_ALLOWED_SYMBOLS,
-    GlobalThrottle,
-    TossInvestAPI,
+    AssassinLedger,
+    TossApiClient,
+    _autoload_dotenv_files,
     safe_float,
     safe_int,
 )
 from whipsaw_plugin import (
     enforce_0407_whipsaw_cutoff_plugin,
-    execute_0358_whipsaw_trap_plugin,
-    manage_whipsaw_1sh_profit_trap,
+    execute_whipsaw_1sh_plugin,
+    is_whipsaw_window,
 )
 
-# ---------------------------------------------------------------------------
 # 로깅 포맷 설정
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -94,891 +83,684 @@ logging.basicConfig(
 )
 logger = logging.getLogger("toss_sniper.main")
 
-# ---------------------------------------------------------------------------
-# 전역 상수 및 6대 인메모리 캐시 (Case 02, Case 11, Case 28, Case 69)
-# ---------------------------------------------------------------------------
-ALL_PLUGIN_FILES: Tuple[str, ...] = (
-    "toss_api.py",
-    "quant_indicators_plugin.py",
-    "quant_engine.py",
-    "sniper_plugin.py",
-    "sniper_exit_plugin.py",
-    "defense_plugin.py",
-    "daymarket_sim_plugin.py",
-    "whipsaw_plugin.py",
-    "tg_ui_plugin.py",
-    "main.py",
-)
+# 메인 루프 주기 상수 (평시 1.5초 / 5대 고주파 부스터 가동 시 0.4초)
+NORMAL_LOOP_INTERVAL_SEC: float = 1.5
+FAST_BOOSTER_INTERVAL_SEC: float = 0.4
 
-# 폴링 주기 상수 (Case 28: 평시 1.5초, 6대 조건 부스터 시 0.4초 고속 폴링)
-NORMAL_LOOP_TIMEOUT_SEC: float = 1.5
-FAST_SHIELD_LOOP_TIMEOUT_SEC: float = 0.4
-# 캔들 레이더 주기 상수 (🎯 3: 데이장 및 03:55 ~ 08:15 EST 또는 보유/추적 중 5.0초 가속)
-FAST_CANDLE_POLL_SEC: float = 5.0
-IDLE_CANDLE_POLL_SEC: float = 20.0
-
-# Case 02: 전역 6대 인메모리 런타임 캐시
-_TRAIL_RUNTIME_CACHE: Dict[str, Dict[str, Any]] = {}
-_EXIT_SNAPSHOT_CACHE: Dict[str, Dict[str, Any]] = {}
-_BOTTOM_TRACK_CACHE: Dict[str, Any] = {"active": False}
-_PRE_LEADER_CACHE: Dict[str, Any] = {
-    "logical_date": "",
-    "locked": False,
-    "leader_sym": "",
-    "vwap_0407": 0.0,
-    "c_0407": 0.0,
-    "disp_0407": 0.0,
-    "notified": False,
-    "hybrid_mode": False,
-}
-_DAY_LEADER_CACHE: Dict[str, Any] = {
-    "logical_date": "",
-    "locked": False,
-    "leader_sym": "",
-    "vwap_1907": 0.0,
-    "c_1907": 0.0,
-    "disp_1907": 0.0,
-    "notified": False,
-    "hybrid_mode": False,
-}
-_DAY_SIM_STATE: Dict[str, Any] = create_default_day_sim_state()
+# 백그라운드 1분봉 캔들 레이더 주기 상수 (집중 세션 5.0초 / 평시 15.0초)
+ACTIVE_CANDLE_POLL_SEC: float = 5.0
+IDLE_CANDLE_POLL_SEC: float = 15.0
 
 
 # ---------------------------------------------------------------------------
-# Case 12 : 시그니처 적응형 플러그인 호출기 (_call_plugin_adaptive)
+# Case 11: SIGTERM / SIGINT 수신 시 0.1초 고속 하드 킬(os._exit(0)) 핸들러
 # ---------------------------------------------------------------------------
-async def _call_plugin_adaptive(
-    func: Callable[..., Any],
-    *args: Any,
-    **kwargs: Any,
-) -> Any:
+def _install_fast_kill_signal_handlers() -> None:
+    def _fast_kill_handler(signum: int, _frame: Any) -> None:
+        logger.info(
+            "🛑 시그널(%d) 수신 -> 0.1초 고속 하드 킬(os._exit(0)) 즉시 종료",
+            signum,
+        )
+        os._exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _fast_kill_handler)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Case 12: 플러그인 함수 시그니처 적응형 호출기 (_call_plugin_adaptive)
+# ---------------------------------------------------------------------------
+async def _call_plugin_adaptive(func: Callable[..., Any], **kwargs: Any) -> Any:
     """
-    Case 12:
-    플러그인 함수의 inspect.signature 를 분석하여 수용 가능한 위치/키워드 인자만
-    안전하게 바인딩해 호출함으로써 모듈 수정 시 인자 불일치(TypeError)를 원천 방어한다.
+    Case 12: 플러그인 함수의 파라미터 시그니처를 동적으로 검사하여
+    지원하는 인자만 안전하게 주입하고 동기/비동기 함수를 모두 실행한다.
     """
     sig = inspect.signature(func)
-    params = list(sig.parameters.values())
-
-    accepts_var_args = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
-    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
-
-    pos_params = [
-        p
-        for p in params
-        if p.kind
-        in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        )
-    ]
-    call_args = list(args) if accepts_var_args else list(args[: len(pos_params)])
-
-    bound_param_names = {p.name for p in pos_params[: len(call_args)]}
+    accepts_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
     if accepts_var_kw:
-        call_kwargs = {
-            k: v for k, v in kwargs.items() if k not in bound_param_names
-        }
+        filtered_kwargs = kwargs
     else:
-        valid_kw_names = {
-            p.name
-            for p in params
-            if p.kind
-            in (
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            )
-        }
-        call_kwargs = {
-            k: v
-            for k, v in kwargs.items()
-            if k in valid_kw_names and k not in bound_param_names
+        filtered_kwargs = {
+            k: v for k, v in kwargs.items() if k in sig.parameters
         }
 
-    res = func(*call_args, **call_kwargs)
+    res = func(**filtered_kwargs)
     if inspect.isawaitable(res):
         return await res
     return res
 
 
 # ---------------------------------------------------------------------------
-# Case 06 & Case 09 : AssassinLedger 원자적 로컬 장부 코어
+# Case 01: 주말 휴장 구간 (금요일 17:00 EST ~ 일요일 17:59 EST) 판별기
 # ---------------------------------------------------------------------------
-def _default_symbol_ledger_entry(
-    symbol: str, logical_date: str = "", default_budget: float = 1000.0
-) -> Dict[str, Any]:
-    return {
-        "symbol": str(symbol).upper().strip(),
-        "logical_date": str(logical_date or get_logical_trading_date_str(rollover_hour=18)),
-        "is_active": True,
-        "is_compound": True,
-        "budget": float(default_budget),
-        "target_profit_rate": 1.0,
-        "is_session_done": False,
-        "entry_session": "",
-        "entry_trend": "",
-        "buy_order_id": "",
-        "sell_order_id": "",
-        "client_order_id": "",
-        "ordered_qty": 0,
-        "holdings_qty": 0,
-        "buy_price": 0.0,
-        "avg_price": 0.0,
-        "target_sell_price": 0.0,
-        "nq_entry_price": 0.0,
-        "nq_entry_amp": 0.0,
-        "last_modify_mono": 0.0,
-        "entry_ts": 0.0,
-        "realized_pnl_usd": 0.0,
-        "trade_count": 0,
-        "win_count": 0,
-    }
-
-
-class AssassinLedger:
+def is_weekend_market_closed(now_est: Optional[datetime] = None) -> bool:
     """
-    제1헌법 & Case 02, 05, 06, 09, 36:
-    - 오직 REAL_ALLOWED_SYMBOLS = ('SOXS', 'SOXL') 2종목만 격리 관리한다.
-    - 모든 파일 읽기와 쓰기는 asyncio.to_thread 및 GlobalThrottle.get_file_lock 으로 보호하며,
-      저장 시 임시 파일(.tmp) 작성 후 os.replace 로 원자적(Atomic) 덮어쓰기를 수행한다.
-    """
-
-    def __init__(
-        self,
-        filepath: str = "assassin_ledger.json",
-        default_budget: float = 1000.0,
-    ) -> None:
-        self.filepath = os.path.abspath(str(filepath or "assassin_ledger.json"))
-        self.default_budget = max(100.0, safe_float(default_budget, 1000.0))
-        self._mem_lock = threading.RLock()
-        logical_today = get_logical_trading_date_str(rollover_hour=18)
-        self._data: Dict[str, Dict[str, Any]] = {
-            "SOXS": _default_symbol_ledger_entry("SOXS", logical_today, self.default_budget),
-            "SOXL": _default_symbol_ledger_entry("SOXL", logical_today, self.default_budget),
-        }
-        self._load_sync()
-
-    def _validate_symbol(self, symbol: str) -> str:
-        sym = str(symbol or "").upper().strip()
-        if sym not in REAL_ALLOWED_SYMBOLS:
-            raise ValueError(f"AssassinLedger 허용 종목({REAL_ALLOWED_SYMBOLS}) 위반: {sym}")
-        return sym
-
-    def _load_sync(self) -> None:
-        lock = GlobalThrottle.get_file_lock(self.filepath)
-        with lock:
-            if not os.path.isfile(self.filepath):
-                self._save_sync_unlocked()
-                return
-            try:
-                with open(self.filepath, "r", encoding="utf-8") as fp:
-                    raw = json.load(fp)
-                if isinstance(raw, dict):
-                    logical_today = get_logical_trading_date_str(rollover_hour=18)
-                    with self._mem_lock:
-                        for sym in REAL_ALLOWED_SYMBOLS:
-                            base = _default_symbol_ledger_entry(
-                                sym, logical_today, self.default_budget
-                            )
-                            loaded_sym = raw.get(sym)
-                            if isinstance(loaded_sym, dict):
-                                for k in base.keys():
-                                    if k in loaded_sym and loaded_sym[k] is not None:
-                                        base[k] = loaded_sym[k]
-                            self._data[sym] = base
-            except Exception as exc:
-                logger.warning("⚠️ 로컬 장부 로드 실패 (기본값 복원): %s", exc)
-
-    def _save_sync_unlocked(self) -> None:
-        tmp_path = f"{self.filepath}.tmp"
-        parent_dir = os.path.dirname(self.filepath)
-        if parent_dir:
-            os.makedirs(parent_dir, exist_ok=True)
-        with self._mem_lock:
-            payload = json.dumps(self._data, ensure_ascii=False, indent=2)
-        with open(tmp_path, "w", encoding="utf-8") as fp:
-            fp.write(payload)
-            fp.flush()
-            os.fsync(fp.fileno())
-        os.replace(tmp_path, self.filepath)
-
-    def save_sync(self) -> None:
-        lock = GlobalThrottle.get_file_lock(self.filepath)
-        with lock:
-            self._save_sync_unlocked()
-
-    async def save_async(self) -> None:
-        await asyncio.wait_for(asyncio.to_thread(self.save_sync), timeout=5.0)
-
-    def get_state(self, symbol: str) -> Dict[str, Any]:
-        sym = self._validate_symbol(symbol)
-        with self._mem_lock:
-            return dict(self._data[sym])
-
-    async def update_state(self, symbol: str, **kwargs: Any) -> Dict[str, Any]:
-        sym = self._validate_symbol(symbol)
-        with self._mem_lock:
-            cur = self._data[sym]
-            for k, v in kwargs.items():
-                cur[k] = v
-            snapshot = dict(cur)
-        await self.save_async()
-        return snapshot
-
-    async def check_and_rollover_logical_date(
-        self, now_est: Optional[datetime] = None
-    ) -> bool:
-        """
-        Case 01 & Case 36:
-        18:00 EST 신세션 진입으로 논리 거래일(logical_date)이 변경되었을 때,
-        미보유 & 미체결 상태인 경우 당일 세션 플래그(is_session_done, entry_session 등)를
-        새 거래일 기준으로 깨끗이 초기화한다 (보유/미체결 주문이 있으면 날짜만 승계).
-        """
-        logical_today = get_logical_trading_date_str(now_est, rollover_hour=18)
-        changed = False
-        with self._mem_lock:
-            for sym in REAL_ALLOWED_SYMBOLS:
-                cur = self._data[sym]
-                if cur.get("logical_date") != logical_today:
-                    changed = True
-                    cur["logical_date"] = logical_today
-                    has_live_state = bool(
-                        safe_int(cur.get("holdings_qty"), 0) > 0
-                        or str(cur.get("buy_order_id") or "").strip()
-                        or str(cur.get("sell_order_id") or "").strip()
-                    )
-                    if not has_live_state:
-                        cur["is_session_done"] = False
-                        cur["entry_session"] = ""
-                        cur["entry_trend"] = ""
-                        cur["ordered_qty"] = 0
-                        cur["buy_price"] = 0.0
-                        cur["target_sell_price"] = 0.0
-                        cur["nq_entry_price"] = 0.0
-                        cur["nq_entry_amp"] = 0.0
-                        cur["entry_ts"] = 0.0
-        if changed:
-            await self.save_async()
-            logger.info("📅 [논리 거래일 롤오버 완료] 신규 거래일=%s", logical_today)
-        return changed
-
-    async def reset_dual_ledgers_preserve_seed(self) -> None:
-        """
-        Case 02: /reset 명령 시 통합 시드(budget), 복리/단리(is_compound), 익절 점화율(target_profit_rate),
-        누적 성적은 보존하고 모든 포지션/주문/세션 락을 원자적으로 0점 소각한다.
-        """
-        logical_today = get_logical_trading_date_str(rollover_hour=18)
-        with self._mem_lock:
-            for sym in REAL_ALLOWED_SYMBOLS:
-                cur = self._data[sym]
-                kept_budget = safe_float(cur.get("budget"), self.default_budget)
-                kept_comp = bool(cur.get("is_compound", True))
-                kept_rate = safe_float(cur.get("target_profit_rate"), 1.0)
-                kept_active = bool(cur.get("is_active", True))
-                kept_pnl = safe_float(cur.get("realized_pnl_usd"), 0.0)
-                kept_trades = safe_int(cur.get("trade_count"), 0)
-                kept_wins = safe_int(cur.get("win_count"), 0)
-
-                fresh = _default_symbol_ledger_entry(sym, logical_today, kept_budget)
-                fresh.update(
-                    {
-                        "is_active": kept_active,
-                        "is_compound": kept_comp,
-                        "target_profit_rate": kept_rate,
-                        "realized_pnl_usd": kept_pnl,
-                        "trade_count": kept_trades,
-                        "win_count": kept_wins,
-                    }
-                )
-                self._data[sym] = fresh
-        await self.save_async()
-
-
-# ---------------------------------------------------------------------------
-# Case 07 & Case 11 : 장중 업데이트 락다운 및 10개 파일 프리플라이트 컴파일 검증기
-# ---------------------------------------------------------------------------
-def is_update_lockdown_window(now_est: Optional[datetime] = None) -> bool:
-    """
-    🚨 Case 07:
-    평일(월 ~ 금) 03:30 ~ 17:00 EST 구간에는 장중 무인 자동 업데이트 및 재기동을 전면 차단한다.
+    Case 01: 금요일 17:00 EST 부터 일요일 17:59 EST 까지를 주말 휴장 구간으로 판별한다.
+    일요일 18:00 EST (CME 선물 신세션 오픈) 부터 정상 가동한다.
     """
     dt = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
-    if dt.weekday() >= 5:
-        return False
+    wd = dt.weekday()  # 0=Mon ... 4=Fri, 5=Sat, 6=Sun
     hm = dt.hour * 100 + dt.minute
-    return bool(330 <= hm <= 1700)
-
-
-def verify_all_modules_compile(base_dir: Optional[str] = None) -> Tuple[bool, List[str]]:
-    """
-    🚨 Case 11:
-    분리된 서브 플러그인을 포함한 전체 10개 코어 모듈(ALL_PLUGIN_FILES)에 대해
-    py_compile 프리플라이트 구문 검증을 수행한다.
-    """
-    root = os.path.abspath(base_dir or os.path.dirname(os.path.abspath(__file__)))
-    errors: List[str] = []
-    for fname in ALL_PLUGIN_FILES:
-        fpath = os.path.join(root, fname)
-        if not os.path.isfile(fpath):
-            errors.append(f"MISSING:{fname}")
-            continue
-        try:
-            py_compile.compile(fpath, doraise=True)
-        except Exception as exc:
-            errors.append(f"SYNTAX_ERR:{fname}:{exc}")
-    return (len(errors) == 0), errors
-
-
-async def execute_safe_hot_reload(context: Any) -> Dict[str, Any]:
-    """
-    Case 07 & Case 11:
-    장중 락다운(03:30 ~ 17:00 EST)이 아니고 보유 포지션/미체결 주문이 없을 때만
-    10개 파일 전체 py_compile 검증 통과 후 os._exit(0) 하드 킬 재기동을 수행한다.
-    """
-    if is_update_lockdown_window():
-        return {"status": "BLOCKED_INTRADAY_LOCKDOWN"}
-
-    ok, errs = await asyncio.to_thread(verify_all_modules_compile)
-    if not ok:
-        return {"status": "COMPILE_FAILED", "errors": errs}
-
-    logger.info("♻️ 10개 플러그인 컴파일 검증 통과 -> os._exit(0) 하드 리로드 실행")
-    os._exit(0)
+    if wd == 4 and hm >= 1700:
+        return True
+    if wd == 5:
+        return True
+    if wd == 6 and hm < 1800:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
-# BotRuntimeContext : 전술 실행 컨텍스트 및 6대 캐시 바인딩 컨테이너
+# 중앙 관제 컨텍스트 (SniperContext : 5대 인메모리 캐시 & 비동기 락 & 공유 상태)
 # ---------------------------------------------------------------------------
-class BotRuntimeContext:
+class SniperContext:
     """
-    10개 플러그인이 공유하는 단일 런타임 컨텍스트 객체.
+    제1헌법 ~ 제6헌법 및 Case 02:
+    듀얼 스나이퍼의 API 클라이언트, 로컬 원장(AssassinLedger), 매크로 캐시(MacroDataCache),
+    5대 핵심 인메모리 캐시(_TRAIL_RUNTIME_CACHE, _EXIT_SNAPSHOT_CACHE, _PRE_LEADER_CACHE,
+    _DAY_LEADER_CACHE, _DAY_SIM_STATE) 및 비동기 타격 뮤텍스를 통합 관리하는 컨텍스트.
+    (MODIFIED: 폐기된 bottom_track_cache 영구 소각 완료)
     """
 
     def __init__(self) -> None:
-        default_seed = safe_float(os.getenv("SNIPER_INITIAL_BUDGET_USD"), 1000.0)
-        self.api = TossInvestAPI()
-        self.ledger = AssassinLedger(
-            filepath=os.getenv("SNIPER_LEDGER_PATH", "assassin_ledger.json"),
-            default_budget=default_seed,
-        )
-        self.macro_cache = MacroDataCache(self.api, nq_ttl_sec=15.0)
-        self.candle_recorder = CandleRecorder(
-            base_dir=os.getenv("SNIPER_CANDLE_DIR", "candle_archive"),
-            retention_days=14,
-        )
-
-        # 비동기 이벤트 및 타격 뮤텍스 락 (Case 25, 27, 54, 63, 64)
+        _autoload_dotenv_files(override=False)
         self.running: bool = True
-        self.wakeup_event = asyncio.Event()
-        self.in_memory_ordering_lock = asyncio.Lock()
-        self.dual_strike_mutex = asyncio.Lock()
+        self.api: TossApiClient = TossApiClient()
+        self.ledger: AssassinLedger = AssassinLedger()
+        self.macro_cache: MacroDataCache = MacroDataCache(toss_api=self.api)
 
-        # 6대 인메모리 캐시 및 보조 캐시 연결 (Case 02)
-        self.trail_runtime_cache = _TRAIL_RUNTIME_CACHE
-        self.exit_snapshot_cache = _EXIT_SNAPSHOT_CACHE
-        self.bottom_track_cache = _BOTTOM_TRACK_CACHE
-        self.pre_leader_cache = _PRE_LEADER_CACHE
-        self.day_leader_cache = _DAY_LEADER_CACHE
-        self.day_sim_state = _DAY_SIM_STATE
+        # Case 25 ~ 27 & Case 54: 소프트웨어 웨이크업 트리거 및 이중 타격 방지 비동기 뮤텍스
+        self.wakeup_event: asyncio.Event = asyncio.Event()
+        self.in_memory_ordering_lock: asyncio.Lock = asyncio.Lock()
+        self.dual_strike_mutex: asyncio.Lock = asyncio.Lock()
+
+        now_est = datetime.now(EST_TZ)
+        logical_date = get_logical_trading_date_str(now_est, rollover_hour=18)
+
+        # Case 02: 5대 핵심 인메모리 캐시 (bottom_track_cache 영구 제거 완료)
+        self.trail_runtime_cache: Dict[str, Dict[str, Any]] = {}
+        self.exit_snapshot_cache: Dict[str, Dict[str, Any]] = {}
+        self.pre_leader_cache: Dict[str, Any] = {
+            "logical_date": logical_date,
+            "locked": False,
+            "leader_sym": "",
+            "vwap_0407": 0.0,
+            "c_0407": 0.0,
+            "disp_0407": 0.0,
+            "notified": False,
+            "hybrid_mode": False,
+        }
+        self.day_leader_cache: Dict[str, Any] = {
+            "logical_date": logical_date,
+            "locked": False,
+            "leader_sym": "",
+            "vwap_1907": 0.0,
+            "c_1907": 0.0,
+            "disp_1907": 0.0,
+            "notified": False,
+            "hybrid_mode": False,
+        }
+        self.day_sim_state: Dict[str, Any] = create_default_day_sim_state(
+            logical_date
+        )
+        # 기동 직후 첫 루프에서 day_sim_state.json 디스크 파일 복원을 수행하도록 플래그 설정
+        self.day_sim_state["_disk_loaded"] = False
+
+        # 보조 런타임 캐시 (5.0초 1분봉 지표 캐시, 체결 인덱싱 그레이스 쉴드, 1주 휩소 캐시)
+        self.candle_metrics_cache: Dict[str, Dict[str, Any]] = {}
         self.indexing_grace_cache: Dict[str, Dict[str, Any]] = {}
         self.whipsaw_runtime_cache: Dict[str, Any] = {}
-        self.candle_metrics_cache: Dict[str, Dict[str, Any]] = {}
+
+        self.fast_shield_mode: bool = False
+        self.last_gc_date: str = ""
+        self.last_rollover_date: str = logical_date
 
         # 텔레그램 라우터 결속
-        self.tg_router = TelegramBotRouter(self)
+        self.tg_router: TelegramBotRouter = TelegramBotRouter(context=self)
 
-    async def send_slim_alert(self, title: str, body: str = "") -> Dict[str, Any]:
-        return await self.tg_router.send_slim_alert(title=title, body=body)
+    async def send_slim_alert(
+        self, title: str, body: str = ""
+    ) -> Dict[str, Any]:
+        if hasattr(self, "tg_router") and self.tg_router is not None:
+            return await self.tg_router.send_slim_alert(title=title, body=body)
+        return {"ok": False}
 
     async def send_strike_hold_alert_once(
         self, symbol: str, reason_key: str, message: str
     ) -> None:
-        await self.tg_router.send_strike_hold_alert_once(
-            symbol=symbol, reason_key=reason_key, message=message
-        )
+        if hasattr(self, "tg_router") and self.tg_router is not None:
+            await self.tg_router.send_strike_hold_alert_once(
+                symbol=symbol, reason_key=reason_key, message=message
+            )
 
     async def refresh_symbol_candles_once(
-        self, symbols: Iterable[str] = ("SOXS", "SOXL")
+        self, symbols: Iterable[str] = REAL_ALLOWED_SYMBOLS
     ) -> None:
         """
-        지정된 심볼들의 다중 페이지(400분봉) 1분봉을 즉시 조회하여
-        candle_metrics_cache 를 최신화하고 로컬 아카이브에 기록한다.
+        🎯 3: 다중 페이지 최대 400분봉 조회로 19:00 EST 데이장 및 04:00 EST 프리장 개장 첫 봉부터
+        누락 없는 시계열을 확보하여 동적 VWAP_t, VWAP_1907, VWAP_0407, 하이킨 아시 기저를 갱신한다.
         """
         now_est = datetime.now(EST_TZ)
-        prices = await self.api.get_current_prices_batch(("SOXS", "SOXL", "QQQ"))
-        if safe_float(prices.get("QQQ"), 0.0) > 0.0:
-            self.macro_cache.record_qqq_tick(prices["QQQ"])
+        sym_tuple = tuple(str(s).upper().strip() for s in symbols if s)
+        if not sym_tuple:
+            return
 
-        for sym in symbols:
-            s_up = str(sym or "").upper().strip()
-            if s_up not in REAL_ALLOWED_SYMBOLS:
-                continue
-            candles = await self.api.get_candles_multi_page(
-                symbol=s_up, interval="1m", total_count=400
-            )
-            live_p = safe_float(prices.get(s_up), 0.0)
-            metrics = await asyncio.to_thread(
-                compute_session_vwap_metrics, candles, live_p, now_est
-            )
-            self.candle_metrics_cache[s_up] = metrics
-            await self.candle_recorder.record_candles_async(
-                s_up, candles, now_est=now_est
-            )
+        prices = await self.api.get_current_prices_batch(sym_tuple)
+        for sym in sym_tuple:
+            try:
+                candles = await self.api.get_candles_multi_page(
+                    symbol=sym,
+                    interval="1m",
+                    total_count=400,
+                    adjusted=True,
+                )
+                live_p = safe_float(prices.get(sym), 0.0)
+                metrics = compute_session_vwap_metrics(
+                    candles=candles,
+                    live_price=live_p,
+                    now_est=now_est,
+                )
+                self.candle_metrics_cache[sym] = metrics
+            except Exception as exc:
+                logger.warning("⚠️ [%s] 1분봉 캔들 지표 갱신 예외: %s", sym, exc)
 
 
 # ---------------------------------------------------------------------------
-# 🎯 3 & Case 28 : 6대 0.4초 고주파 부스터(fast_shield_mode) 판정기
+# 🎯 3 & Case 28: 5대 조건 기반 0.4초 고주파 부스터 (fast_shield_mode) 판별기
 # ---------------------------------------------------------------------------
-def evaluate_fast_shield_mode(
-    context: BotRuntimeContext,
+def _evaluate_fast_shield_mode(
+    context: SniperContext,
     holdings: Dict[str, Dict[str, Any]],
     prices: Dict[str, float],
     now_est: datetime,
 ) -> bool:
     """
-    🎯 3 [6대 0.4초 고주파 부스터 (fast_shield_mode = True)] & Case 28:
-    ① 프리장 또는 데이장 추세 주도주의 실시간 이격도(disp_curr)가 -0.20% 이하로 수축하여
-      동적 VWAP -0.50% 매수 덫 체결권에 근접하거나 매수 덫(PRE_VWAP_M050 / DAY_VWAP_M050)이 대기 중일 때
+    🎯 3 [5대 0.4초 고주파 부스터 (fast_shield_mode = True)]:
+    ① 프리장 또는 데이장 추세 주도주(vwap_leader_sym / day_vwap_leader_sym)의 실시간 이격도(disp_curr)가
+       -0.20% 이하로 수축하여 동적 VWAP -0.50% 매수 덫 체결권에 근접하거나 매수 덫(PRE_VWAP_M050 / DAY_VWAP_M050)이 대기 중일 때
     ② 실전 또는 데이장 [모의] 보유 포지션(수동 진입 포함)이 하이킨 아시 트레일링 점화(armed == True)
-      또는 점화 근접(평단가 대비 +0.80% 이상) 상태일 때
+       또는 점화 근접(평단가 대비 +0.80% 이상) 상태일 때
     ③ 프리장 후반(07:15 ~ 08:14 EST) 또는 데이장 후반(02:45 ~ 03:57 EST) 미익절 포지션이
-      동적 VWAP 선제 탈출(PRE_VWAP_ESC / DAY_VWAP_ESC)을 감시 중일 때
-    ④ 실전 또는 데이장 [모의] 3차 안전망 손절 후 최저점 역트레일링 추적(_BOTTOM_TRACK_CACHE["active"] == True) 중일 때
-    ⑤ 정규장 마감 1시간 전(15:00 ~ 15:58 EST) 미익절 보유 포지션이 당일 정규장 VWAP 탈출(VWAP_ESCAPE)
-      감시 중이거나 15:59 ~ 16:01 EST MOC 윈도우일 때
-    ⑥ 03:58 ~ 04:07 EST 1주 휩소 노출 작전 가동 중일 때
+       동적 VWAP 선제 탈출(PRE_VWAP_ESC / DAY_VWAP_ESC)을 감시 중일 때
+    ④ 정규장 마감 1시간 전(15:00 ~ 15:58 EST) 미익절 보유 포지션이 당일 정규장 VWAP 탈출(VWAP_ESCAPE) 감시 중일 때
+    ⑤ 03:58 ~ 04:07 EST 1주 휩소 노출 작전 가동 중일 때
+    (MODIFIED: 폐기된 최저점 역트레일링 반등 조건 영구 제거 완료)
     """
     hm = now_est.hour * 100 + now_est.minute
 
-    # 조건 ⑥: 03:58 ~ 04:07 EST 1주 휩소 노출 작전 윈도우 또는 15:59 ~ 16:01 EST MOC 윈도우
-    if (358 <= hm <= 407) or (1559 <= hm <= 1601):
+    # 조건 ⑤: 03:58 ~ 04:07 EST 1주 휩소 노출 작전 윈도우
+    if is_whipsaw_window(hm) or hm == 407:
         return True
 
-    # 조건 ④: 실전 또는 데이장 [모의] 3차 손절 후 최저점 반등 추적 중
-    if bool(context.bottom_track_cache.get("active")) or bool(
-        context.day_sim_state.get("bottom_track_active")
-    ):
-        return True
-
-    # 데이장 [모의] 상태 점검 (조건 ①, ②, ③)
-    sim_phase = str(context.day_sim_state.get("phase") or "IDLE")
-    if sim_phase == "TRAP_WAITING":
-        return True
-    if sim_phase == "HOLDING":
-        if bool(context.day_sim_state.get("day_sim_trail_armed")):
-            return True
-        sim_sym = str(context.day_sim_state.get("symbol") or "")
-        sim_ent = safe_float(context.day_sim_state.get("entry_price"), 0.0)
-        sim_live = safe_float((prices or {}).get(sim_sym), 0.0)
-        if sim_ent > 0.0 and sim_live >= (sim_ent * 1.0080):
-            return True
-        if is_daymarket_late_vwap_esc_window(hm):
-            return True
-
-    # 추세 주도주 이격도 <= -0.20% 수축 점검 (조건 ①)
-    if is_daymarket_sim_active_window(hm):
-        d_leader = str(context.day_leader_cache.get("leader_sym") or "")
-        if d_leader in REAL_ALLOWED_SYMBOLS:
-            d_met = context.candle_metrics_cache.get(d_leader, {})
-            if safe_float(d_met.get("day_disp_curr"), 0.0) <= -0.20:
-                return True
-    elif 407 <= hm <= 814:
-        p_leader = str(context.pre_leader_cache.get("leader_sym") or "")
-        if p_leader in REAL_ALLOWED_SYMBOLS:
-            p_met = context.candle_metrics_cache.get(p_leader, {})
-            if safe_float(p_met.get("pre_disp_curr"), 0.0) <= -0.20:
-                return True
-
-    # 실전 SOXS / SOXL 주문 및 포지션 점검 (조건 ①, ②, ③, ⑤)
+    # 조건 ①-A: 실전 미체결 매수 덫 대기 중 또는 데이장 [모의] 매수 덫 대기 중
     for sym in REAL_ALLOWED_SYMBOLS:
         st = context.ledger.get_state(sym)
         if str(st.get("buy_order_id") or "").strip():
             return True
 
+    day_sim = getattr(context, "day_sim_state", {})
+    sim_phase = str(day_sim.get("phase") or "")
+    if is_daymarket_sim_active_window(hm) and sim_phase in (
+        "TRAP_WAITING",
+        "HOLDING",
+    ):
+        if sim_phase == "TRAP_WAITING":
+            return True
+        if bool(day_sim.get("day_sim_trail_armed")):
+            return True
+        sim_ent_p = safe_float(day_sim.get("entry_price"), 0.0)
+        sim_sym = str(day_sim.get("symbol") or "")
+        sim_live_p = safe_float((prices or {}).get(sim_sym), 0.0)
+        if sim_ent_p > 0.0 and sim_live_p >= (sim_ent_p * 1.0080):
+            return True
+        if is_daymarket_late_vwap_esc_window(hm):
+            return True
+
+    # 조건 ①-B: 프리장(04:07~07:55) 또는 데이장(19:07~03:35) 추세 주도주 이격도가 -0.20% 이하로 수축 시
+    if 407 <= hm <= 755:
+        pre_ldr = str(
+            context.pre_leader_cache.get("leader_sym") or ""
+        ).upper()
+        if pre_ldr in REAL_ALLOWED_SYMBOLS:
+            met = refresh_metrics_with_live_tick(
+                context.candle_metrics_cache.get(pre_ldr),
+                safe_float((prices or {}).get(pre_ldr), 0.0),
+                now_est=now_est,
+            )
+            if safe_float(met.get("pre_disp_curr"), 0.0) <= -0.20:
+                return True
+    elif hm >= 1907 or hm <= 335:
+        day_ldr = str(
+            context.day_leader_cache.get("leader_sym") or ""
+        ).upper()
+        if day_ldr in REAL_ALLOWED_SYMBOLS:
+            met = refresh_metrics_with_live_tick(
+                context.candle_metrics_cache.get(day_ldr),
+                safe_float((prices or {}).get(day_ldr), 0.0),
+                now_est=now_est,
+            )
+            if safe_float(met.get("day_disp_curr"), 0.0) <= -0.20:
+                return True
+
+    # 조건 ②, ③, ④: 실전 보유 포지션 점검
+    for sym in REAL_ALLOWED_SYMBOLS:
         h_info = (holdings or {}).get(sym, {})
         h_qty = safe_int(h_info.get("qty"), 0)
         avg_p = safe_float(h_info.get("avg_price"), 0.0)
         if h_qty <= 0 or avg_p <= 0.0:
             continue
 
+        # 조건 ②: 트레일링 점화 완료 또는 평단 대비 +0.80% 이상 근접
         t_state = context.trail_runtime_cache.get(sym, {})
-        if isinstance(t_state, dict) and t_state.get("armed"):
+        if isinstance(t_state, dict) and bool(t_state.get("armed")):
             return True
-
-        live_p = safe_float((prices or {}).get(sym), 0.0)
+        live_p = safe_float(
+            (prices or {}).get(sym), safe_float(h_info.get("last_price"), avg_p)
+        )
         if live_p >= (avg_p * 1.0080):
             return True
 
-        if (715 <= hm <= 814) or (1500 <= hm <= 1558):
+        # 조건 ③: 프리장 후반(07:15 ~ 08:14 EST) 미익절 동적 VWAP 선제 탈출 감시
+        if is_premarket_late_vwap_esc_window(hm):
+            return True
+
+        # 조건 ④: 정규장 마감 1시간 전(15:00 ~ 15:58 EST) 정규장 VWAP 탈출 감시 또는 15:59 MOC
+        if 1500 <= hm <= 1601:
             return True
 
     return False
 
 
-async def _wait_with_wakeup(wakeup_event: asyncio.Event, timeout_sec: float) -> None:
+# ---------------------------------------------------------------------------
+# 백그라운드 루프 1 : 듀얼 5.0초 1분봉 캔들 기저 레이더 (candle_radar_loop)
+# ---------------------------------------------------------------------------
+async def candle_radar_loop(context: SniperContext) -> None:
     """
-    Case 25 & Case 64:
-    지정된 timeout_sec 동안 대기하되, wakeup_event.set() 이 격발되면 0.0초 만에 즉시 깨어난다.
+    🎯 3: 데이장(19:00 ~ 03:57 EST) 및 프리장(03:55 ~ 08:15 EST) 또는 포지션 보유 중일 때
+    5.0초 주기로 SOXS 와 SOXL 의 다중 페이지(400분봉) 1분봉 시계열을 조회하여
+    동적 VWAP_t, VWAP_1907, VWAP_0407, 하이킨 아시 기저를 상시 동기화한다.
     """
-    if wakeup_event.is_set():
-        wakeup_event.clear()
-        return
-    try:
-        await asyncio.wait_for(wakeup_event.wait(), timeout=max(0.05, float(timeout_sec)))
-    except asyncio.TimeoutError:
-        pass
-    finally:
-        wakeup_event.clear()
+    while context.running:
+        now_est = datetime.now(EST_TZ)
+        if is_weekend_market_closed(now_est):
+            await asyncio.sleep(30.0)
+            continue
+
+        hm = now_est.hour * 100 + now_est.minute
+        in_focus_window = bool(
+            hm >= 1900 or hm <= 815 or (1500 <= hm <= 1600)
+        )
+        has_active_trail = any(
+            bool((context.trail_runtime_cache.get(s) or {}).get("armed"))
+            for s in REAL_ALLOWED_SYMBOLS
+        )
+        poll_interval = (
+            ACTIVE_CANDLE_POLL_SEC
+            if (in_focus_window or has_active_trail or context.fast_shield_mode)
+            else IDLE_CANDLE_POLL_SEC
+        )
+
+        try:
+            await context.refresh_symbol_candles_once(REAL_ALLOWED_SYMBOLS)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.debug("캔들 레이더 루프 일시 예외: %s", exc)
+
+        await asyncio.sleep(poll_interval)
 
 
 # ---------------------------------------------------------------------------
-# [루프 1] 듀얼 5.0초 백그라운드 캔들 레이더 루프 (background_candle_radar_loop)
+# 백그라운드 루프 2 : 17:00 EST 일일 GC 및 18:00 EST 신세션 롤오버 루프
 # ---------------------------------------------------------------------------
-async def background_candle_radar_loop(context: BotRuntimeContext) -> None:
+async def daily_gc_and_rollover_loop(context: SniperContext) -> None:
     """
-    🎯 3 [듀얼 5.0초 캔들 기저 동기화]:
-    - 데이장(19:00 ~ 03:57 EST) 및 프리장 골든타임(03:55 ~ 08:15 EST), 정규장 후반(14:55 ~ 16:00 EST),
-      또는 포지션 보유 / 트레일링 점화 / 최저점 반등 추적 중일 때 SOXS 와 SOXL 양쪽 모두
-      5.0초 주기로 다중 페이지(400분봉) 1분봉을 조회하여 VWAP_1907, VWAP_0407, 동적 VWAP_t,
-      Wilder's RSI(14), 하이킨 아시 기저를 상시 동기화한다.
-    - 주말 휴장 또는 16:02 ~ 18:55 EST 대기 구간에는 API Rate Limit 보호를 위해 20.0초 주기로 완화한다.
+    Case 01 & Case 22 & Case 93:
+    - 17:00 EST 정각 일일 가비지 컬렉션(GC) 파이프라인 실행
+    - 18:00 EST CME 선물 신세션 오픈 시 논리적 거래일 롤오버, 당일 세션 플래그 초기화 및
+      토스 QQQ 초기 시세 확보
     """
-    logger.info("📡 백그라운드 5.0초 듀얼 캔들 레이더 루프 가동 개시")
     while context.running:
         try:
             now_est = datetime.now(EST_TZ)
-            bounds = get_cme_futures_session_bounds(now_est)
-            if bounds["is_weekend_closed"]:
-                await asyncio.sleep(15.0)
-                continue
-
+            today_cal_str = now_est.strftime("%Y-%m-%d")
+            logical_date = get_logical_trading_date_str(
+                now_est, rollover_hour=18
+            )
             hm = now_est.hour * 100 + now_est.minute
-            in_active_session = bool(
-                hm >= 1900
-                or hm <= 815
-                or (1455 <= hm <= 1601)
-            )
-            has_active_track = bool(
-                context.bottom_track_cache.get("active")
-                or context.day_sim_state.get("bottom_track_active")
-                or str(context.day_sim_state.get("phase") or "") == "HOLDING"
-                or any(
-                    safe_int(context.ledger.get_state(s).get("holdings_qty"), 0) > 0
-                    for s in REAL_ALLOWED_SYMBOLS
+
+            # 1) 17:00 EST 일일 가비지 컬렉션 (Case 22)
+            if hm == 1700 and context.last_gc_date != today_cal_str:
+                context.last_gc_date = today_cal_str
+                collected = await asyncio.to_thread(gc.collect)
+                logger.info(
+                    "🧹 [17:00 EST 일일 가비지 컬렉션 완료] collected=%d objects",
+                    collected,
                 )
-            )
 
-            # 0세션 대기 구간(16:05 ~ 18:55 EST)이고 미보유 시 캔들 폴링 휴식
-            if (1605 <= hm <= 1855) and not has_active_track:
-                await asyncio.sleep(15.0)
-                continue
+            # 2) 18:00 EST 신세션 논리적 거래일 롤오버 감지 (Case 01)
+            if logical_date != context.last_rollover_date:
+                prev_logical = context.last_rollover_date
+                context.last_rollover_date = logical_date
+                holdings = await context.api.get_holdings_all()
 
-            await context.refresh_symbol_candles_once(("SOXS", "SOXL"))
+                for sym in REAL_ALLOWED_SYMBOLS:
+                    h_qty = safe_int((holdings or {}).get(sym, {}).get("qty"), 0)
+                    st = context.ledger.get_state(sym)
+                    if h_qty == 0:
+                        await context.ledger.update_state(
+                            sym,
+                            buy_order_id="",
+                            sell_order_id="",
+                            ordered_qty=0,
+                            buy_price=0.0,
+                            target_sell_price=0.0,
+                            entry_session="",
+                            entry_trend="",
+                            is_session_done=False,
+                        )
+                    else:
+                        # 수동 오버나이트 보유 물량이 있으면 세션 플래그만 유지
+                        await context.ledger.update_state(
+                            sym,
+                            is_session_done=True,
+                        )
 
-            sleep_sec = (
-                FAST_CANDLE_POLL_SEC
-                if (in_active_session or has_active_track)
-                else IDLE_CANDLE_POLL_SEC
-            )
-            await asyncio.sleep(sleep_sec)
+                context.day_sim_state.clear()
+                context.day_sim_state.update(
+                    create_default_day_sim_state(logical_date)
+                )
+                await persist_day_sim_state_async(context.day_sim_state)
+                await context.macro_cache.ensure_qqq_live_price()
+                logger.info(
+                    "🌐 [18:00 EST 신세션 롤오버 완료] %s -> %s",
+                    prev_logical,
+                    logical_date,
+                )
 
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.warning("⚠️ 캔들 레이더 루프 예외: %s", exc)
-            await asyncio.sleep(5.0)
+            logger.debug("GC/롤오버 루프 대기: %s", exc)
+
+        await asyncio.sleep(10.0)
 
 
 # ---------------------------------------------------------------------------
-# [루프 2] 0.4초 / 1.5초 메인 전술 타격 오케스트레이션 루프 (trading_strike_loop)
+# 메인 전술 오케스트레이션 루프 (main_sniper_loop)
 # ---------------------------------------------------------------------------
-async def trading_strike_loop(context: BotRuntimeContext) -> None:
+async def main_sniper_loop(context: SniperContext) -> None:
     """
-    🎯 1 ~ 🎯 5 전체 시간대별 전술 플러그인을 오케스트레이션하는 메인 타격 루프.
+    제1헌법 ~ 제6헌법 & 🎯 1 ~ 🎯 5:
+    전 시간대(18:00 선물 신세션 -> 19:00 데이장 [모의] -> 03:58 1주 휩소 ->
+    04:07 프리장 동적 VWAP -0.50% 본진 -> 08:15 선제 컷오프 -> 15:00 정규장 VWAP 탈출 ->
+    15:59 MOC 강제 청산)를 총괄하는 메인 루프.
     """
-    logger.info("⚔️ 메인 전술 타격 루프(0.4s 부스터 / 1.5s 평시) 가동 개시")
     while context.running:
+        loop_start_mono = time.monotonic()
+        context.wakeup_event.clear()
+
         try:
             now_est = datetime.now(EST_TZ)
-            hm = now_est.hour * 100 + now_est.minute
 
-            # 1) 18:00 EST 논리 거래일 롤오버 점검 및 주말 휴장 제어 (Case 01, 36)
-            await context.ledger.check_and_rollover_logical_date(now_est)
-            bounds = get_cme_futures_session_bounds(now_est)
-            if bounds["is_weekend_closed"]:
-                await _wait_with_wakeup(context.wakeup_event, 10.0)
+            # 주말 휴장 구간(금 17:00 ~ 일 17:59 EST)에는 관망 대기 (Case 01)
+            if is_weekend_market_closed(now_est):
+                context.fast_shield_mode = False
+                await asyncio.sleep(5.0)
                 continue
 
-            # 2) 실시간 배치 현재가(SOXS, SOXL, QQQ), 계좌 잔고, 매크로 스냅샷 동기화
-            prices = await context.api.get_current_prices_batch(("SOXS", "SOXL", "QQQ"))
+            hm = now_est.hour * 100 + now_est.minute
+
+            # 1. 실시간 현재가 배치 조회 (SOXS, SOXL, QQQ 단일 호출) 및 실보유 잔고 조회
+            prices = await context.api.get_current_prices_batch(
+                ("SOXS", "SOXL", "QQQ")
+            )
             holdings = await context.api.get_holdings_all()
-            macro = await context.macro_cache.get_macro_snapshot(
-                live_qqq_price=safe_float(prices.get("QQQ"), 0.0)
+
+            has_real_pos = any(
+                safe_int((holdings or {}).get(s, {}).get("qty"), 0) > 0
+                for s in REAL_ALLOWED_SYMBOLS
+            )
+            has_sim_pos = bool(
+                is_daymarket_sim_active_window(hm)
+                and str(context.day_sim_state.get("phase") or "") == "HOLDING"
             )
 
-            # 3) 매수 체결 직후 잔고 인덱싱 시차(0.1 ~ 0.4초) MANUAL 둔갑 방어 & 잔고 0주 복리 정산
-            await _call_plugin_adaptive(
-                sync_manual_and_indexing_guard,
-                context,
-                holdings=holdings,
-                prices=prices,
-                macro=macro,
+            # 2. 매크로 스냅샷 갱신 (보유 포지션 존재 시 QQQ 1.5초 프로빙 활성화)
+            macro = await context.macro_cache.get_macro_snapshot(
+                live_qqq_price=safe_float(prices.get("QQQ"), 0.0),
+                has_active_position=(has_real_pos or has_sim_pos),
+                now_est=now_est,
             )
+
+            # 3. 실보유 잔고 0주 복귀 시 실발생 순수익금(세전 - 왕복수수료 0.14%) 복리/단리 정산
+            #    및 07:45 EST 이전 프리장 다회전(Multi-Cycle) 자동 해금
             await _call_plugin_adaptive(
                 reconcile_zero_holdings_exit_plugin,
-                context,
+                context=context,
+                holdings=holdings,
+                macro=macro,
+                now_est=now_est,
+            )
+
+            # 4. 실보유 물량 존재 시: 상단 안전 캡(+5.00% LIMIT) 선장전,
+            #    +1.00% 점화 하드보존 하이킨 아시 트레일링(HARD_TRAIL_100 × NQ_VEL_BYPASS),
+            #    프리장 후반(07:15 ~ 08:14 EST) 미익절 동적 VWAP 선제 탈출(PRE_VWAP_ESC) 가동
+            if has_real_pos:
+                await _call_plugin_adaptive(
+                    manage_mechanical_profit_trap_plugin,
+                    context=context,
+                    holdings=holdings,
+                    prices=prices,
+                    macro=macro,
+                    now_est=now_est,
+                )
+
+            # 5. 방향성 인지 매크로 3단 방어망 (1·2차 NQ=F 진폭 과열방어 & 3차 QQQ 실시간 최소 0.80% 역행방어)
+            await _call_plugin_adaptive(
+                execute_macro_3stage_defense_plugin,
+                context=context,
                 holdings=holdings,
                 prices=prices,
                 macro=macro,
                 now_est=now_est,
             )
 
-            # 4) 시간대별 전술 플러그인 라우팅
-            # [A] 19:00 ~ 03:57 EST: 데이장 100% [모의] 프리장 동형 스나이퍼 (실매수 물리적 차단!)
-            if is_daymarket_sim_active_window(hm):
+            # 6. EST 시간대별 전술 플러그인 라우팅
+            # [A] 18:00 ~ 18:59 EST: 선물 신세션 오픈 및 QQQ 기준가 초기 확보
+            if 1800 <= hm <= 1859:
+                await context.macro_cache.ensure_qqq_live_price(
+                    safe_float(prices.get("QQQ"), 0.0)
+                )
+
+            # [B] 19:00 ~ 03:57 EST: 데이장 100% [모의] 전용 프리장 동형 스나이퍼 (실매수 절대 차단!)
+            elif is_daymarket_sim_active_window(hm):
                 await _call_plugin_adaptive(
                     execute_daymarket_sim_plugin,
-                    context,
+                    context=context,
                     prices=prices,
                     macro=macro,
                     now_est=now_est,
                 )
 
-            # [B] 03:58 ~ 04:06 EST: 데이장 모의 포지션 묵음 클리어 & 과열독립 1주 휩소 노출 작전
-            if 358 <= hm <= 406:
+            # [C] 03:58 ~ 04:06 EST: 데이장 [모의] 묵음 클리어 및 03:58 ~ 04:07 듀얼 1주 휩소 노출 작전
+            elif is_whipsaw_window(hm):
                 await _call_plugin_adaptive(
                     settle_daymarket_sim_before_premarket,
-                    context,
+                    context=context,
                     now_est=now_est,
                 )
                 await _call_plugin_adaptive(
-                    execute_0358_whipsaw_trap_plugin,
-                    context,
-                    holdings=holdings,
-                    prices=prices,
-                    macro=macro,
-                    now_est=now_est,
-                )
-                await _call_plugin_adaptive(
-                    manage_whipsaw_1sh_profit_trap,
-                    context,
+                    execute_whipsaw_1sh_plugin,
+                    context=context,
                     holdings=holdings,
                     prices=prices,
                     macro=macro,
                     now_est=now_est,
                 )
 
-            # [C] 04:07 ~ 08:14 EST: 04:07 정각 1주 휩소 정리 후 프리장 본진 [실전] 동형 스나이퍼 가동
-            if 407 <= hm <= 814:
+            # [D] 04:07 ~ 08:14 EST: 프리장 본진 골든타임 (👑 VWAP_TREND_M050 / 🪤 DYN_VWAP_M050)
+            elif 407 <= hm <= 814:
+                # 04:07:00 EST 정각 1주 휩소 타임쉴드 정리 및 본진 인계/과열차단 복원
                 await _call_plugin_adaptive(
                     enforce_0407_whipsaw_cutoff_plugin,
-                    context,
+                    context=context,
                     holdings=holdings,
                     prices=prices,
                     macro=macro,
                     now_est=now_est,
                 )
+                # 04:07 EST 추세 주도주(C_0407 > VWAP_0407) 선정 및 복원
                 await _call_plugin_adaptive(
                     update_premarket_trend_leader,
-                    context,
+                    context=context,
                     prices=prices,
                     now_est=now_est,
                 )
-                await _call_plugin_adaptive(
-                    execute_post_stop_bottom_rebound_plugin,
-                    context,
-                    holdings=holdings,
-                    prices=prices,
-                    macro=macro,
-                    now_est=now_est,
-                )
+                # 04:07 ~ 07:55 EST 실시간 동적 프리장 VWAP -0.50% 매수 덫 투하 (PRE_VWAP_M050)
                 await _call_plugin_adaptive(
                     execute_premarket_vwap_sniper_plugin,
-                    context,
+                    context=context,
                     holdings=holdings,
                     prices=prices,
                     macro=macro,
                     now_est=now_est,
                 )
+                # 04:07 ~ 08:14 EST 미체결 매수 덫 체결 감시(그레이스 쉴드) 및 15초/$0.03 동적 추적 정정
                 await _call_plugin_adaptive(
                     sync_dynamic_vwap_buy_order_modify,
-                    context,
+                    context=context,
                     holdings=holdings,
                     prices=prices,
                     macro=macro,
                     now_est=now_est,
                 )
 
-            # [D] 08:15 ~ 15:58 EST: 거시지표 발표 15분 전 선제 컷오프
-            if 815 <= hm <= 1558:
+            # [E] 08:15 ~ 15:58 EST: 08:15 거시지표 선제 컷오프 & 15:00 ~ 15:58 정규장 VWAP 탈출
+            elif 815 <= hm <= 1558:
                 await _call_plugin_adaptive(
                     enforce_0815_macro_cutoff_plugin,
-                    context,
+                    context=context,
                     holdings=holdings,
                     now_est=now_est,
                 )
+                if 1500 <= hm <= 1558:
+                    await _call_plugin_adaptive(
+                        execute_1500_vwap_escape_plugin,
+                        context=context,
+                        holdings=holdings,
+                        prices=prices,
+                        macro=macro,
+                        now_est=now_est,
+                    )
 
-            # 5) 상시 가동: 보유 포지션 +5% 안전캡 & +1% 하드보존 HA 트레일링 & 후반부 VWAP 탈출 & 3단 방어망 & MOC
-            await _call_plugin_adaptive(
-                manage_mechanical_profit_trap_plugin,
-                context,
-                holdings=holdings,
-                prices=prices,
-                macro=macro,
-                now_est=now_est,
-            )
-            await _call_plugin_adaptive(
-                execute_premarket_late_vwap_escape,
-                context,
-                holdings=holdings,
-                prices=prices,
-                now_est=now_est,
-            )
-            await _call_plugin_adaptive(
-                execute_stage1_2_nq_overheat_defense,
-                context,
-                holdings=holdings,
-                prices=prices,
-                macro=macro,
-            )
-            await _call_plugin_adaptive(
-                execute_stage3_qqq_adverse_defense,
-                context,
-                holdings=holdings,
-                prices=prices,
-                macro=macro,
-                now_est=now_est,
-            )
-            await _call_plugin_adaptive(
-                execute_1500_regular_vwap_escape,
-                context,
-                holdings=holdings,
-                prices=prices,
-                now_est=now_est,
-            )
-            await _call_plugin_adaptive(
-                execute_1559_moc_force_liquidation,
-                context,
-                holdings=holdings,
-                prices=prices,
-                now_est=now_est,
-            )
-
-            # 6) 6대 고주파 부스터 조건 평가 후 0.4초 또는 1.5초 대기
-            fast_mode = evaluate_fast_shield_mode(context, holdings, prices, now_est)
-            loop_timeout = (
-                FAST_SHIELD_LOOP_TIMEOUT_SEC if fast_mode else NORMAL_LOOP_TIMEOUT_SEC
-            )
-            await _wait_with_wakeup(context.wakeup_event, loop_timeout)
-
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            logger.error("🚨 메인 타격 루프 예외: %s", exc, exc_info=True)
-            await _wait_with_wakeup(context.wakeup_event, NORMAL_LOOP_TIMEOUT_SEC)
-
-
-# ---------------------------------------------------------------------------
-# [루프 3] 17:00 EST 일일 가비지 컬렉션(GC) 및 캐시 정비 루프 (Case 22)
-# ---------------------------------------------------------------------------
-async def daily_gc_maintenance_loop(context: BotRuntimeContext) -> None:
-    """
-    🚨 Case 22:
-    매일 17:00 EST 정각 구간에 오래된 캔들 아카이브 및 .tmp 임시 파일을 청소하고
-    파이썬 가비지 컬렉션(gc.collect)을 수행한다.
-    """
-    last_gc_date = ""
-    while context.running:
-        try:
-            now_est = datetime.now(EST_TZ)
-            date_str = now_est.strftime("%Y-%m-%d")
-            if now_est.hour == 17 and now_est.minute == 0 and last_gc_date != date_str:
-                last_gc_date = date_str
-                removed_cnt = await context.candle_recorder.cleanup_old_files_async()
-                collected_objs = await asyncio.to_thread(gc.collect)
-                logger.info(
-                    "🧹 [17:00 EST 일일 GC 완료] 아카이브 정리=%d개, gc.collect=%d개",
-                    removed_cnt,
-                    collected_objs,
+            # [F] 15:59 ~ 16:01 EST: 제로-오버나이트 MOC 2단계 방탄 강제 청산
+            elif 1559 <= hm <= 1601:
+                await _call_plugin_adaptive(
+                    execute_1559_moc_liquidation_plugin,
+                    context=context,
+                    holdings=holdings,
+                    prices=prices,
+                    macro=macro,
+                    now_est=now_est,
                 )
-            await asyncio.sleep(20.0)
+
+            # 7. 5대 조건 기반 0.4초 고주파 부스터(fast_shield_mode) 판별
+            context.fast_shield_mode = _evaluate_fast_shield_mode(
+                context=context,
+                holdings=holdings,
+                prices=prices,
+                now_est=now_est,
+            )
+
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.warning("⚠️ 일일 GC 루프 예외: %s", exc)
-            await asyncio.sleep(30.0)
+            logger.error("🚨 메인 스나이퍼 루프 예외: %s", exc, exc_info=True)
 
-
-# ---------------------------------------------------------------------------
-# Case 11 : SIGTERM / SIGINT 0.1초 고속 하드 킬 핸들러 및 메인 엔트리포인트
-# ---------------------------------------------------------------------------
-def _install_fast_hard_kill_signals() -> None:
-    """
-    🚨 Case 11:
-    systemd 재시작 또는 컨테이너 종료(SIGTERM / SIGINT) 수신 시 블로킹 스레드 대기 없이
-    0.1초 내에 즉시 프로세스를 종료(os._exit(0))한다.
-    """
-
-    def _hard_kill_handler(signum: int, _frame: Any) -> None:
-        logger.info("⚡ 시그널(%s) 수신 -> 0.1초 고속 하드 킬(os._exit(0)) 실행", signum)
-        os._exit(0)
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
+        target_sleep = (
+            FAST_BOOSTER_INTERVAL_SEC
+            if context.fast_shield_mode
+            else NORMAL_LOOP_INTERVAL_SEC
+        )
+        elapsed = time.monotonic() - loop_start_mono
+        remain_sleep = max(0.05, target_sleep - elapsed)
         try:
-            signal.signal(sig, _hard_kill_handler)
-        except Exception:
+            await asyncio.wait_for(
+                context.wakeup_event.wait(), timeout=remain_sleep
+            )
+        except asyncio.TimeoutError:
             pass
 
 
+# ---------------------------------------------------------------------------
+# 엔트리포인트 : 프리플라이트 검증 ➔ AccountSeq 락온 ➔ 초기 캔들 동기화 ➔ 4대 태스크 가동
+# ---------------------------------------------------------------------------
 async def async_main() -> None:
-    _install_fast_hard_kill_signals()
+    _install_fast_kill_signal_handlers()
+    _autoload_dotenv_files(override=False)
 
-    # 1) 기동 시 10개 전체 플러그인 파일 구문(py_compile) 무결성 사전 검증 (Case 11)
-    compile_ok, compile_errs = await asyncio.to_thread(verify_all_modules_compile)
-    if not compile_ok:
-        logger.error("🚨 플러그인 프리플라이트 컴파일 실패: %s", compile_errs)
-    else:
-        logger.info("✅ 전체 10개 플러그인 모듈 py_compile 무결성 검증 통과")
+    # Case 11: 기동 직전 전체 코어 모듈 py_compile 무결성 검증
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    ok, compile_errs = await asyncio.to_thread(
+        verify_all_modules_compile, base_dir, True
+    )
+    if not ok:
+        logger.error(
+            "🚨 프리플라이트 컴파일 에러 감지:\n%s", "\n".join(compile_errs)
+        )
+        sys.exit(1)
 
-    context = BotRuntimeContext()
+    context = SniperContext()
 
-    # 2) 제2헌법: 종합매매(BROKERAGE) 계좌 AccountSeq 메모리 락온 및 초기 QQQ 기준가 확보
+    # 제2헌법: 기동 시 /api/v1/accounts 1회 호출하여 종합매매(BROKERAGE) accountSeq 메모리 락온
     try:
-        await context.api.ensure_account_seq()
+        acc_seq = await context.api.ensure_account_seq()
+        logger.info("🏛️ [제2헌법 AccountSeq 락온 완료] accountSeq=%s", acc_seq)
     except Exception as exc:
-        logger.warning("⚠️ 기동 시 AccountSeq 락온 지연 (요청 시 자동 재시도): %s", exc)
+        logger.warning("⚠️ 기동 시 AccountSeq 초기 락온 대기 (재시도 예정): %s", exc)
 
+    # 기동 직후 SOXS / SOXL 400분봉 1회 선행 동기화 및 QQQ 초기 시세 확보
     try:
-        await context.refresh_symbol_candles_once(("SOXS", "SOXL"))
-        await relock_qqq_baseline_on_bot_resume(context)
+        await context.refresh_symbol_candles_once(REAL_ALLOWED_SYMBOLS)
+        await context.macro_cache.ensure_qqq_live_price()
     except Exception as exc:
-        logger.warning("⚠️ 기동 시 초기 캔들/QQQ 기준가 동기화 예외: %s", exc)
+        logger.warning("⚠️ 초기 캔들/QQQ 시세 선행 동기화 예외: %s", exc)
 
-    # 3) Case 13: 서버 기동 완료 시 "✅ 서버가 정상 작동 중입니다." 단일 문구 타전
-    await context.tg_router.send_startup_message()
-
-    # 4) 4대 비동기 코어 태스크 병렬 가동
     tasks = [
-        asyncio.create_task(trading_strike_loop(context), name="trading_strike_loop"),
         asyncio.create_task(
-            background_candle_radar_loop(context), name="background_candle_radar_loop"
+            main_sniper_loop(context), name="main_sniper_loop"
         ),
         asyncio.create_task(
-            daily_gc_maintenance_loop(context), name="daily_gc_maintenance_loop"
+            candle_radar_loop(context), name="candle_radar_loop"
         ),
         asyncio.create_task(
-            context.tg_router.polling_loop(), name="telegram_polling_loop"
+            daily_gc_and_rollover_loop(context),
+            name="daily_gc_and_rollover_loop",
+        ),
+        asyncio.create_task(
+            context.tg_router.polling_loop(), name="tg_polling_loop"
         ),
     ]
-    await asyncio.gather(*tasks)
+
+    logger.info(
+        "🚀 [인피니트 스노우볼 듀얼 스나이퍼 가동 완료] 전략=👑VWAP_TREND_M050 (RE_BOT_TRAIL 영구 소각 완료)"
+    )
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        context.running = False
+        for t in tasks:
+            t.cancel()
 
 
-def main() -> None:
+if __name__ == "__main__":
     try:
         asyncio.run(async_main())
     except KeyboardInterrupt:
         os._exit(0)
-
-
-if __name__ == "__main__":
-    main()

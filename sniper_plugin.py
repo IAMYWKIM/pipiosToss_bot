@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: sniper_plugin.py
-프리장 본진 골든타임 (04:07 ~ 08:15 EST) 동적 VWAP -0.50% 언더슈팅 매수 덫 투하,
-15초/$0.03 동적 추적 정정, 07:45 EST 이전 다회전(Multi-Cycle) 재출동 및
-3차 역행 손절 후 최저점 +0.30% 양봉 반등 재진입(RE_BOT_TRAIL) 전술 플러그인 (Step 02 / 04)
-- MODIFIED: RSI(1m) 전면 폐기에 따라 execute_post_stop_bottom_rebound_plugin 내 live_rsi 참조 및
-  조건문을 완전 소각하고 최저점 +0.30% 반등 + 실시간 양봉(일반양봉 또는 🕯️HA양봉) 기준으로 일원화
-- 제3헌법: 프리장 본진 진입/정정/재진입 상태 머신 전담 분리
+프리장 본진 골든타임 (04:07 ~ 08:15 EST) 04:00 ~ 04:07 누적 프리장 VWAP 기준 추세 주도주 선정,
+실시간 동적 프리장 VWAP -0.50% 언더슈팅 매수 덫(PRE_VWAP_M050) 투하,
+15초/$0.03 동적 추적 정정 및 07:45 EST 이전 다회전(Multi-Cycle) 재출동 전술 플러그인 (Step 01 / 05)
+- MODIFIED: 제3헌법 및 최신 프롬프트.txt에 의거하여 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL),
+  activate_bottom_rebound_tracker, execute_post_stop_bottom_rebound_plugin 및 bottom_track_cache
+  참조를 100% 영구 소각하고 오직 동적 VWAP -0.50% 매수 덫(DYN_VWAP_M050) 단일 엔진으로 일원화
+- 제3헌법: 프리장 본진 주도주 선정 / 매수 덫 투하 / 동적 추적 정정 상태 머신 전담 분리
 - 제4헌법: 모든 타임라인 판단 ZoneInfo('America/New_York') 단일 소스 락온
 - 제5헌법: 지정가 매수 주문 발사 시 고유 clientOrderId 주입
-- 🎯 3 & Case 52, 54, 64, 65, 88, 89, 97 ~ 102 완벽 구현
+- 🎯 3 & Case 52, 54, 58, 64, 65, 74, 97 ~ 102 완벽 구현
 """
 
 from __future__ import annotations
@@ -101,7 +102,6 @@ async def _calculate_safe_order_qty(
     ledger_budget = max(0.0, safe_float(st.get("budget"), 1000.0))
     bp_usd = await context.api.get_buying_power_usd(safety_buffer_pct=0.5)
 
-    # 계좌 예수금이 조회되면 min(장부예산, 안전예수금)을 적용하고, 일시 조회 실패(0.0) 시 장부예산 사용
     eff_budget = min(ledger_budget, bp_usd) if bp_usd > 0.0 else ledger_budget
     qty = int(math.floor((eff_budget + 1e-9) / op))
     if qty <= 0:
@@ -168,7 +168,7 @@ async def update_premarket_trend_leader(
             }
         )
 
-    # 04:07 EST 이전에는 아직 초기 7분 VWAP 수집 구간이므로 대기
+    # 04:07 EST 이전에는 초기 7분 VWAP 수집 구간이므로 대기
     if not (407 <= hm <= 814):
         return leader_cache
 
@@ -181,7 +181,7 @@ async def update_premarket_trend_leader(
     soxs_met = _get_live_symbol_metrics(context, "SOXS", prices, dt_now)
     soxl_met = _get_live_symbol_metrics(context, "SOXL", prices, dt_now)
 
-    # 만약 기동 직후라 캔들 캐시에 vwap_0407 이 아직 계산되지 않았다면 즉시 1분봉 조회 후 산출
+    # 기동 직후 캔들 캐시에 vwap_0407 이 아직 계산되지 않았다면 즉시 1분봉 조회 후 산출
     if (
         safe_float(soxs_met.get("vwap_0407"), 0.0) <= 0.0
         and safe_float(soxl_met.get("vwap_0407"), 0.0) <= 0.0
@@ -223,7 +223,7 @@ async def update_premarket_trend_leader(
 
 
 # ---------------------------------------------------------------------------
-# [Step 2] 실시간 동적 프리장 VWAP -0.50% 언더슈팅 매수 덫 투하 (PRE_VWAP_M050)
+# [Step 2-1] 실시간 동적 프리장 VWAP -0.50% 언더슈팅 매수 덫 투하 (PRE_VWAP_M050)
 # ---------------------------------------------------------------------------
 async def execute_premarket_vwap_sniper_plugin(
     context: Any,
@@ -236,8 +236,7 @@ async def execute_premarket_vwap_sniper_plugin(
     🎯 3 [Step 2-1] & Case 52, 54, 64, 65, 97 ~ 100:
     04:07:00 ~ 07:55:59 EST 동안:
     1) 스나이퍼 가동 ON, 양쪽 잔고 0주 및 미체결 주문 부재, NQ=F 당일 진폭 < 2.0% 검증
-    2) 3차 손절 후 최저점 반등 추적(_BOTTOM_TRACK_CACHE["active"]) 중이 아닐 때,
-       당일 프리장 추세 주도주(leader_sym)에 대해 실시간 동적 프리장 VWAP_t 대비 -0.50% 하단가
+    2) 당일 프리장 추세 주도주(leader_sym)에 대해 실시간 동적 프리장 VWAP_t 대비 -0.50% 하단가
        (trap_buy_price = min(cur_p_fl, floor(pre_vwap * 0.9950 * 100) / 100))에
        일반 지정가(LIMIT, DAY) 매수 덫 주문을 투하한다.
     """
@@ -247,11 +246,6 @@ async def execute_premarket_vwap_sniper_plugin(
     # 신규 매수 덫 발사 허용 윈도우: 04:07 ~ 07:55 EST (07:56 ~ 08:14 는 기존 덫 체결/청산만 감시)
     if not (407 <= hm <= 755):
         return {"status": "OUTSIDE_WINDOW"}
-
-    # 3차 역행 손절 후 최저점 반등 추적 중일 때는 RE_BOT_TRAIL 엔진이 우선권을 가진다
-    bottom_cache = getattr(context, "bottom_track_cache", {})
-    if isinstance(bottom_cache, dict) and bottom_cache.get("active"):
-        return {"status": "BOTTOM_TRACK_ACTIVE"}
 
     # 1차 매크로 과열 방어선: NQ=F 당일 진폭 >= 2.0% 이면 진입 원천 차단
     nq_amp = safe_float((macro or {}).get("nq_amp"), 0.0)
@@ -271,8 +265,11 @@ async def execute_premarket_vwap_sniper_plugin(
         return {"status": "BOT_INACTIVE"}
     if bool(st_leader.get("is_session_done", False)):
         return {"status": "SESSION_DONE"}
-    if str(st_leader.get("entry_session") or "") == "CANCELED_MACRO":
-        return {"status": "CANCELED_MACRO"}
+    if str(st_leader.get("entry_session") or "") in (
+        "CANCELED_MACRO",
+        "CANCELED_STAGE3",
+    ):
+        return {"status": str(st_leader.get("entry_session"))}
 
     # 이미 보유 포지션이나 미체결 주문이 존재하면 중복 발사 금지
     if _has_any_active_position_or_order(context, holdings):
@@ -308,7 +305,7 @@ async def execute_premarket_vwap_sniper_plugin(
             ).strip():
                 return {"status": "ALREADY_LOCKED_IN_MUTEX"}
 
-            qty, eff_budget, qty_reason = await _calculate_safe_order_qty(
+            qty, _eff_budget, qty_reason = await _calculate_safe_order_qty(
                 context, leader_sym, trap_buy_price
             )
             if qty <= 0:
@@ -409,13 +406,13 @@ async def sync_dynamic_vwap_buy_order_modify(
 ) -> Dict[str, Any]:
     """
     🎯 3 [Step 2-2] & Case 24, 58, 74, 98, 102:
-    - 04:07 ~ 07:55 EST 동안 미체결 매수 덫(buy_order_id 존재, holdings_qty == 0,
+    - 04:07 ~ 08:14 EST 동안 미체결 매수 덫(buy_order_id 존재, holdings_qty == 0,
       entry_session == 'PRE_VWAP_M050') 대기 중:
     1) 주문 상세(get_order_detail)를 조회하여 FILLED 감지 시 즉시 last_auto_fill_ts 그레이스 쉴드를
        각인하고 wakeup_event 를 깨워 0.0초 만에 +5.00% 안전 캡 매도 덫 장전 루프로 직결한다.
-    2) PENDING 상태이고 실시간 동적 프리장 VWAP_t 가 변화하여 신규 역산 타점(VWAP_t * 0.9950)이
-       기존 주문 단가와 $0.03 이상(>= 0.05%) 벌어지고 최소 15초가 경과하면 modify_order 로
-       매수 덫 단가를 최신 동적 VWAP_t * 0.9950 으로 자동 정정 추적한다.
+    2) 04:08 ~ 07:55 EST 구간에서 PENDING 상태이고 실시간 동적 프리장 VWAP_t 가 변화하여
+       신규 역산 타점(VWAP_t * 0.9950)이 기존 주문 단가와 $0.03 이상(>= 0.05%) 벌어지고
+       최소 15초가 경과하면 modify_order 로 매수 덫 단가를 최신 동적 VWAP_t * 0.9950 으로 자동 정정 추적한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
@@ -481,7 +478,7 @@ async def sync_dynamic_vwap_buy_order_modify(
                 )
                 return {"status": "PARTIAL_FILLED_WAIT", "symbol": sym}
 
-            # 거래소 외부 취소/거부 감지 시 장부 클리어 및 재출동 해금
+            # 거래소 외부 취소/거부 감지 시 장부 클리어 및 07:45 EST 이전 다회전 해금
             if ord_status in ("CANCELED", "REJECTED"):
                 other_sym = "SOXL" if sym == "SOXS" else "SOXS"
                 can_reenter = bool(hm <= 745 and nq_amp < NQ_OVERHEAT_THRESHOLD)
@@ -596,229 +593,3 @@ async def sync_dynamic_vwap_buy_order_modify(
                 logger.warning("⚠️ [%s] 매수덫 정정 예외: %s", sym, exc)
 
     return {"status": "NO_MODIFY_NEEDED"}
-
-
-# ---------------------------------------------------------------------------
-# [Step 3] 3차 역행 손절 후 최저점 역트레일링 +0.30% 양봉 반등 재진입 (RE_BOT_TRAIL)
-# ---------------------------------------------------------------------------
-def activate_bottom_rebound_tracker(
-    context: Any,
-    symbol: str,
-    stop_price: float,
-    nq_amp: float,
-    now_est: Optional[datetime] = None,
-) -> Dict[str, Any]:
-    """
-    🎯 3 [Step 3] & Case 88, 89:
-    04:07 ~ 08:14 EST 프리장 골든타임 중 NQ=F < 2.0% 상태에서 3차 실시간 QQQ 역행 안전망으로
-    손절된 직후 defense_plugin 에서 호출되어, 당일 퇴근 없이 손절가 하회 최저점(Bottom) 역트레일링
-    추적 캐시(_BOTTOM_TRACK_CACHE)를 활성화한다.
-    """
-    dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
-    hm = dt_now.hour * 100 + dt_now.minute
-    logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
-    sym = str(symbol or "").upper().strip()
-    sp = safe_float(stop_price, 0.0)
-
-    bottom_cache: Dict[str, Any] = getattr(context, "bottom_track_cache", {})
-    if (
-        not (407 <= hm <= 814)
-        or safe_float(nq_amp, 0.0) >= NQ_OVERHEAT_THRESHOLD
-        or sp <= 0.0
-    ):
-        bottom_cache.clear()
-        bottom_cache["active"] = False
-        return bottom_cache
-
-    bottom_cache.clear()
-    bottom_cache.update(
-        {
-            "active": True,
-            "logical_date": logical_date,
-            "stopped_sym": sym,
-            "last_stop_price": sp,
-            "post_stop_low": sp,
-            "dipped_below_stop": False,
-            "activated_ts": time.time(),
-        }
-    )
-    logger.info(
-        "🪤 [RE_BOT_TRAIL 가동] %s 3차 손절($%.2f) 후 최저점 역트레일링 +0.30%% 반등 감시 개시",
-        sym,
-        sp,
-    )
-    return bottom_cache
-
-
-async def execute_post_stop_bottom_rebound_plugin(
-    context: Any,
-    holdings: Dict[str, Dict[str, Any]],
-    prices: Dict[str, float],
-    macro: Dict[str, Any],
-    now_est: Optional[datetime] = None,
-) -> Dict[str, Any]:
-    """
-    🎯 3 [Step 3] & Case 88, 89:
-    - 04:07 ~ 08:14 EST 중 _BOTTOM_TRACK_CACHE["active"] == True 상태일 때:
-    1) NQ=F 당일 진폭이 2.0% 이상 돌파하면 즉시 추적을 중단하고 과열차단으로 전환한다.
-    2) 손절된 종목(stopped_sym)이 신저가를 경신(cur_p < post_stop_low)하는 동안에는
-       매수를 100% 보류(칼날 회피)하고 post_stop_low 만 낮춰 갱신한다.
-    3) 손절가 아래 최저점(post_stop_low < last_stop_price)을 찍고 신저가 갱신이 멈춘 뒤,
-       경유 최저점 대비 +0.30% 이상 반등(cur_p >= ceil(post_stop_low * 1.0030 * 100) / 100) &
-       실시간 양봉 전환(is_raw_bull 또는 is_ha_bull) & 손절가 이하(cur_p <= last_stop_price)
-       충족 시 즉시 실시간 현재가(cur_p_fl) LIMIT 주문으로 재진입(RE_BOT_TRAIL)한다!
-       (MODIFIED: 폐기된 RSI(1m) 조건 제거 완료)
-    """
-    bottom_cache: Dict[str, Any] = getattr(context, "bottom_track_cache", {})
-    if not isinstance(bottom_cache, dict) or not bottom_cache.get("active"):
-        return {"status": "INACTIVE"}
-
-    dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
-    hm = dt_now.hour * 100 + dt_now.minute
-    logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
-
-    # 날짜가 바뀌었거나 08:15 EST 거시지표 컷오프 도달 시 추적 종료
-    if bottom_cache.get("logical_date") != logical_date or not (
-        407 <= hm <= 814
-    ):
-        bottom_cache["active"] = False
-        return {"status": "EXPIRED_WINDOW"}
-
-    nq_amp = safe_float((macro or {}).get("nq_amp"), 0.0)
-    if nq_amp >= NQ_OVERHEAT_THRESHOLD:
-        bottom_cache["active"] = False
-        for s in REAL_ALLOWED_SYMBOLS:
-            await context.ledger.update_state(
-                s, is_session_done=True, entry_session="CANCELED_MACRO"
-            )
-        return {"status": "CANCELED_BY_OVERHEAT"}
-
-    sym = str(bottom_cache.get("stopped_sym") or "").upper().strip()
-    if sym not in REAL_ALLOWED_SYMBOLS:
-        bottom_cache["active"] = False
-        return {"status": "INVALID_SYMBOL"}
-
-    st_sym = context.ledger.get_state(sym)
-    if not bool(st_sym.get("is_active", True)):
-        return {"status": "BOT_INACTIVE"}
-
-    if _has_any_active_position_or_order(context, holdings):
-        return {"status": "POSITION_OR_ORDER_ALREADY_EXISTS"}
-
-    met = _get_live_symbol_metrics(context, sym, prices, dt_now)
-    cur_p = safe_float(met.get("live_price"), 0.0)
-    if cur_p <= 0.0:
-        return {"status": "NO_LIVE_PRICE"}
-
-    last_stop_p = safe_float(bottom_cache.get("last_stop_price"), 0.0)
-    post_low = safe_float(bottom_cache.get("post_stop_low"), last_stop_p)
-
-    # 신저가 경신 중에는 칼날 회피 (매수 100% 보류 및 최저점 갱신)
-    if cur_p < post_low:
-        bottom_cache["post_stop_low"] = cur_p
-        if cur_p < last_stop_p:
-            bottom_cache["dipped_below_stop"] = True
-        return {
-            "status": "NEW_LOW_TRACKING",
-            "symbol": sym,
-            "post_stop_low": cur_p,
-        }
-
-    if post_low < last_stop_p:
-        bottom_cache["dipped_below_stop"] = True
-
-    if not bottom_cache.get("dipped_below_stop"):
-        return {"status": "WAITING_DIP_BELOW_STOP", "symbol": sym}
-
-    rebound_trigger_p = math.ceil((post_low * 1.0030) * 100.0) / 100.0
-    is_bull_candle = bool(met.get("is_raw_bull") or met.get("is_ha_bull"))
-
-    # 재진입 핵심 조건 검증: 최저점 +0.30% 반등 & 손절가 이하 & 실시간 양봉 전환 (RSI 폐기 완료)
-    if not (
-        cur_p >= rebound_trigger_p
-        and cur_p <= last_stop_p
-        and is_bull_candle
-    ):
-        return {
-            "status": "MONITORING_REBOUND",
-            "symbol": sym,
-            "cur_p": cur_p,
-            "rebound_trigger_p": rebound_trigger_p,
-        }
-
-    cur_p_fl = math.floor(cur_p * 100.0) / 100.0
-    other_sym = "SOXL" if sym == "SOXS" else "SOXS"
-
-    async with context.in_memory_ordering_lock:
-        async with context.dual_strike_mutex:
-            if not bottom_cache.get("active"):
-                return {"status": "ALREADY_CONSUMED"}
-
-            qty, _, qty_reason = await _calculate_safe_order_qty(
-                context, sym, cur_p_fl
-            )
-            if qty <= 0:
-                return {"status": "HOLD_BUDGET", "reason": qty_reason}
-
-            qqq_ref = await context.macro_cache.ensure_qqq_live_price(
-                safe_float((macro or {}).get("qqq_price"), 0.0)
-            )
-            if qqq_ref <= 0.0:
-                qqq_ref = safe_float((macro or {}).get("nq_price"), 0.0)
-
-            cid = generate_client_order_id(prefix=f"REB{sym}")
-            try:
-                ord_res = await context.api.create_order(
-                    symbol=sym,
-                    side="BUY",
-                    quantity=qty,
-                    price=cur_p_fl,
-                    order_type="LIMIT",
-                    time_in_force="DAY",
-                    client_order_id=cid,
-                    enforce_daymarket_block=True,
-                )
-            except Exception as exc:
-                logger.error(
-                    "🚨 [%s] RE_BOT_TRAIL 반등 재진입 주문 실패: %s", sym, exc
-                )
-                return {"status": "ORDER_ERROR", "error": str(exc)}
-
-            oid = str(ord_res.get("orderId") or "").strip()
-            bottom_cache["active"] = False
-            trend_tag = "DOWN" if sym == "SOXS" else "UP"
-            ha_label = "🕯️HA양봉" if met.get("is_ha_bull") else "🕯️양봉전환"
-
-            await context.ledger.update_state(
-                sym,
-                buy_order_id=oid,
-                client_order_id=cid,
-                ordered_qty=qty,
-                buy_price=cur_p_fl,
-                entry_session="RE_BOT_TRAIL",
-                entry_trend=trend_tag,
-                nq_entry_price=qqq_ref,
-                nq_entry_amp=nq_amp,
-                is_session_done=True,
-                last_modify_mono=time.monotonic(),
-                entry_ts=time.time(),
-            )
-            await context.ledger.update_state(other_sym, is_session_done=True)
-            context.wakeup_event.set()
-
-            if hasattr(context, "send_slim_alert"):
-                await context.send_slim_alert(
-                    title=f"🪤 [최저점 +0.30% 반등 재진입] {sym} {qty}주",
-                    body=(
-                        f"재진입가 ${cur_p_fl:.2f} (최저점 ${post_low:.2f} · 직전손절 ${last_stop_p:.2f}) "
-                        f"· {ha_label} · 신규QQQ기준 ${qqq_ref:.2f}"
-                    ),
-                )
-
-            return {
-                "status": "RE_BOT_TRAIL_ORDERED",
-                "symbol": sym,
-                "orderId": oid,
-                "price": cur_p_fl,
-                "qty": qty,
-            }

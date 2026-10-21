@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: daymarket_sim_plugin.py
-데이장 (19:00 ~ 03:57 EST) 100% [모의] 전용 프리장 동형(Isomorphic) 스나이퍼 플러그인 (Step 03 / 04)
+데이장 (19:00 ~ 03:57 EST) 100% [모의] 전용 프리장 동형(Isomorphic) 스나이퍼 플러그인 (Step 03 / 05)
 - 🚨 데이장 실거래 매수 100% 물리적 절대 차단 (create_order 호출 0건!)
-- MODIFIED: RSI(1m) 전면 폐기에 따라 3차 손절 후 최저점 +0.30% 양봉 반등 [모의] 재진입(RE_BOT_TRAIL) 내
-  live_rsi 참조 및 조건문을 완전 소각하여 프리장 본진(sniper_plugin.py)과 100% 동형 일치
-- 🎯 1 & Case 02, 60, 77 ~ 94, 97 ~ 100: 프리장 본진(🎯 3 & 🎯 4 & 🎯 5)을 절대기준으로 100% 동일한 전략 구동
+- MODIFIED: 제3헌법 및 최신 프롬프트.txt에 의거하여 3차 손절 후 최저점 반등 재진입(RE_BOT_TRAIL / BOTTOM_TRACK)
+  관련 필드 및 분기를 100% 영구 소각하고, 3차 QQQ 역행 손절 시 즉시 당일 데이장 모의 세션 안전 마감(DONE_STAGE3_STOP)
+- NEW: 서버 재기동(/update 등) 시에도 데이장 [모의] 보유 포지션과 당일 출격/승패/세후수익률 전적이 휘발되지 않도록
+  제1헌법 및 Case 05, 06 준수 원자적 로컬 상태 파일(day_sim_state.json) 백업/복원 엔진 탑재
+- 🎯 1 & Case 02, 05, 06, 60, 77 ~ 94, 97 ~ 100 완벽 구현:
   1) [Step 1] 19:00 ~ 19:07 EST 누적 데이장 VWAP(VWAP_1907) 산출 후 19:07 EST 기준
      현재가 > VWAP_1907 (disp_1907 > 0.0%, 양쪽 상회 시 이격도 상위 1위) 데이장 추세 주도주 자동 선정/복원
   2) [Step 2] 19:07 ~ 03:35 EST 실시간 동적 데이장 VWAP_day_t 대비 -0.50% 언더슈팅 하단가
@@ -17,15 +19,18 @@
      🕯️HA양봉 홀딩 & 🌑HA음봉 + 최고가 대비 -0.20% 콜백 스윕 × 실시간 QQQ ±0.20% NQ_VEL_BYPASS)
   4) [Step 4] 데이장 후반(02:45 ~ 03:57 EST) 진입 25분 경과 미익절 표류 물량 동적 데이장 VWAP
      (최소 평단 +0.20% 수수료 보전선) 도달 즉시 [모의] 선제 탈출(DAY_VWAP_ESC)
-  5) [Step 5] 1·2차 NQ=F >= 2.0% 과열 차단/덤핑 & 3차 실시간 QQQ 최소 0.80% 역행 [모의] 손절 후
-     손절가 하회 최저점 역트레일링 +0.30% 양봉 반등 [모의] 재진입(RE_BOT_TRAIL) 및 실시간 승률/세후수익률 집계
+  5) [Step 5] 1·2차 NQ=F >= 2.0% 과열 차단/덤핑 & 3차 실시간 QQQ 최소 0.80% 역행 [모의] 손절 마감
+     및 실시간 승률/세후수익률 집계 영속화
   6) 03:58 ~ 03:59 EST 데이장 마감 2분 전 묵음 바이패스 및 미결 모의 포지션 자동 클리어
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import math
+import os
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
@@ -51,9 +56,29 @@ from sniper_plugin import (
     TRAP_MODIFY_MIN_DIFF_PCT,
     TRAP_MODIFY_MIN_DIFF_USD,
 )
-from toss_api import EST_TZ, REAL_ALLOWED_SYMBOLS, safe_float, safe_int
+from toss_api import (
+    EST_TZ,
+    REAL_ALLOWED_SYMBOLS,
+    GlobalThrottle,
+    safe_float,
+    safe_int,
+)
 
 logger = logging.getLogger("toss_sniper.daymarket_sim_plugin")
+
+DAY_SIM_STATE_FILENAME: str = "day_sim_state.json"
+
+
+def _resolve_day_sim_filepath() -> str:
+    """
+    /home/pipiosToss 단일 운영 디렉토리가 존재하면 해당 경로의 day_sim_state.json 을 반환하고,
+    없으면 현재 모듈 폴더 경로를 반환한다.
+    """
+    prod_dir = "/home/pipiosToss"
+    if os.path.isdir(prod_dir):
+        return os.path.join(prod_dir, DAY_SIM_STATE_FILENAME)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, DAY_SIM_STATE_FILENAME)
 
 
 # ---------------------------------------------------------------------------
@@ -95,17 +120,18 @@ def is_daymarket_late_vwap_esc_window(hm: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 데이장 [모의] 상태 초기화 및 조회 헬퍼 (Case 02, Case 77)
+# 데이장 [모의] 상태 초기화 · 디스크 영속화(Save/Load) 헬퍼 (제1헌법 & Case 02, 05, 06, 77)
 # ---------------------------------------------------------------------------
 def create_default_day_sim_state(logical_date: str = "") -> Dict[str, Any]:
     """
     데이장 100% [모의] 전용 상태 머신 기본 딕셔너리를 생성한다.
+    (MODIFIED: 폐기된 RE_BOT_TRAIL / BOTTOM_TRACK 필드 영구 소각 완료)
     """
     return {
         "logical_date": str(logical_date or ""),
-        "phase": "IDLE",  # IDLE | TRAP_WAITING | HOLDING | BOTTOM_TRACK | DONE_OVERHEAT | CLEARED
+        "phase": "IDLE",  # IDLE | TRAP_WAITING | HOLDING | DONE_OVERHEAT | DONE_STAGE3_STOP | DONE_SESSION | CLEARED
         "symbol": "",
-        "trig_mode": "",  # DAY_VWAP_M050 | RE_BOT_TRAIL
+        "trig_mode": "",  # DAY_VWAP_M050
         # [모의] 매수 덫 대기 필드
         "sim_trap_buy_price": 0.0,
         "last_modify_mono": 0.0,
@@ -123,12 +149,6 @@ def create_default_day_sim_state(logical_date: str = "") -> Dict[str, Any]:
         # 3차 매크로 방어 기준점 (실시간 QQQ 기준가 및 진입 시점 NQ=F 진폭)
         "nq_entry_price": 0.0,
         "nq_entry_amp": 0.0,
-        # 3차 손절 후 최저점 역트레일링 반등(RE_BOT_TRAIL) 추적 필드
-        "bottom_track_active": False,
-        "stopped_sym": "",
-        "last_stop_price": 0.0,
-        "post_stop_low": 0.0,
-        "dipped_below_stop": False,
         # 당일 데이장 [모의] 누적 성과 집계 필드
         "sim_trade_count": 0,
         "sim_win_count": 0,
@@ -139,15 +159,67 @@ def create_default_day_sim_state(logical_date: str = "") -> Dict[str, Any]:
         "sim_last_exit_tag": "",
         "sim_last_exit_rate_pct": 0.0,
         "cleared_before_premarket": False,
+        "_disk_loaded": True,
     }
 
 
-def _ensure_day_sim_caches(
+def _load_day_sim_state_sync() -> Dict[str, Any]:
+    filepath = _resolve_day_sim_filepath()
+    lock = GlobalThrottle.get_file_lock(filepath)
+    with lock:
+        if not os.path.isfile(filepath):
+            return {}
+        try:
+            with open(filepath, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.debug("day_sim_state.json 로드 폴백: %s", exc)
+            return {}
+
+
+def _save_day_sim_state_sync(state_dict: Dict[str, Any]) -> None:
+    filepath = _resolve_day_sim_filepath()
+    lock = GlobalThrottle.get_file_lock(filepath)
+    with lock:
+        tmp_path = f"{filepath}.tmp"
+        clean_payload = {
+            k: v for k, v in state_dict.items() if not str(k).startswith("_")
+        }
+        try:
+            parent = os.path.dirname(filepath)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as fp:
+                json.dump(clean_payload, fp, ensure_ascii=False, indent=2)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp_path, filepath)
+        except Exception as exc:
+            logger.debug("day_sim_state.json 저장 예외: %s", exc)
+
+
+async def persist_day_sim_state_async(day_sim_state: Dict[str, Any]) -> None:
+    """
+    제1헌법 & Case 05, 06: 데이장 [모의] 상태를 백그라운드 스레드에서 원자적으로 디스크에 기록한다.
+    """
+    if not isinstance(day_sim_state, dict):
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_save_day_sim_state_sync, dict(day_sim_state)),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        logger.debug("persist_day_sim_state_async 예외: %s", exc)
+
+
+async def _ensure_day_sim_caches(
     context: Any, logical_date: str
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    context.day_leader_cache 및 context.day_sim_state 의 논리적 거래일 롤오버(18:00 EST)를 점검하고
-    유효한 딕셔너리 참조를 반환한다.
+    context.day_leader_cache 및 context.day_sim_state 의 논리적 거래일 롤오버(18:00 EST)를 점검하고,
+    기동 직후 디스크(day_sim_state.json)에 저장된 당일 데이장 [모의] 상태가 있으면 100% 복원한다.
     """
     day_leader_cache: Dict[str, Any] = getattr(context, "day_leader_cache", {})
     if day_leader_cache.get("logical_date") != logical_date:
@@ -167,9 +239,38 @@ def _ensure_day_sim_caches(
         )
 
     day_sim_state: Dict[str, Any] = getattr(context, "day_sim_state", {})
-    if day_sim_state.get("logical_date") != logical_date:
+    if not day_sim_state.get("_disk_loaded"):
+        try:
+            loaded = await asyncio.wait_for(
+                asyncio.to_thread(_load_day_sim_state_sync),
+                timeout=5.0,
+            )
+        except Exception:
+            loaded = {}
+
+        if (
+            isinstance(loaded, dict)
+            and str(loaded.get("logical_date") or "") == logical_date
+        ):
+            base_state = create_default_day_sim_state(logical_date)
+            for k in base_state:
+                if k in loaded and k != "_disk_loaded":
+                    base_state[k] = loaded[k]
+            base_state["last_modify_mono"] = time.monotonic()
+            day_sim_state.clear()
+            day_sim_state.update(base_state)
+            if str(day_sim_state.get("phase") or "") == "HOLDING":
+                # 재기동 시 이미 [모의] 포지션을 보유 중이면 주도주 중복 알림 억제
+                day_leader_cache["notified"] = True
+        else:
+            day_sim_state.clear()
+            day_sim_state.update(create_default_day_sim_state(logical_date))
+            await persist_day_sim_state_async(day_sim_state)
+
+    elif day_sim_state.get("logical_date") != logical_date:
         day_sim_state.clear()
         day_sim_state.update(create_default_day_sim_state(logical_date))
+        await persist_day_sim_state_async(day_sim_state)
 
     return day_leader_cache, day_sim_state
 
@@ -208,7 +309,7 @@ async def update_daymarket_trend_leader(
     hm = dt_now.hour * 100 + dt_now.minute
     logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
 
-    day_leader_cache, _ = _ensure_day_sim_caches(context, logical_date)
+    day_leader_cache, _ = await _ensure_day_sim_caches(context, logical_date)
 
     if not is_daymarket_leader_lock_window(hm):
         return day_leader_cache
@@ -267,7 +368,7 @@ async def update_daymarket_trend_leader(
 
 
 # ---------------------------------------------------------------------------
-# 내부 헬퍼 : 데이장 [모의] 포지션 청산 정산 및 다회전/최저점 반등 상태 전이
+# 내부 헬퍼 : 데이장 [모의] 포지션 청산 정산 및 다회전/안전마감 상태 전이
 # ---------------------------------------------------------------------------
 async def _finalize_daymarket_sim_exit(
     context: Any,
@@ -281,7 +382,7 @@ async def _finalize_daymarket_sim_exit(
     """
     데이장 [모의] 포지션 청산 시 왕복 수수료(0.14%) 차감 세후 수익률 및 승률을 실시간 집계하고,
     - 03:25 EST 이전 익절(TP_WIN) / 안전탈출(DAY_VWAP_ESC) 완료 시 다회전 재출동(IDLE) 해금
-    - 3차 역행 손절(STAGE3_QQQ_STOP) 시 NQ < 2.0% 이면 최저점 +0.30% 반등 추적(BOTTOM_TRACK) 가동
+    - 3차 역행 손절(STAGE3_QQQ_STOP) 시 즉시 당일 데이장 모의 세션 마감(DONE_STAGE3_STOP)
     - 2차 과열 손절(STAGE2_OVERHEAT_DUMP) 시 DONE_OVERHEAT 로 마감한다.
     """
     sym = str(day_sim_state.get("symbol") or "").upper().strip()
@@ -344,27 +445,21 @@ async def _finalize_daymarket_sim_exit(
     reentry_note = ""
     if nq_amp >= NQ_OVERHEAT_THRESHOLD or exit_tag == "STAGE2_OVERHEAT_DUMP":
         day_sim_state["phase"] = "DONE_OVERHEAT"
-        day_sim_state["bottom_track_active"] = False
-    elif exit_tag == "STAGE3_QQQ_STOP" and is_daymarket_trap_entry_window(hm):
-        # 3차 QQQ 역행 손절 후 최저점 +0.30% 양봉 반등 [모의] 재진입(RE_BOT_TRAIL) 활성화
-        day_sim_state["phase"] = "BOTTOM_TRACK"
-        day_sim_state["bottom_track_active"] = True
-        day_sim_state["stopped_sym"] = sym
-        day_sim_state["last_stop_price"] = ex_p
-        day_sim_state["post_stop_low"] = ex_p
-        day_sim_state["dipped_below_stop"] = False
-        reentry_note = " · 🪤최저점 +0.30% 반등 [모의] 감시"
+    elif exit_tag == "STAGE3_QQQ_STOP":
+        # MODIFIED: 폐기된 RE_BOT_TRAIL 없이 즉시 당일 데이장 모의 세션 안전 마감
+        day_sim_state["phase"] = "DONE_STAGE3_STOP"
+        reentry_note = " · 🔒당일 데이장 [모의] 마감"
     elif exit_tag in (
         "TP_WIN",
         "DAY_VWAP_ESC",
     ) and is_daymarket_multicycle_unlock_window(hm):
         # 03:25 EST 이전 익절/탈출 완료 시 다회전 무한 [모의] 재출동 해금
         day_sim_state["phase"] = "IDLE"
-        day_sim_state["bottom_track_active"] = False
         reentry_note = " · ♻️다회전 [모의] 재출동 해금"
     else:
-        day_sim_state["phase"] = "IDLE"
-        day_sim_state["bottom_track_active"] = False
+        day_sim_state["phase"] = "DONE_SESSION"
+
+    await persist_day_sim_state_async(day_sim_state)
 
     tot_cnt = safe_int(day_sim_state.get("sim_trade_count"), 0)
     win_cnt = safe_int(day_sim_state.get("sim_win_count"), 0)
@@ -409,13 +504,13 @@ async def execute_daymarket_sim_plugin(
     """
     🎯 1 [Step 1 ~ Step 5] & Case 77 ~ 94, 97 ~ 100:
     19:00:00 ~ 03:57:59 EST 데이장 구간에서 실거래 매수 없이 100% [모의]로
-    프리장 본진과 완전히 동일한 5단계 전략을 실행한다 (폐기된 RSI(1m) 조건 제거 완료).
+    프리장 본진과 완전히 동일한 5단계 전략을 실행한다 (폐기된 RE_BOT_TRAIL 완전 소각 완료).
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
     logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
 
-    day_leader_cache, day_sim_state = _ensure_day_sim_caches(
+    day_leader_cache, day_sim_state = await _ensure_day_sim_caches(
         context, logical_date
     )
 
@@ -438,14 +533,18 @@ async def execute_daymarket_sim_plugin(
 
     phase = str(day_sim_state.get("phase") or "IDLE")
 
+    # 이미 당일 데이장 모의 세션이 마감된 상태이면 즉시 리턴
+    if phase in ("DONE_OVERHEAT", "DONE_STAGE3_STOP", "DONE_SESSION", "CLEARED"):
+        return {"status": f"SIM_ALREADY_{phase}"}
+
     # -----------------------------------------------------------------------
     # [Step 5-A] 1·2차 매크로 과열 방어선 (NQ=F 당일 진폭 >= 2.0%)
     # -----------------------------------------------------------------------
     if nq_amp >= NQ_OVERHEAT_THRESHOLD:
-        day_sim_state["bottom_track_active"] = False
         if phase == "TRAP_WAITING":
             day_sim_state["sim_trap_buy_price"] = 0.0
             day_sim_state["phase"] = "DONE_OVERHEAT"
+            await persist_day_sim_state_async(day_sim_state)
             if hasattr(context, "send_slim_alert"):
                 await context.send_slim_alert(
                     title=f"🧪🛑 [데이장 [모의] 1차 과열방어] {day_sim_state.get('symbol')}",
@@ -470,97 +569,11 @@ async def execute_daymarket_sim_plugin(
                 )
         elif phase != "HOLDING":
             day_sim_state["phase"] = "DONE_OVERHEAT"
+            await persist_day_sim_state_async(day_sim_state)
             return {"status": "SIM_BLOCKED_OVERHEAT", "nq_amp": nq_amp}
 
     # -----------------------------------------------------------------------
-    # [분기 1] 3차 역행 손절 후 최저점 +0.30% 양봉 반등 [모의] 재진입 (RE_BOT_TRAIL)
-    # -----------------------------------------------------------------------
-    if phase == "BOTTOM_TRACK" and day_sim_state.get("bottom_track_active"):
-        if not is_daymarket_trap_entry_window(hm):
-            day_sim_state["bottom_track_active"] = False
-            day_sim_state["phase"] = "IDLE"
-            return {"status": "SIM_BOTTOM_TRACK_EXPIRED"}
-
-        sym_b = (
-            str(day_sim_state.get("stopped_sym") or leader_sym).upper().strip()
-        )
-        met_b = _get_live_day_metrics(context, sym_b, prices, dt_now)
-        cur_p = safe_float(met_b.get("live_price"), 0.0)
-        if cur_p <= 0.0:
-            return {"status": "NO_LIVE_PRICE"}
-
-        last_stop_p = safe_float(day_sim_state.get("last_stop_price"), 0.0)
-        post_low = safe_float(day_sim_state.get("post_stop_low"), last_stop_p)
-
-        # 신저가 경신 중에는 칼날 회피 (매수 보류 및 최저점 갱신)
-        if cur_p < post_low:
-            day_sim_state["post_stop_low"] = cur_p
-            if cur_p < last_stop_p:
-                day_sim_state["dipped_below_stop"] = True
-            return {"status": "SIM_NEW_LOW_TRACKING", "post_stop_low": cur_p}
-
-        if post_low < last_stop_p:
-            day_sim_state["dipped_below_stop"] = True
-
-        if not day_sim_state.get("dipped_below_stop"):
-            return {"status": "SIM_WAITING_DIP_BELOW_STOP"}
-
-        rebound_p = math.ceil((post_low * 1.0030) * 100.0) / 100.0
-        is_bull = bool(met_b.get("is_raw_bull") or met_b.get("is_ha_bull"))
-        cur_p_fl = math.floor(cur_p * 100.0) / 100.0
-
-        # MODIFIED: 폐기된 RSI(1m) 조건 제거 완료 (최저점 +0.30% 반등 & 손절가 이하 & 실시간 양봉 전환)
-        if cur_p_fl >= rebound_p and cur_p_fl <= last_stop_p and is_bull:
-            arm_p = (
-                math.ceil(
-                    (cur_p_fl * (1.0 + TRAIL_ARM_PROFIT_PCT / 100.0)) * 100.0
-                )
-                / 100.0
-            )
-            cap_p = (
-                math.ceil(
-                    (cur_p_fl * (1.0 + SAFETY_CAP_PROFIT_PCT / 100.0)) * 100.0
-                )
-                / 100.0
-            )
-            ha_label = "🕯️HA양봉" if met_b.get("is_ha_bull") else "🕯️양봉전환"
-            day_sim_state.update(
-                {
-                    "phase": "HOLDING",
-                    "symbol": sym_b,
-                    "trig_mode": "RE_BOT_TRAIL",
-                    "bottom_track_active": False,
-                    "entry_price": cur_p_fl,
-                    "entry_ts": time.time(),
-                    "safety_cap_price": cap_p,
-                    "arm_price": arm_p,
-                    "day_sim_trail_armed": False,
-                    "ratchet_130_locked": False,
-                    "peak_price": cur_p_fl,
-                    "floor_price": 0.0,
-                    "effective_stop_p": 0.0,
-                    "nq_entry_price": qqq_curr,
-                    "nq_entry_amp": nq_amp,
-                }
-            )
-            if hasattr(context, "send_slim_alert"):
-                await context.send_slim_alert(
-                    title=f"🧪🪤 [데이장 [모의] 최저점 +0.30% 반등 재진입] {sym_b}",
-                    body=(
-                        f"[모의] 체결가 ${cur_p_fl:.2f} (최저점 ${post_low:.2f} · 직전손절 ${last_stop_p:.2f}) "
-                        f"· {ha_label} · QQQ기준 ${qqq_curr:.2f}"
-                    ),
-                )
-            return {
-                "status": "SIM_RE_BOT_TRAIL_FILLED",
-                "symbol": sym_b,
-                "price": cur_p_fl,
-            }
-
-        return {"status": "SIM_MONITORING_REBOUND", "symbol": sym_b}
-
-    # -----------------------------------------------------------------------
-    # [분기 2 : Step 2] 미보유(IDLE / TRAP_WAITING) 시 동적 데이장 VWAP -0.50% [모의] 매수 덫
+    # [분기 1 : Step 2] 미보유(IDLE / TRAP_WAITING) 시 동적 데이장 VWAP -0.50% [모의] 매수 덫
     # -----------------------------------------------------------------------
     if phase in ("IDLE", "TRAP_WAITING"):
         if leader_sym not in REAL_ALLOWED_SYMBOLS:
@@ -602,6 +615,7 @@ async def execute_daymarket_sim_plugin(
                     "last_modify_mono": time.monotonic(),
                 }
             )
+            await persist_day_sim_state_async(day_sim_state)
             logger.info(
                 "🧪🪤 [데이장 [모의] 매수덫 장전] %s @ $%.2f (데이장VWAP $%.2f, 현가 $%.2f)",
                 leader_sym,
@@ -630,6 +644,7 @@ async def execute_daymarket_sim_plugin(
                 sim_trap_p = raw_trap_p
                 day_sim_state["sim_trap_buy_price"] = sim_trap_p
                 day_sim_state["last_modify_mono"] = time.monotonic()
+                await persist_day_sim_state_async(day_sim_state)
 
         # 3) 현재가(cur_p_fl)가 장전된 [모의] 매수 덫 단가 이하 도달 시 즉시 [모의] 체결 확정!
         if sim_trap_p > 0.0 and cur_p_fl <= sim_trap_p:
@@ -665,6 +680,8 @@ async def execute_daymarket_sim_plugin(
                     "nq_entry_amp": nq_amp,
                 }
             )
+            await persist_day_sim_state_async(day_sim_state)
+
             if hasattr(context, "send_slim_alert"):
                 await context.send_slim_alert(
                     title=f"🧪🛡️ [데이장 [모의] VWAP -0.50% 매수 체결] {leader_sym}",
@@ -688,7 +705,7 @@ async def execute_daymarket_sim_plugin(
         }
 
     # -----------------------------------------------------------------------
-    # [분기 3 : Step 3 ~ Step 5] [모의] 보유 중(HOLDING) :
+    # [분기 2 : Step 3 ~ Step 5] [모의] 보유 중(HOLDING) :
     #   +5.00% 캡 & +1.00% 하드보존 HA 트레일링 & 02:45 후반부 VWAP 탈출 & 3차 QQQ 역행 손절
     # -----------------------------------------------------------------------
     if phase == "HOLDING":
@@ -696,6 +713,7 @@ async def execute_daymarket_sim_plugin(
         ent_p = safe_float(day_sim_state.get("entry_price"), 0.0)
         if sym not in REAL_ALLOWED_SYMBOLS or ent_p <= 0.0:
             day_sim_state["phase"] = "IDLE"
+            await persist_day_sim_state_async(day_sim_state)
             return {"status": "INVALID_SIM_HOLDING_RESET"}
 
         met = _get_live_day_metrics(context, sym, prices, dt_now)
@@ -732,6 +750,7 @@ async def execute_daymarket_sim_plugin(
             day_sim_state["peak_price"] = max(
                 safe_float(day_sim_state.get("peak_price"), live_p), live_p
             )
+            await persist_day_sim_state_async(day_sim_state)
             if hasattr(context, "send_slim_alert"):
                 await context.send_slim_alert(
                     title=f"🧪🔥 [데이장 [모의] +1.00% HA 트레일링 점화] {sym}",
@@ -739,9 +758,8 @@ async def execute_daymarket_sim_plugin(
                 )
 
         if day_sim_state.get("day_sim_trail_armed"):
-            peak_p = max(
-                safe_float(day_sim_state.get("peak_price"), live_p), live_p
-            )
+            prev_peak = safe_float(day_sim_state.get("peak_price"), live_p)
+            peak_p = max(prev_peak, live_p)
             day_sim_state["peak_price"] = peak_p
 
             if peak_p >= ent_p * (1.0 + TRAIL_RATCHET_LOCK_PCT / 100.0):
@@ -768,6 +786,8 @@ async def execute_daymarket_sim_plugin(
 
             day_sim_state["floor_price"] = floor_p
             day_sim_state["effective_stop_p"] = eff_stop_p
+            if peak_p > prev_peak:
+                await persist_day_sim_state_async(day_sim_state)
 
             is_ha_bull = bool(met.get("is_ha_bull", False))
             nq_vel_bypass = bool(
@@ -836,6 +856,7 @@ async def execute_daymarket_sim_plugin(
             )
             if not adv.get("scale_valid"):
                 day_sim_state["nq_entry_price"] = qqq_curr
+                await persist_day_sim_state_async(day_sim_state)
             elif adv.get("should_stop"):
                 return await _finalize_daymarket_sim_exit(
                     context=context,
@@ -866,7 +887,7 @@ async def settle_daymarket_sim_before_premarket(
 ) -> Dict[str, Any]:
     """
     🎯 1 [03:58 ~ 03:59 EST 데이장 마감 휩소 묵음 바이패스 및 04:00 EST 자동 클리어]:
-    - 03:58:00 EST 도달 시 데이장 [모의] 미체결 매수 덫이나 미청산 [모의] 포지션, 최저점 반등 추적을
+    - 03:58:00 EST 도달 시 데이장 [모의] 미체결 매수 덫이나 미청산 [모의] 포지션을
       텔레그램 알림 없이 100% 묵음(Silent)으로 즉시 클리어하여,
       03:58 EST 1주 휩소 노출 작전과 04:00 EST 프리장 본진 스나이퍼를 보호한다.
     - 단, 당일 데이장 누적 승률/세후수익률 통계(sim_trade_count, sim_win_count, sim_cum_net_rate_pct)는
@@ -874,7 +895,7 @@ async def settle_daymarket_sim_before_premarket(
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
-    _, day_sim_state = _ensure_day_sim_caches(context, logical_date)
+    _, day_sim_state = await _ensure_day_sim_caches(context, logical_date)
 
     if day_sim_state.get("cleared_before_premarket"):
         return {"status": "ALREADY_CLEARED"}
@@ -894,14 +915,10 @@ async def settle_daymarket_sim_before_premarket(
             "peak_price": 0.0,
             "floor_price": 0.0,
             "effective_stop_p": 0.0,
-            "bottom_track_active": False,
-            "stopped_sym": "",
-            "last_stop_price": 0.0,
-            "post_stop_low": 0.0,
-            "dipped_below_stop": False,
             "cleared_before_premarket": True,
         }
     )
+    await persist_day_sim_state_async(day_sim_state)
     logger.info(
         "🧹 [03:58 EST 데이장 [모의] 묵음 클리어] 미결 모의 상태 초기화 완료 (통계 보존)"
     )

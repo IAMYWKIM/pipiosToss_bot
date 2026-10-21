@@ -3,13 +3,11 @@
 # MODIFIED: tg_ui_plugin.py
 텔레그램 비동기 롱폴링 라우터, /update 무한 재기동 원천 차단 4중 방어벽,
 스크린샷(1000031235.jpg) 100% 동기화 전술 제어반(/settlement), 대화형 통합 시드 숫자 입력기,
-메인 메뉴(/menu), 듀얼 지시서(/sync), 스나이퍼 레이더(/avwap) 및 /reset 원자적 소각 플러그인 (Step 01 / 04)
+메인 메뉴(/menu), 듀얼 지시서(/sync), 스나이퍼 레이더(/avwap) 및 /reset 원자적 소각 플러그인 (Step 04 / 05)
+- MODIFIED: 제3헌법 및 최신 프롬프트.txt(Case 02)에 의거하여 RE_BOT_TRAIL 및 bottom_track_cache
+  관련 분기/문구를 100% 영구 소각하고, /reset 시 day_sim_state.json 디스크 파일까지 동시 0점 소각 결속
 - MODIFIED: /update 실행 후 os._exit(0) 재기동 시 텔레그램 서버 큐에 미커밋된 /update 가 재수신되어
-  무한 재기동 루프에 빠지는 현상을 막기 위해 4중 오프셋/타임스탬프/update_id 멱등성 방어벽 탑재
-  1) 기동 직후 _flush_stale_updates_on_startup() 으로 과거 잔류 업데이트 큐 즉시 소각
-  2) /update 수신 즉시 _commit_offset_to_telegram_server() 로 텔레그램 본사 서버에 offset=uid+1 강제 확정
-  3) message.date < _boot_epoch 과거 타임스탬프 /update 명령 무시
-  4) /tmp/toss_sniper_last_update_id.txt 에 처리된 update_id 를 원자적 기록하여 동일 ID 재실행 영구 차단
+  무한 재기동 루프에 빠지는 현상을 막기 위해 4중 오프셋/타임스탬프/update_id 멱등성 방어벽 유지
 - 제1헌법: 모든 텔레그램/환율 HTTP 요청 및 파일/서브프로세스 I/O의 asyncio.to_thread 격리 및 GlobalThrottle 통제
 - 제4헌법: 모든 논리 판단은 EST_TZ(America/New_York) 100% 락온
 - Case 02, 06, 07, 11, 13, 17, 18, 26, 38, 39, 40, 42, 47, 50, 55, 56, 68, 93 완벽 준수
@@ -29,7 +27,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from daymarket_sim_plugin import create_default_day_sim_state
+from daymarket_sim_plugin import (
+    create_default_day_sim_state,
+    persist_day_sim_state_async,
+)
 from defense_plugin import relock_qqq_baseline_on_bot_resume
 from plugin_updater import (
     has_active_orders_in_ledger,
@@ -85,7 +86,7 @@ def sanitize_tg_text(text: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# NEW: /update 무한 재기동 방지용 update_id 원자적 파일 기록/조회 헬퍼 (제1헌법 & Case 06)
+# /update 무한 재기동 방지용 update_id 원자적 파일 기록/조회 헬퍼 (제1헌법 & Case 06)
 # ---------------------------------------------------------------------------
 def _read_last_processed_update_id_sync() -> int:
     lock = GlobalThrottle.get_file_lock(LAST_UPDATE_ID_FILE)
@@ -245,6 +246,7 @@ def _format_symbol_directive_status(
 ) -> str:
     """
     /sync 및 /avwap 하단에 표출할 종목별 상태 문자열(예: '🎯 수동보유 (점화 $45.03)', '⏳ 대기') 생성.
+    (MODIFIED: 폐기된 bottom_track_cache 분기 영구 소각 완료)
     """
     st = context.ledger.get_state(symbol)
     if not bool(st.get("is_active", True)):
@@ -271,17 +273,11 @@ def _format_symbol_directive_status(
         buy_p = safe_float(st.get("buy_price"), 0.0)
         return f"🪤 매수덫대기 (${buy_p:.2f})"
 
-    bottom_cache = getattr(context, "bottom_track_cache", {})
-    if (
-        isinstance(bottom_cache, dict)
-        and bottom_cache.get("active")
-        and str(bottom_cache.get("stopped_sym") or "") == symbol
-    ):
-        low_p = safe_float(bottom_cache.get("post_stop_low"), 0.0)
-        return f"🪤 최저점반등감시 (저점 ${low_p:.2f})"
-
-    if str(st.get("entry_session") or "") == "CANCELED_MACRO":
+    entry_sess_str = str(st.get("entry_session") or "")
+    if entry_sess_str == "CANCELED_MACRO":
         return "🛑 과열차단 (NQ 2.0%초과)"
+    if entry_sess_str == "CANCELED_STAGE3":
+        return "🛑 3차역행마감 (QQQ역행)"
 
     if other_holdings_qty > 0:
         other_sym = "SOXS" if symbol == "SOXL" else "SOXL"
@@ -793,9 +789,9 @@ async def handle_reset_command(
     텔레그램 /reset 명령어를 통해:
     1) SOXS 및 SOXL 듀얼 로컬 장부(AssassinLedger)의 주문/보유/세션 상태 필드를 원자적 0점 소각하되,
        통합 시드 금액(budget), 복리/단리 모드(is_compound), 목표 수익률(target_profit_rate)은 보존한다.
-    2) 6대 인메모리 캐시(_TRAIL_RUNTIME_CACHE, _EXIT_SNAPSHOT_CACHE, _BOTTOM_TRACK_CACHE,
-       _PRE_LEADER_CACHE, _DAY_LEADER_CACHE, _DAY_SIM_STATE) 및 인덱싱 그레이스 캐시를
-       즉시 0점 초기화한다.
+    2) 5대 인메모리 캐시(_TRAIL_RUNTIME_CACHE, _EXIT_SNAPSHOT_CACHE, _PRE_LEADER_CACHE,
+       _DAY_LEADER_CACHE, _DAY_SIM_STATE) 및 로컬 디스크(day_sim_state.json), 인덱싱 그레이스 캐시를
+       즉시 0점 초기화한다 (폐기된 bottom_track_cache 완전 제거 완료).
     """
     dt_est = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     logical_date = get_logical_trading_date_str(dt_est, rollover_hour=18)
@@ -820,11 +816,6 @@ async def handle_reset_command(
         context.exit_snapshot_cache, dict
     ):
         context.exit_snapshot_cache.clear()
-    if hasattr(context, "bottom_track_cache") and isinstance(
-        context.bottom_track_cache, dict
-    ):
-        context.bottom_track_cache.clear()
-        context.bottom_track_cache["active"] = False
     if hasattr(context, "pre_leader_cache") and isinstance(
         context.pre_leader_cache, dict
     ):
@@ -864,6 +855,7 @@ async def handle_reset_command(
     ):
         context.day_sim_state.clear()
         context.day_sim_state.update(create_default_day_sim_state(logical_date))
+        await persist_day_sim_state_async(context.day_sim_state)
     if hasattr(context, "indexing_grace_cache") and isinstance(
         context.indexing_grace_cache, dict
     ):
@@ -883,7 +875,7 @@ async def handle_reset_command(
     comp_kept = "통합 복리" if st_after.get("is_compound", True) else "고정 단리"
 
     return (
-        "🧹 <b>[/reset 듀얼 장부 및 6대 캐시 원자적 0점 소각 완료]</b>\n"
+        "🧹 <b>[/reset 듀얼 장부 및 5대 캐시 원자적 0점 소각 완료]</b>\n"
         f"🔸 보존 시드: <code>${budget_kept:,.2f}</code> ({comp_kept}) · SOXS/SOXL 대기 복원"
     )
 
@@ -1029,7 +1021,7 @@ class TelegramBotRouter:
 
     async def _commit_offset_to_telegram_server(self) -> None:
         """
-        # NEW [2차 방어벽]: 현재 self._offset 을 텔레그램 본사 서버에 즉시 커밋하여
+        [2차 방어벽]: 현재 self._offset 을 텔레그램 본사 서버에 즉시 커밋하여
         처리 완료된 메시지(/update 등)가 재기동 후 다시 내려오는 현상을 원천 차단한다.
         """
         if self._offset <= 0:
@@ -1049,7 +1041,7 @@ class TelegramBotRouter:
 
     async def _flush_stale_updates_on_startup(self) -> None:
         """
-        # NEW [1차 방어벽]: 프로세스 기동 직후 롱폴링에 들어가기 전에
+        [1차 방어벽]: 프로세스 기동 직후 롱폴링에 들어가기 전에
         텔레그램 큐의 마지막(offset=-1) 업데이트를 확인하여 부팅 이전에 쌓인
         구버전 메시지(특히 직전 /update)를 모두 스킵하고 서버 큐를 깨끗이 비운다.
         """
@@ -1389,7 +1381,7 @@ class TelegramBotRouter:
                 toast_text = "💵 채팅창에 시드 금액(숫자)을 입력해주세요."
                 prompt_msg = (
                     "💵 <b>[통합 시드 설정]</b>\n"
-                    "프리장 본진 · 최저점 반등 재진입 · 수동 스나이퍼 · 1주 휩소 작전 등 모든 청산 시 "
+                    "프리장 본진(동적 VWAP -0.50%) · 수동 스나이퍼 · 1주 휩소 작전 등 모든 청산 시 "
                     "<b>실제 발생한 순수익금(세전손익 - 왕복수수료 0.14%)</b>이 양쪽 장부 시드에 동시 가감됩니다.\n\n"
                     "적용할 통합 시드 금액(USD 숫자, 예: <code>200</code>)을 채팅창에 입력해주세요."
                 )
@@ -1464,7 +1456,6 @@ class TelegramBotRouter:
                 )
                 logged_wait = False
 
-            # 기동 직후 잔류 구버전 업데이트 큐를 먼저 비운 뒤 기동 메시지 전송
             if not self._stale_flushed:
                 await self._flush_stale_updates_on_startup()
 
