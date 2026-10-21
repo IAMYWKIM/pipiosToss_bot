@@ -2,7 +2,8 @@
 """
 # MODIFIED: toss_api.py
 토스증권(Toss) Open API v1.2.14 방탄 클라이언트, GlobalThrottle 중앙 통제기,
-_HybridFileLock 하이브리드 파일 락 및 AssassinLedger 듀얼 스나이퍼 원자적 원장 코어 (Step 01 / 03)
+_HybridFileLock 하이브리드 파일 락 및 AssassinLedger 듀얼 스나이퍼 원자적 원장 코어 (Step 01 / 01)
+- MODIFIED: safe_float() 및 format_us_order_price() 내부 들여쓰기(PEP8 8-Space) 무결성 교정 완료
 - NEW: main.py 및 전술 플러그인과 100% 호환되는 AssassinLedger 클래스 탑재 (ImportError 완벽 소각)
 - 제1헌법: 모든 동기 I/O(파일, HTTP)의 asyncio.to_thread 비동기 격리 및 GlobalThrottle / _HybridFileLock 통제
 - 제2헌법: GET /api/v1/accounts 호출을 통한 종합매매(BROKERAGE) accountSeq 메모리 락온 및 X-Tossinvest-Account 주입
@@ -55,7 +56,7 @@ def safe_float(val: Any, default: float = 0.0) -> float:
     if val is None or isinstance(val, bool):
         return float(default)
     try:
-         cleaned = str(val).replace(",", "").replace("$", "").strip()
+        cleaned = str(val).replace(",", "").replace("$", "").strip()
         if not cleaned:
             return float(default)
         res = float(cleaned)
@@ -101,9 +102,17 @@ def _autoload_dotenv_files(override: bool = False) -> None:
                     k, v = line.split("=", 1)
                     key = k.strip()
                     val = v.strip()
-                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                    if (
+                        len(val) >= 2
+                        and val[0] == val[-1]
+                        and val[0] in ("'", '"')
+                    ):
                         val = val[1:-1]
-                    if key and (override or key not in os.environ or not os.environ.get(key)):
+                    if key and (
+                        override
+                        or key not in os.environ
+                        or not os.environ.get(key)
+                    ):
                         os.environ[key] = val
         except Exception as exc:
             logger.debug(".env 로드 예외(%s): %s", env_path, exc)
@@ -118,7 +127,9 @@ def generate_client_order_id(prefix: str = "SNP") -> str:
     토스증권 주문 생성 시 최대 36자 영숫자 및 '-', '_' 규칙(^[a-zA-Z0-9\\-_]+$)을 만족하는
     고유 멱등성 키(clientOrderId)를 생성한다.
     """
-    clean_prefix = re.sub(r"[^a-zA-Z0-9]", "", str(prefix or "SNP"))[:8] or "SNP"
+    clean_prefix = (
+        re.sub(r"[^a-zA-Z0-9]", "", str(prefix or "SNP"))[:8] or "SNP"
+    )
     ts_ms = int(time.time() * 1000) % 1000000000
     rand_hex = uuid.uuid4().hex[:12]
     cid = f"{clean_prefix}-{ts_ms}-{rand_hex}"
@@ -128,12 +139,12 @@ def generate_client_order_id(prefix: str = "SNP") -> str:
 def format_us_order_price(price: float) -> str:
     """
     API.txt OrderCreateRequest / OrderModifyRequest 가격 포맷 규격:
-    - US 주식 $1 이상: 소수점 둘째 자리까지 (불필요한 후행 0 제거 또는 표준 소수 문자열)
+    - US 주식 $1 이상: 소수점 둘째 자리까지
     - US 주식 $1 미만: 소수점 넷째 자리까지
     """
     p = max(0.0001, safe_float(price, 0.0))
     if p >= 1.0:
-         floored = math.floor((p + 1e-9) * 100.0) / 100.0
+        floored = math.floor((p + 1e-9) * 100.0) / 100.0
         return f"{floored:.2f}"
     floored_sub = math.floor((p + 1e-9) * 10000.0) / 10000.0
     return f"{floored_sub:.4f}"
@@ -142,7 +153,7 @@ def format_us_order_price(price: float) -> str:
 # ---------------------------------------------------------------------------
 # Case 21 : 4xx 비즈니스/클라이언트 에러 즉시 탈출용 예외 클래스
 # ---------------------------------------------------------------------------
-class _NonRetryableApiError( RuntimeError):
+class _NonRetryableApiError(RuntimeError):
     """
     Case 21: 400, 403, 404, 409, 415, 422 등 재시도해도 결과가 같거나
     즉각적인 분기 처리가 필요한 4xx 에러 발생 시 백오프 없이 즉시 탈출하기 위한 예외.
@@ -545,7 +556,9 @@ class TossApiClient:
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
             }
-            resp = self._session.post(url, headers=headers, data=data, timeout=10.0)
+            resp = self._session.post(
+                url, headers=headers, data=data, timeout=10.0
+            )
             if resp.status_code != 200:
                 try:
                     err_j = resp.json()
@@ -570,7 +583,11 @@ class TossApiClient:
     # -----------------------------------------------------------------------
     def _ensure_account_seq_sync(self, force_refresh: bool = False) -> int:
         with self._auth_lock:
-            if not force_refresh and self._account_seq is not None and self._account_seq > 0:
+            if (
+                not force_refresh
+                and self._account_seq is not None
+                and self._account_seq > 0
+            ):
                 return self._account_seq
 
             env_seq = safe_int(os.getenv("TOSS_ACCOUNT_SEQ"), 0)
@@ -649,7 +666,7 @@ class TossApiClient:
 
         for attempt in range(len(backoff_delays) + 1):
             try:
-                token = self._ensure_token_sync(force_refresh=(attempt > 0 and False))
+                token = self._ensure_token_sync(force_refresh=False)
                 headers: Dict[str, str] = {
                     "Authorization": f"Bearer {token}",
                     "Accept": "application/json",
@@ -715,7 +732,8 @@ class TossApiClient:
                 # 429 Rate Limit 또는 5xx 서버 오류 시 지수 백오프
                 if resp.status_code == 429:
                     retry_after = safe_float(
-                        resp.headers.get("Retry-After"), backoff_delays[min(attempt, 2)]
+                        resp.headers.get("Retry-After"),
+                        backoff_delays[min(attempt, 2)],
                     )
                     time.sleep(max(0.2, min(retry_after, 3.0)))
                     continue
@@ -837,11 +855,11 @@ class TossApiClient:
         ob = await self.get_orderbook(symbol)
         asks = ob.get("asks") if isinstance(ob, dict) else []
         if isinstance(asks, list) and asks:
-            # asks 는 낮은 가격순 정렬이나 안전을 위해 양수 최소값 추출
             valid_asks = [
                 safe_float(a.get("price"), 0.0)
                 for a in asks
-                if isinstance(a, dict) and safe_float(a.get("price"), 0.0) > 0.0
+                if isinstance(a, dict)
+                and safe_float(a.get("price"), 0.0) > 0.0
             ]
             if valid_asks:
                 return min(valid_asks)
@@ -881,7 +899,9 @@ class TossApiClient:
         )
         if isinstance(res, dict):
             c_list = (
-                res.get("candles") if isinstance(res.get("candles"), list) else []
+                res.get("candles")
+                if isinstance(res.get("candles"), list)
+                else []
             )
             next_b = res.get("nextBefore")
             return c_list, (str(next_b) if next_b else None)
@@ -989,8 +1009,12 @@ class TossApiClient:
                             mv_obj.get("purchaseAmount"), 0.0
                         ),
                         "market_value": safe_float(mv_obj.get("amount"), 0.0),
-                        "profit_loss_usd": safe_float(pl_obj.get("amount"), 0.0),
-                        "profit_loss_rate": safe_float(pl_obj.get("rate"), 0.0)
+                        "profit_loss_usd": safe_float(
+                            pl_obj.get("amount"), 0.0
+                        ),
+                        "profit_loss_rate": safe_float(
+                            pl_obj.get("rate"), 0.0
+                        )
                         * 100.0,
                     }
         except Exception as exc:
@@ -1263,7 +1287,11 @@ class TossApiClient:
             )
             return res if isinstance(res, dict) else {"orderId": oid}
         except _NonRetryableApiError as exc:
-            if exc.error_code in ("already-canceled", "already-filled", "order-not-found"):
+            if exc.error_code in (
+                "already-canceled",
+                "already-filled",
+                "order-not-found",
+            ):
                 return {"orderId": oid, "status": exc.error_code}
             raise
 
@@ -1284,7 +1312,11 @@ class TossApiClient:
         with self._cal_lock:
             if (
                 self._cal_cache.get("date") == target_date
-                and (time.monotonic() - safe_float(self._cal_cache.get("updated_mono"), 0.0)) < 30.0
+                and (
+                    time.monotonic()
+                    - safe_float(self._cal_cache.get("updated_mono"), 0.0)
+                )
+                < 30.0
                 and self._cal_cache.get("data")
             ):
                 return dict(self._cal_cache["data"])
