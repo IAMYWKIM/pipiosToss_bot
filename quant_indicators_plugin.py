@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-# NEW: quant_indicators_plugin.py
-100% 벡터화 퀀트 지표 연산 및 0.0ms 실시간 틱 합성 플러그인 (Step 02 / 10)
-- 제3헌법 & 벡터화 강제: Pandas/NumPy 벡터 연산 기반 VWAP, Wilder's RSI(14), Heikin-Ashi 산출
+# MODIFIED: quant_indicators_plugin.py
+100% 벡터화 퀀트 지표 연산 및 0.0ms 실시간 틱 하이킨 아시 합성 플러그인 (Step 01 / 04)
+- MODIFIED: RSI(1m) 자료 미사용 결정에 따라 Wilder's RSI(1m) 연산 및 상태를 전면 폐기(소각)하여 연산 속도 극대화
+- NEW: /avwap 레이더 보드의 '🌅 프리장' 및 '🔥 정규장' 개별 팩트 고가/저가/진폭(pre_high, pre_low, pre_amp_pct,
+  reg_high, reg_low, reg_amp_pct) 벡터 추출 및 실시간 틱 갱신 추가
+- NEW: /sync 듀얼 지시서의 금일 고가/저가 전일 대비 등락률(%) 표출을 위해 직전 확정 일봉 종가(prev_close) 및
+  세션별 5MA 예상 밴드(pre_exp_high/low, reg_exp_high/low) 산출 추가
+- 제3헌법 & 벡터화 강제: Pandas/NumPy 벡터 연산 기반 VWAP 및 Heikin-Ashi 산출
 - 제4헌법 & Case 01, 08: 모든 시계열 인덱스를 ZoneInfo('America/New_York') 단일 타임존으로 락온
-- 🎯 1 & 🎯 3: 데이장(19:00 ~ 19:07 EST) VWAP_1907 및 프리장(04:00 ~ 04:07 EST) VWAP_0407 초기 이격도,
-  실시간 동적 누적 VWAP_t, -0.50% 언더슈팅 매수 덫(VWAP_t * 0.9950), 하이브리드 덫 단가 산출
-- 🎯 4: +1.00% 하드보존 트레일링용 0.0ms 실시간 틱 하이킨 아시(🕯️HA양봉 / 🌑HA음봉) 합성
-- Case 39, 40, 47, 55, 56: 5MA(당일 미완성 일봉 배제) 예상 밴드 및 당일 세션(19:00 EST~) 고/저가 집계
 """
 
 from __future__ import annotations
@@ -15,12 +16,12 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 from toss_api import EST_TZ, safe_float
+
 
 # ---------------------------------------------------------------------------
 # 논리적 거래일(18:00 / 19:00 EST 롤오버) 및 세션 경계 시각 산출 유틸리티 (Case 01)
@@ -58,19 +59,37 @@ def get_session_anchor_datetimes(
     """
     dt = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     logical_date_str = get_logical_trading_date_str(dt, rollover_hour=18)
-    trade_day = datetime.strptime(logical_date_str, "%Y-%m-%d").replace(tzinfo=EST_TZ)
+    trade_day = datetime.strptime(logical_date_str, "%Y-%m-%d").replace(
+        tzinfo=EST_TZ
+    )
     prev_day = trade_day - timedelta(days=1)
 
     return {
         "trade_day": trade_day,
-        "day_start": prev_day.replace(hour=19, minute=0, second=0, microsecond=0),
-        "day_1907_end": prev_day.replace(hour=19, minute=7, second=59, microsecond=999999),
-        "day_end": trade_day.replace(hour=3, minute=59, second=59, microsecond=999999),
-        "pre_start": trade_day.replace(hour=4, minute=0, second=0, microsecond=0),
-        "pre_0407_end": trade_day.replace(hour=4, minute=7, second=59, microsecond=999999),
-        "pre_end": trade_day.replace(hour=9, minute=29, second=59, microsecond=999999),
-        "reg_start": trade_day.replace(hour=9, minute=30, second=0, microsecond=0),
-        "reg_end": trade_day.replace(hour=15, minute=59, second=59, microsecond=999999),
+        "day_start": prev_day.replace(
+            hour=19, minute=0, second=0, microsecond=0
+        ),
+        "day_1907_end": prev_day.replace(
+            hour=19, minute=7, second=59, microsecond=999999
+        ),
+        "day_end": trade_day.replace(
+            hour=3, minute=59, second=59, microsecond=999999
+        ),
+        "pre_start": trade_day.replace(
+            hour=4, minute=0, second=0, microsecond=0
+        ),
+        "pre_0407_end": trade_day.replace(
+            hour=4, minute=7, second=59, microsecond=999999
+        ),
+        "pre_end": trade_day.replace(
+            hour=9, minute=29, second=59, microsecond=999999
+        ),
+        "reg_start": trade_day.replace(
+            hour=9, minute=30, second=0, microsecond=0
+        ),
+        "reg_end": trade_day.replace(
+            hour=15, minute=59, second=59, microsecond=999999
+        ),
     }
 
 
@@ -88,7 +107,14 @@ def candles_to_est_dataframe(candles: List[Dict[str, Any]]) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(candles)
-    required_cols = {"timestamp", "openPrice", "highPrice", "lowPrice", "closePrice", "volume"}
+    required_cols = {
+        "timestamp",
+        "openPrice",
+        "highPrice",
+        "lowPrice",
+        "closePrice",
+        "volume",
+    }
     if not required_cols.issubset(set(df.columns)):
         return pd.DataFrame(
             columns=["open", "high", "low", "close", "volume", "tp", "pv"]
@@ -96,7 +122,9 @@ def candles_to_est_dataframe(candles: List[Dict[str, Any]]) -> pd.DataFrame:
 
     ts_series = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.assign(dt_est=ts_series.dt.tz_convert(EST_TZ))
-    df = df.dropna(subset=["dt_est"]).drop_duplicates(subset=["dt_est"], keep="first")
+    df = df.dropna(subset=["dt_est"]).drop_duplicates(
+        subset=["dt_est"], keep="first"
+    )
     if df.empty:
         return pd.DataFrame(
             columns=["open", "high", "low", "close", "volume", "tp", "pv"]
@@ -104,11 +132,27 @@ def candles_to_est_dataframe(candles: List[Dict[str, Any]]) -> pd.DataFrame:
 
     df = df.sort_values("dt_est", ascending=True).set_index("dt_est")
 
-    open_s = pd.to_numeric(df["openPrice"], errors="coerce").fillna(0.0).astype(float)
-    high_s = pd.to_numeric(df["highPrice"], errors="coerce").fillna(0.0).astype(float)
-    low_s = pd.to_numeric(df["lowPrice"], errors="coerce").fillna(0.0).astype(float)
-    close_s = pd.to_numeric(df["closePrice"], errors="coerce").fillna(0.0).astype(float)
-    vol_s = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).astype(float)
+    open_s = (
+        pd.to_numeric(df["openPrice"], errors="coerce")
+        .fillna(0.0)
+        .astype(float)
+    )
+    high_s = (
+        pd.to_numeric(df["highPrice"], errors="coerce")
+        .fillna(0.0)
+        .astype(float)
+    )
+    low_s = (
+        pd.to_numeric(df["lowPrice"], errors="coerce").fillna(0.0).astype(float)
+    )
+    close_s = (
+        pd.to_numeric(df["closePrice"], errors="coerce")
+        .fillna(0.0)
+        .astype(float)
+    )
+    vol_s = (
+        pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).astype(float)
+    )
 
     # 대표가격 TP = (H + L + C) / 3.0, 거래량 0인 봉은 1.0 등가중 폴백 (🎯 3)
     tp_s = (high_s + low_s + close_s) / 3.0
@@ -130,85 +174,6 @@ def candles_to_est_dataframe(candles: List[Dict[str, Any]]) -> pd.DataFrame:
     )
     out_df = out_df[out_df["close"] > 0.0]
     return out_df
-
-
-# ---------------------------------------------------------------------------
-# Wilder's RSI(14) 벡터 연산 및 0.0ms 실시간 틱 RSI 합성기
-# ---------------------------------------------------------------------------
-def compute_wilders_rsi_vectorized(
-    close_series: pd.Series, period: int = 14
-) -> Tuple[float, Dict[str, float]]:
-    """
-    Wilder's Smoothing (alpha = 1 / period) 기반 RSI(14)를 100% 벡터 연산으로 산출하고,
-    직전 확정 분봉(iloc[-2]) 기준 ewm_state(prev_close, avg_gain, avg_loss)를 함께 반환한다.
-    """
-    default_state = {
-        "prev_close": 0.0,
-        "avg_gain": 0.0,
-        "avg_loss": 0.0,
-        "period": float(period),
-    }
-    if close_series is None or len(close_series) < 2:
-        return 50.0, default_state
-
-    closes = close_series.astype(float)
-    delta = closes.diff()
-    gains = delta.clip(lower=0.0).fillna(0.0)
-    losses = (-delta.clip(upper=0.0)).fillna(0.0)
-
-    avg_gain_s = gains.ewm(alpha=1.0 / float(period), adjust=False).mean()
-    avg_loss_s = losses.ewm(alpha=1.0 / float(period), adjust=False).mean()
-
-    last_ag = float(avg_gain_s.iloc[-1])
-    last_al = float(avg_loss_s.iloc[-1])
-    if last_al <= 1e-12:
-        rsi_val = 100.0 if last_ag > 0.0 else 50.0
-    else:
-        rs = last_ag / last_al
-        rsi_val = 100.0 - (100.0 / (1.0 + rs))
-
-    # 실시간 틱 보정을 위해 직전 확정 봉(iloc[-2]) 기저 저장
-    idx_base = -2 if len(closes) >= 2 else -1
-    state = {
-        "prev_close": float(closes.iloc[idx_base]),
-        "avg_gain": float(avg_gain_s.iloc[idx_base]),
-        "avg_loss": float(avg_loss_s.iloc[idx_base]),
-        "period": float(period),
-    }
-    return round(float(rsi_val), 2), state
-
-
-def compute_realtime_tick_rsi(
-    ewm_state: Optional[Dict[str, Any]], live_price: float
-) -> float:
-    """
-    직전 확정 분봉의 Wilder's EWM 기저(ewm_state)에 실시간 현재가(live_price)를 결합하여
-    0.0ms 지연으로 실시간 틱 RSI(14)를 산출한다.
-    """
-    lp = safe_float(live_price, 0.0)
-    if not isinstance(ewm_state, dict) or lp <= 0.0:
-        return 50.0
-
-    prev_c = safe_float(ewm_state.get("prev_close"), 0.0)
-    prev_ag = safe_float(ewm_state.get("avg_gain"), 0.0)
-    prev_al = safe_float(ewm_state.get("avg_loss"), 0.0)
-    period = max(2.0, safe_float(ewm_state.get("period"), 14.0))
-
-    if prev_c <= 0.0:
-        return 50.0
-
-    diff = lp - prev_c
-    cur_gain = diff if diff > 0.0 else 0.0
-    cur_loss = -diff if diff < 0.0 else 0.0
-
-    alpha = 1.0 / period
-    live_ag = (prev_ag * (1.0 - alpha)) + (cur_gain * alpha)
-    live_al = (prev_al * (1.0 - alpha)) + (cur_loss * alpha)
-
-    if live_al <= 1e-12:
-        return 100.0 if live_ag > 0.0 else 50.0
-    rs = live_ag / live_al
-    return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +210,6 @@ def compute_heikin_ashi_state(df: pd.DataFrame) -> Dict[str, Any]:
     ha_open_arr = np.empty(n, dtype=float)
     ha_open_arr[0] = (o_arr[0] + c_arr[0]) * 0.5
 
-    # NumPy 배열 상에서 1차 선형 점화식 고속 연산
     for i in range(1, n):
         ha_open_arr[i] = (ha_open_arr[i - 1] + ha_close_arr[i - 1]) * 0.5
 
@@ -286,6 +250,8 @@ def compute_realtime_tick_heikin_ashi(
             "is_ha_bull": False,
             "is_raw_bull": False,
             "cur_open": lp,
+            "cur_high": lp,
+            "cur_low": lp,
         }
 
     prev_ha_o = safe_float(ha_state.get("prev_ha_open"), lp)
@@ -325,6 +291,32 @@ def _calc_vwap_from_slice(df_slice: pd.DataFrame) -> Tuple[float, float, float]:
     return cum_pv / cum_vol, cum_pv, cum_vol
 
 
+def _calc_high_low_amp_from_slice(
+    df_slice: pd.DataFrame, in_session: bool, live_price: float
+) -> Tuple[float, float, float]:
+    """
+    # NEW: 특정 세션(데이장/프리장/정규장) 슬라이스의 팩트 고가, 저가, 진폭(%)을 산출한다.
+    세션 시작 전이거나 데이터가 없으면 (0.0, 0.0, 0.0)을 반환한다.
+    """
+    if df_slice is None or df_slice.empty:
+        if in_session and live_price > 0.0:
+            return live_price, live_price, 0.0
+        return 0.0, 0.0, 0.0
+
+    s_high = float(df_slice["high"].max())
+    s_low = float(df_slice["low"].min())
+    if in_session and live_price > 0.0:
+        s_high = max(s_high, live_price)
+        s_low = min(s_low, live_price) if s_low > 0.0 else live_price
+
+    s_amp = (
+        ((s_high - s_low) / s_low) * 100.0
+        if (s_low > 0.0 and s_high >= s_low)
+        else 0.0
+    )
+    return s_high, s_low, s_amp
+
+
 def compute_session_vwap_metrics(
     candles: List[Dict[str, Any]],
     live_price: float = 0.0,
@@ -333,8 +325,8 @@ def compute_session_vwap_metrics(
     """
     🎯 1 & 🎯 3 & Case 97 ~ 101:
     400개 다중 페이지 1분봉 시계열과 실시간 현재가(live_price)를 결합하여
-    데이장 [모의], 03:58 1주 휩소, 프리장 [실전], 정규장 VWAP 탈출에 필요한 모든 지표를
-    100% 벡터 연산으로 일괄 산출한다.
+    데이장 [모의], 03:58 1주 휩소, 프리장 [실전], 정규장 VWAP 탈출 및 텔레그램 보드에 필요한 모든 지표를
+    100% 벡터 연산으로 일괄 산출한다 (RSI(1m) 연산 전면 폐기 완료).
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     anchors = get_session_anchor_datetimes(dt_now)
@@ -344,6 +336,11 @@ def compute_session_vwap_metrics(
     if lp <= 0.0 and not df.empty:
         lp = float(df["close"].iloc[-1])
 
+    hm = dt_now.hour * 100 + dt_now.minute
+    in_day_session = bool(hm >= 1900 or hm <= 359)
+    in_pre_session = bool(400 <= hm <= 929)
+    in_reg_session = bool(930 <= hm <= 1559)
+
     # 1. 데이장 (19:00 ~ 03:59 EST) 슬라이스 및 초기 7분(19:00 ~ 19:07 EST) VWAP_1907
     df_day = (
         df[(df.index >= anchors["day_start"]) & (df.index <= anchors["day_end"])]
@@ -351,12 +348,17 @@ def compute_session_vwap_metrics(
         else pd.DataFrame()
     )
     df_day_1907 = (
-        df[(df.index >= anchors["day_start"]) & (df.index <= anchors["day_1907_end"])]
+        df[
+            (df.index >= anchors["day_start"])
+            & (df.index <= anchors["day_1907_end"])
+        ]
         if not df.empty
         else pd.DataFrame()
     )
     vwap_1907, _, _ = _calc_vwap_from_slice(df_day_1907)
-    c_1907 = float(df_day_1907["close"].iloc[-1]) if not df_day_1907.empty else 0.0
+    c_1907 = (
+        float(df_day_1907["close"].iloc[-1]) if not df_day_1907.empty else 0.0
+    )
     disp_1907 = (
         ((c_1907 - vwap_1907) / vwap_1907) * 100.0
         if (vwap_1907 > 0.0 and c_1907 > 0.0)
@@ -364,9 +366,6 @@ def compute_session_vwap_metrics(
     )
 
     day_vwap, day_cum_pv, day_cum_vol = _calc_vwap_from_slice(df_day)
-    # 데이장 진행 중 실시간 현재가(lp) 틱 보정
-    hm = dt_now.hour * 100 + dt_now.minute
-    in_day_session = bool(hm >= 1900 or hm <= 359)
     if in_day_session and lp > 0.0:
         if day_cum_vol > 0.0:
             day_vwap = (day_cum_pv + lp) / (day_cum_vol + 1.0)
@@ -382,7 +381,9 @@ def compute_session_vwap_metrics(
         else 0.0
     )
     day_dyn_trap_m050 = (
-        math.floor((day_vwap * 0.9950) * 100.0) / 100.0 if day_vwap > 0.0 else 0.0
+        math.floor((day_vwap * 0.9950) * 100.0) / 100.0
+        if day_vwap > 0.0
+        else 0.0
     )
     day_hyb_trap_m050 = (
         min(math.floor(vwap_1907 * 100.0) / 100.0, day_dyn_trap_m050)
@@ -390,7 +391,12 @@ def compute_session_vwap_metrics(
         else day_dyn_trap_m050
     )
     whipsaw_buy_p = (
-        math.floor((day_vwap / 1.005) * 100.0) / 100.0 if day_vwap > 0.0 else 0.0
+        math.floor((day_vwap / 1.005) * 100.0) / 100.0
+        if day_vwap > 0.0
+        else 0.0
+    )
+    day_high, day_low, day_amp_pct = _calc_high_low_amp_from_slice(
+        df_day, in_day_session, lp
     )
 
     # 2. 프리장 (04:00 ~ 09:29 EST) 슬라이스 및 초기 7분(04:00 ~ 04:07 EST) VWAP_0407
@@ -400,12 +406,17 @@ def compute_session_vwap_metrics(
         else pd.DataFrame()
     )
     df_pre_0407 = (
-        df[(df.index >= anchors["pre_start"]) & (df.index <= anchors["pre_0407_end"])]
+        df[
+            (df.index >= anchors["pre_start"])
+            & (df.index <= anchors["pre_0407_end"])
+        ]
         if not df.empty
         else pd.DataFrame()
     )
     vwap_0407, _, _ = _calc_vwap_from_slice(df_pre_0407)
-    c_0407 = float(df_pre_0407["close"].iloc[-1]) if not df_pre_0407.empty else 0.0
+    c_0407 = (
+        float(df_pre_0407["close"].iloc[-1]) if not df_pre_0407.empty else 0.0
+    )
     disp_0407 = (
         ((c_0407 - vwap_0407) / vwap_0407) * 100.0
         if (vwap_0407 > 0.0 and c_0407 > 0.0)
@@ -413,7 +424,6 @@ def compute_session_vwap_metrics(
     )
 
     pre_vwap, pre_cum_pv, pre_cum_vol = _calc_vwap_from_slice(df_pre)
-    in_pre_session = bool(400 <= hm <= 929)
     if in_pre_session and lp > 0.0:
         if pre_cum_vol > 0.0:
             pre_vwap = (pre_cum_pv + lp) / (pre_cum_vol + 1.0)
@@ -429,12 +439,17 @@ def compute_session_vwap_metrics(
         else 0.0
     )
     pre_dyn_trap_m050 = (
-        math.floor((pre_vwap * 0.9950) * 100.0) / 100.0 if pre_vwap > 0.0 else 0.0
+        math.floor((pre_vwap * 0.9950) * 100.0) / 100.0
+        if pre_vwap > 0.0
+        else 0.0
     )
     pre_hyb_trap_m050 = (
         min(math.floor(vwap_0407 * 100.0) / 100.0, pre_dyn_trap_m050)
         if vwap_0407 > 0.0 and pre_dyn_trap_m050 > 0.0
         else pre_dyn_trap_m050
+    )
+    pre_high, pre_low, pre_amp_pct = _calc_high_low_amp_from_slice(
+        df_pre, in_pre_session, lp
     )
 
     # 3. 정규장 (09:30 ~ 15:59 EST) 슬라이스 및 누적 reg_vwap (15:00 ~ 15:58 VWAP_ESCAPE 용)
@@ -444,7 +459,6 @@ def compute_session_vwap_metrics(
         else pd.DataFrame()
     )
     reg_vwap, reg_cum_pv, reg_cum_vol = _calc_vwap_from_slice(df_reg)
-    in_reg_session = bool(930 <= hm <= 1559)
     if in_reg_session and lp > 0.0:
         if reg_cum_vol > 0.0:
             reg_vwap = (reg_cum_pv + lp) / (reg_cum_vol + 1.0)
@@ -456,31 +470,27 @@ def compute_session_vwap_metrics(
         if (reg_vwap > 0.0 and lp > 0.0)
         else 0.0
     )
-
-    # 4. Wilder's RSI(14) 및 하이킨 아시 기저 추출
-    rsi_1m, rsi_ewm_state = (
-        compute_wilders_rsi_vectorized(df["close"], period=14)
-        if not df.empty
-        else (50.0, {"prev_close": lp, "avg_gain": 0.0, "avg_loss": 0.0, "period": 14.0})
-    )
-    live_rsi = (
-        compute_realtime_tick_rsi(rsi_ewm_state, lp) if lp > 0.0 else rsi_1m
+    reg_high, reg_low, reg_amp_pct = _calc_high_low_amp_from_slice(
+        df_reg, in_reg_session, lp
     )
 
+    # 4. 하이킨 아시(Heikin-Ashi) 1분봉 기저 및 실시간 틱 합성
     ha_state = compute_heikin_ashi_state(df)
     live_ha = compute_realtime_tick_heikin_ashi(ha_state, lp)
 
-    # 5. 당일 세션(19:00 EST ~) 통합 고가 / 저가 / 진폭 집계 (Case 40, /sync 보드용)
+    # 5. 당일 전체 세션(19:00 EST ~) 통합 고가 / 저가 / 진폭 집계 (Case 40, /sync 보드용)
     df_full_session = (
         df[df.index >= anchors["day_start"]] if not df.empty else pd.DataFrame()
     )
     if not df_full_session.empty:
+        sess_open = float(df_full_session["open"].iloc[0])
         sess_high = float(df_full_session["high"].max())
         sess_low = float(df_full_session["low"].min())
         if lp > 0.0:
             sess_high = max(sess_high, lp)
             sess_low = min(sess_low, lp) if sess_low > 0.0 else lp
     else:
+        sess_open = lp
         sess_high = lp
         sess_low = lp
 
@@ -504,6 +514,9 @@ def compute_session_vwap_metrics(
         "day_dyn_trap_m050": day_dyn_trap_m050,
         "day_hyb_trap_m050": day_hyb_trap_m050,
         "whipsaw_buy_p": whipsaw_buy_p,
+        "day_high": round(day_high, 4),
+        "day_low": round(day_low, 4),
+        "day_amp_pct": round(day_amp_pct, 2),
         # 프리장 [실전] 지표
         "vwap_0407": round(vwap_0407, 4),
         "c_0407": round(c_0407, 4),
@@ -514,22 +527,26 @@ def compute_session_vwap_metrics(
         "pre_disp_curr": round(pre_disp_curr, 3),
         "pre_dyn_trap_m050": pre_dyn_trap_m050,
         "pre_hyb_trap_m050": pre_hyb_trap_m050,
+        "pre_high": round(pre_high, 4),
+        "pre_low": round(pre_low, 4),
+        "pre_amp_pct": round(pre_amp_pct, 2),
         # 정규장 지표
         "reg_vwap": round(reg_vwap, 4),
         "reg_cum_pv": reg_cum_pv,
         "reg_cum_vol": reg_cum_vol,
         "reg_disp_curr": round(reg_disp_curr, 3),
-        # RSI 및 하이킨 아시 기저
-        "rsi_1m": rsi_1m,
-        "live_rsi": live_rsi,
-        "rsi_ewm_state": rsi_ewm_state,
+        "reg_high": round(reg_high, 4),
+        "reg_low": round(reg_low, 4),
+        "reg_amp_pct": round(reg_amp_pct, 2),
+        # 하이킨 아시(Heikin-Ashi) 1분봉 기저 및 실시간 상태
         "ha_state": ha_state,
         "is_ha_bull": bool(live_ha["is_ha_bull"]),
         "is_raw_bull": bool(live_ha["is_raw_bull"]),
         "ha_open": live_ha["ha_open"],
         "ha_close": live_ha["ha_close"],
         "cur_bar_open": live_ha["cur_open"],
-        # 당일 세션 고가/저가/진폭
+        # 당일 통합 세션(19:00 EST~) 시가/고가/저가/진폭
+        "session_open": round(sess_open, 4),
         "session_high": round(sess_high, 4),
         "session_low": round(sess_low, 4),
         "session_amp_pct": round(sess_amp_pct, 2),
@@ -545,8 +562,8 @@ def refresh_metrics_with_live_tick(
     """
     5.0초 캔들 폴링 사이의 0.4초 고주파 부스터 틱마다 호출되어,
     실시간 현재가(live_price)를 반영한 동적 VWAP_t, 실시간 이격도(disp_curr),
-    -0.50% 매수 덫 단가, 실시간 틱 RSI, 실시간 틱 하이킨 아시(🕯️HA양봉/🌑HA음봉)를
-    0.0ms 에 즉시 재합성한다.
+    -0.50% 매수 덫 단가, 세션별 고가/저가, 실시간 틱 하이킨 아시(🕯️HA양봉/🌑HA음봉)를
+    0.0ms 에 즉시 재합성한다 (RSI(1m) 연산 전면 폐기 완료).
     """
     lp = safe_float(live_price, 0.0)
     if not isinstance(cached_metrics, dict):
@@ -559,13 +576,21 @@ def refresh_metrics_with_live_tick(
     m = dict(cached_metrics)
     m["live_price"] = lp
 
-    # 데이장 동적 VWAP 및 이격도 즉시 갱신
+    # 데이장 동적 VWAP 및 고저가 즉시 갱신
     day_pv = safe_float(m.get("day_cum_pv"), 0.0)
     day_vol = safe_float(m.get("day_cum_vol"), 0.0)
     day_vwap = safe_float(m.get("day_vwap"), 0.0)
     if hm >= 1900 or hm <= 359:
         day_vwap = (day_pv + lp) / (day_vol + 1.0) if day_vol > 0.0 else lp
         m["day_vwap"] = round(day_vwap, 4)
+        dh = max(safe_float(m.get("day_high"), lp), lp)
+        dl_prev = safe_float(m.get("day_low"), lp)
+        dl = min(dl_prev, lp) if dl_prev > 0.0 else lp
+        m["day_high"] = round(dh, 4)
+        m["day_low"] = round(dl, 4)
+        m["day_amp_pct"] = (
+            round(((dh - dl) / dl) * 100.0, 2) if dl > 0.0 and dh >= dl else 0.0
+        )
     if day_vwap > 0.0:
         m["day_disp_curr"] = round(((lp - day_vwap) / day_vwap) * 100.0, 3)
         m["day_dyn_trap_m050"] = math.floor((day_vwap * 0.9950) * 100.0) / 100.0
@@ -577,13 +602,21 @@ def refresh_metrics_with_live_tick(
         )
         m["whipsaw_buy_p"] = math.floor((day_vwap / 1.005) * 100.0) / 100.0
 
-    # 프리장 동적 VWAP 및 이격도 즉시 갱신
+    # 프리장 동적 VWAP 및 고저가 즉시 갱신
     pre_pv = safe_float(m.get("pre_cum_pv"), 0.0)
     pre_vol = safe_float(m.get("pre_cum_vol"), 0.0)
     pre_vwap = safe_float(m.get("pre_vwap"), 0.0)
     if 400 <= hm <= 929:
         pre_vwap = (pre_pv + lp) / (pre_vol + 1.0) if pre_vol > 0.0 else lp
         m["pre_vwap"] = round(pre_vwap, 4)
+        ph = max(safe_float(m.get("pre_high"), lp), lp)
+        pl_prev = safe_float(m.get("pre_low"), lp)
+        pl = min(pl_prev, lp) if pl_prev > 0.0 else lp
+        m["pre_high"] = round(ph, 4)
+        m["pre_low"] = round(pl, 4)
+        m["pre_amp_pct"] = (
+            round(((ph - pl) / pl) * 100.0, 2) if pl > 0.0 and ph >= pl else 0.0
+        )
     if pre_vwap > 0.0:
         m["pre_disp_curr"] = round(((lp - pre_vwap) / pre_vwap) * 100.0, 3)
         m["pre_dyn_trap_m050"] = math.floor((pre_vwap * 0.9950) * 100.0) / 100.0
@@ -594,18 +627,25 @@ def refresh_metrics_with_live_tick(
             else m["pre_dyn_trap_m050"]
         )
 
-    # 정규장 동적 VWAP 즉시 갱신
+    # 정규장 동적 VWAP 및 고저가 즉시 갱신
     reg_pv = safe_float(m.get("reg_cum_pv"), 0.0)
     reg_vol = safe_float(m.get("reg_cum_vol"), 0.0)
     reg_vwap = safe_float(m.get("reg_vwap"), 0.0)
     if 930 <= hm <= 1559:
         reg_vwap = (reg_pv + lp) / (reg_vol + 1.0) if reg_vol > 0.0 else lp
         m["reg_vwap"] = round(reg_vwap, 4)
+        rh = max(safe_float(m.get("reg_high"), lp), lp)
+        rl_prev = safe_float(m.get("reg_low"), lp)
+        rl = min(rl_prev, lp) if rl_prev > 0.0 else lp
+        m["reg_high"] = round(rh, 4)
+        m["reg_low"] = round(rl, 4)
+        m["reg_amp_pct"] = (
+            round(((rh - rl) / rl) * 100.0, 2) if rl > 0.0 and rh >= rl else 0.0
+        )
     if reg_vwap > 0.0:
         m["reg_disp_curr"] = round(((lp - reg_vwap) / reg_vwap) * 100.0, 3)
 
-    # 실시간 틱 RSI & 틱 하이킨 아시 즉시 합성
-    m["live_rsi"] = compute_realtime_tick_rsi(m.get("rsi_ewm_state"), lp)
+    # 실시간 틱 하이킨 아시 즉시 합성
     live_ha = compute_realtime_tick_heikin_ashi(m.get("ha_state"), lp)
     m["is_ha_bull"] = bool(live_ha["is_ha_bull"])
     m["is_raw_bull"] = bool(live_ha["is_raw_bull"])
@@ -613,7 +653,7 @@ def refresh_metrics_with_live_tick(
     m["ha_close"] = live_ha["ha_close"]
     m["cur_bar_open"] = live_ha["cur_open"]
 
-    # 세션 고가/저가 갱신
+    # 통합 세션 고가/저가 갱신
     sh = max(safe_float(m.get("session_high"), lp), lp)
     sl_prev = safe_float(m.get("session_low"), lp)
     sl = min(sl_prev, lp) if sl_prev > 0.0 else lp
@@ -639,7 +679,6 @@ def select_vwap_trend_leader(
     양쪽에서 100% 동일한 공식으로 추세추종 주도주(leader_sym)를 선정한다.
     - 조건: C_init > VWAP_init (disp_init > 0.0%)
     - 양쪽 모두 disp_init > 0.0% 만족 시 초기 이격도(disp_init)가 더 큰 상위 1위 종목 선정
-    - 만약 04:07 / 19:07 시점 봉이 누락되어 초기값이 0.0이면 현재 동적 VWAP 대비 이격도로 폴백
     """
     is_day = str(session_mode or "PRE").upper().startswith("DAY")
     vwap_key = "vwap_1907" if is_day else "vwap_0407"
@@ -673,7 +712,6 @@ def select_vwap_trend_leader(
             "reason": "NO_SYMBOL_ABOVE_VWAP",
         }
 
-    # 초기 이격도(disp_init) 내림차순 정렬 후 상위 1위 선정
     candidates.sort(key=lambda x: x[1], reverse=True)
     win_sym, win_disp, win_vwap, win_c = candidates[0]
     return {
@@ -686,7 +724,7 @@ def select_vwap_trend_leader(
 
 
 # ---------------------------------------------------------------------------
-# Case 39, 47, 55, 56 : 일봉 6개(count=6) 기반 5MA 진폭 및 예상 고/저가 밴드 연산
+# Case 39, 47, 55, 56 : 일봉 6개(count=6) 기반 5MA 진폭 · 예상 밴드 · 전일종가 등락률 연산
 # ---------------------------------------------------------------------------
 def compute_daily_5ma_and_expected_band(
     daily_candles: List[Dict[str, Any]],
@@ -698,8 +736,8 @@ def compute_daily_5ma_and_expected_band(
     """
     Case 39 & Case 47 & Case 55 & Case 56:
     토스 Open API 일봉 6개(count=6)에서 당일 미완성 일봉을 배제하고
-    직전 확정된 5영업일의 일평균 진폭(5MA, %)과 전일 진폭(yesterday_amp)을 산출하여,
-    당일 예상 고가/저가 밴드 및 장세(상승/하락/횡보)를 반환한다.
+    직전 확정된 5영업일의 일평균 진폭(5MA, %), 전일 진폭(yesterday_amp), 직전 확정 일봉 종가(prev_close)를
+    산출하여, 당일 예상 고가/저가 밴드 및 금일 고가/저가의 전일 종가 대비 등락률(%)을 반환한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     logical_today = get_logical_trading_date_str(dt_now, rollover_hour=18)
@@ -707,19 +745,28 @@ def compute_daily_5ma_and_expected_band(
     default_out = {
         "amp_5ma_pct": 6.50,
         "yesterday_amp_pct": 0.0,
+        "prev_close": live_price,
+        "high_chg_pct": 0.0,
+        "low_chg_pct": 0.0,
         "expected_high": max(session_high, live_price),
-        "expected_low": min(session_low, live_price) if session_low > 0 else live_price,
+        "expected_low": (
+            min(session_low, live_price) if session_low > 0 else live_price
+        ),
         "market_regime": "횡보장",
     }
     if not daily_candles or not isinstance(daily_candles, list):
         return default_out
 
     df_d = pd.DataFrame(daily_candles)
-    if not {"timestamp", "highPrice", "lowPrice", "closePrice"}.issubset(set(df_d.columns)):
+    if not {"timestamp", "highPrice", "lowPrice", "closePrice"}.issubset(
+        set(df_d.columns)
+    ):
         return default_out
 
     ts_s = pd.to_datetime(df_d["timestamp"], utc=True, errors="coerce")
-    df_d = df_d.assign(date_str=ts_s.dt.tz_convert(EST_TZ).dt.strftime("%Y-%m-%d"))
+    df_d = df_d.assign(
+        date_str=ts_s.dt.tz_convert(EST_TZ).dt.strftime("%Y-%m-%d")
+    )
     df_d = df_d.dropna(subset=["date_str"]).drop_duplicates(subset=["date_str"])
     df_d = df_d.sort_values("date_str", ascending=False)
 
@@ -728,9 +775,13 @@ def compute_daily_5ma_and_expected_band(
     if completed_df.empty:
         completed_df = df_d.iloc[1:6] if len(df_d) > 1 else df_d.head(5)
 
-    highs = pd.to_numeric(completed_df["highPrice"], errors="coerce").fillna(0.0)
+    highs = pd.to_numeric(completed_df["highPrice"], errors="coerce").fillna(
+        0.0
+    )
     lows = pd.to_numeric(completed_df["lowPrice"], errors="coerce").fillna(0.0)
-    closes = pd.to_numeric(completed_df["closePrice"], errors="coerce").fillna(0.0)
+    closes = pd.to_numeric(completed_df["closePrice"], errors="coerce").fillna(
+        0.0
+    )
     opens = (
         pd.to_numeric(completed_df["openPrice"], errors="coerce").fillna(closes)
         if "openPrice" in completed_df.columns
@@ -745,11 +796,13 @@ def compute_daily_5ma_and_expected_band(
     amp_5ma = float(amps.mean()) if not amps.empty else 6.50
     yest_amp = float(amps.iloc[0]) if not amps.empty else amp_5ma
 
-    # Case 56: 어제 등락 및 진폭 격차 기반 상승/하락/횡보장 판별
+    # Case 56: 어제 등락 기반 상승/하락/횡보장 판별 및 전일 종가(prev_close) 추출
     yest_open = float(opens[valid_mask].iloc[0])
     yest_close = float(closes[valid_mask].iloc[0])
     yest_chg_pct = (
-        ((yest_close - yest_open) / yest_open) * 100.0 if yest_open > 0.0 else 0.0
+        ((yest_close - yest_open) / yest_open) * 100.0
+        if yest_open > 0.0
+        else 0.0
     )
     if yest_chg_pct >= 1.0:
         regime = "상승장"
@@ -758,16 +811,48 @@ def compute_daily_5ma_and_expected_band(
     else:
         regime = "횡보장"
 
-    # Case 47: 5MA 기반 동적 예상 고가/저가 연산
-    eff_low = session_low if session_low > 0.0 else live_price
+    # 금일 세션 고가/저가의 전일 종가(yest_close) 대비 등락률(%) 산출 (/sync 보드용)
     eff_high = session_high if session_high > 0.0 else live_price
+    eff_low = session_low if session_low > 0.0 else live_price
+    high_chg_pct = (
+        ((eff_high - yest_close) / yest_close) * 100.0
+        if (yest_close > 0.0 and eff_high > 0.0)
+        else 0.0
+    )
+    low_chg_pct = (
+        ((eff_low - yest_close) / yest_close) * 100.0
+        if (yest_close > 0.0 and eff_low > 0.0)
+        else 0.0
+    )
+
+    # Case 47: 5MA 기반 동적 예상 고가/저가 연산
     exp_high = eff_low * (1.0 + (amp_5ma / 100.0)) if eff_low > 0.0 else 0.0
     exp_low = eff_high / (1.0 + (amp_5ma / 100.0)) if eff_high > 0.0 else 0.0
 
     return {
         "amp_5ma_pct": round(amp_5ma, 2),
         "yesterday_amp_pct": round(yest_amp, 2),
+        "prev_close": round(yest_close, 4),
+        "high_chg_pct": round(high_chg_pct, 2),
+        "low_chg_pct": round(low_chg_pct, 2),
         "expected_high": round(exp_high, 2),
         "expected_low": round(exp_low, 2),
         "market_regime": regime,
     }
+
+
+def calc_session_expected_band(
+    sess_high: float, sess_low: float, amp_5ma_pct: float
+) -> Tuple[float, float]:
+    """
+    # NEW: /avwap 레이더 보드의 프리장/정규장 세션별 팩트 고/저가와 5MA 진폭을 결합하여
+    해당 세션의 동적 예상 저가 ~ 예상 고가 밴드를 반환한다 (미개장 시 0.00, 0.00 반환).
+    """
+    sh = safe_float(sess_high, 0.0)
+    sl = safe_float(sess_low, 0.0)
+    amp = max(0.0, safe_float(amp_5ma_pct, 0.0))
+    if sh <= 0.0 or sl <= 0.0 or amp <= 0.0:
+        return 0.0, 0.0
+    exp_high = sl * (1.0 + (amp / 100.0))
+    exp_low = sh / (1.0 + (amp / 100.0))
+    return round(exp_low, 2), round(exp_high, 2)

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-# NEW: daymarket_sim_plugin.py
-데이장 (19:00 ~ 03:57 EST) 100% [모의] 전용 프리장 동형(Isomorphic) 스나이퍼 플러그인 (Step 07 / 10)
+# MODIFIED: daymarket_sim_plugin.py
+데이장 (19:00 ~ 03:57 EST) 100% [모의] 전용 프리장 동형(Isomorphic) 스나이퍼 플러그인 (Step 03 / 04)
 - 🚨 데이장 실거래 매수 100% 물리적 절대 차단 (create_order 호출 0건!)
+- MODIFIED: RSI(1m) 전면 폐기에 따라 3차 손절 후 최저점 +0.30% 양봉 반등 [모의] 재진입(RE_BOT_TRAIL) 내
+  live_rsi 참조 및 조건문을 완전 소각하여 프리장 본진(sniper_plugin.py)과 100% 동형 일치
 - 🎯 1 & Case 02, 60, 77 ~ 94, 97 ~ 100: 프리장 본진(🎯 3 & 🎯 4 & 🎯 5)을 절대기준으로 100% 동일한 전략 구동
   1) [Step 1] 19:00 ~ 19:07 EST 누적 데이장 VWAP(VWAP_1907) 산출 후 19:07 EST 기준
      현재가 > VWAP_1907 (disp_1907 > 0.0%, 양쪽 상회 시 이격도 상위 1위) 데이장 추세 주도주 자동 선정/복원
@@ -26,7 +28,7 @@ import logging
 import math
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from quant_engine import NQ_OVERHEAT_THRESHOLD, calc_qqq_adverse_status
 from quant_indicators_plugin import (
@@ -291,21 +293,31 @@ async def _finalize_daymarket_sim_exit(
     )
     net_rate_pct = gross_rate_pct - ROUND_TRIP_FEE_RATE_PCT
 
-    day_sim_state["sim_trade_count"] = safe_int(day_sim_state.get("sim_trade_count"), 0) + 1
+    day_sim_state["sim_trade_count"] = (
+        safe_int(day_sim_state.get("sim_trade_count"), 0) + 1
+    )
     if net_rate_pct >= 0.0:
-        day_sim_state["sim_win_count"] = safe_int(day_sim_state.get("sim_win_count"), 0) + 1
+        day_sim_state["sim_win_count"] = (
+            safe_int(day_sim_state.get("sim_win_count"), 0) + 1
+        )
     else:
-        day_sim_state["sim_loss_count"] = safe_int(day_sim_state.get("sim_loss_count"), 0) + 1
+        day_sim_state["sim_loss_count"] = (
+            safe_int(day_sim_state.get("sim_loss_count"), 0) + 1
+        )
 
     if exit_tag == "DAY_VWAP_ESC":
-        day_sim_state["sim_esc_count"] = safe_int(day_sim_state.get("sim_esc_count"), 0) + 1
+        day_sim_state["sim_esc_count"] = (
+            safe_int(day_sim_state.get("sim_esc_count"), 0) + 1
+        )
 
     day_sim_state["sim_cum_gross_rate_pct"] = round(
-        safe_float(day_sim_state.get("sim_cum_gross_rate_pct"), 0.0) + gross_rate_pct,
+        safe_float(day_sim_state.get("sim_cum_gross_rate_pct"), 0.0)
+        + gross_rate_pct,
         2,
     )
     day_sim_state["sim_cum_net_rate_pct"] = round(
-        safe_float(day_sim_state.get("sim_cum_net_rate_pct"), 0.0) + net_rate_pct,
+        safe_float(day_sim_state.get("sim_cum_net_rate_pct"), 0.0)
+        + net_rate_pct,
         2,
     )
     day_sim_state["sim_last_exit_tag"] = exit_tag
@@ -342,7 +354,10 @@ async def _finalize_daymarket_sim_exit(
         day_sim_state["post_stop_low"] = ex_p
         day_sim_state["dipped_below_stop"] = False
         reentry_note = " · 🪤최저점 +0.30% 반등 [모의] 감시"
-    elif exit_tag in ("TP_WIN", "DAY_VWAP_ESC") and is_daymarket_multicycle_unlock_window(hm):
+    elif exit_tag in (
+        "TP_WIN",
+        "DAY_VWAP_ESC",
+    ) and is_daymarket_multicycle_unlock_window(hm):
         # 03:25 EST 이전 익절/탈출 완료 시 다회전 무한 [모의] 재출동 해금
         day_sim_state["phase"] = "IDLE"
         day_sim_state["bottom_track_active"] = False
@@ -356,7 +371,11 @@ async def _finalize_daymarket_sim_exit(
     win_rate = (float(win_cnt) / float(tot_cnt)) * 100.0 if tot_cnt > 0 else 0.0
     cum_net = safe_float(day_sim_state.get("sim_cum_net_rate_pct"), 0.0)
 
-    if not silent and is_daymarket_sim_active_window(hm) and hasattr(context, "send_slim_alert"):
+    if (
+        not silent
+        and is_daymarket_sim_active_window(hm)
+        and hasattr(context, "send_slim_alert")
+    ):
         sign = "+" if net_rate_pct >= 0.0 else ""
         cum_sign = "+" if cum_net >= 0.0 else ""
         icon = "🧪🎯" if net_rate_pct >= 0.0 else "🧪🛑"
@@ -390,13 +409,15 @@ async def execute_daymarket_sim_plugin(
     """
     🎯 1 [Step 1 ~ Step 5] & Case 77 ~ 94, 97 ~ 100:
     19:00:00 ~ 03:57:59 EST 데이장 구간에서 실거래 매수 없이 100% [모의]로
-    프리장 본진과 완전히 동일한 5단계 전략을 실행한다.
+    프리장 본진과 완전히 동일한 5단계 전략을 실행한다 (폐기된 RSI(1m) 조건 제거 완료).
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
     logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
 
-    day_leader_cache, day_sim_state = _ensure_day_sim_caches(context, logical_date)
+    day_leader_cache, day_sim_state = _ensure_day_sim_caches(
+        context, logical_date
+    )
 
     if not is_daymarket_sim_active_window(hm):
         return {"status": "OUTSIDE_DAYMARKET_WINDOW"}
@@ -460,7 +481,9 @@ async def execute_daymarket_sim_plugin(
             day_sim_state["phase"] = "IDLE"
             return {"status": "SIM_BOTTOM_TRACK_EXPIRED"}
 
-        sym_b = str(day_sim_state.get("stopped_sym") or leader_sym).upper().strip()
+        sym_b = (
+            str(day_sim_state.get("stopped_sym") or leader_sym).upper().strip()
+        )
         met_b = _get_live_day_metrics(context, sym_b, prices, dt_now)
         cur_p = safe_float(met_b.get("live_price"), 0.0)
         if cur_p <= 0.0:
@@ -484,17 +507,23 @@ async def execute_daymarket_sim_plugin(
 
         rebound_p = math.ceil((post_low * 1.0030) * 100.0) / 100.0
         is_bull = bool(met_b.get("is_raw_bull") or met_b.get("is_ha_bull"))
-        live_rsi = safe_float(met_b.get("live_rsi"), 50.0)
         cur_p_fl = math.floor(cur_p * 100.0) / 100.0
 
-        if (
-            cur_p_fl >= rebound_p
-            and cur_p_fl <= last_stop_p
-            and is_bull
-            and live_rsi <= 38.0
-        ):
-            arm_p = math.ceil((cur_p_fl * (1.0 + TRAIL_ARM_PROFIT_PCT / 100.0)) * 100.0) / 100.0
-            cap_p = math.ceil((cur_p_fl * (1.0 + SAFETY_CAP_PROFIT_PCT / 100.0)) * 100.0) / 100.0
+        # MODIFIED: 폐기된 RSI(1m) 조건 제거 완료 (최저점 +0.30% 반등 & 손절가 이하 & 실시간 양봉 전환)
+        if cur_p_fl >= rebound_p and cur_p_fl <= last_stop_p and is_bull:
+            arm_p = (
+                math.ceil(
+                    (cur_p_fl * (1.0 + TRAIL_ARM_PROFIT_PCT / 100.0)) * 100.0
+                )
+                / 100.0
+            )
+            cap_p = (
+                math.ceil(
+                    (cur_p_fl * (1.0 + SAFETY_CAP_PROFIT_PCT / 100.0)) * 100.0
+                )
+                / 100.0
+            )
+            ha_label = "🕯️HA양봉" if met_b.get("is_ha_bull") else "🕯️양봉전환"
             day_sim_state.update(
                 {
                     "phase": "HOLDING",
@@ -519,10 +548,14 @@ async def execute_daymarket_sim_plugin(
                     title=f"🧪🪤 [데이장 [모의] 최저점 +0.30% 반등 재진입] {sym_b}",
                     body=(
                         f"[모의] 체결가 ${cur_p_fl:.2f} (최저점 ${post_low:.2f} · 직전손절 ${last_stop_p:.2f}) "
-                        f"· RSI {live_rsi:.1f} · QQQ기준 ${qqq_curr:.2f}"
+                        f"· {ha_label} · QQQ기준 ${qqq_curr:.2f}"
                     ),
                 )
-            return {"status": "SIM_RE_BOT_TRAIL_FILLED", "symbol": sym_b, "price": cur_p_fl}
+            return {
+                "status": "SIM_RE_BOT_TRAIL_FILLED",
+                "symbol": sym_b,
+                "price": cur_p_fl,
+            }
 
         return {"status": "SIM_MONITORING_REBOUND", "symbol": sym_b}
 
@@ -579,7 +612,11 @@ async def execute_daymarket_sim_plugin(
 
         # 2) TRAP_WAITING 상태에서 동적 VWAP_day_t 변화 반영 자동 추적 정정 (15초 & $0.03 괴리)
         sim_trap_p = safe_float(day_sim_state.get("sim_trap_buy_price"), 0.0)
-        if is_daymarket_trap_entry_window(hm) and sim_trap_p > 0.0 and raw_trap_p > 0.0:
+        if (
+            is_daymarket_trap_entry_window(hm)
+            and sim_trap_p > 0.0
+            and raw_trap_p > 0.0
+        ):
             elapsed_mod = time.monotonic() - safe_float(
                 day_sim_state.get("last_modify_mono"), 0.0
             )
@@ -597,8 +634,18 @@ async def execute_daymarket_sim_plugin(
         # 3) 현재가(cur_p_fl)가 장전된 [모의] 매수 덫 단가 이하 도달 시 즉시 [모의] 체결 확정!
         if sim_trap_p > 0.0 and cur_p_fl <= sim_trap_p:
             fill_p = min(cur_p_fl, sim_trap_p)
-            arm_p = math.ceil((fill_p * (1.0 + TRAIL_ARM_PROFIT_PCT / 100.0)) * 100.0) / 100.0
-            cap_p = math.ceil((fill_p * (1.0 + SAFETY_CAP_PROFIT_PCT / 100.0)) * 100.0) / 100.0
+            arm_p = (
+                math.ceil(
+                    (fill_p * (1.0 + TRAIL_ARM_PROFIT_PCT / 100.0)) * 100.0
+                )
+                / 100.0
+            )
+            cap_p = (
+                math.ceil(
+                    (fill_p * (1.0 + SAFETY_CAP_PROFIT_PCT / 100.0)) * 100.0
+                )
+                / 100.0
+            )
 
             day_sim_state.update(
                 {
@@ -659,11 +706,13 @@ async def execute_daymarket_sim_plugin(
 
         arm_p = safe_float(
             day_sim_state.get("arm_price"),
-            math.ceil((ent_p * (1.0 + TRAIL_ARM_PROFIT_PCT / 100.0)) * 100.0) / 100.0,
+            math.ceil((ent_p * (1.0 + TRAIL_ARM_PROFIT_PCT / 100.0)) * 100.0)
+            / 100.0,
         )
         cap_p = safe_float(
             day_sim_state.get("safety_cap_price"),
-            math.ceil((ent_p * (1.0 + SAFETY_CAP_PROFIT_PCT / 100.0)) * 100.0) / 100.0,
+            math.ceil((ent_p * (1.0 + SAFETY_CAP_PROFIT_PCT / 100.0)) * 100.0)
+            / 100.0,
         )
 
         # 1) 상단 안전 캡(+5.00%) 도달 시 즉시 익절 확정
@@ -690,23 +739,31 @@ async def execute_daymarket_sim_plugin(
                 )
 
         if day_sim_state.get("day_sim_trail_armed"):
-            peak_p = max(safe_float(day_sim_state.get("peak_price"), live_p), live_p)
+            peak_p = max(
+                safe_float(day_sim_state.get("peak_price"), live_p), live_p
+            )
             day_sim_state["peak_price"] = peak_p
 
             if peak_p >= ent_p * (1.0 + TRAIL_RATCHET_LOCK_PCT / 100.0):
                 day_sim_state["ratchet_130_locked"] = True
 
             cushion_floor = (
-                math.ceil((ent_p * (1.0 + TRAIL_CUSHION_FLOOR_PCT / 100.0)) * 100.0)
+                math.ceil(
+                    (ent_p * (1.0 + TRAIL_CUSHION_FLOOR_PCT / 100.0)) * 100.0
+                )
                 / 100.0
             )
             floor_p = (
-                arm_p if day_sim_state.get("ratchet_130_locked") else cushion_floor
+                arm_p
+                if day_sim_state.get("ratchet_130_locked")
+                else cushion_floor
             )
             cb_pct = safe_float(
                 day_sim_state.get("callback_pct"), TRAIL_DEFAULT_CALLBACK_PCT
             )
-            cb_stop_p = math.floor((peak_p * (1.0 - cb_pct / 100.0)) * 100.0) / 100.0
+            cb_stop_p = (
+                math.floor((peak_p * (1.0 - cb_pct / 100.0)) * 100.0) / 100.0
+            )
             eff_stop_p = max(floor_p, cb_stop_p)
 
             day_sim_state["floor_price"] = floor_p
@@ -745,11 +802,14 @@ async def execute_daymarket_sim_plugin(
             ):
                 min_fee_p = (
                     math.ceil(
-                        (ent_p * (1.0 + LATE_VWAP_ESC_MIN_PROFIT_PCT / 100.0)) * 100.0
+                        (ent_p * (1.0 + LATE_VWAP_ESC_MIN_PROFIT_PCT / 100.0))
+                        * 100.0
                     )
                     / 100.0
                 )
-                esc_target_p = max(math.floor(day_vwap * 100.0) / 100.0, min_fee_p)
+                esc_target_p = max(
+                    math.floor(day_vwap * 100.0) / 100.0, min_fee_p
+                )
                 if live_p >= esc_target_p:
                     return await _finalize_daymarket_sim_exit(
                         context=context,
@@ -764,9 +824,13 @@ async def execute_daymarket_sim_plugin(
         if 0.0 < live_p < ent_p and qqq_curr > 0.0:
             adv = calc_qqq_adverse_status(
                 symbol=sym,
-                qqq_entry_price=safe_float(day_sim_state.get("nq_entry_price"), qqq_curr),
+                qqq_entry_price=safe_float(
+                    day_sim_state.get("nq_entry_price"), qqq_curr
+                ),
                 qqq_curr_price=qqq_curr,
-                nq_entry_amp=safe_float(day_sim_state.get("nq_entry_amp"), nq_amp),
+                nq_entry_amp=safe_float(
+                    day_sim_state.get("nq_entry_amp"), nq_amp
+                ),
                 position_avg_price=ent_p,
                 position_live_price=live_p,
             )
@@ -838,5 +902,7 @@ async def settle_daymarket_sim_before_premarket(
             "cleared_before_premarket": True,
         }
     )
-    logger.info("🧹 [03:58 EST 데이장 [모의] 묵음 클리어] 미결 모의 상태 초기화 완료 (통계 보존)")
+    logger.info(
+        "🧹 [03:58 EST 데이장 [모의] 묵음 클리어] 미결 모의 상태 초기화 완료 (통계 보존)"
+    )
     return {"status": "CLEARED_SILENTLY"}
