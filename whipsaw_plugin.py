@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-# NEW: whipsaw_plugin.py
-03:58 ~ 04:07 EST (9분간) 과열차단 독립형 듀얼 1주 고정 '휩소 노출 작전' 전술 플러그인 (Step 08 / 10)
-- 제3헌법: 03:58 ~ 04:07 EST 1주 역산 매수 덫, +1.00% 익절 매도 덫, 04:07 정각 타임쉴드 정리 전담 분리
-- 제4헌법: 모든 타임라인 판단 ZoneInfo('America/New_York') 단일 소스 락온
-- 제5헌법: 1주 매수/매도 주문 생성 시 36자 이내 고유 clientOrderId 주입
-- 🎯 2 & Case 24, 52, 54, 95, 96, 102:
-  1) NQ=F >= 2.0% 과열차단(CANCELED_MACRO)일에도 본진과 별개로 독립 진입 허용
-  2) 데이장 누적 VWAP 상단 종목(current_price > day_vwap, 양쪽 하회 시 이격도 1위 폴백) 기준
-     하단 0.5% 역산 단가(floor((day_vwap / 1.005) * 100) / 100)에 1주 LIMIT 매수 덫 설치
-  3) 1주 매수 체결 시 팩트 평단가 대비 +1.00%(ceil(avg_price * 1.0100 * 100) / 100) LIMIT 매도 덫 장전
-  4) 04:07:00 EST 정각 도달 시 미체결 1주 매수 덫 무비용 취소 및 보유 1주 현재가 즉시 매도 후
-     NQ < 2.0% 이면 프리장 본진 해금, NQ >= 2.0% 이면 CANCELED_MACRO 과열차단 복원
+# MODIFIED: whipsaw_plugin.py
+03:58 ~ 04:07 EST (9분간) 듀얼 1주 고정 '휩소 노출 작전' 전술 플러그인 (Step 03 / 03)
+- 🎯 2 & Case 95, 96, 102 완벽 구현:
+  1) [선취 매수 폐기 및 무비용 하단 0.5% 역산 매수 덫 전용화]
+     데이장 누적 VWAP보다 높은 가격(current_price > day_vwap, 양쪽 하회 시 상대 괴리율 1위 폴백)에
+     위치한 종목을 기준으로 데이장 VWAP에서 0.5% 역산한 하단 가격(VWAP / 1.005)에
+     단 1주(quantity = 1) 지정가 매수 덫(entry_session = "WHIPSAW_1SH")만 설치하고,
+     체결 즉시 실제 매수 평단가 대비 +1.00% 익절가(avg_price * 1.01)로 매도 주문을 장전한다.
+  2) [NQ=F >= 2.0% 과열차단 독립(별개) 가동 원칙 (Case 95 & Case 96)]
+     당일 데이장에서 NQ=F 진폭이 2.0%를 초과하여 CANCELED_MACRO 가 발동된 날에도
+     차단되지 않고 별개로 정상 1주 진입하여 +1.00% 익절을 노린다.
+  3) [04:07:00 EST 타임쉴드 만료 및 강제 정리 후 본진 인계 / 과열차단 복원]
+     - 04:07:00 EST 미체결 시: 즉시 주문 취소(비용 $0) 후 NQ < 2.0% 이면 프리장 본진 해금,
+       NQ >= 2.0% 이면 CANCELED_MACRO 복원
+     - 04:07:00 EST 1주 보유 중일 시: 실시간 매수 1호가로 즉시 스윕 매도 및 복리 정산 후
+       NQ < 2.0% 이면 프리장 본진 해금, NQ >= 2.0% 이면 CANCELED_MACRO 복원
 """
 
 from __future__ import annotations
@@ -20,13 +24,18 @@ import logging
 import math
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from defense_plugin import unlock_all_symbols_for_reentry
-from quant_engine import NQ_OVERHEAT_THRESHOLD
 from quant_indicators_plugin import (
     get_logical_trading_date_str,
     refresh_metrics_with_live_tick,
+)
+from sniper_exit_plugin import (
+    WHIPSAW_TARGET_PROFIT_PCT,
+    ensure_safety_cap_sell_order,
+    execute_bulletproof_sell_sweep,
+    reconcile_zero_holdings_exit_plugin,
+    unlock_all_symbols_for_reentry,
 )
 from sniper_plugin import mark_auto_fill_grace_shield
 from toss_api import (
@@ -39,222 +48,90 @@ from toss_api import (
 
 logger = logging.getLogger("toss_sniper.whipsaw_plugin")
 
+# 1주 휩소 작전 역산 비율 (VWAP / 1.005) 및 고정 수량 (1주)
+WHIPSAW_DIVISOR: float = 1.005
+WHIPSAW_FIXED_QTY: int = 1
 
-# ---------------------------------------------------------------------------
-# 내부 헬퍼 : 데이장 누적 VWAP 상단 종목 선정 및 0.5% 역산 단가(VWAP / 1.005) 산출
-# ---------------------------------------------------------------------------
-def _select_whipsaw_target_symbol(
-    context: Any,
-    prices: Dict[str, float],
-    now_est: datetime,
-) -> Dict[str, Any]:
+
+def is_whipsaw_window(hm: int) -> bool:
     """
-    🎯 2 [선취 매수 폐기 및 무비용 하단 0.5% 역산 매수 덫 전용화 원칙]:
-    - SOXS 와 SOXL 중 데이장 누적 VWAP(day_vwap)보다 높은 가격(current_price > day_vwap)에
-      위치한 종목을 우선 선정한다 (양쪽 모두 상회 시 day_disp_curr 상위 1위 선정).
-    - 만약 양쪽 모두 day_vwap 하단에 위치할 경우 상대 괴리율(day_disp_curr) 1위 종목으로 폴백한다.
-    - 선정된 종목의 데이장 VWAP 에서 0.5% 역산한 하단 가격(floor((day_vwap / 1.005) * 100) / 100,
-      단 현재가 cur_p_fl 이하 캡 적용)을 반환한다.
+    🎯 2: 03:58:00 ~ 04:06:59 EST (9분간) 1주 휩소 노출 작전 활성 윈도우 여부 반환.
+    (04:07:00 EST 정각은 enforce_0407_whipsaw_cutoff_plugin 이 타임쉴드 정리를 수행)
     """
-    raw_cache = getattr(context, "candle_metrics_cache", {})
-    above_candidates: List[Tuple[str, float, float, float, float]] = []
-    all_candidates: List[Tuple[str, float, float, float, float]] = []
-
-    for sym in REAL_ALLOWED_SYMBOLS:
-        base_met = raw_cache.get(sym) if isinstance(raw_cache, dict) else None
-        live_p = safe_float((prices or {}).get(sym), 0.0)
-        if live_p <= 0.0 and isinstance(base_met, dict):
-            live_p = safe_float(base_met.get("live_price"), 0.0)
-        met = refresh_metrics_with_live_tick(base_met, live_p, now_est=now_est)
-
-        day_vwap = safe_float(met.get("day_vwap"), 0.0)
-        cur_p = safe_float(met.get("live_price"), 0.0)
-        if day_vwap <= 0.0 or cur_p <= 0.0:
-            continue
-
-        disp_pct = ((cur_p - day_vwap) / day_vwap) * 100.0
-        raw_rev_p = safe_float(met.get("whipsaw_buy_p"), 0.0)
-        if raw_rev_p <= 0.0:
-            raw_rev_p = math.floor((day_vwap / 1.005) * 100.0) / 100.0
-
-        cur_p_fl = math.floor(cur_p * 100.0) / 100.0
-        trap_p = min(cur_p_fl, raw_rev_p)
-        if trap_p <= 0.0:
-            continue
-
-        item = (sym, disp_pct, day_vwap, cur_p, trap_p)
-        all_candidates.append(item)
-        if cur_p > day_vwap:
-            above_candidates.append(item)
-
-    target_list = above_candidates if above_candidates else all_candidates
-    if not target_list:
-        return {
-            "symbol": "",
-            "disp_pct": 0.0,
-            "day_vwap": 0.0,
-            "live_price": 0.0,
-            "trap_buy_price": 0.0,
-        }
-
-    target_list.sort(key=lambda x: x[1], reverse=True)
-    win_sym, win_disp, win_vwap, win_cur, win_trap = target_list[0]
-    return {
-        "symbol": win_sym,
-        "disp_pct": round(win_disp, 3),
-        "day_vwap": round(win_vwap, 4),
-        "live_price": round(win_cur, 4),
-        "trap_buy_price": win_trap,
-    }
+    return bool(358 <= hm <= 406)
 
 
-# ---------------------------------------------------------------------------
-# [핵심 1] 03:58 ~ 04:06 EST 과열차단 독립형 1주 역산 매수 덫 발사 (execute_0358_whipsaw_trap_plugin)
-# ---------------------------------------------------------------------------
-async def execute_0358_whipsaw_trap_plugin(
-    context: Any,
-    holdings: Dict[str, Dict[str, Any]],
-    prices: Dict[str, float],
-    macro: Dict[str, Any],
-    now_est: Optional[datetime] = None,
-) -> Dict[str, Any]:
-    """
-    🎯 2 & 초과 Case 95, 초과 Case 96:
-    - 03:58:00 ~ 04:06:59 EST (9분간) 윈도우에서 당일 단 1회 1주(quantity = 1) 역산 매수 덫을 설치한다.
-    - 당일 데이장에서 NQ=F 진폭이 2.0%를 초과하여 CANCELED_MACRO(is_session_done = True) 상태이더라도
-      차단되지 않고 본진과 별개로 정상 진입하여 매수 체결가 대비 +1.00% 익절을 노린다!
-    """
-    dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
-    hm = dt_now.hour * 100 + dt_now.minute
-    if not (358 <= hm <= 406):
-        return {"status": "OUTSIDE_WHIPSAW_WINDOW"}
-
-    logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
-    whipsaw_cache: Dict[str, Any] = getattr(context, "whipsaw_runtime_cache", {})
-    if whipsaw_cache.get("logical_date") != logical_date:
-        whipsaw_cache.clear()
-        whipsaw_cache.update(
+def _ensure_whipsaw_cache(context: Any, logical_date: str) -> Dict[str, Any]:
+    cache: Dict[str, Any] = getattr(context, "whipsaw_runtime_cache", {})
+    if cache.get("logical_date") != logical_date:
+        cache.clear()
+        cache.update(
             {
                 "logical_date": logical_date,
                 "fired_today": False,
-                "cutoff_done": False,
-                "symbol": "",
+                "target_symbol": "",
                 "trap_price": 0.0,
+                "order_id": "",
+                "cutoff_0407_done": False,
             }
         )
+    return cache
 
-    # 당일 이미 1주 휩소 매수 덫을 1회 발사했다면 중복 발사 금지
-    if whipsaw_cache.get("fired_today"):
-        return {"status": "ALREADY_FIRED_TODAY"}
 
-    # 현재 실보유 잔고나 미체결 주문이 존재하면 진입 보류 (수동 보유 포지션 등 보호)
-    for s in REAL_ALLOWED_SYMBOLS:
-        if safe_int((holdings or {}).get(s, {}).get("qty"), 0) > 0:
-            return {"status": "EXISTING_HOLDINGS_PRESENT"}
-        st_s = context.ledger.get_state(s)
-        if str(st_s.get("buy_order_id") or "").strip() or str(st_s.get("sell_order_id") or "").strip():
-            return {"status": "EXISTING_ORDER_PRESENT"}
+def _get_live_metrics_for_whipsaw(
+    context: Any,
+    symbol: str,
+    prices: Dict[str, float],
+    now_est: datetime,
+) -> Dict[str, Any]:
+    sym = str(symbol or "").upper().strip()
+    raw_cache = getattr(context, "candle_metrics_cache", {})
+    base_met = raw_cache.get(sym) if isinstance(raw_cache, dict) else None
+    live_p = safe_float((prices or {}).get(sym), 0.0)
+    if live_p <= 0.0 and isinstance(base_met, dict):
+        live_p = safe_float(base_met.get("live_price"), 0.0)
+    return refresh_metrics_with_live_tick(base_met, live_p, now_est=now_est)
 
-    cand = _select_whipsaw_target_symbol(context, prices, dt_now)
-    sym = str(cand.get("symbol") or "").upper().strip()
-    trap_p = safe_float(cand.get("trap_buy_price"), 0.0)
-    day_vwap = safe_float(cand.get("day_vwap"), 0.0)
-    live_p = safe_float(cand.get("live_price"), 0.0)
 
-    if sym not in REAL_ALLOWED_SYMBOLS or trap_p <= 0.0:
-        return {"status": "TARGET_NOT_READY"}
+def _select_whipsaw_symbol_and_vwap(
+    soxs_met: Dict[str, Any],
+    soxl_met: Dict[str, Any],
+) -> Tuple[str, float, float, float]:
+    """
+    🎯 2:
+    데이장 누적 VWAP(day_vwap, 부재 시 pre_vwap 또는 session_vwap 폴백)보다 높은 가격
+    (current_price > day_vwap)에 위치한 종목을 선정한다.
+    양쪽 모두 상회하거나 양쪽 모두 하회할 경우 VWAP 대비 상대 괴리율((live_p - vwap) / vwap)
+    상위 1위 종목으로 폴백하여 (symbol, ref_vwap, live_price, disp_pct)를 반환한다.
+    """
+    candidates = []
+    for sym, met in (("SOXS", soxs_met), ("SOXL", soxl_met)):
+        if not isinstance(met, dict):
+            continue
+        live_p = safe_float(met.get("live_price"), 0.0)
+        ref_vwap = safe_float(met.get("day_vwap"), 0.0)
+        if ref_vwap <= 0.0:
+            ref_vwap = safe_float(met.get("pre_vwap"), 0.0)
+        if ref_vwap <= 0.0:
+            ref_vwap = safe_float(met.get("session_vwap"), live_p)
 
-    st_sym = context.ledger.get_state(sym)
-    if not bool(st_sym.get("is_active", True)):
-        return {"status": "BOT_INACTIVE"}
+        if live_p > 0.0 and ref_vwap > 0.0:
+            disp_pct = ((live_p - ref_vwap) / ref_vwap) * 100.0
+            candidates.append((disp_pct, sym, ref_vwap, live_p))
 
-    # 1주 매수가 가능한 USD 매수가능금액 확인
-    bp_usd = await context.api.get_buying_power_usd(safety_buffer_pct=0.5)
-    if bp_usd > 0.0 and bp_usd < trap_p:
-        return {"status": "INSUFFICIENT_USD_FOR_1SH", "bp_usd": bp_usd, "trap_p": trap_p}
+    if not candidates:
+        return "", 0.0, 0.0, 0.0
 
-    other_sym = "SOXL" if sym == "SOXS" else "SOXS"
-    nq_amp = safe_float((macro or {}).get("nq_amp"), 0.0)
-    qqq_ref = await context.macro_cache.ensure_qqq_live_price(
-        safe_float((macro or {}).get("qqq_price"), 0.0)
-    )
-    if qqq_ref <= 0.0:
-        qqq_ref = safe_float((macro or {}).get("nq_price"), 0.0)
-
-    async with context.in_memory_ordering_lock:
-        async with context.dual_strike_mutex:
-            if whipsaw_cache.get("fired_today"):
-                return {"status": "ALREADY_FIRED_IN_MUTEX"}
-
-            cid = generate_client_order_id(prefix=f"WHP{sym}")
-            try:
-                # 03:58 EST 이후이므로 enforce_daymarket_block=True 여도 통과되며, 단 1주(quantity=1)만 발사
-                ord_res = await context.api.create_order(
-                    symbol=sym,
-                    side="BUY",
-                    quantity=1,
-                    price=trap_p,
-                    order_type="LIMIT",
-                    time_in_force="DAY",
-                    client_order_id=cid,
-                    enforce_daymarket_block=True,
-                )
-            except Exception as exc:
-                logger.error("🚨 [%s] 03:58 1주 휩소 역산 매수덫 발사 실패: %s", sym, exc)
-                return {"status": "ORDER_ERROR", "error": str(exc)}
-
-            oid = str(ord_res.get("orderId") or "").strip()
-            trend_tag = "DOWN" if sym == "SOXS" else "UP"
-
-            whipsaw_cache.update(
-                {
-                    "fired_today": True,
-                    "symbol": sym,
-                    "trap_price": trap_p,
-                    "order_id": oid,
-                }
-            )
-
-            # Case 95 & 96: entry_session = "WHIPSAW_1SH" 로 각인하여 1·2차 과열 방어선을 100% 패스시킨다!
-            await context.ledger.update_state(
-                sym,
-                buy_order_id=oid,
-                client_order_id=cid,
-                ordered_qty=1,
-                buy_price=trap_p,
-                entry_session="WHIPSAW_1SH",
-                entry_trend=trend_tag,
-                nq_entry_price=qqq_ref,
-                nq_entry_amp=nq_amp,
-                is_session_done=True,
-                entry_ts=time.time(),
-            )
-            await context.ledger.update_state(other_sym, is_session_done=True)
-            context.wakeup_event.set()
-
-            overheat_note = " · ⚡과열차단일 독립가동" if nq_amp >= NQ_OVERHEAT_THRESHOLD else ""
-            if hasattr(context, "send_slim_alert"):
-                await context.send_slim_alert(
-                    title=f"⚡ [03:58 1주 휩소 역산 매수덫 장전] {sym} 1주",
-                    body=(
-                        f"역산가 ${trap_p:.2f} (데이장VWAP ${day_vwap:.2f} / 1.005 · 현가 ${live_p:.2f})"
-                        f" · 04:07 정각 타임쉴드{overheat_note}"
-                    ),
-                )
-
-            return {
-                "status": "WHIPSAW_1SH_TRAP_PLACED",
-                "symbol": sym,
-                "orderId": oid,
-                "price": trap_p,
-                "day_vwap": day_vwap,
-            }
+    # 괴리율(disp_pct) 내림차순 정렬 -> current_price > day_vwap 인 종목이 자연스럽게 우선 선택됨
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_disp, best_sym, best_vwap, best_live = candidates[0]
+    return best_sym, best_vwap, best_live, round(best_disp, 2)
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 03:58 ~ 04:06 EST 1주 체결 감시 및 +1.00% 익절 매도 덫 장전 (manage_whipsaw_1sh_profit_trap)
+# [핵심 1] 03:58 ~ 04:06 EST 과열차단 독립 1주 휩소 역산 매수 덫 발사 및 체결 감시
 # ---------------------------------------------------------------------------
-async def manage_whipsaw_1sh_profit_trap(
+async def execute_whipsaw_1sh_plugin(
     context: Any,
     holdings: Dict[str, Dict[str, Any]],
     prices: Dict[str, float],
@@ -262,119 +139,214 @@ async def manage_whipsaw_1sh_profit_trap(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 2 & Case 102:
-    - 03:58 ~ 04:06 EST 동안 WHIPSAW_1SH 1주 매수 주문의 FILLED 여부를 프로빙하여
-      체결 시 즉시 mark_auto_fill_grace_shield 를 각인(MANUAL 오분류 차단)하고,
-    - 실보유 잔고(holdings_qty >= 1)가 확인되면 실제 매수 평단가(avg_price) 대비 +1.00% 익절가
-      (ceil(avg_price * 1.0100 * 100) / 100)로 1주 지정가 매도 덫을 즉시 장전한다.
+    🎯 2 & Case 95, 96, 102:
+    - 03:58:00 ~ 04:06:59 EST 구간에서 작동한다.
+    - 당일 NQ=F >= 2.0% 과열차단(CANCELED_MACRO)이 발동된 날에도 차단되지 않고 독립 가동된다!
+    - 데이장 누적 VWAP 상단 종목을 기준으로 VWAP / 1.005 하단 가격에 1주 지정가 매수 덫을 설치하고,
+      매수 체결 확인 시 실제 체결 평단가 대비 +1.00% 익절가(avg_price * 1.01)로 매도 주문을 장전한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
-    if not (358 <= hm <= 406):
-        return {"status": "OUTSIDE_WINDOW"}
+    if not is_whipsaw_window(hm):
+        return {"status": "OUTSIDE_WHIPSAW_WINDOW"}
 
-    snap_cache_map: Dict[str, Dict[str, Any]] = getattr(
-        context, "exit_snapshot_cache", {}
-    )
+    logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
+    w_cache = _ensure_whipsaw_cache(context, logical_date)
 
+    # 1) 스나이퍼 마스터 전원(is_active) 확인
+    st_soxs = context.ledger.get_state("SOXS")
+    st_soxl = context.ledger.get_state("SOXL")
+    if not (
+        bool(st_soxs.get("is_active", True))
+        and bool(st_soxl.get("is_active", True))
+    ):
+        return {"status": "BOT_INACTIVE"}
+
+    # 2) 현재 보유 중인 포지션 또는 미체결 1주 휩소 매수 주문 점검
     for sym in REAL_ALLOWED_SYMBOLS:
-        st = context.ledger.get_state(sym)
-        if str(st.get("entry_session") or "") != "WHIPSAW_1SH":
-            continue
-
         h_info = (holdings or {}).get(sym, {})
         h_qty = safe_int(h_info.get("qty"), 0)
         avg_p = safe_float(h_info.get("avg_price"), 0.0)
+        st = context.ledger.get_state(sym)
+        entry_sess = str(st.get("entry_session") or "")
         buy_oid = str(st.get("buy_order_id") or "").strip()
-        sell_oid = str(st.get("sell_order_id") or "").strip()
 
-        # 1) 잔고 미반영 상태에서 매수 주문 FILLED 프로빙 -> 인덱싱 시차 그레이스 쉴드 각인 (Case 102)
-        if h_qty <= 0 and buy_oid:
+        # 이미 1주 휩소 물량이 체결되어 보유 중인 경우 -> +1.00% 익절 매도 주문 선장전 보장
+        if h_qty > 0 and avg_p > 0.0:
+            if entry_sess == "WHIPSAW_1SH":
+                await ensure_safety_cap_sell_order(context, sym, h_qty, avg_p)
+                return {
+                    "status": "WHIPSAW_HOLDING_MONITORED",
+                    "symbol": sym,
+                    "qty": h_qty,
+                    "avg_price": avg_p,
+                }
+            # 수동 오버나이트 등 다른 포지션을 이미 보유 중이면 1주 휩소 진입 스킵
+            return {"status": "EXISTING_HOLDINGS_SKIP", "symbol": sym}
+
+        # 미체결 1주 휩소 매수 덫 대기 중인 경우 -> 체결 여부(get_order_detail) 즉시 프로빙
+        if buy_oid and entry_sess == "WHIPSAW_1SH":
             detail = await context.api.get_order_detail(buy_oid)
             if isinstance(detail, dict):
-                ord_st = str(detail.get("status") or "").upper().strip()
+                ord_status = str(detail.get("status") or "").upper().strip()
                 exec_obj = (
                     detail.get("execution")
                     if isinstance(detail.get("execution"), dict)
                     else {}
                 )
-                f_qty = safe_int(exec_obj.get("filledQuantity"), 0)
-                f_avg = safe_float(exec_obj.get("averageFilledPrice"), 0.0)
-                if ord_st == "FILLED" or f_qty > 0:
+                filled_q = safe_int(exec_obj.get("filledQuantity"), 0)
+                avg_fill_p = safe_float(exec_obj.get("averageFilledPrice"), 0.0)
+                if ord_status in ("FILLED", "PARTIAL_FILLED") or filled_q > 0:
+                    fill_p = (
+                        avg_fill_p
+                        if avg_fill_p > 0.0
+                        else safe_float(st.get("buy_price"), 0.0)
+                    )
+                    # Case 102: 체결 직후 잔고 인덱싱 시차 중 MANUAL 오분류 차단 그레이스 쉴드 각인
                     mark_auto_fill_grace_shield(
                         context,
                         symbol=sym,
                         entry_session="WHIPSAW_1SH",
-                        fill_price=f_avg if f_avg > 0.0 else safe_float(st.get("buy_price"), 0.0),
+                        fill_price=fill_p,
                     )
                     context.wakeup_event.set()
-            continue
+                    return {
+                        "status": "WHIPSAW_BUY_FILLED_DETECTED",
+                        "symbol": sym,
+                        "fill_price": fill_p,
+                    }
+            return {
+                "status": "WHIPSAW_TRAP_WAITING",
+                "symbol": sym,
+                "orderId": buy_oid,
+            }
 
-        # 2) 1주 체결 완료 후 아직 +1.00% 익절 매도 주문이 장전되지 않은 경우 즉시 장전
-        if h_qty > 0 and avg_p > 0.0 and not sell_oid:
-            target_100_p = math.ceil((avg_p * 1.0100) * 100.0) / 100.0
-            qqq_now = await context.macro_cache.ensure_qqq_live_price(
+    # 당일 이미 1주 휩소 매수 덫을 1회 발사했다면 중복 발사 금지
+    if bool(w_cache.get("fired_today")):
+        return {"status": "WHIPSAW_ALREADY_FIRED_TODAY"}
+
+    # 3) 데이장 VWAP 상단 종목 선정 및 하단 0.5% 역산 단가(VWAP / 1.005) 산출
+    soxs_met = _get_live_metrics_for_whipsaw(context, "SOXS", prices, dt_now)
+    soxl_met = _get_live_metrics_for_whipsaw(context, "SOXL", prices, dt_now)
+    win_sym, ref_vwap, live_p, disp_pct = _select_whipsaw_symbol_and_vwap(
+        soxs_met, soxl_met
+    )
+
+    if win_sym not in REAL_ALLOWED_SYMBOLS or ref_vwap <= 0.0 or live_p <= 0.0:
+        return {"status": "WHIPSAW_METRICS_NOT_READY"}
+
+    raw_trap_p = math.floor(((ref_vwap / WHIPSAW_DIVISOR) + 1e-9) * 100.0) / 100.0
+    cur_p_fl = math.floor((live_p + 1e-9) * 100.0) / 100.0
+    trap_buy_p = min(cur_p_fl, raw_trap_p)
+    if trap_buy_p <= 0.0:
+        return {"status": "INVALID_WHIPSAW_TRAP_PRICE"}
+
+    # 4) 1주 매수 예산 확인 후 지정가(LIMIT, DAY) 1주 매수 덫 투하 (과열일 CANCELED_MACRO 무관 독립 진입!)
+    bp_usd = await context.api.get_buying_power_usd(safety_buffer_pct=0.2)
+    if 0.0 < bp_usd < trap_buy_p:
+        return {
+            "status": "INSUFFICIENT_BUYING_POWER_FOR_1SH",
+            "bp_usd": bp_usd,
+            "trap_price": trap_buy_p,
+        }
+
+    async with context.in_memory_ordering_lock:
+        async with context.dual_strike_mutex:
+            if bool(w_cache.get("fired_today")):
+                return {"status": "WHIPSAW_ALREADY_FIRED_IN_MUTEX"}
+
+            nq_amp = safe_float((macro or {}).get("nq_amp"), 0.0)
+            qqq_ref = await context.macro_cache.ensure_qqq_live_price(
                 safe_float((macro or {}).get("qqq_price"), 0.0)
             )
-            if qqq_now <= 0.0:
-                qqq_now = safe_float((macro or {}).get("nq_price"), 0.0)
-            nq_amp_now = safe_float((macro or {}).get("nq_amp"), 0.0)
+            if qqq_ref <= 0.0:
+                qqq_ref = safe_float((macro or {}).get("nq_price"), 0.0)
 
-            async with context.in_memory_ordering_lock:
-                cid = generate_client_order_id(prefix=f"WHPS{sym}")
-                try:
-                    ord_res = await context.api.create_order(
-                        symbol=sym,
-                        side="SELL",
-                        quantity=h_qty,
-                        price=target_100_p,
-                        order_type="LIMIT",
-                        time_in_force="DAY",
-                        client_order_id=cid,
-                        enforce_daymarket_block=False,
-                    )
-                    new_sell_oid = str(ord_res.get("orderId") or "").strip()
-                    await context.ledger.update_state(
-                        sym,
-                        buy_order_id="",
-                        holdings_qty=h_qty,
-                        avg_price=avg_p,
-                        sell_order_id=new_sell_oid,
-                        target_sell_price=target_100_p,
-                        nq_entry_price=qqq_now,
-                        nq_entry_amp=nq_amp_now,
-                    )
-                    snap_cache_map[sym] = {
-                        "symbol": sym,
-                        "last_holdings_qty": h_qty,
-                        "last_avg_price": avg_p,
-                        "peak_price": max(avg_p, safe_float((prices or {}).get(sym), avg_p)),
-                        "entry_session": "WHIPSAW_1SH",
-                        "safety_cap_price": target_100_p,
-                        "arm_price": target_100_p,
-                        "last_sweep_price": target_100_p,
-                        "exit_tag": "WHIPSAW_TP_100",
-                        "updated_ts": time.time(),
-                    }
-                    if hasattr(context, "send_slim_alert"):
-                        await context.send_slim_alert(
-                            title=f"⚡🎯 [1주 휩소 체결 · +1.00% 익절덫 장전] {sym} {h_qty}주",
-                            body=f"매수평단 ${avg_p:.2f} ➔ 익절지정가 ${target_100_p:.2f}(+1.00%) · 04:07 정각 타임쉴드",
-                        )
-                    return {
-                        "status": "WHIPSAW_SELL_TRAP_PLACED",
-                        "symbol": sym,
-                        "sell_order_id": new_sell_oid,
-                        "target_price": target_100_p,
-                    }
-                except Exception as exc:
-                    logger.error("🚨 [%s] 1주 휩소 +1.00%% 매도덫 장전 실패: %s", sym, exc)
+            cid = generate_client_order_id(prefix=f"WHP{win_sym}")
+            try:
+                ord_res = await context.api.create_order(
+                    symbol=win_sym,
+                    side="BUY",
+                    quantity=WHIPSAW_FIXED_QTY,
+                    price=trap_buy_p,
+                    order_type="LIMIT",
+                    time_in_force="DAY",
+                    client_order_id=cid,
+                    enforce_daymarket_block=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "⚠️ [%s] 03:58 1주 휩소 매수덫 발사 보류: %s",
+                    win_sym,
+                    exc,
+                )
+                return {"status": "WHIPSAW_ORDER_ERROR", "error": str(exc)}
 
-    return {"status": "MONITORED"}
+            oid = str(ord_res.get("orderId") or "").strip()
+            other_sym = "SOXL" if win_sym == "SOXS" else "SOXS"
+            target_tp_p = (
+                math.ceil(
+                    (trap_buy_p * (1.0 + WHIPSAW_TARGET_PROFIT_PCT / 100.0))
+                    * 100.0
+                )
+                / 100.0
+            )
+
+            w_cache.update(
+                {
+                    "fired_today": True,
+                    "target_symbol": win_sym,
+                    "trap_price": trap_buy_p,
+                    "order_id": oid,
+                    "cutoff_0407_done": False,
+                }
+            )
+
+            await context.ledger.update_state(
+                win_sym,
+                buy_order_id=oid,
+                client_order_id=cid,
+                ordered_qty=WHIPSAW_FIXED_QTY,
+                buy_price=trap_buy_p,
+                target_sell_price=target_tp_p,
+                entry_session="WHIPSAW_1SH",
+                entry_trend=("DOWN" if win_sym == "SOXS" else "UP"),
+                nq_entry_price=qqq_ref,
+                nq_entry_amp=nq_amp,
+                is_session_done=True,
+                last_modify_mono=time.monotonic(),
+                entry_ts=time.time(),
+            )
+            await context.ledger.update_state(
+                other_sym,
+                is_session_done=True,
+            )
+
+            context.wakeup_event.set()
+
+            if hasattr(context, "send_slim_alert"):
+                overheat_badge = (
+                    " · 🔥과열일 독립가동" if nq_amp >= 2.0 else ""
+                )
+                await context.send_slim_alert(
+                    title=f"🌪️ [03:58 1주 휩소 매수덫 장전] {win_sym} 1주",
+                    body=(
+                        f"역산지정가 ${trap_buy_p:.2f} (데이장VWAP ${ref_vwap:.2f} / 1.005 · 이격 {disp_pct:+.2f}%)"
+                        f" · 체결시 목표 ${target_tp_p:.2f}(+1.00%){overheat_badge}"
+                    ),
+                )
+
+            return {
+                "status": "WHIPSAW_TRAP_PLACED",
+                "symbol": win_sym,
+                "orderId": oid,
+                "trap_price": trap_buy_p,
+                "ref_vwap": ref_vwap,
+            }
 
 
 # ---------------------------------------------------------------------------
-# [핵심 3] 04:07:00 EST 타임쉴드 만료 및 강제 정리 후 본진 인계 / 과열차단 복원
+# [핵심 2] 04:07:00 EST 타임쉴드 만료 정리 및 프리장 본진 인계 / 과열차단 복원
 # ---------------------------------------------------------------------------
 async def enforce_0407_whipsaw_cutoff_plugin(
     context: Any,
@@ -385,139 +357,147 @@ async def enforce_0407_whipsaw_cutoff_plugin(
 ) -> Dict[str, Any]:
     """
     🎯 2 [04:07:00 EST 타임쉴드 만료 및 강제 정리 후 본진 인계/과열차단 복원] & Case 95, 96:
-    - 04:07:00 EST 이상(hm >= 407) 도달 시 entry_session == 'WHIPSAW_1SH' 인 주문을 전수 점검한다.
-    - ① [미체결 시 (비용 $0 취소)] : holdings_qty == 0 이고 buy_order_id 가 존재하면 즉시 cancel_order 로
-         취소하고 장부의 buy_order_id='' 를 원자적으로 소각한 뒤 unlock_all_symbols_for_reentry() 를 호출한다.
-         (NQ < 2.0% 이면 프리장 본진에 매수 권한 인계, NQ >= 2.0% 이면 즉시 CANCELED_MACRO 복원!)
-    - ② [1주 보유 중일 시 (현재가 즉시 매도)] : holdings_qty > 0 이고 entry_session == 'WHIPSAW_1SH' 이면
-         2단계 방탄 매도 스윕(sweep_sell_position_bulletproof)으로 실시간 매수 1호가/현재가에 즉시 매도 처분한다.
+    - 04:07:00 EST 이상 도달 시:
+    ① 미체결 시 (비용 $0 취소): 1주 매수 덫 주문이 미체결 상태(holdings_qty == 0, entry_session == 'WHIPSAW_1SH')이면
+       즉시 cancel_order 로 취소하고 장부의 buy_order_id="" 소각 후 unlock_all_symbols_for_reentry() 호출!
+    ② 1주 보유 중일 시 (현재가 즉시 매도): 체결되어 보유 중(holdings_qty > 0, entry_session == 'WHIPSAW_1SH')이나
+       아직 +1.00% 목표가에 매도되지 않았다면, execute_bulletproof_sell_sweep 으로 실시간 매수 1호가에
+       즉시 매도 처분 및 정산 완료 후 unlock_all_symbols_for_reentry() 호출!
+    ③ 이미 04:07 이전에 +1.00% 익절 체결 완료된 경우에도 04:07 정각에 unlock_all_symbols_for_reentry() 를
+       호출하여 당일 NQ < 2.0% 이면 프리장 본진에 인계하고 NQ >= 2.0% 이면 CANCELED_MACRO 로 복원한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
-    if not (407 <= hm <= 814):
-        return {"status": "OUTSIDE_CUTOFF_WINDOW"}
+    if hm < 407:
+        return {"status": "BEFORE_0407_CUTOFF"}
 
-    nq_amp = safe_float((macro or {}).get("nq_amp"), 0.0)
-    snap_cache_map: Dict[str, Dict[str, Any]] = getattr(
-        context, "exit_snapshot_cache", {}
+    logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
+    w_cache = _ensure_whipsaw_cache(context, logical_date)
+
+    has_whipsaw_ledger = any(
+        str(context.ledger.get_state(s).get("entry_session") or "")
+        == "WHIPSAW_1SH"
+        for s in REAL_ALLOWED_SYMBOLS
     )
-    grace_cache_map: Dict[str, Dict[str, Any]] = getattr(
-        context, "indexing_grace_cache", {}
-    )
+    if bool(w_cache.get("cutoff_0407_done")) and not has_whipsaw_ledger:
+        return {"status": "ALREADY_CUTOFF_DONE"}
+
+    handled_any = False
 
     for sym in REAL_ALLOWED_SYMBOLS:
         st = context.ledger.get_state(sym)
-        if str(st.get("entry_session") or "") != "WHIPSAW_1SH":
+        entry_sess = str(st.get("entry_session") or "")
+        if entry_sess != "WHIPSAW_1SH":
             continue
 
         h_info = (holdings or {}).get(sym, {})
         h_qty = safe_int(h_info.get("qty"), 0)
         avg_p = safe_float(h_info.get("avg_price"), 0.0)
         buy_oid = str(st.get("buy_order_id") or "").strip()
-        sell_oid = str(st.get("sell_order_id") or "").strip()
 
-        # ① 04:07:00 EST 미체결 상태 (비용 $0 취소 후 본진 인계 또는 과열차단 복원)
-        if h_qty <= 0:
-            # 단, 방금 04:06:59 에 체결되어 잔고 인덱싱 시차 중인지 주문 상세를 1회 확인
-            if buy_oid:
-                detail = await context.api.get_order_detail(buy_oid)
-                if isinstance(detail, dict):
-                    ord_st = str(detail.get("status") or "").upper().strip()
-                    exec_obj = (
-                        detail.get("execution")
-                        if isinstance(detail.get("execution"), dict)
-                        else {}
+        # 케이스 ①: 04:07:00 EST 미체결 상태 -> 즉시 무비용 취소 후 본진 인계/과열차단 복원
+        if h_qty == 0 and buy_oid:
+            # 취소 직전 혹시 방금 체결되었는지 1회 최종 확인
+            detail = await context.api.get_order_detail(buy_oid)
+            exec_obj = (
+                detail.get("execution")
+                if (isinstance(detail, dict) and isinstance(detail.get("execution"), dict))
+                else {}
+            )
+            filled_q = safe_int(exec_obj.get("filledQuantity"), 0)
+            avg_fill_p = safe_float(exec_obj.get("averageFilledPrice"), 0.0)
+            if filled_q > 0:
+                h_qty = filled_q
+                avg_p = (
+                    avg_fill_p
+                    if avg_fill_p > 0.0
+                    else safe_float(st.get("buy_price"), 0.0)
+                )
+            else:
+                try:
+                    await context.api.cancel_order(buy_oid)
+                except Exception as exc:
+                    logger.warning(
+                        "⚠️ [%s] 04:07 휩소 미체결 매수 취소 예외: %s",
+                        sym,
+                        exc,
                     )
-                    if ord_st == "FILLED" or safe_int(exec_obj.get("filledQuantity"), 0) > 0:
-                        mark_auto_fill_grace_shield(
-                            context,
-                            symbol=sym,
-                            entry_session="WHIPSAW_1SH",
-                            fill_price=safe_float(exec_obj.get("averageFilledPrice"), 0.0),
-                        )
-                        continue
-
-            async with context.in_memory_ordering_lock:
-                if buy_oid:
-                    try:
-                        await context.api.cancel_order(buy_oid)
-                    except Exception as exc:
-                        logger.warning("⚠️ [%s] 04:07 1주 휩소 미체결 취소 예외: %s", sym, exc)
-
-                grace_cache_map.pop(sym, None)
                 unlock_res = await unlock_all_symbols_for_reentry(
-                    context=context,
-                    nq_amp=nq_amp,
-                    reason="WHIPSAW_0407_UNFILLED_CANCEL",
+                    context, macro=macro, now_est=dt_now
                 )
-                context.wakeup_event.set()
-
-                handover_msg = (
-                    f"🛑 NQ진폭 {nq_amp:.2f}% >= 2.00% 과열차단(CANCELED_MACRO) 복원"
-                    if nq_amp >= NQ_OVERHEAT_THRESHOLD
-                    else "👑 04:07 프리장 본진 추세추종 스나이퍼 인계 완료"
-                )
+                w_cache["cutoff_0407_done"] = True
+                handled_any = True
                 if hasattr(context, "send_slim_alert"):
-                    await context.send_slim_alert(
-                        title=f"⏰ [04:07 1주 휩소 타임쉴드 · 무비용($0) 취소] {sym}",
-                        body=f"미체결 1주 매수덫 취소 완료 · {handover_msg}",
+                    handover_txt = (
+                        "🛑 과열차단 복원(NQ>=2.0%)"
+                        if unlock_res.get("status") == "LOCKED_MACRO"
+                        else "🔫 프리장 본진 인계 완료"
                     )
-                return {
-                    "status": "WHIPSAW_UNFILLED_CANCELED",
-                    "symbol": sym,
-                    "unlock_result": unlock_res,
-                }
-
-        # ② 04:07:00 EST 1주 보유 중인 상태 (현재가/매수 1호가 즉시 매도 스윕)
-        live_p = safe_float((prices or {}).get(sym), 0.0)
-        if live_p <= 0.0:
-            live_p = safe_float(h_info.get("last_price"), avg_p)
-
-        async with context.in_memory_ordering_lock:
-            try:
-                sweep_res = await context.api.sweep_sell_position_bulletproof(
-                    symbol=sym,
-                    holdings_qty=h_qty,
-                    sell_order_id=sell_oid,
-                    fallback_price=live_p,
-                )
-                sweep_p = safe_float(sweep_res.get("sweep_price"), live_p)
-                new_oid = str(sweep_res.get("orderId") or sell_oid).strip()
-
-                snap_cache_map[sym] = {
-                    "symbol": sym,
-                    "last_holdings_qty": h_qty,
-                    "last_avg_price": avg_p if avg_p > 0.0 else sweep_p,
-                    "peak_price": max(avg_p, live_p),
-                    "entry_session": "WHIPSAW_1SH",
-                    "last_sweep_price": sweep_p,
-                    "exit_tag": "WHIPSAW_0407_CUTOFF",
-                    "updated_ts": time.time(),
-                }
-
-                await context.ledger.update_state(
-                    sym,
-                    buy_order_id="",
-                    sell_order_id=new_oid,
-                    target_sell_price=sweep_p,
-                )
-                context.wakeup_event.set()
-
-                if hasattr(context, "send_slim_alert"):
                     await context.send_slim_alert(
-                        title=f"⏰🧹 [04:07 1주 휩소 타임쉴드 즉시 매도] {sym} {h_qty}주",
-                        body=(
-                            f"평단 ${avg_p:.2f} ➔ 현재가 스윕 ${sweep_p:.2f} 처분 발사 "
-                            f"· 정산 직후 본진 인계/복원"
-                        ),
+                        title=f"🌪️🔒 [04:07 휩소 타임쉴드 · 미체결 무비용 취소] {sym}",
+                        body=f"1주 매수덫 취소 완료 (비용 $0) · {handover_txt}",
                     )
-                return {
-                    "status": "WHIPSAW_HOLDING_SWEPT",
-                    "symbol": sym,
-                    "sweep_price": sweep_p,
-                    "qty": h_qty,
-                }
-            except Exception as exc:
-                logger.error("🚨 [%s] 04:07 1주 휩소 보유분 즉시 매도 실패: %s", sym, exc)
+                continue
 
-    return {"status": "NO_WHIPSAW_ACTION"}
+        # 케이스 ②: 04:07:00 EST 1주 보유 중 -> 실시간 매수 1호가로 즉시 매도 처분 후 본진 인계/과열 복원
+        if h_qty > 0:
+            live_p = safe_float(
+                (prices or {}).get(sym),
+                safe_float(h_info.get("last_price"), avg_p),
+            )
+            bid1_p = await context.api.get_best_bid_price(
+                sym, fallback_price=live_p
+            )
+            sweep_p = max(
+                0.01,
+                math.floor(min(live_p, bid1_p) * 100.0) / 100.0
+                if (live_p > 0.0 and bid1_p > 0.0)
+                else math.floor(max(live_p, avg_p) * 100.0) / 100.0,
+            )
+
+            await execute_bulletproof_sell_sweep(
+                context=context,
+                symbol=sym,
+                holdings_qty=h_qty,
+                sweep_price=sweep_p,
+                reason_tag="WHIPSAW_0407_CUTOFF",
+            )
+            await reconcile_zero_holdings_exit_plugin(
+                context=context,
+                holdings={sym: {"qty": 0, "avg_price": 0.0}},
+                macro=macro,
+                now_est=dt_now,
+                override_exit_price=sweep_p,
+                override_exit_reason="WHIPSAW_0407_CUTOFF(04:07 타임쉴드 즉시청산)",
+            )
+            await unlock_all_symbols_for_reentry(
+                context, macro=macro, now_est=dt_now
+            )
+            w_cache["cutoff_0407_done"] = True
+            handled_any = True
+            continue
+
+        # 잔고 0주이고 buy_order_id 도 없는 잔류 WHIPSAW_1SH 상태 정리
+        await unlock_all_symbols_for_reentry(
+            context, macro=macro, now_est=dt_now
+        )
+        w_cache["cutoff_0407_done"] = True
+        handled_any = True
+
+    # 케이스 ③: 04:07 이전에 이미 +1.00% 익절로 청산 완료되었던 경우에도 04:07 정각 1회 본진 인계/과열 복원 보장
+    if (
+        not handled_any
+        and bool(w_cache.get("fired_today"))
+        and not bool(w_cache.get("cutoff_0407_done"))
+    ):
+        any_holding = any(
+            safe_int((holdings or {}).get(s, {}).get("qty"), 0) > 0
+            for s in REAL_ALLOWED_SYMBOLS
+        )
+        if not any_holding:
+            await unlock_all_symbols_for_reentry(
+                context, macro=macro, now_est=dt_now
+            )
+        w_cache["cutoff_0407_done"] = True
+
+    return {"status": "WHIPSAW_0407_CUTOFF_CHECKED", "handled": handled_any}

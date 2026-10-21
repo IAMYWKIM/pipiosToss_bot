@@ -1,587 +1,67 @@
 # -*- coding: utf-8 -*-
 """
-# NEW: quant_engine.py
-매크로 선물(NQ=F) 18:00 EST 신세션 방어/자가치유 캐시, 토스 QQQ 0.0초 실시간 속도/역행 연산 및
-1분봉 아카이빙/GC 통합 엔진 (Step 03 / 10)
-- 제1헌법: 모든 yfinance 조회 및 로컬 파일 I/O의 asyncio.to_thread 비동기 격리 및 GlobalThrottle 통제
-- 제4헌법: 모든 세션 경계 판단 ZoneInfo('America/New_York') 단일 소스 락온
-- 🎯 4 & Case 90: 토스 QQQ 0.0초 실시간 10m/3m ±0.20% 급등락 감지 시 HA음봉 바이패스(NQ_VEL_BYPASS)
-- 🎯 5 & Case 61, 62, 91 ~ 94:
-  1) 18:00 EST CME 선물 신세션 오픈 시 전일 fast_info/1d 잔재 혼입 100% 차단 및 0.00% 영점 출발
-  2) 18:10 EST 이후 오염된 prev_h / prev_l 감지 시 신세션 1m + fast_last 범위로 자가 치유(Self-Healing)
-  3) 17:00 ~ 17:59 EST 마감 휴장 및 주말(금 17:00 ~ 일 17:59 EST) 직전 마감 세션 고/저가 단조 보존
-  4) 포지션 자체 손실률 즉시 손절 금지 & NQ 진폭 기반 동적 임계치 max(nq_amp*0.5, 0.80%) × QQQ 역행 판정
+# MODIFIED: quant_engine.py
+나스닥 100 선물(NQ=F · 18:00 EST 신세션 하드 컷오프 시 전일 fast_info/1d 잔재 혼입 100% 차단·자가 치유
+및 17:00 ~ 17:59 EST 마감 휴장 중 직전 마감 세션 고/저가·마감가 단조 보존) &
+토스 Open API QQQ 0.0초 실시간 시세 기반 3차 방향성 인지 역행 방어망 &
+실시간 QQQ 10m/3m ±0.20% 급등락 시 HA음봉 바이패스(🚀 NQ_VEL_BYPASS) 코어 엔진 (Step 02 / 03)
+- 제1헌법: yfinance 외부 I/O의 asyncio.to_thread 비동기 격리 및 타임아웃 강제
+- 제4헌법: 모든 논리 시계열 ZoneInfo('America/New_York') 단일 소스 락온
+- 🎯 4 & 🎯 5 & Case 61, 62, 66, 91, 92, 93, 94 완벽 구현
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import math
-import os
 import threading
 import time
 from collections import deque
-from datetime import datetime, timedelta
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from datetime import datetime, time as dt_time, timedelta
+from typing import Any, Deque, Dict, Optional, Tuple
 
 import pandas as pd
+import yfinance as yf
 
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-
-from quant_indicators_plugin import (
-    candles_to_est_dataframe,
-    get_logical_trading_date_str,
-)
-from toss_api import EST_TZ, GlobalThrottle, TossInvestAPI, safe_float
+from quant_indicators_plugin import get_logical_trading_date_str
+from toss_api import EST_TZ, safe_float
 
 logger = logging.getLogger("toss_sniper.quant_engine")
 
-# 3차 매크로 방어선 동적 임계치 최소 하한선 (0.80% 하드 락온, Case 69 & Case 94)
-NQ_DYNAMIC_FLOOR: float = 0.80
-# 1·2차 매크로 과열 방어선 절대 진폭 임계치 (2.00% 하드 락온, Case 66)
-NQ_OVERHEAT_THRESHOLD: float = 2.00
-# HA음봉 바이패스용 QQQ 10m / 3m 유리 방향 급등락 임계치 (±0.20%, Case 90)
-QQQ_VELOCITY_BYPASS_THRESHOLD: float = 0.20
+# ---------------------------------------------------------------------------
+# 🎯 5 : 매크로 3단 방어망 및 실시간 QQQ 급등락 바이패스 핵심 상수
+# ---------------------------------------------------------------------------
+NQ_OVERHEAT_THRESHOLD: float = 2.00          # 1·2차 매크로 과열 방어 임계치 (NQ=F 당일 진폭 2.00%)
+MIN_QQQ_ADVERSE_STOP_PCT: float = 0.80       # 3차 실시간 QQQ 역행 방어 최소 하한선 (0.80%)
+STAGE3_AMP_MULTIPLIER: float = 0.50          # 3차 동적 임계치 산출용 선물 진폭 가중치 (진폭 * 0.50)
+NQ_VEL_BYPASS_THRESHOLD_PCT: float = 0.20    # 실시간 QQQ 10m/3m 급등락 HA음봉 바이패스 임계치 (±0.20%)
+
+# 캐시 유효 주기 상수 (Case 61: NQ=F 15.0초 캐싱, 보유 중 QQQ 1.5초 프로빙)
+NQ_CACHE_TTL_SEC: float = 15.0
+QQQ_ACTIVE_PROBE_TTL_SEC: float = 1.5
+QQQ_IDLE_PROBE_TTL_SEC: float = 5.0
 
 
 # ---------------------------------------------------------------------------
-# CME 나스닥 100 선물(NQ=F) 세션 경계 시각 산출 유틸리티 (Case 01, 62, 91)
+# 순수 함수 : QQQ 스케일 검증 · 3차 동적 임계치 · 방향성 인지 3차 역행 판정기
 # ---------------------------------------------------------------------------
-def get_cme_futures_session_bounds(
-    now_est: Optional[datetime] = None,
-) -> Dict[str, Any]:
+def is_qqq_scale_valid(price: float) -> bool:
     """
-    현재 시각(EST) 기준 CME 나스닥 100 선물(NQ=F)의 현행 논리 세션 시작 시각(18:00 EST)과
-    직전 마감 세션의 시작/종료 시각, 그리고 마감 휴장(17:00 ~ 17:59 EST) 및 주말 여부를 반환한다.
+    🚨 Case 93:
+    3차 방어 기준가(nq_entry_price)에 NQ=F 선물 지수(약 15,000 ~ 25,000)나 0.0 이
+    오염되어 들어가는 것을 차단하기 위해 QQQ 유효 가격 스케일(100.0 ~ 2,000.0 USD)을 검증한다.
     """
-    dt = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
-    wd = dt.weekday()  # 0=Mon ... 4=Fri, 5=Sat, 6=Sun
-    hm = dt.hour * 100 + dt.minute
-
-    # 금요일 17:00 EST ~ 일요일 17:59 EST 주말 휴장 판정 (Case 01)
-    is_weekend_closed = bool(
-        (wd == 4 and hm >= 1700)
-        or (wd == 5)
-        or (wd == 6 and hm < 1800)
-    )
-    # 평일/일요일 17:00 ~ 17:59 EST 선물 일일 마감 휴장 구간
-    is_daily_maintenance = bool(1700 <= hm <= 1759)
-
-    if is_weekend_closed:
-        # 주말에는 직전 금요일 마감 세션(목 18:00 ~ 금 17:00 EST)을 보존 기준으로 삼는다
-        days_since_fri = (wd - 4) % 7
-        fri_date = (dt - timedelta(days=days_since_fri)).replace(
-            hour=17, minute=0, second=0, microsecond=0
-        )
-        curr_sess_start = fri_date - timedelta(hours=23)  # 목요일 18:00 EST
-        prev_sess_end = curr_sess_start - timedelta(hours=1)
-        prev_sess_start = prev_sess_end - timedelta(hours=23)
-        session_id = fri_date.strftime("%Y-%m-%d")
-    elif hm >= 1800:
-        # 18:00 ~ 23:59 EST: 당일 18:00 EST 에 신세션 오픈 (논리 거래일은 익일)
-        curr_sess_start = dt.replace(hour=18, minute=0, second=0, microsecond=0)
-        prev_sess_end = dt.replace(hour=17, minute=0, second=0, microsecond=0)
-        prev_sess_start = prev_sess_end - timedelta(hours=23)
-        session_id = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
-        # 00:00 ~ 17:59 EST: 전일 18:00 EST 에 오픈한 세션 (논리 거래일은 당일)
-        curr_sess_start = (dt - timedelta(days=1)).replace(
-            hour=18, minute=0, second=0, microsecond=0
-        )
-        prev_sess_end = curr_sess_start - timedelta(hours=1)
-        prev_sess_start = prev_sess_end - timedelta(hours=23)
-        session_id = dt.strftime("%Y-%m-%d")
-
-    is_early_new_session_window = bool(
-        not is_weekend_closed and 1800 <= hm <= 1810
-    )
-
-    return {
-        "now_est": dt,
-        "session_id": session_id,
-        "curr_sess_start": curr_sess_start,
-        "prev_sess_start": prev_sess_start,
-        "prev_sess_end": prev_sess_end,
-        "is_weekend_closed": is_weekend_closed,
-        "is_daily_maintenance": is_daily_maintenance,
-        "is_early_new_session_window": is_early_new_session_window,
-    }
+    p = safe_float(price, 0.0)
+    return bool(100.0 <= p < 2000.0)
 
 
-# ---------------------------------------------------------------------------
-# MacroDataCache : NQ=F 18:00 EST 신세션 방어/자가치유 & QQQ 0.0초 실시간 캐시
-# ---------------------------------------------------------------------------
-class MacroDataCache:
+def calc_dynamic_stage3_threshold(nq_entry_amp: float) -> float:
     """
-    🎯 5 & Case 61, 62, 90 ~ 94:
-    1) NQ=F 선물 진폭(nq_amp) 및 고/저가 추적:
-       - 18:00 ~ 18:10 EST 신세션 초입 df_session 미수신 시 fast_info.day_high/low 및 1d 병합 100% 차단,
-         오직 fast_last 단일 영점(0.00%)으로 출발
-       - 18:10 EST 이후 전일 잔재로 오염된 prev_h / prev_l 감지 시 신세션 1m + fast_last 로 자가 치유
-       - 17:00 ~ 17:59 EST 마감 휴장 및 주말에는 직전 마감 세션 고/저가/마감가 100% 단조 보존
-    2) 토스 Open API QQQ 0.0초 실시간 현재가 및 10m/3m 단기 급등락 속도(±0.20% NQ_VEL_BYPASS) 추적:
-       - 17:00 ~ 18:59 EST 구간에도 초기 1회 즉시 QQQ 시세를 확보하여 선물 스케일 오염 차단
+    🎯 5: 3차 역행 방어 동적 임계치 산출 공식
+    dynamic_threshold = max(nq_entry_amp * 0.5, 0.80%)
     """
-
-    def __init__(self, api: TossInvestAPI, nq_ttl_sec: float = 15.0) -> None:
-        self.api = api
-        self.nq_ttl_sec = float(nq_ttl_sec)
-
-        self._lock = threading.RLock()
-        self._nq_state: Dict[str, Any] = {
-            "session_id": "",
-            "nq_price": 0.0,
-            "nq_high": 0.0,
-            "nq_low": 0.0,
-            "nq_amp": 0.0,
-            "prev_sess_high": 0.0,
-            "prev_sess_low": 0.0,
-            "updated_mono": 0.0,
-            "updated_est_str": "",
-            "is_self_healed": False,
-        }
-
-        # QQQ 실시간 틱 히스토리 (최근 20분치 (epoch_sec, qqq_price) 링버퍼)
-        self._qqq_tick_history: Deque[Tuple[float, float]] = deque(maxlen=3600)
-        self._qqq_last_price: float = 0.0
-        self._qqq_last_fetch_mono: float = 0.0
-        self._qqq_1m_cache_mono: float = 0.0
-        self._qqq_1m_df: pd.DataFrame = pd.DataFrame()
-
-    def reset_runtime_cache(self) -> None:
-        """
-        Case 02: /reset 명령 시 QQQ 직전 시세는 보존하되 오염 가능한 세션 고/저가 캐시를 초기화한다.
-        """
-        with self._lock:
-            self._nq_state["updated_mono"] = 0.0
-
-    # -----------------------------------------------------------------------
-    # 내부 동기 NQ=F 조회 및 18:00 EST 전일 잔재 차단 / 자가 치유 코어
-    # -----------------------------------------------------------------------
-    def _fetch_nq_sync(self, now_est: Optional[datetime] = None) -> Dict[str, Any]:
-        """
-        백그라운드 스레드(asyncio.to_thread)에서 실행되는 NQ=F 조회 및 세션 정합성 검증 코어.
-        """
-        bounds = get_cme_futures_session_bounds(now_est)
-        dt_now: datetime = bounds["now_est"]
-        sess_id: str = bounds["session_id"]
-        curr_start: datetime = bounds["curr_sess_start"]
-        prev_start: datetime = bounds["prev_sess_start"]
-        prev_end: datetime = bounds["prev_sess_end"]
-        is_closed_preserve: bool = (
-            bounds["is_weekend_closed"] or bounds["is_daily_maintenance"]
-        )
-
-        with self._lock:
-            prev_state = dict(self._nq_state)
-
-        # 세션 롤오버(18:00 EST 신세션 진입) 감지 시 이전 세션 고/저가 분리 보관 후 즉시 0점 리셋
-        if prev_state.get("session_id") != sess_id:
-            old_h = safe_float(prev_state.get("nq_high"), 0.0)
-            old_l = safe_float(prev_state.get("nq_low"), 0.0)
-            prev_state = {
-                "session_id": sess_id,
-                "nq_price": 0.0,
-                "nq_high": 0.0,
-                "nq_low": 0.0,
-                "nq_amp": 0.0,
-                "prev_sess_high": old_h if old_h > 0.0 else safe_float(prev_state.get("prev_sess_high"), 0.0),
-                "prev_sess_low": old_l if old_l > 0.0 else safe_float(prev_state.get("prev_sess_low"), 0.0),
-                "updated_mono": 0.0,
-                "updated_est_str": dt_now.strftime("%H:%M:%S"),
-                "is_self_healed": False,
-            }
-
-        # 17:00 ~ 17:59 EST 마감 휴장 또는 주말에 이미 유효한 마감 세션 데이터가 있으면 단조 보존
-        if (
-            is_closed_preserve
-            and safe_float(prev_state.get("nq_price"), 0.0) > 0.0
-            and safe_float(prev_state.get("nq_high"), 0.0) > 0.0
-            and safe_float(prev_state.get("nq_low"), 0.0) > 0.0
-        ):
-            prev_state["updated_mono"] = time.monotonic()
-            prev_state["updated_est_str"] = dt_now.strftime("%H:%M:%S")
-            with self._lock:
-                self._nq_state = dict(prev_state)
-            return prev_state
-
-        if yf is None:
-            return prev_state
-
-        GlobalThrottle.wait_api_sync("MARKET_INFO")
-        ticker = yf.Ticker("NQ=F")
-
-        # 1) fast_info 추출
-        fast_last = 0.0
-        fast_high = 0.0
-        fast_low = 0.0
-        try:
-            fi = ticker.fast_info
-            if fi is not None:
-                fast_last = safe_float(getattr(fi, "last_price", None), 0.0)
-                fast_high = safe_float(getattr(fi, "day_high", None), 0.0)
-                fast_low = safe_float(getattr(fi, "day_low", None), 0.0)
-        except Exception:
-            pass
-
-        # 2) 1분봉(5d, prepost=True) 조회 후 America/New_York 타임존 변환 (Case 62)
-        df_1m = pd.DataFrame()
-        try:
-            raw_1m = ticker.history(period="5d", interval="1m", prepost=True)
-            if isinstance(raw_1m, pd.DataFrame) and not raw_1m.empty:
-                idx = raw_1m.index
-                if idx.tz is None:
-                    idx = idx.tz_localize("UTC").tz_convert(EST_TZ)
-                else:
-                    idx = idx.tz_convert(EST_TZ)
-                df_1m = raw_1m.copy()
-                df_1m.index = idx
-                df_1m = df_1m[df_1m["Close"] > 0.0]
-        except Exception as exc:
-            logger.warning("⚠️ yfinance NQ=F 1m 조회 실패: %s", exc)
-
-        # 직전 마감 세션(prev_start ~ prev_end) 및 현재 신세션(index >= curr_start) 분리
-        df_prev_sess = (
-            df_1m[(df_1m.index >= prev_start) & (df_1m.index <= prev_end)]
-            if not df_1m.empty
-            else pd.DataFrame()
-        )
-        df_session = (
-            df_1m[df_1m.index >= curr_start]
-            if not df_1m.empty
-            else pd.DataFrame()
-        )
-
-        prev_sess_h = (
-            float(df_prev_sess["High"].max())
-            if not df_prev_sess.empty
-            else safe_float(prev_state.get("prev_sess_high"), 0.0)
-        )
-        prev_sess_l = (
-            float(df_prev_sess["Low"].min())
-            if not df_prev_sess.empty
-            else safe_float(prev_state.get("prev_sess_low"), 0.0)
-        )
-
-        prev_h = safe_float(prev_state.get("nq_high"), 0.0)
-        prev_l = safe_float(prev_state.get("nq_low"), 0.0)
-        self_healed = False
-
-        # -------------------------------------------------------------------
-        # 🎯 5 & Case 91:
-        # [분기 A] 신세션 1분봉(df_session)이 아직 비어 있는 경우 (18:00 ~ 18:10 EST 지연 구간)
-        # -------------------------------------------------------------------
-        if df_session.empty:
-            if is_closed_preserve and not df_prev_sess.empty:
-                # 마감 휴장/주말 중 기동하여 당일 세션이 곧 직전 마감 세션인 경우
-                cur_c = float(df_prev_sess["Close"].iloc[-1])
-                cur_h = float(df_prev_sess["High"].max())
-                cur_l = float(df_prev_sess["Low"].min())
-            else:
-                # 18:00 EST 신세션 직후: 전일 fast_info.day_high/low 및 1d 병합 100% 금지!
-                # 오직 실시간 체결가 fast_last 단일 영점(진폭 0.00%)으로 출발한다.
-                if fast_last <= 0.0 and not df_1m.empty:
-                    fast_last = float(df_1m["Close"].iloc[-1])
-                cur_c = fast_last
-
-                # 기존 prev_h / prev_l 이 직전 마감 세션 고/저가와 일치하거나
-                # fast_last 대비 0.20% 이상 벌어져 있으면 전일 잔재 오염이므로 즉시 폐기!
-                is_prev_contaminated = False
-                if prev_h > 0.0 and prev_l > 0.0 and cur_c > 0.0:
-                    if (
-                        (prev_sess_h > 0.0 and abs(prev_h - prev_sess_h) < 1.0)
-                        or (prev_sess_l > 0.0 and abs(prev_l - prev_sess_l) < 1.0)
-                        or ((prev_h - cur_c) / cur_c) * 100.0 >= 0.20
-                        or ((cur_c - prev_l) / cur_c) * 100.0 >= 0.20
-                    ):
-                        is_prev_contaminated = True
-                        self_healed = True
-
-                if is_prev_contaminated or prev_h <= 0.0 or prev_l <= 0.0:
-                    cur_h = cur_c
-                    cur_l = cur_c
-                else:
-                    cur_h = max(prev_h, cur_c)
-                    cur_l = min(prev_l, cur_c)
-
-        # -------------------------------------------------------------------
-        # [분기 B] 신세션 1분봉(df_session)이 존재하는 경우 (18:10 EST 이후 정상 세션)
-        # -------------------------------------------------------------------
-        else:
-            sess_bar_h = float(df_session["High"].max())
-            sess_bar_l = float(df_session["Low"].min())
-            sess_bar_c = float(df_session["Close"].iloc[-1])
-
-            cur_c = fast_last if fast_last > 0.0 else sess_bar_c
-            true_sess_h = max(sess_bar_h, cur_c)
-            true_sess_l = min(sess_bar_l, cur_c) if sess_bar_l > 0.0 else cur_c
-
-            # 1) 기존 캐시(prev_h, prev_l)의 전일 잔재 오염 검증 및 자가 치유(Self-Healing)
-            if prev_h > 0.0 and prev_l > 0.0 and true_sess_l > 0.0:
-                exceed_high_pct = ((prev_h - true_sess_h) / true_sess_h) * 100.0
-                exceed_low_pct = ((true_sess_l - prev_l) / true_sess_l) * 100.0
-                matches_prev_sess = bool(
-                    (prev_sess_h > 0.0 and abs(prev_h - prev_sess_h) < 1.0 and prev_h > true_sess_h)
-                    or (prev_sess_l > 0.0 and abs(prev_l - prev_sess_l) < 1.0 and prev_l < true_sess_l)
-                )
-                if matches_prev_sess or exceed_high_pct >= 0.20 or exceed_low_pct >= 0.20:
-                    logger.info(
-                        "🩹 [Self-Healing] NQ=F 오염 캐시 자가 치유 발동: 기존(H=%.2f, L=%.2f) -> 신세션(H=%.2f, L=%.2f)",
-                        prev_h,
-                        prev_l,
-                        true_sess_h,
-                        true_sess_l,
-                    )
-                    prev_h = true_sess_h
-                    prev_l = true_sess_l
-                    self_healed = True
-
-            # 2) fast_info.day_high / day_low 병합 시 전일 잔재 여부 엄격 검증
-            cand_h = max(true_sess_h, prev_h) if prev_h > 0.0 else true_sess_h
-            cand_l = min(true_sess_l, prev_l) if prev_l > 0.0 else true_sess_l
-
-            if fast_high > 0.0 and true_sess_h > 0.0:
-                is_fast_h_prev_remnant = bool(
-                    (prev_sess_h > 0.0 and abs(fast_high - prev_sess_h) < 1.0 and fast_high > true_sess_h)
-                    or (((fast_high - true_sess_h) / true_sess_h) * 100.0 >= 0.25)
-                )
-                if not is_fast_h_prev_remnant:
-                    cand_h = max(cand_h, fast_high)
-
-            if fast_low > 0.0 and true_sess_l > 0.0:
-                is_fast_l_prev_remnant = bool(
-                    (prev_sess_l > 0.0 and abs(fast_low - prev_sess_l) < 1.0 and fast_low < true_sess_l)
-                    or (((true_sess_l - fast_low) / true_sess_l) * 100.0 >= 0.25)
-                )
-                if not is_fast_l_prev_remnant:
-                    cand_l = min(cand_l, fast_low)
-
-            cur_h = cand_h
-            cur_l = cand_l
-
-        nq_amp = (
-            ((cur_h - cur_l) / cur_l) * 100.0
-            if (cur_l > 0.0 and cur_h >= cur_l)
-            else 0.0
-        )
-
-        new_state = {
-            "session_id": sess_id,
-            "nq_price": round(cur_c, 2),
-            "nq_high": round(cur_h, 2),
-            "nq_low": round(cur_l, 2),
-            "nq_amp": round(nq_amp, 2),
-            "prev_sess_high": round(prev_sess_h, 2),
-            "prev_sess_low": round(prev_sess_l, 2),
-            "updated_mono": time.monotonic(),
-            "updated_est_str": dt_now.strftime("%H:%M:%S"),
-            "is_self_healed": self_healed,
-        }
-        with self._lock:
-            self._nq_state = dict(new_state)
-        return new_state
-
-    # -----------------------------------------------------------------------
-    # 토스 Open API QQQ 0.0초 실시간 시세 및 10m / 3m 단기 속도 산출 (Case 90, 93)
-    # -----------------------------------------------------------------------
-    def record_qqq_tick(self, qqq_price: float, now_ts: Optional[float] = None) -> None:
-        """
-        메인 루프에서 배치 조회된 실시간 QQQ 현재가를 링버퍼에 즉시 적재한다.
-        """
-        qp = safe_float(qqq_price, 0.0)
-        if qp <= 0.0:
-            return
-        ts = float(now_ts if now_ts is not None else time.time())
-        with self._lock:
-            self._qqq_last_price = qp
-            self._qqq_last_fetch_mono = time.monotonic()
-            self._qqq_tick_history.append((ts, qp))
-
-    async def ensure_qqq_live_price(
-        self, provided_qqq_price: float = 0.0, force_refresh_sec: float = 1.5
-    ) -> float:
-        """
-        Case 61 & Case 93:
-        - 외부에서 이미 배치 조회된 provided_qqq_price(> 0)가 있으면 즉시 기록 후 반환한다.
-        - 17:00 ~ 18:59 EST 구간을 포함하여 _qqq_last_price 가 0.0 이거나
-          force_refresh_sec 이상 경과했으면 토스 Open API GET /api/v1/prices?symbols=QQQ 를
-          즉시 호출하여 선물 지수 스케일(20,000pt) 오염을 원천 차단한다.
-        """
-        qp = safe_float(provided_qqq_price, 0.0)
-        if qp > 0.0:
-            self.record_qqq_tick(qp)
-            return qp
-
-        with self._lock:
-            cached_qp = self._qqq_last_price
-            elapsed = time.monotonic() - self._qqq_last_fetch_mono
-
-        if cached_qp > 0.0 and elapsed < force_refresh_sec:
-            return cached_qp
-
-        fetched_qp = await self.api.get_current_price("QQQ")
-        if fetched_qp > 0.0:
-            self.record_qqq_tick(fetched_qp)
-            return fetched_qp
-        return cached_qp
-
-    async def get_qqq_velocity_metrics(
-        self, live_qqq_price: float = 0.0
-    ) -> Dict[str, Any]:
-        """
-        🎯 4 & Case 90:
-        토스 Open API QQQ 실시간 틱 히스토리(부족 시 QQQ 1분봉 15개 보충)를 기반으로
-        최근 10분 변화율(qqq_10m_chg_pct)과 3분 변화율(qqq_3m_chg_pct)을 산출하여,
-        보유 포지션 유리 방향 ±0.20% 급등락 시 HA음봉을 바이패스(🚀 NQ_VEL_BYPASS)할지 판정한다.
-        """
-        qp = await self.ensure_qqq_live_price(live_qqq_price)
-        now_epoch = time.time()
-
-        # 링버퍼가 아직 10분치를 채우지 못한 기동 직후에는 60초 주기로 QQQ 1분봉 15개를 보충 조회
-        with self._lock:
-            oldest_epoch = (
-                self._qqq_tick_history[0][0] if self._qqq_tick_history else now_epoch
-            )
-            need_candle_backfill = bool((now_epoch - oldest_epoch) < 540.0)
-            candle_cache_age = time.monotonic() - self._qqq_1m_cache_mono
-
-        if need_candle_backfill and candle_cache_age >= 60.0:
-            try:
-                qqq_candles, _ = await self.api.get_candles(
-                    symbol="QQQ", interval="1m", count=20, adjusted=True
-                )
-                df_q = candles_to_est_dataframe(qqq_candles)
-                with self._lock:
-                    self._qqq_1m_df = df_q
-                    self._qqq_1m_cache_mono = time.monotonic()
-            except Exception:
-                pass
-
-        p_3m_ago = 0.0
-        p_10m_ago = 0.0
-        target_3m = now_epoch - 180.0
-        target_10m = now_epoch - 600.0
-
-        with self._lock:
-            for ts_val, price_val in reversed(self._qqq_tick_history):
-                if p_3m_ago <= 0.0 and ts_val <= target_3m:
-                    p_3m_ago = price_val
-                if p_10m_ago <= 0.0 and ts_val <= target_10m:
-                    p_10m_ago = price_val
-                    break
-
-            df_q_ref = self._qqq_1m_df
-
-        if (p_3m_ago <= 0.0 or p_10m_ago <= 0.0) and isinstance(df_q_ref, pd.DataFrame) and not df_q_ref.empty:
-            closes = df_q_ref["close"]
-            if p_3m_ago <= 0.0 and len(closes) >= 4:
-                p_3m_ago = float(closes.iloc[-4])
-            elif p_3m_ago <= 0.0:
-                p_3m_ago = float(closes.iloc[0])
-
-            if p_10m_ago <= 0.0 and len(closes) >= 11:
-                p_10m_ago = float(closes.iloc[-11])
-            elif p_10m_ago <= 0.0:
-                p_10m_ago = float(closes.iloc[0])
-
-        chg_3m_pct = (
-            ((qp - p_3m_ago) / p_3m_ago) * 100.0
-            if (qp > 0.0 and p_3m_ago > 0.0)
-            else 0.0
-        )
-        chg_10m_pct = (
-            ((qp - p_10m_ago) / p_10m_ago) * 100.0
-            if (qp > 0.0 and p_10m_ago > 0.0)
-            else 0.0
-        )
-
-        # SOXS(숏) 보유 시 QQQ -0.20% 이하 급락이 유리 방향 급등락
-        bypass_soxs = bool(
-            chg_3m_pct <= -QQQ_VELOCITY_BYPASS_THRESHOLD
-            or chg_10m_pct <= -QQQ_VELOCITY_BYPASS_THRESHOLD
-        )
-        # SOXL(롱) 보유 시 QQQ +0.20% 이상 급등이 유리 방향 급등락
-        bypass_soxl = bool(
-            chg_3m_pct >= QQQ_VELOCITY_BYPASS_THRESHOLD
-            or chg_10m_pct >= QQQ_VELOCITY_BYPASS_THRESHOLD
-        )
-
-        return {
-            "qqq_price": round(qp, 4),
-            "qqq_3m_chg_pct": round(chg_3m_pct, 3),
-            "qqq_10m_chg_pct": round(chg_10m_pct, 3),
-            "bypass_soxs": bypass_soxs,
-            "bypass_soxl": bypass_soxl,
-        }
-
-    async def get_macro_snapshot(
-        self,
-        live_qqq_price: float = 0.0,
-        force_nq_refresh: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        메인 타격 루프 및 UI 관제 보드에서 호출하는 통합 매크로 스냅샷 반환기:
-        - NQ=F 진폭/고저가(15초 TTL 캐시) + 토스 QQQ 0.0초 실시간 현재가 및 10m/3m 속도 통합
-        """
-        now_mono = time.monotonic()
-        with self._lock:
-            cached_nq = dict(self._nq_state)
-            nq_age = now_mono - safe_float(cached_nq.get("updated_mono"), 0.0)
-
-        if (
-            force_nq_refresh
-            or safe_float(cached_nq.get("nq_price"), 0.0) <= 0.0
-            or nq_age >= self.nq_ttl_sec
-        ):
-            try:
-                cached_nq = await asyncio.wait_for(
-                    asyncio.to_thread(self._fetch_nq_sync),
-                    timeout=10.0,
-                )
-            except Exception as exc:
-                logger.warning("⚠️ NQ=F 스냅샷 갱신 타임아웃/실패 (캐시 폴백): %s", exc)
-
-        vel = await self.get_qqq_velocity_metrics(live_qqq_price=live_qqq_price)
-        nq_amp = safe_float(cached_nq.get("nq_amp"), 0.0)
-        dyn_thresh = max(round(nq_amp * 0.5, 2), NQ_DYNAMIC_FLOOR)
-
-        return {
-            "session_id": str(cached_nq.get("session_id") or ""),
-            "nq_price": safe_float(cached_nq.get("nq_price"), 0.0),
-            "nq_high": safe_float(cached_nq.get("nq_high"), 0.0),
-            "nq_low": safe_float(cached_nq.get("nq_low"), 0.0),
-            "nq_amp": nq_amp,
-            "is_overheated_200": bool(nq_amp >= NQ_OVERHEAT_THRESHOLD),
-            "dynamic_threshold_pct": dyn_thresh,
-            "qqq_price": safe_float(vel.get("qqq_price"), 0.0),
-            "qqq_3m_chg_pct": safe_float(vel.get("qqq_3m_chg_pct"), 0.0),
-            "qqq_10m_chg_pct": safe_float(vel.get("qqq_10m_chg_pct"), 0.0),
-            "bypass_soxs": bool(vel.get("bypass_soxs")),
-            "bypass_soxl": bool(vel.get("bypass_soxl")),
-            "updated_est_str": str(cached_nq.get("updated_est_str") or ""),
-            "is_self_healed": bool(cached_nq.get("is_self_healed")),
-        }
-
-
-# ---------------------------------------------------------------------------
-# 3차 방향성 인지(Direction-Aware) QQQ 실시간 역행 판정 함수 (🎯 5 & Case 67, 69, 93, 94)
-# ---------------------------------------------------------------------------
-def is_qqq_scale_valid(ref_price: float, curr_qqq_price: float) -> bool:
-    """
-    Case 93: 장부의 nq_entry_price(ref_price)가 NQ=F 선물 스케일(예: 20,000pt)로
-    오염되어 있는지 검증한다. 현재 QQQ 가격 대비 0.3배 ~ 3.0배 범위 내에 있어야 유효한 QQQ 스케일이다.
-    """
-    rp = safe_float(ref_price, 0.0)
-    cp = safe_float(curr_qqq_price, 0.0)
-    if rp <= 0.0 or cp <= 0.0:
-        return False
-    ratio = rp / cp
-    return bool(0.30 <= ratio <= 3.00)
+    amp = max(0.0, safe_float(nq_entry_amp, 0.0))
+    return round(max(amp * STAGE3_AMP_MULTIPLIER, MIN_QQQ_ADVERSE_STOP_PCT), 4)
 
 
 def calc_qqq_adverse_status(
@@ -593,142 +73,547 @@ def calc_qqq_adverse_status(
     position_live_price: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    🎯 5 & Case 67, 69, 94:
-    3차 방향성 인지 매크로 방어선 판정기:
-    - 포지션 자체 평가손실률이 -0.80% 이상이더라도 즉시 손절 절대 금지!
-    - 동적 임계치: dynamic_threshold = max(nq_entry_amp * 0.5, 0.80%)
-    - 역행률(adverse_move_pct):
-      * SOXS(숏) 보유 시: QQQ 상승률 = ((qqq_curr - qqq_entry) / qqq_entry) * 100.0
-      * SOXL(롱) 보유 시: QQQ 하락률 = ((qqq_entry - qqq_curr) / qqq_entry) * 100.0
-    - 오직 포지션이 손실 구간(0 < position_live_price < position_avg_price)이면서
-      adverse_move_pct >= dynamic_threshold 일 때만 should_stop = True 를 반환한다.
+    🎯 5 & Case 66, 92, 93, 94:
+    - 보유 포지션 자체의 평가손실률(-0.80% 등)로 즉시 손절하는 것을 100% 금지한다!
+    - 오직 포지션이 평가손실 구간(0 < position_live_price < position_avg_price)에 있다는 전제 하에,
+      진입(또는 수동 ON 락온) 시점의 실시간 QQQ 기준가(qqq_entry_price) 대비
+      현재 실시간 QQQ 가격(qqq_curr_price)이 반대 방향으로 dynamic_threshold = max(nq_entry_amp * 0.5, 0.80%)
+      이상 역행했을 때만 should_stop = True 를 반환한다.
+      * SOXS (숏) 보유 시: QQQ 가 기준가 대비 +dynamic_threshold 이상 상승하면 역행
+      * SOXL (롱) 보유 시: QQQ 가 기준가 대비 -dynamic_threshold 이하 하락하면 역행 (역행폭 양수 환산)
     """
-    sym = str(symbol or "").upper().strip()
-    q_ent = safe_float(qqq_entry_price, 0.0)
-    q_cur = safe_float(qqq_curr_price, 0.0)
-    e_amp = max(0.0, safe_float(nq_entry_amp, 0.0))
+    sym = str(symbol or "SOXS").upper().strip()
+    ref_entry = safe_float(qqq_entry_price, 0.0)
+    ref_curr = safe_float(qqq_curr_price, 0.0)
+    dyn_thr = calc_dynamic_stage3_threshold(nq_entry_amp)
+
     avg_p = safe_float(position_avg_price, 0.0)
     live_p = safe_float(position_live_price, 0.0)
+    in_loss_zone = bool(0.0 < live_p < avg_p) if (avg_p > 0.0 and live_p > 0.0) else True
 
-    dyn_threshold = max(round(e_amp * 0.5, 2), NQ_DYNAMIC_FLOOR)
-    in_loss_zone = bool(avg_p > 0.0 and 0.0 < live_p < avg_p)
-
-    if not is_qqq_scale_valid(q_ent, q_cur):
+    scale_ok = bool(is_qqq_scale_valid(ref_entry) and is_qqq_scale_valid(ref_curr))
+    if not scale_ok or ref_entry <= 0.0 or ref_curr <= 0.0:
         return {
+            "symbol": sym,
             "scale_valid": False,
-            "dynamic_threshold_pct": dyn_threshold,
-            "qqq_raw_chg_pct": 0.0,
-            "adverse_move_pct": 0.0,
             "in_loss_zone": in_loss_zone,
+            "qqq_entry_price": ref_entry,
+            "qqq_curr_price": ref_curr,
+            "raw_qqq_chg_pct": 0.0,
+            "adverse_move_pct": 0.0,
+            "dynamic_threshold_pct": dyn_thr,
             "should_stop": False,
         }
 
-    raw_chg_pct = ((q_cur - q_ent) / q_ent) * 100.0
+    raw_chg_pct = ((ref_curr - ref_entry) / ref_entry) * 100.0
     # SOXS 는 QQQ 상승(+)이 역행, SOXL 은 QQQ 하락(-)이 역행
-    adverse_move_pct = raw_chg_pct if sym == "SOXS" else (-raw_chg_pct)
-    should_stop = bool(in_loss_zone and adverse_move_pct >= dyn_threshold)
+    adverse_pct = raw_chg_pct if sym == "SOXS" else (-raw_chg_pct)
+    should_stop = bool(in_loss_zone and (adverse_pct >= dyn_thr))
 
     return {
+        "symbol": sym,
         "scale_valid": True,
-        "dynamic_threshold_pct": dyn_threshold,
-        "qqq_raw_chg_pct": round(raw_chg_pct, 3),
-        "adverse_move_pct": round(adverse_move_pct, 3),
         "in_loss_zone": in_loss_zone,
+        "qqq_entry_price": round(ref_entry, 4),
+        "qqq_curr_price": round(ref_curr, 4),
+        "raw_qqq_chg_pct": round(raw_chg_pct, 4),
+        "adverse_move_pct": round(adverse_pct, 4),
+        "dynamic_threshold_pct": round(dyn_thr, 4),
         "should_stop": should_stop,
     }
 
 
 # ---------------------------------------------------------------------------
-# CandleRecorder : SOXS · SOXL · QQQ 1분봉 비동기 로컬 아카이빙 & 17:00 EST GC (Case 22)
+# CME 선물 세션(18:00 EST 오픈 ~ 익일 17:00 EST 마감) 경계 시각 계산 헬퍼
 # ---------------------------------------------------------------------------
-class CandleRecorder:
+def _get_cme_session_bounds_est(now_est: datetime) -> Tuple[datetime, datetime, bool]:
     """
-    제1헌법 & Case 05, 06, 22:
-    백그라운드 캔들 레이더 루프에서 수집된 SOXS, SOXL, QQQ 1분봉 데이터를
-    asyncio.to_thread 와 GlobalThrottle.get_file_lock 으로 안전하게 로컬 JSONL 파일에 아카이빙하고,
-    매일 17:00 EST 가비지 컬렉션(GC) 시 보존 기한이 지난 오래된 아카이브/임시 파일을 정리한다.
+    현재 EST 시각을 기준으로:
+    - 현재 진행 중인 CME 선물 세션의 시작 시각(session_start_est, 18:00:00 EST),
+    - 직전 마감된 CME 선물 세션의 시작 시각(prev_session_start_est),
+    - 현재가 17:00 ~ 17:59 EST 마감 휴장 또는 주말 휴장 구간인지 여부(is_break_or_weekend)를 반환한다.
+    """
+    dt = now_est.astimezone(EST_TZ)
+    wd = dt.weekday()  # 0=Mon ... 4=Fri, 5=Sat, 6=Sun
+    hm = dt.hour * 100 + dt.minute
+
+    is_weekend = bool(
+        (wd == 4 and hm >= 1700) or (wd == 5) or (wd == 6 and hm < 1800)
+    )
+    is_daily_break = bool(1700 <= hm <= 1759)
+    is_break_or_weekend = bool(is_weekend or is_daily_break)
+
+    if dt.hour >= 18:
+        sess_start_date = dt.date()
+    elif dt.hour == 17 or is_weekend:
+        # 17:00 ~ 17:59 마감 휴장 또는 주말에는 직전 마감 세션의 시작일(전일 18:00 EST)을 기준으로 조회
+        days_back = 1
+        if wd == 5:
+            days_back = 2
+        elif wd == 6 and dt.hour < 18:
+            days_back = 3
+        sess_start_date = dt.date() - timedelta(days=days_back)
+    else:
+        sess_start_date = dt.date() - timedelta(days=1)
+
+    session_start_est = datetime.combine(
+        sess_start_date, dt_time(18, 0, 0), tzinfo=EST_TZ
+    )
+    prev_session_start_est = session_start_est - timedelta(days=1)
+    return session_start_est, prev_session_start_est, is_break_or_weekend
+
+
+# ---------------------------------------------------------------------------
+# MacroDataCache : NQ=F 18:00 신세션 자가 치유 캐시 & 토스 QQQ 0.0초 실시간 시세/속도 추적기
+# ---------------------------------------------------------------------------
+class MacroDataCache:
+    """
+    🎯 4 & 🎯 5 & Case 61, 62, 91, 93:
+    1) yfinance NQ=F 15초 백그라운드 캐싱 및 18:00 EST 신세션 전일 잔재 혼입 100% 차단/자가 치유
+    2) 17:00 ~ 17:59 EST 마감 휴장 및 주말 동안 직전 마감 세션 고/저가/마감가 단조 보존
+    3) 토스 Open API QQQ 0.0초 실시간 시세 연동 및 10분/3분 변화율 기반 NQ_VEL_BYPASS(±0.20%) 산출
     """
 
-    def __init__(
-        self, base_dir: str = "candle_archive", retention_days: int = 14
-    ) -> None:
-        self.base_dir = os.path.abspath(str(base_dir or "candle_archive"))
-        self.retention_days = max(3, int(retention_days))
-        self._last_saved_ts: Dict[str, str] = {}
+    def __init__(self, toss_api: Optional[Any] = None) -> None:
+        self.toss_api = toss_api
+        self._lock = threading.RLock()
 
-    def _append_candles_sync(
-        self, symbol: str, candles: List[Dict[str, Any]], logical_date: str
-    ) -> int:
-        os.makedirs(self.base_dir, exist_ok=True)
-        sym = str(symbol or "").upper().strip()
-        filepath = os.path.join(self.base_dir, f"{sym}_{logical_date}_1m.jsonl")
-
-        last_ts = self._last_saved_ts.get(sym, "")
-        # 시간 오름차순 정렬 후 아직 기록하지 않은 최신 분봉만 필터링
-        sorted_c = sorted(
-            [c for c in candles if isinstance(c, dict) and c.get("timestamp")],
-            key=lambda x: str(x.get("timestamp")),
-        )
-        new_rows = [
-            c for c in sorted_c if str(c.get("timestamp")) > last_ts
-        ]
-        if not new_rows:
-            return 0
-
-        with GlobalThrottle.get_file_lock(filepath):
-            with open(filepath, "a", encoding="utf-8") as fp:
-                for row in new_rows:
-                    fp.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-        self._last_saved_ts[sym] = str(new_rows[-1].get("timestamp"))
-        return len(new_rows)
-
-    async def record_candles_async(
-        self,
-        symbol: str,
-        candles: List[Dict[str, Any]],
-        now_est: Optional[datetime] = None,
-    ) -> int:
-        if not candles:
-            return 0
+        now_est = datetime.now(EST_TZ)
         logical_date = get_logical_trading_date_str(now_est, rollover_hour=18)
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._append_candles_sync, symbol, candles, logical_date
-                ),
-                timeout=5.0,
-            )
-        except Exception as exc:
-            logger.debug("캔들 아카이빙 스킵 (%s): %s", symbol, exc)
-            return 0
 
-    def _cleanup_old_files_sync(self) -> int:
-        if not os.path.isdir(self.base_dir):
-            return 0
-        cutoff_ts = time.time() - (self.retention_days * 86400.0)
-        removed = 0
-        for fname in os.listdir(self.base_dir):
-            fpath = os.path.join(self.base_dir, fname)
-            if not os.path.isfile(fpath):
-                continue
+        self._nq_state: Dict[str, Any] = {
+            "logical_date": logical_date,
+            "nq_price": 0.0,
+            "nq_high": 0.0,
+            "nq_low": 0.0,
+            "nq_amp": 0.0,
+            "prev_session_high": 0.0,
+            "prev_session_low": 0.0,
+            "updated_mono": 0.0,
+        }
+        self._qqq_price: float = 0.0
+        self._qqq_updated_mono: float = 0.0
+        # (epoch_sec, qqq_price) 링버퍼 (최근 15분 보관)
+        self._qqq_history: Deque[Tuple[float, float]] = deque(maxlen=600)
+
+    def reset_runtime_cache(self) -> None:
+        """
+        Case 02: /reset 명령 시 매크로 런타임 캐시를 안전하게 재초기화한다.
+        """
+        now_est = datetime.now(EST_TZ)
+        logical_date = get_logical_trading_date_str(now_est, rollover_hour=18)
+        with self._lock:
+            self._nq_state["logical_date"] = logical_date
+            self._nq_state["updated_mono"] = 0.0
+            self._qqq_updated_mono = 0.0
+            self._qqq_history.clear()
+
+    def _record_qqq_tick(
+        self, qqq_price: float, now_epoch: Optional[float] = None
+    ) -> None:
+        qp = safe_float(qqq_price, 0.0)
+        if not is_qqq_scale_valid(qp):
+            return
+        ts = float(now_epoch if now_epoch is not None else time.time())
+        with self._lock:
+            self._qqq_price = qp
+            self._qqq_updated_mono = time.monotonic()
+            self._qqq_history.append((ts, qp))
+            cutoff = ts - 900.0
+            while self._qqq_history and self._qqq_history[0][0] < cutoff:
+                self._qqq_history.popleft()
+
+    def _compute_qqq_velocities(self) -> Tuple[float, float, bool, bool]:
+        """
+        🎯 4: 최근 10분(600초) 및 3분(180초) 동안의 실시간 QQQ 변화율(%)을 계산하여
+        - bypass_soxl: QQQ 10m 또는 3m 변화율 >= +0.20% (SOXL 급등 중 HA음봉 바이패스)
+        - bypass_soxs: QQQ 10m 또는 3m 변화율 <= -0.20% (SOXS 급등 중 HA음봉 바이패스)
+        를 반환한다.
+        """
+        with self._lock:
+            if len(self._qqq_history) < 2 or self._qqq_price <= 0.0:
+                return 0.0, 0.0, False, False
+
+            now_ts, cur_p = self._qqq_history[-1]
+            p_10m = cur_p
+            p_3m = cur_p
+
+            target_10m = now_ts - 600.0
+            target_3m = now_ts - 180.0
+
+            for ts, p in self._qqq_history:
+                if ts >= target_10m:
+                    p_10m = p
+                    break
+
+            for ts, p in self._qqq_history:
+                if ts >= target_3m:
+                    p_3m = p
+                    break
+
+        vel_10m = ((cur_p - p_10m) / p_10m) * 100.0 if p_10m > 0.0 else 0.0
+        vel_3m = ((cur_p - p_3m) / p_3m) * 100.0 if p_3m > 0.0 else 0.0
+
+        bypass_soxl = bool(
+            vel_10m >= NQ_VEL_BYPASS_THRESHOLD_PCT
+            or vel_3m >= NQ_VEL_BYPASS_THRESHOLD_PCT
+        )
+        bypass_soxs = bool(
+            vel_10m <= -NQ_VEL_BYPASS_THRESHOLD_PCT
+            or vel_3m <= -NQ_VEL_BYPASS_THRESHOLD_PCT
+        )
+        return round(vel_10m, 4), round(vel_3m, 4), bypass_soxs, bypass_soxl
+
+    async def ensure_qqq_live_price(self, fallback_qqq: float = 0.0) -> float:
+        """
+        🚨 Case 93:
+        17:00 ~ 18:59 EST 구간을 포함하여 전 시간대에서 3차 역행 방어 기준가용
+        토스 실시간 QQQ 현재가를 즉시 확보한다 (현재가 API 실패 시 QQQ 1분봉 종가 폴백).
+        """
+        fb = safe_float(fallback_qqq, 0.0)
+        if is_qqq_scale_valid(fb):
+            self._record_qqq_tick(fb)
+            return fb
+
+        with self._lock:
+            cached_q = self._qqq_price
+            age = time.monotonic() - self._qqq_updated_mono
+        if is_qqq_scale_valid(cached_q) and age < QQQ_ACTIVE_PROBE_TTL_SEC:
+            return cached_q
+
+        if self.toss_api is not None:
             try:
-                if os.path.getmtime(fpath) < cutoff_ts or fname.endswith(".tmp"):
-                    with GlobalThrottle.get_file_lock(fpath):
-                        os.remove(fpath)
-                    removed += 1
-            except Exception:
-                pass
-        return removed
+                prices = await self.toss_api.get_current_prices_batch(("QQQ",))
+                live_q = safe_float((prices or {}).get("QQQ"), 0.0)
+                if is_qqq_scale_valid(live_q):
+                    self._record_qqq_tick(live_q)
+                    return live_q
+            except Exception as exc:
+                logger.debug("QQQ 실시간 현재가 조회 예외: %s", exc)
 
-    async def cleanup_old_files_async(self) -> int:
+            # 17:00 ~ 18:59 EST 등에서 lastPrice 가 비어 있을 경우 QQQ 최신 1분봉 종가 폴백
+            try:
+                c_list, _ = await self.toss_api.get_candles(
+                    symbol="QQQ", interval="1m", count=5, adjusted=True
+                )
+                if isinstance(c_list, list) and c_list:
+                    for c_item in c_list:
+                        if isinstance(c_item, dict):
+                            cp = safe_float(c_item.get("closePrice"), 0.0)
+                            if is_qqq_scale_valid(cp):
+                                self._record_qqq_tick(cp)
+                                return cp
+            except Exception as exc:
+                logger.debug("QQQ 1분봉 폴백 조회 예외: %s", exc)
+
+        return cached_q if is_qqq_scale_valid(cached_q) else 0.0
+
+    def _fetch_nq_sync(self, now_est: Optional[datetime] = None) -> Dict[str, Any]:
         """
-        Case 22: 17:00 EST 일일 GC 파이프라인에서 호출되어 오래된 캔들 아카이브 및 .tmp 파일을 청소한다.
+        🎯 5 & Case 61, 62, 91:
+        yfinance NQ=F(나스닥 100 선물) 조회 및 18:00 EST 신세션 전일 잔재 혼입 100% 차단·자가 치유 엔진.
+        - 18:00:00 EST 신세션 롤오버 감지 시 이전 캐시(prev_h, prev_l)를 즉시 초기화한다.
+        - 18:00 ~ 18:10 EST 구간에 yfinance 1분봉 지연으로 df_session 이 비어 있을 때는
+          전일 세션 잔재가 남아 있는 fast_info.day_high / day_low 병합을 100% 금지하고
+          오직 실시간 체결가 fast_last 단일 영점(high = low = close = fast_last, 진폭 0.00%)으로 출발한다!
+        - 18:10 EST 이후 df_session 이 존재할 때도 fast_high / fast_low 나 기존 캐시가
+          직전 마감 세션 고/저가와 일치하거나 신세션 1분봉+현재가 범위를 0.20% 이상 벗어나면
+          전일 잔재 오염으로 판정하여 즉시 폐기하고 신세션 실데이터 범위로 자가 치유(Self-Healing)한다.
+        - 17:00 ~ 17:59 EST 마감 휴장 및 주말에는 직전 마감 세션의 고/저가/마감가를 단조 보존한다.
         """
+        dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+        logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
+        sess_start_est, prev_sess_start_est, is_break_or_weekend = (
+            _get_cme_session_bounds_est(dt_now)
+        )
+
+        with self._lock:
+            prev_logical = str(self._nq_state.get("logical_date") or "")
+            if prev_logical != logical_date and not is_break_or_weekend:
+                # 18:00 EST 신세션 진입 시 이전 세션 고/저가 잔재를 prev_session 으로 이관하고 당일 캐시 영점 리셋
+                self._nq_state = {
+                    "logical_date": logical_date,
+                    "nq_price": 0.0,
+                    "nq_high": 0.0,
+                    "nq_low": 0.0,
+                    "nq_amp": 0.0,
+                    "prev_session_high": safe_float(
+                        self._nq_state.get("nq_high"), 0.0
+                    ),
+                    "prev_session_low": safe_float(
+                        self._nq_state.get("nq_low"), 0.0
+                    ),
+                    "updated_mono": 0.0,
+                }
+            cached_snapshot = dict(self._nq_state)
+
+        ticker = yf.Ticker("NQ=F")
+        fast_last = 0.0
+        fast_high = 0.0
+        fast_low = 0.0
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self._cleanup_old_files_sync), timeout=8.0
-            )
+            fi = ticker.fast_info
+            if fi is not None:
+                fast_last = safe_float(getattr(fi, "last_price", 0.0), 0.0)
+                fast_high = safe_float(getattr(fi, "day_high", 0.0), 0.0)
+                fast_low = safe_float(getattr(fi, "day_low", 0.0), 0.0)
+        except Exception:
+            pass
+
+        df_1m = pd.DataFrame()
+        try:
+            raw_df = ticker.history(period="2d", interval="1m", prepost=True)
+            if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
+                idx = raw_df.index
+                if idx.tz is None:
+                    idx = idx.tz_localize("UTC").tz_convert(EST_TZ)
+                else:
+                    idx = idx.tz_convert(EST_TZ)
+                df_1m = raw_df.copy()
+                df_1m.index = idx
         except Exception as exc:
-            logger.warning("⚠️ 캔들 아카이브 GC 실패: %s", exc)
-            return 0
+            logger.debug("yfinance NQ=F 1m history 조회 예외: %s", exc)
+
+        # 1) 17:00 ~ 17:59 EST 마감 휴장 또는 주말 휴장 구간: 직전 마감 세션 데이터 보존
+        if is_break_or_weekend:
+            if not df_1m.empty:
+                df_closed = df_1m[df_1m.index >= sess_start_est]
+                if not df_closed.empty:
+                    c_last = safe_float(df_closed["Close"].iloc[-1], fast_last)
+                    c_high = safe_float(df_closed["High"].max(), c_last)
+                    c_low = safe_float(df_closed["Low"].min(), c_last)
+                    if c_low > 0.0 and c_high >= c_low:
+                        c_amp = ((c_high - c_low) / c_low) * 100.0
+                        with self._lock:
+                            self._nq_state.update(
+                                {
+                                    "nq_price": round(c_last, 2),
+                                    "nq_high": round(c_high, 2),
+                                    "nq_low": round(c_low, 2),
+                                    "nq_amp": round(c_amp, 2),
+                                    "updated_mono": time.monotonic(),
+                                }
+                            )
+                            return dict(self._nq_state)
+            # 이미 보존된 캐시가 있으면 그대로 유지
+            if safe_float(cached_snapshot.get("nq_price"), 0.0) > 0.0:
+                with self._lock:
+                    self._nq_state["updated_mono"] = time.monotonic()
+                    return dict(self._nq_state)
+
+        # 2) 직전 세션(prev_sess_start_est ~ sess_start_est) 고/저가 추출 (전일 잔재 대조용)
+        prev_sess_h = safe_float(cached_snapshot.get("prev_session_high"), 0.0)
+        prev_sess_l = safe_float(cached_snapshot.get("prev_session_low"), 0.0)
+        if not df_1m.empty:
+            df_prev = df_1m[
+                (df_1m.index >= prev_sess_start_est)
+                & (df_1m.index < sess_start_est)
+            ]
+            if not df_prev.empty:
+                prev_sess_h = max(
+                    prev_sess_h, safe_float(df_prev["High"].max(), 0.0)
+                )
+                pl_cand = safe_float(df_prev["Low"].min(), 0.0)
+                if pl_cand > 0.0:
+                    prev_sess_l = (
+                        min(prev_sess_l, pl_cand)
+                        if prev_sess_l > 0.0
+                        else pl_cand
+                    )
+
+        # 3) 현재 신세션(index >= 18:00:00 EST) 1분봉 슬라이싱
+        df_session = (
+            df_1m[df_1m.index >= sess_start_est]
+            if not df_1m.empty
+            else pd.DataFrame()
+        )
+
+        # 🚨 [핵심 방어 1] 18:00 ~ 18:10 EST 신세션 직후 df_session 이 비어 있을 때:
+        # 전일 fast_info.day_high / day_low 병합을 100% 금지하고 fast_last 단일 영점(0.00%)으로 출발!
+        if df_session.empty:
+            ref_p = (
+                fast_last
+                if fast_last > 0.0
+                else safe_float(cached_snapshot.get("nq_price"), 0.0)
+            )
+            if ref_p <= 0.0 and not df_1m.empty:
+                ref_p = safe_float(df_1m["Close"].iloc[-1], 0.0)
+
+            prev_h = safe_float(cached_snapshot.get("nq_high"), 0.0)
+            prev_l = safe_float(cached_snapshot.get("nq_low"), 0.0)
+
+            # 기존 캐시가 비어 있거나 직전 마감 세션 고/저가와 일치(오염)하거나 현재가 대비 0.20% 이상 괴리 시 영점 리셋
+            cache_contaminated = bool(
+                prev_h <= 0.0
+                or prev_l <= 0.0
+                or (prev_sess_h > 0.0 and abs(prev_h - prev_sess_h) < 1.0)
+                or (prev_sess_l > 0.0 and abs(prev_l - prev_sess_l) < 1.0)
+                or (ref_p > 0.0 and ((prev_h - prev_l) / ref_p) * 100.0 > 0.20)
+            )
+            if cache_contaminated or (
+                dt_now.hour == 18 and dt_now.minute <= 12
+            ):
+                cur_h = ref_p
+                cur_l = ref_p
+            else:
+                cur_h = max(prev_h, ref_p) if ref_p > 0.0 else prev_h
+                cur_l = min(prev_l, ref_p) if ref_p > 0.0 else prev_l
+
+            cur_amp = (
+                ((cur_h - cur_l) / cur_l) * 100.0
+                if (cur_l > 0.0 and cur_h >= cur_l)
+                else 0.0
+            )
+            with self._lock:
+                self._nq_state.update(
+                    {
+                        "logical_date": logical_date,
+                        "nq_price": round(ref_p, 2),
+                        "nq_high": round(cur_h, 2),
+                        "nq_low": round(cur_l, 2),
+                        "nq_amp": round(cur_amp, 2),
+                        "prev_session_high": prev_sess_h,
+                        "prev_session_low": prev_sess_l,
+                        "updated_mono": time.monotonic(),
+                    }
+                )
+                return dict(self._nq_state)
+
+        # 🚨 [핵심 방어 2] 신세션 1분봉(df_session)이 존재할 때:
+        # 신세션 1분봉 고/저가 + 실시간 fast_last 로 순수 신세션 기준 범위(pure_h, pure_l) 산출 후
+        # 오염된 fast_high / fast_low 나 오염된 이전 캐시(prev_h, prev_l)를 자가 치유(Self-Healing)한다!
+        bar_last = safe_float(df_session["Close"].iloc[-1], 0.0)
+        cur_p = fast_last if fast_last > 0.0 else bar_last
+        bar_h = safe_float(df_session["High"].max(), cur_p)
+        bar_l = safe_float(df_session["Low"].min(), cur_p)
+
+        pure_h = max(bar_h, cur_p) if cur_p > 0.0 else bar_h
+        pure_l = (
+            min(bar_l, cur_p) if (cur_p > 0.0 and bar_l > 0.0) else max(bar_l, cur_p)
+        )
+
+        # fast_high / fast_low 가 직전 세션 고/저가와 일치하지 않고 pure_h/pure_l 대비 0.20% 이내일 때만 병합 허용
+        if (
+            fast_high > pure_h
+            and (prev_sess_h <= 0.0 or abs(fast_high - prev_sess_h) > 1.5)
+            and ((fast_high - pure_h) / pure_h) * 100.0 <= 0.20
+        ):
+            pure_h = fast_high
+
+        if (
+            0.0 < fast_low < pure_l
+            and (prev_sess_l <= 0.0 or abs(fast_low - prev_sess_l) > 1.5)
+            and ((pure_l - fast_low) / pure_l) * 100.0 <= 0.20
+        ):
+            pure_l = fast_low
+
+        # 기존 인메모리 캐시(prev_h, prev_l)가 오염되지 않았을 때만 단조 병합(Self-Healing)
+        prev_h = safe_float(cached_snapshot.get("nq_high"), 0.0)
+        prev_l = safe_float(cached_snapshot.get("nq_low"), 0.0)
+        if (
+            prev_h > pure_h
+            and (prev_sess_h <= 0.0 or abs(prev_h - prev_sess_h) > 1.5)
+            and ((prev_h - pure_h) / pure_h) * 100.0 <= 0.25
+        ):
+            pure_h = prev_h
+
+        if (
+            0.0 < prev_l < pure_l
+            and (prev_sess_l <= 0.0 or abs(prev_l - prev_sess_l) > 1.5)
+            and ((pure_l - prev_l) / pure_l) * 100.0 <= 0.25
+        ):
+            pure_l = prev_l
+
+        cur_amp = (
+            ((pure_h - pure_l) / pure_l) * 100.0
+            if (pure_l > 0.0 and pure_h >= pure_l)
+            else 0.0
+        )
+
+        with self._lock:
+            self._nq_state.update(
+                {
+                    "logical_date": logical_date,
+                    "nq_price": round(cur_p, 2),
+                    "nq_high": round(pure_h, 2),
+                    "nq_low": round(pure_l, 2),
+                    "nq_amp": round(cur_amp, 2),
+                    "prev_session_high": prev_sess_h,
+                    "prev_session_low": prev_sess_l,
+                    "updated_mono": time.monotonic(),
+                }
+            )
+            return dict(self._nq_state)
+
+    async def get_macro_snapshot(
+        self,
+        live_qqq_price: float = 0.0,
+        has_active_position: bool = False,
+        now_est: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        제1헌법 & Case 61:
+        - NQ=F 선물 데이터는 15.0초 주기로 백그라운드 스레드(asyncio.to_thread)에서 갱신하고,
+        - QQQ 실시간 시세는 외부 주입값(live_qqq_price) 또는 보유 중 1.5초 프로빙으로 즉시 갱신하여
+          통합 매크로 스냅샷을 반환한다.
+        """
+        dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+        logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
+
+        # 1) 실시간 QQQ 가격 갱신
+        if is_qqq_scale_valid(live_qqq_price):
+            self._record_qqq_tick(live_qqq_price)
+            qqq_p = safe_float(live_qqq_price, 0.0)
+        else:
+            with self._lock:
+                qqq_age = time.monotonic() - self._qqq_updated_mono
+                qqq_p = self._qqq_price
+            probe_ttl = (
+                QQQ_ACTIVE_PROBE_TTL_SEC
+                if has_active_position
+                else QQQ_IDLE_PROBE_TTL_SEC
+            )
+            if not is_qqq_scale_valid(qqq_p) or qqq_age >= probe_ttl:
+                qqq_p = await self.ensure_qqq_live_price()
+
+        # 2) NQ=F 선물 캐시 TTL(15.0초) 또는 18:00 EST 신세션 롤오버 확인
+        with self._lock:
+            nq_age = time.monotonic() - safe_float(
+                self._nq_state.get("updated_mono"), 0.0
+            )
+            nq_logical = str(self._nq_state.get("logical_date") or "")
+            nq_ready = safe_float(self._nq_state.get("nq_price"), 0.0) > 0.0
+
+        if not nq_ready or nq_age >= NQ_CACHE_TTL_SEC or nq_logical != logical_date:
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._fetch_nq_sync, dt_now),
+                    timeout=10.0,
+                )
+            except Exception as exc:
+                logger.debug("NQ=F 백그라운드 갱신 폴백(기존 캐시 유지): %s", exc)
+
+        with self._lock:
+            nq_snap = dict(self._nq_state)
+
+        nq_amp = safe_float(nq_snap.get("nq_amp"), 0.0)
+        dyn_thr = calc_dynamic_stage3_threshold(nq_amp)
+        vel_10m, vel_3m, bypass_soxs, bypass_soxl = (
+            self._compute_qqq_velocities()
+        )
+
+        return {
+            "logical_date": logical_date,
+            "nq_price": safe_float(nq_snap.get("nq_price"), 0.0),
+            "nq_high": safe_float(nq_snap.get("nq_high"), 0.0),
+            "nq_low": safe_float(nq_snap.get("nq_low"), 0.0),
+            "nq_amp": nq_amp,
+            "is_overheated": bool(nq_amp >= NQ_OVERHEAT_THRESHOLD),
+            "qqq_price": round(qqq_p, 4) if is_qqq_scale_valid(qqq_p) else 0.0,
+            "dynamic_threshold_pct": dyn_thr,
+            "qqq_vel_10m_pct": vel_10m,
+            "qqq_vel_3m_pct": vel_3m,
+            "bypass_soxs": bypass_soxs,
+            "bypass_soxl": bypass_soxl,
+            "updated_at": dt_now.strftime("%Y-%m-%d %H:%M:%S EST"),
+        }
