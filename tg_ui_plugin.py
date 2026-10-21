@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-# NEW: tg_ui_plugin.py
-텔레그램 비동기 롱폴링 라우터, 3대 전술 관제 보드(/avwap, /settlement, /sync),
-/reset 원자적 0점 소각, 인플레이스 콜백 제어반 및 모바일 2줄 초슬림 타전망 통합 플러그인 (Step 09 / 10)
+# MODIFIED: tg_ui_plugin.py
+텔레그램 비동기 롱폴링 라우터, /home/pipiosToss/.env 동적 자격증명 복구기,
+3대 전술 관제 보드(/avwap, /settlement, /sync), /reset 원자적 0점 소각,
+인플레이스 콜백 제어반 및 모바일 2줄 초슬림 타전망 통합 플러그인 (Step 02 / 02)
+- MODIFIED: toss_api._autoload_dotenv_files 연동으로 /home/pipios4006 참조 없이
+  오직 /home/pipiosToss/.env 단일 경로에서 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 자동 로드 및 동적 복구
 - 제1헌법: 모든 텔레그램 HTTP 요청의 asyncio.to_thread 비동기 격리 및 GlobalThrottle 통제
 - 제3헌법: 구버전 +0.64% 고정 익절 버튼, set_rate_SOXS_ 콜백, RSI 패닉셀 알림 데드코드 완전 소각
 - 제4헌법: 모든 논리 판단은 EST_TZ(America/New_York) 100% 락온, KST_TZ는 UI 표출 전용 격리
@@ -19,12 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import html
-import json
 import logging
-import math
 import os
 import threading
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,11 +43,15 @@ from toss_api import (
     KST_TZ,
     REAL_ALLOWED_SYMBOLS,
     GlobalThrottle,
+    _autoload_dotenv_files,
     safe_float,
     safe_int,
 )
 
 logger = logging.getLogger("toss_sniper.tg_ui_plugin")
+
+# 모듈 임포트 시점 /home/pipiosToss/.env 단일 경로 자동 로드 확인
+_autoload_dotenv_files(override=False)
 
 # ---------------------------------------------------------------------------
 # Case 45 : 미국 증시(NYSE/NASDAQ) 주요 휴장일 영문 -> 한글 정밀 맵핑 사전
@@ -101,7 +105,11 @@ def _format_session_status_label(
     cfg_rate = safe_float(st.get("target_profit_rate"), 1.0)
 
     if holdings_qty > 0 and avg_price > 0.0:
-        pnl_pct = ((live_price - avg_price) / avg_price) * 100.0 if live_price > 0.0 else 0.0
+        pnl_pct = (
+            ((live_price - avg_price) / avg_price) * 100.0
+            if live_price > 0.0
+            else 0.0
+        )
         sign = "+" if pnl_pct >= 0.0 else ""
         t_state = getattr(context, "trail_runtime_cache", {}).get(symbol, {})
         if isinstance(t_state, dict) and t_state.get("armed"):
@@ -131,11 +139,13 @@ def _format_session_status_label(
     if 400 <= hm <= 406:
         return "🔍 프리장 04:07 주도주 수집중"
     if 407 <= hm <= 814:
-        leader_sym = str(getattr(context, "pre_leader_cache", {}).get("leader_sym") or "")
+        leader_sym = str(
+            getattr(context, "pre_leader_cache", {}).get("leader_sym") or ""
+        )
         if leader_sym == symbol:
             return "👑 프리장 주도주 (VWAP -0.50% 조준)"
         return "🔍 프리장 정찰 대기"
-    if hm >= 815 and hm <= 1600:
+    if 815 <= hm <= 1600:
         return "장외대기 (08:15 컷오프 완료)"
     return "🌙 시스템 대기"
 
@@ -172,7 +182,9 @@ async def render_avwap_radar_board(
     qqq_p = safe_float(macro.get("qqq_price"), 0.0)
     qqq_3m = safe_float(macro.get("qqq_3m_chg_pct"), 0.0)
     qqq_10m = safe_float(macro.get("qqq_10m_chg_pct"), 0.0)
-    overheat_badge = "🛑과열(2.0%초과)" if nq_amp >= NQ_OVERHEAT_THRESHOLD else "🟢정상"
+    overheat_badge = (
+        "🛑과열(2.0%초과)" if nq_amp >= NQ_OVERHEAT_THRESHOLD else "🟢정상"
+    )
 
     # 데이장 [모의] 요약
     day_leader = getattr(context, "day_leader_cache", {})
@@ -196,14 +208,14 @@ async def render_avwap_radar_board(
     p_disp_0407 = safe_float(pre_leader.get("disp_0407"), 0.0)
 
     lines: List[str] = [
-        f"📡 <b>[토스 스나이퍼 aVWAP 실시간 관제탑]</b>",
+        "📡 <b>[토스 스나이퍼 aVWAP 실시간 관제탑]</b>",
         f"🕒 EST <code>{dt_est.strftime('%Y-%m-%d %H:%M:%S')}</code> · KST <code>{dt_kst.strftime('%H:%M:%S')}</code>",
         "",
         f"🛡️ <b>[매크로 3단 방어망 · {overheat_badge}]</b>",
         f"🔸 NQ=F <code>{nq_p:,.2f}</code> (H <code>{nq_h:,.2f}</code> · L <code>{nq_l:,.2f}</code> · 진폭 <b>{nq_amp:.2f}%</b>)",
         f"🔸 QQQ <code>${qqq_p:.2f}</code> (3m <code>{qqq_3m:+.2f}%</code> · 10m <code>{qqq_10m:+.2f}%</code> · 3차임계 <b>{dyn_thresh:.2f}%</b>)",
         "",
-        f"🧪 <b>[데이장 19:00 ~ 03:57 [모의] 동형 스나이퍼]</b>",
+        "🧪 <b>[데이장 19:00 ~ 03:57 [모의] 동형 스나이퍼]</b>",
         f"🔸 주도주 <b>{sanitize_tg_text(d_sym)}</b> (VWAP_1907 <code>${d_vwap_1907:.2f}</code> · 초기이격 <code>{d_disp_1907:+.2f}%</code>)",
         f"🔸 상태 <code>{sanitize_tg_text(d_phase)}</code> · 덫단가 <code>${d_trap_p:.2f}</code> · 진입가 <code>${d_ent_p:.2f}</code>",
         f"🔸 당일성적 <b>{d_tot}전 {d_win}승 (승률 {d_wrate:.1f}%)</b> · 세후누적 <b>{d_cum_sign}{d_cum_net:.2f}%</b>",
@@ -240,9 +252,7 @@ async def render_avwap_radar_board(
         lines.append(
             f"{icon} <b>[{sym}]</b> 현가 <code>${live_p:.2f}</code> · {ha_badge} · RSI <code>{live_rsi:.1f}</code>"
         )
-        lines.append(
-            f"🔸 상태: <b>{sanitize_tg_text(status_label)}</b>"
-        )
+        lines.append(f"🔸 상태: <b>{sanitize_tg_text(status_label)}</b>")
         lines.append(
             f"🔸 프리VWAP <code>${pre_vwap:.2f}</code> (이격 <code>{pre_disp:+.2f}%</code>) · -0.50%덫 <code>${trap_m050:.2f}</code>"
         )
@@ -267,7 +277,10 @@ async def render_avwap_radar_board(
         "inline_keyboard": [
             [
                 {"text": "🔄 레이더 갱신", "callback_data": "refresh_avwap"},
-                {"text": "⚙️ 전술 제어반 (/settlement)", "callback_data": "refresh_settlement"},
+                {
+                    "text": "⚙️ 전술 제어반 (/settlement)",
+                    "callback_data": "refresh_settlement",
+                },
             ],
             [
                 {"text": "📊 세션 고저/5MA (/sync)", "callback_data": "refresh_sync"},
@@ -293,28 +306,46 @@ async def render_settlement_control_board(
     st_soxs = context.ledger.get_state("SOXS")
     st_soxl = context.ledger.get_state("SOXL")
 
-    is_active = bool(st_soxs.get("is_active", True) and st_soxl.get("is_active", True))
+    is_active = bool(
+        st_soxs.get("is_active", True) and st_soxl.get("is_active", True)
+    )
     is_compound = bool(st_soxs.get("is_compound", True))
     budget = safe_float(st_soxs.get("budget"), 1000.0)
     target_rate = safe_float(st_soxs.get("target_profit_rate"), 1.0)
-    hybrid_mode = bool(getattr(context, "pre_leader_cache", {}).get("hybrid_mode", False))
+    hybrid_mode = bool(
+        getattr(context, "pre_leader_cache", {}).get("hybrid_mode", False)
+    )
 
-    tot_trades = safe_int(st_soxs.get("trade_count"), 0) + safe_int(st_soxl.get("trade_count"), 0)
-    tot_wins = safe_int(st_soxs.get("win_count"), 0) + safe_int(st_soxl.get("win_count"), 0)
+    tot_trades = safe_int(st_soxs.get("trade_count"), 0) + safe_int(
+        st_soxl.get("trade_count"), 0
+    )
+    tot_wins = safe_int(st_soxs.get("win_count"), 0) + safe_int(
+        st_soxl.get("win_count"), 0
+    )
     tot_pnl = safe_float(st_soxs.get("realized_pnl_usd"), 0.0) + safe_float(
         st_soxl.get("realized_pnl_usd"), 0.0
     )
-    win_rate = (float(tot_wins) / float(tot_trades)) * 100.0 if tot_trades > 0 else 0.0
+    win_rate = (
+        (float(tot_wins) / float(tot_trades)) * 100.0 if tot_trades > 0 else 0.0
+    )
     pnl_sign = "+" if tot_pnl >= 0.0 else ""
 
     bp_usd = await context.api.get_buying_power_usd(safety_buffer_pct=0.5)
 
-    active_str = "🟢 가동중 (ON · 15:59 제로-오버나이트 사수)" if is_active else "⛔ 정지 (OFF · 수동 오버나이트 허용)"
+    active_str = (
+        "🟢 가동중 (ON · 15:59 제로-오버나이트 사수)"
+        if is_active
+        else "⛔ 정지 (OFF · 수동 오버나이트 허용)"
+    )
     comp_str = "♻️ 복리 (실발생 순수익 가감)" if is_compound else "📌 단리 (고정 예산)"
-    trap_mode_str = "🛡️ 하이브리드 min(VWAP_0407, VWAP_t×0.995)" if hybrid_mode else "⚡ 동적 VWAP_t × 0.995 (-0.50%)"
+    trap_mode_str = (
+        "🛡️ 하이브리드 min(VWAP_0407, VWAP_t×0.995)"
+        if hybrid_mode
+        else "⚡ 동적 VWAP_t × 0.995 (-0.50%)"
+    )
 
     lines: List[str] = [
-        f"⚙️ <b>[인피니트 스노우볼 복리 · 전술 제어반]</b>",
+        "⚙️ <b>[인피니트 스노우볼 복리 · 전술 제어반]</b>",
         f"🕒 기준시각 EST <code>{dt_est.strftime('%Y-%m-%d %H:%M:%S')}</code>",
         "",
         f"🔸 <b>전술 가동 상태</b> : <b>{active_str}</b>",
@@ -323,17 +354,29 @@ async def render_settlement_control_board(
         f"🔸 <b>트레일링 점화율</b> : <b>+{target_rate:.2f}%</b> (안전캡 <code>+5.00%</code> · 보존잠금 <code>+1.30%</code>)",
         f"🔸 <b>매수 덫 산출식</b> : <b>{trap_mode_str}</b>",
         "",
-        f"📊 <b>[실전 누적 정산 성적]</b>",
+        "📊 <b>[실전 누적 정산 성적]</b>",
         f"🔸 총 <b>{tot_trades}전 {tot_wins}승 (승률 {win_rate:.1f}%)</b> · 실발생 순수익 <b>{pnl_sign}${tot_pnl:,.2f}</b>",
         "",
-        f"💡 <b>[수동 오버나이트 안내]</b>",
-        f"🔸 오버나이트 홀딩을 원하실 경우 아래 <b>[전술 가동 ON/OFF]</b> 버튼으로 봇을 <b>OFF</b> 하십시오. 봇이 OFF 되면 15:59 EST 강제 청산(MOC) 루프가 정지되며, 다시 <b>ON</b> 하면 현재 QQQ 기준가(0.00%)로 3차 방어선이 재락온됩니다.",
+        "💡 <b>[수동 오버나이트 안내]</b>",
+        "🔸 오버나이트 홀딩을 원하실 경우 아래 <b>[전술 가동 ON/OFF]</b> 버튼으로 봇을 <b>OFF</b> 하십시오. 봇이 OFF 되면 15:59 EST 강제 청산(MOC) 루프가 정지되며, 다시 <b>ON</b> 하면 현재 QQQ 기준가(0.00%)로 3차 방어선이 재락온됩니다.",
     ]
 
-    toggle_active_label = "⛔ 전술 가동 OFF 전환" if is_active else "🟢 전술 가동 ON 전환 (QQQ 재락온)"
+    toggle_active_label = (
+        "⛔ 전술 가동 OFF 전환"
+        if is_active
+        else "🟢 전술 가동 ON 전환 (QQQ 재락온)"
+    )
     toggle_comp_label = "📌 단리 모드로 전환" if is_compound else "♻️ 복리 모드로 전환"
-    toggle_rate_label = "🎯 점화율 +0.50%로 전환" if abs(target_rate - 1.0) < 0.05 else "🎯 점화율 +1.00%로 전환"
-    toggle_hyb_label = "⚡ 순수 동적 VWAP(-0.50%) 전환" if hybrid_mode else "🛡️ 하이브리드 매수덫 전환"
+    toggle_rate_label = (
+        "🎯 점화율 +0.50%로 전환"
+        if abs(target_rate - 1.0) < 0.05
+        else "🎯 점화율 +1.00%로 전환"
+    )
+    toggle_hyb_label = (
+        "⚡ 순수 동적 VWAP(-0.50%) 전환"
+        if hybrid_mode
+        else "🛡️ 하이브리드 매수덫 전환"
+    )
 
     reply_markup = {
         "inline_keyboard": [
@@ -373,7 +416,9 @@ async def render_sync_session_board(
     """
     dt_est = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     prices = await context.api.get_current_prices_batch(("SOXS", "SOXL"))
-    cal_info = await context.api.get_us_market_calendar(dt_est.strftime("%Y-%m-%d"))
+    cal_info = await context.api.get_us_market_calendar(
+        dt_est.strftime("%Y-%m-%d")
+    )
 
     is_open_day = bool(cal_info.get("is_open_day", True))
     cal_badge = "🟢 정상 영업일" if is_open_day else "🛑 미국 증시 휴장일"
@@ -381,7 +426,7 @@ async def render_sync_session_board(
         cal_badge += " (제6헌법 Fail-Open 폴백)"
 
     lines: List[str] = [
-        f"📊 <b>[당일 세션 고/저가 및 5MA 예상 밴드 동기화 (/sync)]</b>",
+        "📊 <b>[당일 세션 고/저가 및 5MA 예상 밴드 동기화 (/sync)]</b>",
         f"🕒 EST <code>{dt_est.strftime('%Y-%m-%d %H:%M:%S')}</code> · {cal_badge}",
     ]
 
@@ -469,14 +514,22 @@ async def handle_reset_command(
     await context.ledger.reset_dual_ledgers_preserve_seed()
 
     # 6대 인메모리 캐시 원자적 0점 소각
-    if hasattr(context, "trail_runtime_cache") and isinstance(context.trail_runtime_cache, dict):
+    if hasattr(context, "trail_runtime_cache") and isinstance(
+        context.trail_runtime_cache, dict
+    ):
         context.trail_runtime_cache.clear()
-    if hasattr(context, "exit_snapshot_cache") and isinstance(context.exit_snapshot_cache, dict):
+    if hasattr(context, "exit_snapshot_cache") and isinstance(
+        context.exit_snapshot_cache, dict
+    ):
         context.exit_snapshot_cache.clear()
-    if hasattr(context, "bottom_track_cache") and isinstance(context.bottom_track_cache, dict):
+    if hasattr(context, "bottom_track_cache") and isinstance(
+        context.bottom_track_cache, dict
+    ):
         context.bottom_track_cache.clear()
         context.bottom_track_cache["active"] = False
-    if hasattr(context, "pre_leader_cache") and isinstance(context.pre_leader_cache, dict):
+    if hasattr(context, "pre_leader_cache") and isinstance(
+        context.pre_leader_cache, dict
+    ):
         hyb = bool(context.pre_leader_cache.get("hybrid_mode", False))
         context.pre_leader_cache.clear()
         context.pre_leader_cache.update(
@@ -491,7 +544,9 @@ async def handle_reset_command(
                 "hybrid_mode": hyb,
             }
         )
-    if hasattr(context, "day_leader_cache") and isinstance(context.day_leader_cache, dict):
+    if hasattr(context, "day_leader_cache") and isinstance(
+        context.day_leader_cache, dict
+    ):
         hyb_d = bool(context.day_leader_cache.get("hybrid_mode", False))
         context.day_leader_cache.clear()
         context.day_leader_cache.update(
@@ -506,14 +561,22 @@ async def handle_reset_command(
                 "hybrid_mode": hyb_d,
             }
         )
-    if hasattr(context, "day_sim_state") and isinstance(context.day_sim_state, dict):
+    if hasattr(context, "day_sim_state") and isinstance(
+        context.day_sim_state, dict
+    ):
         context.day_sim_state.clear()
         context.day_sim_state.update(create_default_day_sim_state(logical_date))
-    if hasattr(context, "indexing_grace_cache") and isinstance(context.indexing_grace_cache, dict):
+    if hasattr(context, "indexing_grace_cache") and isinstance(
+        context.indexing_grace_cache, dict
+    ):
         context.indexing_grace_cache.clear()
-    if hasattr(context, "whipsaw_runtime_cache") and isinstance(context.whipsaw_runtime_cache, dict):
+    if hasattr(context, "whipsaw_runtime_cache") and isinstance(
+        context.whipsaw_runtime_cache, dict
+    ):
         context.whipsaw_runtime_cache.clear()
-    if hasattr(context, "macro_cache") and hasattr(context.macro_cache, "reset_runtime_cache"):
+    if hasattr(context, "macro_cache") and hasattr(
+        context.macro_cache, "reset_runtime_cache"
+    ):
         context.macro_cache.reset_runtime_cache()
 
     context.wakeup_event.set()
@@ -522,7 +585,7 @@ async def handle_reset_command(
     comp_kept = "복리" if st_after.get("is_compound", True) else "단리"
 
     return (
-        f"🧹 <b>[/reset 양방향 장부 및 6대 캐시 원자적 0점 소각 완료]</b>\n"
+        "🧹 <b>[/reset 양방향 장부 및 6대 캐시 원자적 0점 소각 완료]</b>\n"
         f"🔸 보존 시드 <code>${budget_kept:,.2f}</code> ({comp_kept}) · SOXS/SOXL 대기 상태 복원 완료"
     )
 
@@ -534,6 +597,8 @@ class TelegramBotRouter:
     """
     제1헌법 & Case 02, 13, 17, 18, 26, 38:
     텔레그램 봇 폴링 라우터 및 알림/보드 전송 전담 클래스.
+    - # MODIFIED: /home/pipiosToss/.env 단일 경로 자동 로더(_autoload_dotenv_files)를 통해
+      런타임 중에도 텔레그램 토큰/챗ID를 동적 복구한다.
     """
 
     def __init__(
@@ -542,6 +607,7 @@ class TelegramBotRouter:
         bot_token: Optional[str] = None,
         chat_id: Optional[str] = None,
     ) -> None:
+        _autoload_dotenv_files(override=False)
         self.context = context
         self.bot_token = str(
             bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "") or ""
@@ -551,17 +617,29 @@ class TelegramBotRouter:
         ).strip()
         self._session = requests.Session()
         self._offset: int = 0
+        self._startup_sent: bool = False
         self._hold_alert_lock = threading.Lock()
         self._hold_alert_sent_keys: Dict[str, str] = {}
 
+    def _refresh_credentials_if_needed(self) -> bool:
+        """
+        # NEW: bot_token 또는 chat_id 가 비어 있을 경우 /home/pipiosToss/.env 를 즉시 재스캔하여 복구한다.
+        """
+        if self.bot_token and self.chat_id:
+            return True
+        _autoload_dotenv_files(override=True)
+        self.bot_token = str(os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
+        self.chat_id = str(os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+        return bool(self.bot_token and self.chat_id)
+
     @property
     def is_configured(self) -> bool:
-        return bool(self.bot_token and self.chat_id)
+        return self._refresh_credentials_if_needed()
 
     def _tg_post_sync(
         self, method: str, payload: Dict[str, Any], timeout: float = 10.0
     ) -> Dict[str, Any]:
-        if not self.is_configured:
+        if not self._refresh_credentials_if_needed():
             return {"ok": False, "description": "TELEGRAM_NOT_CONFIGURED"}
         GlobalThrottle.wait_api_sync("DEFAULT")
         url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
@@ -578,7 +656,12 @@ class TelegramBotRouter:
             return {"ok": False}
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._tg_post_sync, method, payload, max(timeout - 1.0, 4.0)),
+                asyncio.to_thread(
+                    self._tg_post_sync,
+                    method,
+                    payload,
+                    max(timeout - 1.0, 4.0),
+                ),
                 timeout=timeout,
             )
         except Exception as exc:
@@ -591,6 +674,8 @@ class TelegramBotRouter:
         reply_markup: Optional[Dict[str, Any]] = None,
         chat_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if not self.is_configured:
+            return {"ok": False}
         target_chat = str(chat_id or self.chat_id).strip()
         if not target_chat:
             return {"ok": False}
@@ -636,7 +721,12 @@ class TelegramBotRouter:
         """
         🚨 Case 13: 서버 기동 완료 시 "✅ 서버가 정상 작동 중입니다." 단일 문구를 타전한다.
         """
-        return await self.send_raw_html("✅ 서버가 정상 작동 중입니다.")
+        if not self.is_configured:
+            return {"ok": False}
+        res = await self.send_raw_html("✅ 서버가 정상 작동 중입니다.")
+        if isinstance(res, dict) and res.get("ok"):
+            self._startup_sent = True
+        return res
 
     async def send_slim_alert(self, title: str, body: str = "") -> Dict[str, Any]:
         """
@@ -680,7 +770,9 @@ class TelegramBotRouter:
 
         if cmd in ("/start", "/avwap", "/status", "/radar"):
             board_html, markup = await render_avwap_radar_board(self.context)
-            await self.send_raw_html(board_html, reply_markup=markup, chat_id=chat_id)
+            await self.send_raw_html(
+                board_html, reply_markup=markup, chat_id=chat_id
+            )
             return
 
         if cmd in ("/settlement", "/seed", "/config"):
@@ -689,14 +781,22 @@ class TelegramBotRouter:
                 new_b = safe_float(parts[1], 0.0)
                 if new_b >= 100.0:
                     for s in REAL_ALLOWED_SYMBOLS:
-                        await self.context.ledger.update_state(s, budget=round(new_b, 2))
-            board_html, markup = await render_settlement_control_board(self.context)
-            await self.send_raw_html(board_html, reply_markup=markup, chat_id=chat_id)
+                        await self.context.ledger.update_state(
+                            s, budget=round(new_b, 2)
+                        )
+            board_html, markup = await render_settlement_control_board(
+                self.context
+            )
+            await self.send_raw_html(
+                board_html, reply_markup=markup, chat_id=chat_id
+            )
             return
 
         if cmd == "/sync":
             board_html, markup = await render_sync_session_board(self.context)
-            await self.send_raw_html(board_html, reply_markup=markup, chat_id=chat_id)
+            await self.send_raw_html(
+                board_html, reply_markup=markup, chat_id=chat_id
+            )
             return
 
         if cmd == "/reset":
@@ -719,7 +819,9 @@ class TelegramBotRouter:
         cb_id = str(cb.get("id") or "")
         data = str(cb.get("data") or "").strip()
         msg_obj = cb.get("message") if isinstance(cb.get("message"), dict) else {}
-        chat_obj = msg_obj.get("chat") if isinstance(msg_obj.get("chat"), dict) else {}
+        chat_obj = (
+            msg_obj.get("chat") if isinstance(msg_obj.get("chat"), dict) else {}
+        )
         chat_id = str(chat_obj.get("id") or self.chat_id)
         message_id = safe_int(msg_obj.get("message_id"), 0)
 
@@ -730,7 +832,9 @@ class TelegramBotRouter:
                 st = self.context.ledger.get_state("SOXS")
                 next_active = not bool(st.get("is_active", True))
                 for s in REAL_ALLOWED_SYMBOLS:
-                    await self.context.ledger.update_state(s, is_active=next_active)
+                    await self.context.ledger.update_state(
+                        s, is_active=next_active
+                    )
                 if next_active:
                     # OFF ➔ ON 재가동 시 현재 QQQ 기준가 0.00% 재락온 (Case 50, 93)
                     await relock_qqq_baseline_on_bot_resume(self.context)
@@ -738,17 +842,29 @@ class TelegramBotRouter:
                 else:
                     toast_text = "⛔ 스나이퍼 OFF (수동 오버나이트 허용)"
                 self.context.wakeup_event.set()
-                board_html, markup = await render_settlement_control_board(self.context)
-                await self.edit_message_html(chat_id, message_id, board_html, markup)
+                board_html, markup = await render_settlement_control_board(
+                    self.context
+                )
+                await self.edit_message_html(
+                    chat_id, message_id, board_html, markup
+                )
 
             elif data == "toggle_compound_mode":
                 st = self.context.ledger.get_state("SOXS")
                 next_comp = not bool(st.get("is_compound", True))
                 for s in REAL_ALLOWED_SYMBOLS:
-                    await self.context.ledger.update_state(s, is_compound=next_comp)
-                toast_text = "♻️ 복리 모드 전환" if next_comp else "📌 단리 모드 전환"
-                board_html, markup = await render_settlement_control_board(self.context)
-                await self.edit_message_html(chat_id, message_id, board_html, markup)
+                    await self.context.ledger.update_state(
+                        s, is_compound=next_comp
+                    )
+                toast_text = (
+                    "♻️ 복리 모드 전환" if next_comp else "📌 단리 모드 전환"
+                )
+                board_html, markup = await render_settlement_control_board(
+                    self.context
+                )
+                await self.edit_message_html(
+                    chat_id, message_id, board_html, markup
+                )
 
             elif data == "toggle_profit_rate":
                 # Case 68: +1.0% ↔ +0.5% 단일 익절 점화 변수 토글
@@ -756,10 +872,16 @@ class TelegramBotRouter:
                 cur_rate = safe_float(st.get("target_profit_rate"), 1.0)
                 next_rate = 0.5 if abs(cur_rate - 1.0) < 0.05 else 1.0
                 for s in REAL_ALLOWED_SYMBOLS:
-                    await self.context.ledger.update_state(s, target_profit_rate=next_rate)
+                    await self.context.ledger.update_state(
+                        s, target_profit_rate=next_rate
+                    )
                 toast_text = f"🎯 트레일링 점화율 +{next_rate:.2f}% 설정"
-                board_html, markup = await render_settlement_control_board(self.context)
-                await self.edit_message_html(chat_id, message_id, board_html, markup)
+                board_html, markup = await render_settlement_control_board(
+                    self.context
+                )
+                await self.edit_message_html(
+                    chat_id, message_id, board_html, markup
+                )
 
             elif data == "toggle_hybrid_trap":
                 pre_c = getattr(self.context, "pre_leader_cache", {})
@@ -767,9 +889,17 @@ class TelegramBotRouter:
                 next_hyb = not bool(pre_c.get("hybrid_mode", False))
                 pre_c["hybrid_mode"] = next_hyb
                 day_c["hybrid_mode"] = next_hyb
-                toast_text = "🛡️ 하이브리드 매수덫 ON" if next_hyb else "⚡ 순수 동적 VWAP -0.50% ON"
-                board_html, markup = await render_settlement_control_board(self.context)
-                await self.edit_message_html(chat_id, message_id, board_html, markup)
+                toast_text = (
+                    "🛡️ 하이브리드 매수덫 ON"
+                    if next_hyb
+                    else "⚡ 순수 동적 VWAP -0.50% ON"
+                )
+                board_html, markup = await render_settlement_control_board(
+                    self.context
+                )
+                await self.edit_message_html(
+                    chat_id, message_id, board_html, markup
+                )
 
             elif data.startswith("seed_adj_"):
                 delta = safe_float(data.replace("seed_adj_", ""), 0.0)
@@ -779,23 +909,39 @@ class TelegramBotRouter:
                 for s in REAL_ALLOWED_SYMBOLS:
                     await self.context.ledger.update_state(s, budget=next_b)
                 toast_text = f"💰 통합 시드 ${next_b:,.2f} 설정"
-                board_html, markup = await render_settlement_control_board(self.context)
-                await self.edit_message_html(chat_id, message_id, board_html, markup)
+                board_html, markup = await render_settlement_control_board(
+                    self.context
+                )
+                await self.edit_message_html(
+                    chat_id, message_id, board_html, markup
+                )
 
             elif data == "refresh_avwap":
                 toast_text = "📡 레이더 최신화 완료"
-                board_html, markup = await render_avwap_radar_board(self.context)
-                await self.edit_message_html(chat_id, message_id, board_html, markup)
+                board_html, markup = await render_avwap_radar_board(
+                    self.context
+                )
+                await self.edit_message_html(
+                    chat_id, message_id, board_html, markup
+                )
 
             elif data == "refresh_settlement":
                 toast_text = "⚙️ 제어반 최신화 완료"
-                board_html, markup = await render_settlement_control_board(self.context)
-                await self.edit_message_html(chat_id, message_id, board_html, markup)
+                board_html, markup = await render_settlement_control_board(
+                    self.context
+                )
+                await self.edit_message_html(
+                    chat_id, message_id, board_html, markup
+                )
 
             elif data == "refresh_sync":
                 toast_text = "📊 /sync 고저가 최신화 완료"
-                board_html, markup = await render_sync_session_board(self.context)
-                await self.edit_message_html(chat_id, message_id, board_html, markup)
+                board_html, markup = await render_sync_session_board(
+                    self.context
+                )
+                await self.edit_message_html(
+                    chat_id, message_id, board_html, markup
+                )
 
         except Exception as exc:
             logger.warning("⚠️ 텔레그램 콜백 처리 예외 (%s): %s", data, exc)
@@ -810,15 +956,29 @@ class TelegramBotRouter:
     async def polling_loop(self) -> None:
         """
         백그라운드 비동기 텔레그램 롱폴링 루프.
+        # MODIFIED: 기동 시점에 /home/pipiosToss/.env 가 없었더라도 루프 내에서 동적 감지하여
+        즉시 폴링을 시작하고 기동 완료 단일 문구(Case 13)를 타전한다.
         """
-        if not self.is_configured:
-            logger.info("ℹ️ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정 -> 텔레그램 폴링 대기")
-            while getattr(self.context, "running", True):
-                await asyncio.sleep(10.0)
-            return
-
-        logger.info("🤖 텔레그램 비동기 롱폴링 라우터 가동 개시")
+        logged_wait = False
         while getattr(self.context, "running", True):
+            if not self._refresh_credentials_if_needed():
+                if not logged_wait:
+                    logger.info(
+                        "ℹ️ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미감지 (/home/pipiosToss/.env 대기 중)"
+                    )
+                    logged_wait = True
+                await asyncio.sleep(5.0)
+                continue
+
+            if logged_wait:
+                logger.info(
+                    "🤖 /home/pipiosToss/.env 텔레그램 토큰 동적 로드 완료 -> 롱폴링 라우터 가동"
+                )
+                logged_wait = False
+
+            if not self._startup_sent:
+                await self.send_startup_message()
+
             try:
                 res = await self._tg_post_async(
                     "getUpdates",
@@ -847,14 +1007,15 @@ class TelegramBotRouter:
                             )
                             cid = str(chat_obj.get("id") or "")
                             txt = str(msg.get("text") or "").strip()
-                            # 지정된 운용자 chat_id 검증
                             if txt.startswith("/") and (
                                 not self.chat_id or cid == self.chat_id
                             ):
                                 await self._handle_text_command(cid, txt)
 
                         elif isinstance(upd.get("callback_query"), dict):
-                            await self._handle_callback_query(upd["callback_query"])
+                            await self._handle_callback_query(
+                                upd["callback_query"]
+                            )
 
             except asyncio.CancelledError:
                 break

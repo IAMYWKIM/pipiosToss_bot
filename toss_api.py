@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-# NEW: toss_api.py
-토스증권 Open API 방탄 통신 코어 및 중앙 스로틀링/파일락 통제 모듈 (Step 01 / 10)
+# MODIFIED: toss_api.py
+토스증권 Open API 방탄 통신 코어, /home/pipiosToss/.env 전용 내장형 자동 로더 및
+중앙 스로틀링/파일락 통제 모듈 (Step 01 / 02)
+- MODIFIED: 타 봇 환경변수 오염 방지를 위해 /home/pipios4006 및 ~/.env 참조를 100% 삭제하고
+  오직 /home/pipiosToss/.env 와 스크립트 폴더 직하위 .env 만 로드하도록 하드 락온
+- MODIFIED: _issue_token_sync 호출 시 client_id / client_secret 미감지 시 /home/pipiosToss/.env 즉시 재스캔 복구
+- MODIFIED: get_holdings_all 호출 시 일시 예외 전파로 인한 메인 루프 중단 방지 및 안전 폴백 강화
 - 제1헌법: 모든 동기 HTTP/파일 I/O의 asyncio.to_thread 비동기 격리 및 GlobalThrottle 통제
 - 제2헌법: /api/v1/accounts 기반 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 주입
 - 제4헌법: 모든 시간 판단 ZoneInfo('America/New_York') 단일 소스 락온
@@ -12,7 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import os
@@ -20,13 +24,87 @@ import threading
 import time
 import urllib.parse
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
 
 logger = logging.getLogger("toss_sniper.toss_api")
+
+
+# ---------------------------------------------------------------------------
+# MODIFIED: /home/pipiosToss/.env 단일 경로 전용 내장형 자동 파서 (_autoload_dotenv_files)
+# ---------------------------------------------------------------------------
+def _autoload_dotenv_files(override: bool = False) -> int:
+    """
+    # MODIFIED: /home/pipios4006 및 ~/.env 참조를 100% 영구 삭제하고,
+    오직 /home/pipiosToss/.env 와 스크립트 위치(script_dir)의 .env 만 안전하게 파싱하여
+    os.environ 에 주입한다.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate_paths = (
+        "/home/pipiosToss/.env",
+        os.path.join(script_dir, ".env"),
+    )
+
+    loaded_count = 0
+    seen_paths = set()
+
+    for path in candidate_paths:
+        norm_p = os.path.abspath(path)
+        if norm_p in seen_paths or not os.path.isfile(norm_p):
+            continue
+        seen_paths.add(norm_p)
+        try:
+            with open(norm_p, "r", encoding="utf-8") as fp:
+                for raw_line in fp:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.lower().startswith("export "):
+                        line = line[7:].strip()
+                    if "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if not key:
+                        continue
+                    # 양끝 따옴표("..." 또는 '...') 제거 및 인라인 주석 제거
+                    if len(val) >= 2 and (
+                        (val[0] == '"' and val[-1] == '"')
+                        or (val[0] == "'" and val[-1] == "'")
+                    ):
+                        val = val[1:-1].strip()
+                    elif " #" in val:
+                        val = val.split(" #", 1)[0].strip()
+
+                    if override or not os.environ.get(key):
+                        os.environ[key] = val
+                        loaded_count += 1
+        except Exception as exc:
+            logger.debug(".env 자동 로드 스킵 (%s): %s", norm_p, exc)
+
+    # 별칭(Alias) 키 상호 보완 매핑
+    alias_pairs = (
+        ("TOSS_CLIENT_ID", ("CLIENT_ID", "TOSS_API_KEY", "TOSS_APP_KEY")),
+        ("TOSS_CLIENT_SECRET", ("CLIENT_SECRET", "TOSS_API_SECRET", "TOSS_APP_SECRET")),
+        ("TELEGRAM_BOT_TOKEN", ("TG_BOT_TOKEN", "BOT_TOKEN", "TG_TOKEN")),
+        ("TELEGRAM_CHAT_ID", ("TG_CHAT_ID", "CHAT_ID")),
+    )
+    for canonical_key, aliases in alias_pairs:
+        if not os.environ.get(canonical_key):
+            for ak in aliases:
+                if os.environ.get(ak):
+                    os.environ[canonical_key] = os.environ[ak]
+                    break
+
+    return loaded_count
+
+
+# 모듈 임포트 즉시 /home/pipiosToss/.env 자동 로드 실행
+_autoload_dotenv_files(override=False)
 
 # ---------------------------------------------------------------------------
 # 전역 타임존 및 화이트리스트 상수 (제4헌법 & Case 08, Case 09)
@@ -267,13 +345,16 @@ class TossInvestAPI:
         base_url: Optional[str] = None,
         request_timeout: float = 8.0,
     ) -> None:
+        _autoload_dotenv_files(override=False)
         self.client_id = str(
             client_id or os.getenv("TOSS_CLIENT_ID", "") or ""
         ).strip()
         self.client_secret = str(
             client_secret or os.getenv("TOSS_CLIENT_SECRET", "") or ""
         ).strip()
-        self.base_url = str(base_url or os.getenv("TOSS_API_BASE_URL", self.BASE_URL)).rstrip("/")
+        self.base_url = str(
+            base_url or os.getenv("TOSS_API_BASE_URL", self.BASE_URL)
+        ).rstrip("/")
         self.request_timeout = float(request_timeout)
 
         self._session = requests.Session()
@@ -300,6 +381,7 @@ class TossInvestAPI:
         """
         POST /oauth2/token (application/x-www-form-urlencoded)
         OAuth2 Client Credentials Grant 토큰 발급.
+        # MODIFIED: 자격증명이 비어 있을 경우 런타임에 /home/pipiosToss/.env 를 즉시 재스캔하여 복구.
         """
         with self._token_lock:
             now_mono = time.monotonic()
@@ -311,10 +393,17 @@ class TossInvestAPI:
                 return self._access_token
 
             if not self.client_id or not self.client_secret:
+                _autoload_dotenv_files(override=True)
+                self.client_id = str(os.getenv("TOSS_CLIENT_ID", "") or "").strip()
+                self.client_secret = str(
+                    os.getenv("TOSS_CLIENT_SECRET", "") or ""
+                ).strip()
+
+            if not self.client_id or not self.client_secret:
                 raise _NonRetryableApiError(
                     401,
                     "missing-credentials",
-                    "TOSS_CLIENT_ID 또는 TOSS_CLIENT_SECRET 환경변수가 설정되지 않았습니다.",
+                    "TOSS_CLIENT_ID 또는 TOSS_CLIENT_SECRET 환경변수가 설정되지 않았습니다 (/home/pipiosToss/.env 확인 필요).",
                 )
 
             GlobalThrottle.wait_api_sync("AUTH")
@@ -741,8 +830,10 @@ class TossInvestAPI:
     async def get_holdings_all(self) -> Dict[str, Dict[str, Any]]:
         """
         GET /api/v1/holdings (Rate Limits Group: ASSET)
-        Case 03: krw / usd 분리 객체의 null 체크 및 0.0 강제 형변환을 수행하고,
-        SOXS 와 SOXL 의 실보유 수량(qty) 및 팩트 평단가(avg_price)를 반환한다.
+        Case 03 & Case 19:
+        - krw / usd 분리 객체의 null 체크 및 0.0 강제 형변환을 수행하고,
+          SOXS 와 SOXL 의 실보유 수량(qty) 및 팩트 평단가(avg_price)를 반환한다.
+        - 일시적 네트워크/인증 에러 발생 시 안전 기본 객체를 반환하여 메인 루프 중단을 방어한다.
         """
         default_item = lambda s: {
             "symbol": s,
@@ -758,13 +849,18 @@ class TossInvestAPI:
             "SOXS": default_item("SOXS"),
             "SOXL": default_item("SOXL"),
         }
-        res = await self._request_async(
-            "GET",
-            "/api/v1/holdings",
-            group="ASSET",
-            require_account=True,
-            timeout=10.0,
-        )
+        try:
+            res = await self._request_async(
+                "GET",
+                "/api/v1/holdings",
+                group="ASSET",
+                require_account=True,
+                timeout=10.0,
+            )
+        except Exception as exc:
+            logger.warning("⚠️ 보유 잔고 조회 실패 (안전 폴백 유지): %s", exc)
+            return out
+
         if not isinstance(res, dict):
             return out
 
@@ -816,7 +912,9 @@ class TossInvestAPI:
             )
             if isinstance(res, dict):
                 raw_bp = safe_float(res.get("cashBuyingPower"), 0.0)
-                buffer_mult = max(0.0, 1.0 - (safe_float(safety_buffer_pct, 0.5) / 100.0))
+                buffer_mult = max(
+                    0.0, 1.0 - (safe_float(safety_buffer_pct, 0.5) / 100.0)
+                )
                 return math.floor((raw_bp * buffer_mult) * 100.0) / 100.0
         except Exception as exc:
             logger.warning("⚠️ USD 매수가능금액 조회 실패: %s", exc)
@@ -878,7 +976,9 @@ class TossInvestAPI:
             if isinstance(res, dict) and isinstance(res.get("orders"), list):
                 return res["orders"]
         except Exception as exc:
-            logger.warning("⚠️ 주문 목록 조회 실패 (status=%s, symbol=%s): %s", st, symbol, exc)
+            logger.warning(
+                "⚠️ 주문 목록 조회 실패 (status=%s, symbol=%s): %s", st, symbol, exc
+            )
         return []
 
     async def get_order_detail(self, order_id: str) -> Optional[Dict[str, Any]]:
@@ -1033,11 +1133,15 @@ class TossInvestAPI:
             return {
                 "orderId": new_oid,
                 "price": safe_float(formatted_price, new_price),
-                " tracked_from_409": False,
+                "tracked_from_409": False,
             }
         except _NonRetryableApiError as exc:
             # 409 already-modified 발생 시 해당 종목의 현재 OPEN 주문을 추적하여 재정정
-            if exc.status_code == 409 and exc.error_code == "already-modified" and symbol:
+            if (
+                exc.status_code == 409
+                and exc.error_code == "already-modified"
+                and symbol
+            ):
                 open_orders = await self.get_orders(status="OPEN", symbol=symbol)
                 target_side = str(side or "").upper().strip()
                 for o in open_orders:
@@ -1045,7 +1149,11 @@ class TossInvestAPI:
                         continue
                     cand_id = str(o.get("orderId") or "").strip()
                     cand_side = str(o.get("side") or "").upper().strip()
-                    if cand_id and cand_id != oid and (not target_side or cand_side == target_side):
+                    if (
+                        cand_id
+                        and cand_id != oid
+                        and (not target_side or cand_side == target_side)
+                    ):
                         encoded_cand = urllib.parse.quote(cand_id, safe="")
                         res2 = await self._request_async(
                             "POST",
@@ -1129,7 +1237,9 @@ class TossInvestAPI:
 
         sweep_price = math.floor(base_p * 100.0) / 100.0
         if min_floor_price > 0.0:
-            sweep_price = max(sweep_price, math.ceil(min_floor_price * 100.0) / 100.0)
+            sweep_price = max(
+                sweep_price, math.ceil(min_floor_price * 100.0) / 100.0
+            )
 
         # [1단계] 기장전된 매도 주문이 있으면 modify_order 즉시 정정 시도
         if sell_order_id:
