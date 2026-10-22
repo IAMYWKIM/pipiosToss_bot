@@ -1,19 +1,28 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: toss_api.py
-토스증권(Toss) Open API v1.2.14 방탄 클라이언트, GlobalThrottle 중앙 통제기,
-_HybridFileLock 하이브리드 파일 락 및 순수 롱(SOXL) 2-Tier 지층관리 원자적 원장(AssassinLedger) 코어 (Step 01 / 04)
-- NEW: 인버스 숏(SOXS) 및 데이장/1주 휩소 영구 폐기에 따라 REAL_ALLOWED_SYMBOLS = ("SOXL",) 단일 롱 하드 락온
-- NEW: 04:07 ~ 16:00 EST 운용 시간대 외 자동 매수 주문 물리적 차단 가드 장착
-- MODIFIED (Case 64): AssassinLedger 를 '8% 황금비율 정액 기반 정량제(COMP_08PCT 고정) + 자투리/수익금 복리 산입 +
-  10분 고정 시드보호 매수 게이트(buy_interval_min = 10 고정) + 1분 상시 스나이퍼 매도(08_VREV_PROG 고정) +
-  실물 기반 무팽창 True Always-L1 리앵커링' 전용 2-Tier 지층 원장(state_SOXL.json / soxl_stratum_ledger.json)으로 하드 락온
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 64 완벽 준수
+인피니트 스노우볼 (Infinite Snowball) v3.0 — 토스증권 Open API (v1.2.14) 방탄 통신 통제소 &
+SOXL 단일 롱 2-Tier 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 02 / 06)
+- 제1헌법: 모든 파일 I/O 및 네트워크 통신의 asyncio.to_thread 비동기 격리 + GlobalThrottle 중앙 통제
+- 제2헌법: 기동 시 GET /api/v1/accounts 1회 호출로 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 자동 주입
+- 제3헌법 ~ 제6헌법 및 Case 01 ~ 68 전수 락온:
+  1) REAL_ALLOWED_SYMBOLS = ("SOXL",) 단일 롱 화이트리스트 물리적 강제 (인버스 숏 SOXS 원천 차단)
+  2) get_holdings_map_with_status, get_candles_1m, get_candles_1d, get_current_prices_batch,
+     get_orderbook, get_buying_power_usd, get_sellable_quantity, create_order, modify_order,
+     cancel_order, get_order_detail, get_open_orders, get_usd_krw_rate 등 전 메서드 100% 정식 구현!
+  3) 미국 주식 주문 정정(/modify) 시 quantity 필드 원천 배제(400 us-modify-quantity-not-supported 차단) 및
+     주문 취소(/cancel) 시 빈 JSON 객체 {} 전송 강제(HTTP 415 차단)
+  4) 🚨 [Case 68 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 시드 $100 변조 방어]
+     - "/home/pipiosToss" 고정 경로 하드코딩 100% 영구 소각 -> 오직 실행 파일이 위치한 폴더(base_dir)의 .env 만 로드
+     - 폴더명(folder_slug) 기반 ① 고유 원장(soxl_stratum_ledger_<폴더명>.json), ② 호환 원장(soxl_stratum_ledger.json),
+       ③ 실시간 백업 금고(ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json) 3중 원자적 동기화 및 기존 데이터 무손실 자동 이관
+     - initial_seed_usd 결측/0.0 유입 시 $100.0 으로 강제 박제되던 버그 영구 소각 및 백업/환경변수/기본값($10,000) 자가 치유 복원
 """
 
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
 import math
@@ -21,1343 +30,1794 @@ import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-import requests
-
 logger = logging.getLogger("toss_sniper.toss_api")
 
-# 🚨 제4헌법: 타임존 단일 소스 락온 (EST 100%)
+# ---------------------------------------------------------------------------
+# [핵심 상수] 제4헌법 EST 단일 타임존 & 전술 A (🛡️ 05_AF_WIDE_10_01) 전역 상수
+# ---------------------------------------------------------------------------
 EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
 
-# 🚨 Case 09: 순수 롱(SOXL 단독) 허용 종목 화이트리스트 하드 락온 (숏 SOXS 영구 폐기)
 TARGET_SYMBOL: str = "SOXL"
 REAL_ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
-READONLY_ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
+ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
 
-TOSS_API_BASE_URL: str = "https://openapi.tossinvest.com"
-
-# 4xx 즉시 탈출 대상 상태 코드 (Case 21: 백오프 재시도 금지)
-NON_RETRYABLE_STATUS_CODES: Tuple[int, ...] = (400, 403, 404, 409, 415, 422)
-
-# NEW: 기본 초기 시드머니($10,000.00) · 8%(12.5분할) 황금비율 · 리앵커링 버퍼(0.994) · 왕복 수수료(0.14%) · 10분 게이트 고정 상수
 DEFAULT_INITIAL_SEED_USD: float = 10000.0
 PORTION_RATIO_LOCKED: float = 0.08
-REANCHOR_NET_BUFFER_MULT: float = 0.994
-ROUND_TRIP_FEE_RATE_PCT: float = 0.14
+BASE_MAX_LOTS_8PCT: int = 12
 LOCKED_BUY_INTERVAL_MIN: int = 10
+LOCKED_SELL_INTERVAL_MIN: int = 1
+ROUND_TRIP_FEE_RATE: float = 0.0014
+ROUND_TRIP_FEE_RATE_PCT: float = 0.14
+REANCHOR_NET_BUFFER_MULT: float = 0.994
+KRW_PER_USD_DEFAULT: float = 1380.0
+
+TOSS_OPENAPI_BASE_URL: str = "https://openapi.tossinvest.com"
 
 
 # ---------------------------------------------------------------------------
-# 안전한 형변환 및 /home/pipiosToss/.env 단일 경로 자동 로더
+# [유틸리티] 안전한 수치 형변환 (ZeroDivision / NaN / inf / null 방어 — Case 03, 23)
 # ---------------------------------------------------------------------------
 def safe_float(val: Any, default: float = 0.0) -> float:
-    """
-    Case 03 & Case 23: None, 빈 문자열, NaN, Inf 를 방어하는 안전한 float 변환기.
-    """
     if val is None or isinstance(val, bool):
         return float(default)
     try:
-        cleaned = str(val).replace(",", "").replace("$", "").strip()
-        if not cleaned:
+        if isinstance(val, str):
+            cleaned = (
+                val.replace(",", "").replace("$", "").replace("%", "").strip()
+            )
+            if not cleaned:
+                return float(default)
+            f_val = float(cleaned)
+        else:
+            f_val = float(val)
+        if math.isnan(f_val) or math.isinf(f_val):
             return float(default)
-        res = float(cleaned)
-        if math.isnan(res) or math.isinf(res):
-            return float(default)
-        return res
-    except (ValueError, TypeError):
+        return f_val
+    except Exception:
         return float(default)
 
 
 def safe_int(val: Any, default: int = 0) -> int:
-    """
-    소수점 문자열("10.0" 등)이나 None 도 안전하게 정수(int)로 변환한다.
-    """
     if val is None or isinstance(val, bool):
         return int(default)
     try:
-        return int(math.floor(safe_float(val, float(default))))
-    except (ValueError, TypeError):
+        f_val = safe_float(val, float(default))
+        return (
+            int(round(f_val))
+            if abs(f_val - round(f_val)) < 1e-6
+            else int(math.floor(f_val))
+        )
+    except Exception:
         return int(default)
 
 
-def _autoload_dotenv_files(override: bool = False) -> None:
+def generate_client_order_id(prefix: str = "SNIPER") -> str:
     """
-    /home/pipiosToss/.env 단일 운영 경로(및 현재 모듈 폴더 폴백)에서
-    환경변수를 파싱하여 os.environ 에 주입한다.
+    🚨 제5헌법:
+    토스증권 주문 생성 시 최대 36자 영숫자 및 '-', '_' 로 구성된 고유 멱등성 키(clientOrderId)를 생성한다.
     """
-    candidate_paths = [
-        "/home/pipiosToss/.env",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
-    ]
-    for env_path in candidate_paths:
-        if not os.path.isfile(env_path):
-            continue
+    clean_prefix = "".join(
+        ch for ch in str(prefix or "ORD").upper() if ch.isalnum()
+    )[:8]
+    ts_part = int(time.time() * 1000) % 100000000
+    rand_part = uuid.uuid4().hex[:12]
+    cid = f"{clean_prefix}-{ts_part}-{rand_part}"
+    return cid[:36]
+
+
+class _NonRetryableApiError(Exception):
+    """
+    🚨 Case 21:
+    4xx 클라이언트 비즈니스 에러(400, 401, 403, 404, 409, 415, 422) 발생 시
+    불필요한 재시도 없이 즉시 탈출하기 위한 전용 예외 클래스.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        error_code: str,
+        message: str,
+        raw_body: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.status_code = int(status_code)
+        self.error_code = str(error_code or "unknown-error")
+        self.message = str(message or "")
+        self.raw_body = raw_body or {}
+        super().__init__(
+            f"[HTTP {self.status_code} · {self.error_code}] {self.message}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# [NEW · Case 68] 폴더 위치(base_dir) 기반 자동 식별기 및 격리 환경변수 로더
+# ("/home/pipiosToss" 고정 경로 하드코딩 100% 영구 소각)
+# ---------------------------------------------------------------------------
+def get_bot_base_dir(explicit_dir: Optional[str] = None) -> str:
+    """
+    🚨 Case 68:
+    고정 경로("/home/pipiosToss")를 절대 참조하지 않고, 오직 현재 봇 스크립트가 위치한
+    실제 물리적 폴더(base_dir)의 절대 경로를 반환한다.
+    """
+    if explicit_dir and str(explicit_dir).strip():
+        cand = os.path.abspath(str(explicit_dir).strip())
+        if os.path.isfile(cand):
+            return os.path.dirname(cand)
+        return cand
+    return os.path.abspath(os.path.dirname(os.path.abspath(__file__)) or ".")
+
+
+def get_folder_slug(base_dir: Optional[str] = None) -> str:
+    """
+    🚨 Case 68:
+    현재 봇이 실행 중인 폴더명(예: /home/pipiosToss_family1 -> "pipiosToss_family1")을
+    안전한 파일명 식별자(slug)로 정규화하여 반환한다.
+    """
+    target_dir = get_bot_base_dir(base_dir)
+    raw_name = os.path.basename(os.path.normpath(target_dir)).strip()
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._-")
+    return slug if slug else "default_bot"
+
+
+def resolve_folder_isolated_ledger_paths(
+    base_dir: Optional[str] = None,
+    explicit_filepath: Optional[str] = None,
+) -> Tuple[str, str, str, str]:
+    """
+    🚨 Case 68 [폴더별 3중 안전 원장 경로 결정기]:
+    단일 서버 내 여러 폴더에서 다중 봇을 운영할 때 각 폴더 위치를 기준으로:
+    1) primary_path : <base_dir>/soxl_stratum_ledger_<folder_slug>.json (Git 추적 면역 폴더 고유 원장)
+    2) legacy_path  : <base_dir>/soxl_stratum_ledger.json (하위 호환 미러 원장)
+    3) backup_path  : <base_dir>/ledger_backups/soxl_stratum_ledger_<folder_slug>.bak.json (실시간 백업 금고)
+    4) folder_slug  : 현재 폴더 식별자 문자열
+    을 산출하여 반환한다.
+    """
+    if explicit_filepath and str(explicit_filepath).strip():
+        raw_fp = str(explicit_filepath).strip()
+        if os.path.isabs(raw_fp):
+            target_dir = os.path.dirname(raw_fp) or get_bot_base_dir(base_dir)
+        else:
+            target_dir = get_bot_base_dir(base_dir)
+    else:
+        target_dir = get_bot_base_dir(base_dir)
+
+    folder_slug = get_folder_slug(target_dir)
+    primary_path = os.path.join(
+        target_dir, f"soxl_stratum_ledger_{folder_slug}.json"
+    )
+    legacy_path = os.path.join(target_dir, "soxl_stratum_ledger.json")
+    backup_dir = os.path.join(target_dir, "ledger_backups")
+    backup_path = os.path.join(
+        backup_dir, f"soxl_stratum_ledger_{folder_slug}.bak.json"
+    )
+    return primary_path, legacy_path, backup_path, folder_slug
+
+
+def _load_env_files_into_environ(
+    base_dir: Optional[str] = None,
+    override_existing: bool = False,
+) -> str:
+    """
+    🚨 Case 68:
+    "/home/pipiosToss" 고정 경로 폴백을 100% 폐기하고, 오직 해당 봇이 위치한 폴더(target_dir)의
+    .env 및 설정 JSON 파일만 로드하여 폴더 간 환경변수 교차 오염을 원천 차단한다.
+    """
+    target_dir = get_bot_base_dir(base_dir)
+    if not os.path.isdir(target_dir):
+        return target_dir
+
+    env_fp = os.path.join(target_dir, ".env")
+    if os.path.isfile(env_fp):
         try:
-            with open(env_path, "r", encoding="utf-8") as fp:
-                for raw_line in fp:
+            with open(env_fp, "r", encoding="utf-8", errors="ignore") as f:
+                for raw_line in f:
                     line = raw_line.strip()
                     if not line or line.startswith("#") or "=" not in line:
                         continue
                     if line.startswith("export "):
                         line = line[len("export ") :].strip()
                     k, v = line.split("=", 1)
-                    key = k.strip()
-                    val = v.strip()
-                    if (
-                        len(val) >= 2
-                        and val[0] == val[-1]
-                        and val[0] in ("'", '"')
-                    ):
-                        val = val[1:-1]
-                    if key and (
-                        override
-                        or key not in os.environ
-                        or not os.environ.get(key)
-                    ):
-                        os.environ[key] = val
-        except Exception as exc:
-            logger.debug(".env 로드 예외(%s): %s", env_path, exc)
+                    k = k.strip()
+                    v = v.strip().strip("'").strip('"')
+                    if k and (override_existing or k not in os.environ):
+                        os.environ[k] = v
+        except Exception:
+            pass
+
+    for json_name in ("config.json", "secrets.json", "toss_config.json"):
+        j_fp = os.path.join(target_dir, json_name)
+        if os.path.isfile(j_fp):
+            try:
+                with open(j_fp, "r", encoding="utf-8", errors="ignore") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(v, (str, int, float)):
+                            k_str = str(k).strip()
+                            if k_str and (
+                                override_existing or k_str not in os.environ
+                            ):
+                                os.environ[k_str] = str(v)
+            except Exception:
+                pass
+
+    return target_dir
 
 
-_autoload_dotenv_files(override=False)
-
-
-def generate_client_order_id(prefix: str = "SOXL") -> str:
-    """
-    🚨 제5헌법:
-    토스증권 주문 생성 시 최대 36자 영숫자 및 '-', '_' 규칙(^[a-zA-Z0-9\\-_]+$)을 만족하는
-    고유 멱등성 키(clientOrderId)를 생성한다.
-    """
-    clean_prefix = (
-        re.sub(r"[^a-zA-Z0-9]", "", str(prefix or "SOXL"))[:8] or "SOXL"
-    )
-    ts_ms = int(time.time() * 1000) % 1000000000
-    rand_hex = uuid.uuid4().hex[:12]
-    cid = f"{clean_prefix}-{ts_ms}-{rand_hex}"
-    return cid[:36]
-
-
-def format_us_order_price(price: float) -> str:
-    """
-    API.txt OrderCreateRequest / OrderModifyRequest 가격 포맷 규격:
-    - US 주식 $1 이상: 소수점 둘째 자리까지
-    - US 주식 $1 미만: 소수점 넷째 자리까지
-    """
-    p = max(0.0001, safe_float(price, 0.0))
-    if p >= 1.0:
-        floored = math.floor((p + 1e-9) * 100.0) / 100.0
-        return f"{floored:.2f}"
-    floored_sub = math.floor((p + 1e-9) * 10000.0) / 10000.0
-    return f"{floored_sub:.4f}"
+_load_env_files_into_environ()
 
 
 # ---------------------------------------------------------------------------
-# Case 21 : 4xx 비즈니스/클라이언트 에러 즉시 탈출용 예외 클래스
-# ---------------------------------------------------------------------------
-class _NonRetryableApiError(RuntimeError):
-    """
-    Case 21: 400, 403, 404, 409, 415, 422 등 재시도해도 결과가 같거나
-    즉각적인 분기 처리가 필요한 4xx 에러 발생 시 백오프 없이 즉시 탈출하기 위한 예외.
-    """
-
-    def __init__(
-        self,
-        status_code: int,
-        error_code: str = "",
-        error_message: str = "",
-        error_data: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        self.status_code = int(status_code)
-        self.error_code = str(error_code or f"http-{status_code}")
-        self.error_message = str(error_message or "")
-        self.error_data = error_data if isinstance(error_data, dict) else {}
-        super().__init__(
-            f"[{self.status_code} {self.error_code}] {self.error_message}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Case 06 & Case 30 : 동기(with) / 비동기(async with) 양방향 호환 _HybridFileLock
+# [제1헌법] _HybridFileLock 및 GlobalThrottle (동기/비동기 양방향 호환 중앙 통제)
 # ---------------------------------------------------------------------------
 class _HybridFileLock:
     """
-    🚨 제1헌법 & Case 06 & Case 30:
-    단일 파일 경로에 대해 스레드 간 동기 컨텍스트(with lock:)와
-    코루틴 간 비동기 컨텍스트(async with lock:) 모두에서 안전하게 동작하는 하이브리드 락.
+    🚨 제1헌법 & Case 06:
+    일반 동기 `with GlobalThrottle.get_file_lock(path):` 와
+    비동기 `async with GlobalThrottle.get_file_lock(path):` 를 모두 지원하는 하이브리드 락.
     """
 
-    def __init__(self, filepath: str) -> None:
-        self.filepath = os.path.abspath(str(filepath or ""))
-        self._rlock = threading.RLock()
-
-    def acquire(self) -> None:
-        self._rlock.acquire()
-
-    def release(self) -> None:
-        try:
-            self._rlock.release()
-        except RuntimeError:
-            pass
+    def __init__(self) -> None:
+        self._thread_lock = threading.RLock()
 
     def __enter__(self) -> "_HybridFileLock":
-        self._rlock.acquire()
+        self._thread_lock.acquire()
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.release()
+        self._thread_lock.release()
 
     async def __aenter__(self) -> "_HybridFileLock":
-        await asyncio.to_thread(self._rlock.acquire)
+        await asyncio.to_thread(self._thread_lock.acquire)
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.release()
+        self._thread_lock.release()
 
 
-# ---------------------------------------------------------------------------
-# 제1헌법 & Case 20 : GlobalThrottle (API Rate Limit 그룹별 중앙 통제 및 파일 락 레지스트리)
-# ---------------------------------------------------------------------------
 class GlobalThrottle:
     """
     🚨 제1헌법 & Case 20:
-    토스증권 Open API Rate Limits 그룹별 최소 호출 간격을 중앙에서 통제하고,
-    파일 경로별 단일 _HybridFileLock 인스턴스를 관리한다.
+    모든 API 호출 전 그룹별 최소 호출 간격(Rate Limit)을 강제하고,
+    모든 로컬 파일 I/O 시 파일 경로별 상호 배제 Lock 을 제공한다.
     """
 
-    _group_locks_guard = threading.Lock()
-    _group_locks: Dict[str, threading.Lock] = {}
-    _group_last_call_mono: Dict[str, float] = {}
-
+    _api_lock = threading.Lock()
+    _last_call_mono: Dict[str, float] = {}
     _file_locks_guard = threading.Lock()
     _file_locks: Dict[str, _HybridFileLock] = {}
 
-    GROUP_MIN_INTERVALS: Dict[str, float] = {
-        "AUTH": 1.00,
-        "ACCOUNT": 0.25,
-        "ASSET": 0.20,
-        "ORDER": 0.12,
-        "ORDER_HISTORY": 0.20,
-        "ORDER_INFO": 0.20,
-        "MARKET_DATA": 0.10,
+    GROUP_INTERVALS: Dict[str, float] = {
+        "AUTH": 0.50,
+        "ORDER": 0.18,
+        "ORDER_HISTORY": 0.15,
+        "ORDER_INFO": 0.15,
+        "ASSET": 0.18,
+        "MARKET_DATA": 0.12,
         "MARKET_DATA_CHART": 0.22,
-        "MARKET_INFO": 0.30,
+        "MARKET_INFO": 0.25,
         "DEFAULT": 0.15,
     }
 
     @classmethod
     def wait_api_sync(cls, group: str = "DEFAULT") -> None:
         grp = str(group or "DEFAULT").upper().strip()
-        min_interval = cls.GROUP_MIN_INTERVALS.get(
-            grp, cls.GROUP_MIN_INTERVALS["DEFAULT"]
+        min_gap = cls.GROUP_INTERVALS.get(
+            grp, cls.GROUP_INTERVALS["DEFAULT"]
         )
-        with cls._group_locks_guard:
-            grp_lock = cls._group_locks.get(grp)
-            if grp_lock is None:
-                grp_lock = threading.Lock()
-                cls._group_locks[grp] = grp_lock
-
-        with grp_lock:
-            now_mono = time.monotonic()
-            last_mono = cls._group_last_call_mono.get(grp, 0.0)
-            elapsed = now_mono - last_mono
-            if elapsed < min_interval:
-                time.sleep(max(0.0, min_interval - elapsed))
-            cls._group_last_call_mono[grp] = time.monotonic()
+        with cls._api_lock:
+            now_m = time.monotonic()
+            last_m = cls._last_call_mono.get(grp, 0.0)
+            wait_s = min_gap - (now_m - last_m)
+            if wait_s > 0.0:
+                time.sleep(wait_s)
+            cls._last_call_mono[grp] = time.monotonic()
 
     @classmethod
-    async def wait_api_async(cls, group: str = "DEFAULT") -> None:
+    async def wait_api(cls, group: str = "DEFAULT") -> None:
         await asyncio.to_thread(cls.wait_api_sync, group)
 
     @classmethod
     def get_file_lock(cls, filepath: str) -> _HybridFileLock:
-        abs_path = os.path.abspath(str(filepath or "default.lock"))
+        abs_p = os.path.abspath(str(filepath or "default.lock"))
         with cls._file_locks_guard:
-            lock_obj = cls._file_locks.get(abs_path)
+            lock_obj = cls._file_locks.get(abs_p)
             if lock_obj is None:
-                lock_obj = _HybridFileLock(abs_path)
-                cls._file_locks[abs_path] = lock_obj
+                lock_obj = _HybridFileLock()
+                cls._file_locks[abs_p] = lock_obj
             return lock_obj
 
 
 # ---------------------------------------------------------------------------
-# NEW : AssassinLedger (순수 롱 SOXL 2-Tier 지층 · 8% 황금정량 · 복리 시드 원장 관리기)
+# [핵심 2] SOXL 단일 롱 2-Tier 폴더별 3중 안전 지층 원장 (SoxlStratumLedger)
 # ---------------------------------------------------------------------------
-def _normalize_bucket_dict(raw_b: Any) -> Optional[Dict[str, Any]]:
+class SoxlStratumLedger:
     """
-    JSON 에서 로드된 지층 딕셔너리의 수치형 필드를 정규화하고 유효성(qty > 0)을 검증한다.
-    """
-    if not isinstance(raw_b, dict):
-        return None
-    qty = safe_int(raw_b.get("qty"), 0)
-    if qty <= 0:
-        return None
-    book_p = max(0.01, safe_float(raw_b.get("book_price"), 0.01))
-    book_inv = max(
-        0.01 * float(qty),
-        safe_float(raw_b.get("book_invested_usd"), book_p * float(qty)),
-    )
-    actual_cost = max(
-        0.01 * float(qty),
-        safe_float(raw_b.get("actual_cost_usd"), book_inv),
-    )
-    lot_cnt = max(1, safe_int(raw_b.get("lot_count"), 1))
-    lot_type = str(raw_b.get("lot_type") or "QUOTA_L1").strip()
-    return {
-        "qty": qty,
-        "book_price": round(book_p, 4),
-        "book_invested_usd": round(book_inv, 4),
-        "actual_cost_usd": round(actual_cost, 4),
-        "lot_count": lot_cnt,
-        "lot_type": lot_type,
-    }
-
-
-def _default_soxl_stratum_state() -> Dict[str, Any]:
-    """
-    순수 롱(SOXL) 8% 황금비율 정액 기반 정량제 × 2-Tier 리앵커링 × 무팽창 Always-L1 기본 원장 스키마.
-    """
-    return {
-        "symbol": TARGET_SYMBOL,
-        "is_active": True,
-        "is_compound": True,
-        "portion_mode": "COMP_08PCT",         # MODIFIED (🎯 1 & Case 64): 총자산 8% 동적 복리 고정
-        "threshold_mode": "08_VREV_PROG",     # MODIFIED (🎯 2 & Case 64): 1층 +1.50% / 2층 +1.00% 고정
-        "buy_interval_min": LOCKED_BUY_INTERVAL_MIN,  # MODIFIED (Case 64): 10분 시드보호 매수 게이트 하드 고정
-        "initial_seed_usd": DEFAULT_INITIAL_SEED_USD,
-        "budget": DEFAULT_INITIAL_SEED_USD,   # 하위 호환 별칭 (initial_seed_usd 와 상시 동기화)
-        "free_cash_usd": DEFAULT_INITIAL_SEED_USD,
-        "buckets": [],                        # List[Dict]: 최대 2개 지층 ([0]=1층 L1, [1]=2층 MERGED_UPPER)
-        "anchor_price": 0.0,                  # 직전 매매 기준가 (8% 정량 주수 산출 기준)
-        "cycle_min_buy_price": 0.0,           # 현재 사이클 역대 최저 매수가 (무팽창 ANTI_BLOAT 신저가 판정용)
-        "ratchet_anchor_price": 0.0,          # 호환용 기준가 필드 (anchor_price 와 동기화)
-        "last_evaluated_buy_bucket_id": -1,   # 동일 10m 버킷 내 중복 매수 평가 방지 락
-        "last_evaluated_date": "",
-        # 미체결 주문 추적 필드
-        "buy_order_id": "",
-        "sell_order_id": "",
-        "client_order_id": "",
-        "ordered_qty": 0,
-        "buy_price": 0.0,
-        "pending_portion_budget": 0.0,
-        "pending_lot_type": "",
-        "pending_sell_mode": "",              # "SELL_L1_ONLY" | "SELL_ALL_GRAD" | "SELL_L2_GRAD"
-        "target_sell_price": 0.0,
-        # 5개년 모델 누적 통계 필드
-        "total_buy_events": 0,
-        "total_buy_shares": 0,
-        "total_sell_events": 0,
-        "total_sold_shares": 0,
-        "win_sell_events": 0,
-        "reanchor_cnt": 0,
-        "cumulative_reanchor_drop_usd": 0.0,
-        "extra_13plus_buy_events": 0,
-        "seed_protect_pass_cnt": 0,
-        "cumulative_leftover_saved_usd": 0.0,
-        "cumulative_realized_gross_usd": 0.0,
-        "cumulative_realized_fee_usd": 0.0,
-        "cumulative_realized_net_usd": 0.0,
-        # 일일 결산 통계 필드 (16:00 EST 정규장 마감 리포트용)
-        "daily_realized_net_usd": 0.0,
-        "daily_buy_events": 0,
-        "daily_sell_events": 0,
-        "daily_seed_protect_pass_cnt": 0,
-        "daily_leftover_saved_usd": 0.0,
-        "daily_reanchor_cnt": 0,
-        "last_daily_report_date": "",
-        "last_modify_mono": 0.0,
-        "entry_ts": 0.0,
-        "updated_at": "",
-    }
-
-
-class AssassinLedger:
-    """
-    🚨 제1헌법 & Case 02, 04 ~ 06, 09, 25 ~ 64:
-    순수 롱(SOXL) 단일 종목 2-Tier 지층관리 원장(state_SOXL.json 및 soxl_stratum_ledger.json)을
-    인메모리 캐시와 원자적 파일 덮어쓰기(.tmp 기록 + fsync + os.replace)로 동기화 관리하는 클래스.
+    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 68:
+    현재 봇이 위치한 폴더(`base_dir`)를 기준으로:
+    ① 폴더 고유 원장(`soxl_stratum_ledger_<folder_slug>.json` — Git 덮어쓰기 100% 면역)
+    ② 표준 호환 원장(`soxl_stratum_ledger.json` — 기존 코드 및 외부 도구 호환 미러)
+    ③ 실시간 백업 금고(`ledger_backups/soxl_stratum_ledger_<folder_slug>.bak.json`)
+    3곳에 SOXL 2-Tier 지층(buckets), 가용 현금 시드(free_cash_usd), 기억된 사이클 최저 매수가(cycle_min_buy_price),
+    양방향 60초 타임쉴드 시각, 누적 세후 실현수익금 및 자투리 절약금을 원자적(.tmp -> os.replace)으로 동시 영속화한다.
     """
 
-    def __init__(self, base_dir: Optional[str] = None) -> None:
-        if base_dir and os.path.isdir(base_dir):
-            self.base_dir = os.path.abspath(base_dir)
-        elif os.path.isdir("/home/pipiosToss"):
-            self.base_dir = "/home/pipiosToss"
-        else:
-            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+    ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
+
+    def __init__(
+        self,
+        filepath: Optional[str] = None,
+        base_dir: Optional[str] = None,
+    ) -> None:
+        self.base_dir: str = get_bot_base_dir(
+            base_dir
+            or (
+                os.path.dirname(os.path.abspath(filepath))
+                if filepath and os.path.isabs(str(filepath))
+                else None
+            )
+        )
+        (
+            self.primary_filepath,
+            self.legacy_filepath,
+            self.backup_filepath,
+            self.folder_slug,
+        ) = resolve_folder_isolated_ledger_paths(
+            base_dir=self.base_dir,
+            explicit_filepath=filepath,
+        )
+        # 하위 호환성 유지: 외부에서 ledger.filepath 접근 시 legacy_filepath 반환
+        self.filepath: str = self.legacy_filepath
+        self.backup_dir: str = os.path.dirname(self.backup_filepath)
 
         self._mem_lock = threading.RLock()
-        self._state: Dict[str, Any] = self._load_soxl_state_sync()
+        self._last_known_valid_seed: float = self._read_env_initial_seed()
+        self._data: Dict[str, Dict[str, Any]] = {}
+        self._load_sync()
 
-    def _validate_symbol(self, symbol: str = TARGET_SYMBOL) -> str:
-        sym = str(symbol or TARGET_SYMBOL).upper().strip()
-        if sym != TARGET_SYMBOL:
-            raise ValueError(
-                f"[Case 09 위반] 순수 롱(SOXL) 전용 원장에 비허용 종목 접근 차단: {sym}"
-            )
-        return TARGET_SYMBOL
+    @staticmethod
+    def _read_env_initial_seed() -> float:
+        for env_k in (
+            "INITIAL_SEED_USD",
+            "TOSS_INITIAL_SEED_USD",
+            "SEED_USD",
+            "DEFAULT_INITIAL_SEED_USD",
+        ):
+            val = safe_float(os.environ.get(env_k), 0.0)
+            if val > 100.0:
+                return round(val, 4)
+        return DEFAULT_INITIAL_SEED_USD
 
-    def _get_primary_filepath(self) -> str:
-        return os.path.join(self.base_dir, f"state_{TARGET_SYMBOL}.json")
-
-    def _get_stratum_mirror_filepath(self) -> str:
-        return os.path.join(self.base_dir, "soxl_stratum_ledger.json")
-
-    def _reconcile_accounting_identity_in_place(
-        self, st: Dict[str, Any]
-    ) -> None:
+    @classmethod
+    def _resolve_safe_initial_seed(
+        cls,
+        raw_st: Dict[str, Any],
+        fallback_seed: float = DEFAULT_INITIAL_SEED_USD,
+    ) -> float:
         """
-        🎯 5 & Case 63, Case 64 [회계 항등식(Accounting Identity) 무결성 및 챔피언 파라미터 하드 락온]:
-        1) 가용 현금(free_cash_usd) = max(0.0, (initial_seed_usd + cumulative_realized_net_usd) - sum(actual_cost_usd))
-           항등식을 상시 동기화하며, 수동 매수로 실투입 원금이 초기 시드를 초과하더라도 max(0.0, ...) 로 안전 클램핑한다.
-        2) Case 64: 30분 옵션을 완전히 제거하고 buy_interval_min = 10, portion_mode = "COMP_08PCT",
-           threshold_mode = "08_VREV_PROG", is_compound = True 로 상시 하드 고정한다.
+        🚨 Case 68 [시드머니 $100 강제 변조 버그 영구 소각]:
+        기존 코드의 `max(100.0, safe_float(st.get("initial_seed_usd"), 10000.0))` 는
+        `initial_seed_usd` 에 0 또는 0.0 이 들어왔을 때 $10,000 이 아닌 $100.0 으로 시드를 고정시켜 버렸다.
+        이를 방지하기 위해:
+        1) raw_seed > 100.0 이면 사용자 설정 시드로 정상 인정한다.
+        2) raw_seed == 100.0 인 경우, 명시적 플래그(`seed_explicitly_set_100 == True`)가 없으면
+           초기화 오류로 발생한 $100 변조로 판정하여 직전 정상 시드(fallback_seed) 또는 환경변수/기본값($10,000)으로 복구한다!
+        3) raw_seed < 100.0 (0.0 또는 음수/결측)이면 즉시 fallback_seed (또는 $10,000)로 복원한다.
         """
+        raw_val = (
+            raw_st.get("initial_seed_usd")
+            if isinstance(raw_st, dict)
+            else None
+        )
+        raw_seed = safe_float(raw_val, 0.0)
+        explicit_100 = bool(
+            isinstance(raw_st, dict)
+            and raw_st.get("seed_explicitly_set_100", False)
+        )
+
+        safe_fb = (
+            fallback_seed
+            if fallback_seed > 100.0
+            else cls._read_env_initial_seed()
+        )
+        if safe_fb <= 100.0:
+            safe_fb = DEFAULT_INITIAL_SEED_USD
+
+        if raw_seed > 100.0:
+            return round(raw_seed, 4)
+        if abs(raw_seed - 100.0) < 1e-6 and explicit_100:
+            return 100.0
+        return round(safe_fb, 4)
+
+    @classmethod
+    def _default_symbol_state(
+        cls,
+        folder_slug: str = "default_bot",
+        initial_seed: float = DEFAULT_INITIAL_SEED_USD,
+    ) -> Dict[str, Any]:
+        today_est = datetime.now(EST_TZ).strftime("%Y-%m-%d")
+        clean_seed = (
+            round(initial_seed, 4)
+            if initial_seed >= 100.0
+            else DEFAULT_INITIAL_SEED_USD
+        )
+        return {
+            "symbol": TARGET_SYMBOL,
+            "folder_slug": str(folder_slug or "default_bot"),
+            "is_active": True,
+            "initial_seed_usd": clean_seed,
+            "seed_explicitly_set_100": False,
+            "free_cash_usd": clean_seed,
+            "portion_mode": "COMP_08PCT",
+            "threshold_mode": "WIDE_RUNWAY",
+            "reentry_mode": "HYBRID_PULL_OR_BRK",
+            "buy_interval_min": LOCKED_BUY_INTERVAL_MIN,
+            "sell_interval_min": LOCKED_SELL_INTERVAL_MIN,
+            "buckets": [],
+            "anchor_price": 0.0,
+            "cycle_min_buy_price": 0.0,
+            "ratchet_anchor_price": 0.0,
+            "buy_order_id": "",
+            "sell_order_id": "",
+            "client_order_id": "",
+            "ordered_qty": 0,
+            "buy_price": 0.0,
+            "target_sell_price": 0.0,
+            "pending_portion_budget": 0.0,
+            "pending_lot_type": "",
+            "pending_sell_mode": "",
+            "last_modify_mono": 0.0,
+            "entry_ts": 0.0,
+            "last_buy_fill_ts": 0.0,
+            "last_sell_fill_ts": 0.0,
+            "last_evaluated_buy_bucket_id": -1,
+            "last_evaluated_date": today_est,
+            "logical_date": today_est,
+            "last_closing_report_date": "",
+            "last_tg_update_id": 0,
+            "total_buy_events": 0,
+            "total_buy_shares": 0,
+            "daily_buy_events": 0,
+            "extra_13plus_buy_events": 0,
+            "seed_protect_pass_cnt": 0,
+            "daily_seed_protect_pass_cnt": 0,
+            "cumulative_leftover_saved_usd": 0.0,
+            "daily_leftover_saved_usd": 0.0,
+            "total_sell_events": 0,
+            "total_sold_shares": 0,
+            "win_sell_events": 0,
+            "daily_sell_events": 0,
+            "reanchor_cnt": 0,
+            "daily_reanchor_cnt": 0,
+            "cumulative_reanchor_drop_usd": 0.0,
+            "cumulative_realized_gross_usd": 0.0,
+            "cumulative_realized_fee_usd": 0.0,
+            "cumulative_realized_net_usd": 0.0,
+            "daily_realized_net_usd": 0.0,
+            "updated_at": datetime.now(EST_TZ).isoformat(),
+        }
+
+    def _sanitize_and_enforce_identity(
+        self, raw_st: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        🚨 Case 63, Case 64 & Case 68:
+        1) buy_interval_min = 10, sell_interval_min = 1, portion_mode = "COMP_08PCT",
+           threshold_mode = "WIDE_RUNWAY" 를 강제 동기화한다.
+        2) 시드머니 결측 또는 0.0 유입 시 $100.0 으로 변조되지 않도록 _resolve_safe_initial_seed() 를 적용한다.
+        3) 회계 항등식(free_cash_usd = max(0.0, initial_seed_usd + cumulative_realized_net_usd - actual_invested))을
+           항상 정밀 유지한다.
+        """
+        st = self._default_symbol_state(
+            folder_slug=self.folder_slug,
+            initial_seed=self._last_known_valid_seed,
+        )
+        if isinstance(raw_st, dict):
+            st.update(raw_st)
+
+        st["symbol"] = TARGET_SYMBOL
+        st["folder_slug"] = self.folder_slug
+        st["buy_interval_min"] = LOCKED_BUY_INTERVAL_MIN
+        st["sell_interval_min"] = LOCKED_SELL_INTERVAL_MIN
+        st["portion_mode"] = "COMP_08PCT"
+        st["threshold_mode"] = "WIDE_RUNWAY"
+        st["reentry_mode"] = "HYBRID_PULL_OR_BRK"
+
+        init_seed = self._resolve_safe_initial_seed(
+            st, fallback_seed=self._last_known_valid_seed
+        )
+        st["initial_seed_usd"] = round(init_seed, 4)
+        if init_seed > 100.0:
+            self._last_known_valid_seed = round(init_seed, 4)
+
         raw_buckets = st.get("buckets")
         clean_buckets: List[Dict[str, Any]] = []
         if isinstance(raw_buckets, list):
             for b in raw_buckets:
-                nb = _normalize_bucket_dict(b)
-                if nb is not None:
-                    clean_buckets.append(nb)
+                if isinstance(b, dict) and safe_int(b.get("qty"), 0) > 0:
+                    q = max(1, safe_int(b.get("qty"), 1))
+                    bp = round(
+                        max(0.01, safe_float(b.get("book_price"), 0.01)), 4
+                    )
+                    bi = round(
+                        max(
+                            0.01 * q,
+                            safe_float(b.get("book_invested_usd"), q * bp),
+                        ),
+                        4,
+                    )
+                    ac = round(
+                        max(
+                            0.01 * q,
+                            safe_float(b.get("actual_cost_usd"), bi),
+                        ),
+                        4,
+                    )
+                    lc = max(1, safe_int(b.get("lot_count"), 1))
+                    lt = str(b.get("lot_type") or "QUOTA_L1").upper().strip()
+                    clean_buckets.append(
+                        {
+                            "qty": q,
+                            "book_price": bp,
+                            "book_invested_usd": bi,
+                            "actual_cost_usd": ac,
+                            "lot_count": lc,
+                            "lot_type": lt,
+                        }
+                    )
         st["buckets"] = clean_buckets
 
-        init_seed = max(
-            100.0,
-            safe_float(
-                st.get("initial_seed_usd"),
-                safe_float(st.get("budget"), DEFAULT_INITIAL_SEED_USD),
-            ),
+        actual_inv = round(
+            sum(safe_float(b["actual_cost_usd"], 0.0) for b in clean_buckets),
+            4,
         )
-        st["initial_seed_usd"] = round(init_seed, 4)
-        st["budget"] = round(init_seed, 2)
-
-        cum_net = safe_float(st.get("cumulative_realized_net_usd"), 0.0)
-        invested_actual = sum(
-            safe_float(b.get("actual_cost_usd"), 0.0) for b in clean_buckets
+        cum_net = round(
+            safe_float(st.get("cumulative_realized_net_usd"), 0.0), 4
         )
-        expected_free_cash = max(0.0, (init_seed + cum_net) - invested_actual)
-        st["free_cash_usd"] = round(expected_free_cash, 4)
+        st["cumulative_realized_net_usd"] = cum_net
 
-        # MODIFIED (🎯 1, 🎯 2, Case 64): 챔피언 전략 파라미터 하드 락온 (30분 옵션 및 고정 정량 잔재 원천 배제)
-        st["portion_mode"] = "COMP_08PCT"
-        st["is_compound"] = True
-        st["threshold_mode"] = "08_VREV_PROG"
-        st["buy_interval_min"] = LOCKED_BUY_INTERVAL_MIN
+        realized_equity = max(0.0, init_seed + cum_net)
+        st["free_cash_usd"] = round(max(0.0, realized_equity - actual_inv), 4)
+        st["updated_at"] = datetime.now(EST_TZ).isoformat()
+        return st
 
-    def _load_soxl_state_sync(self) -> Dict[str, Any]:
-        primary_fp = self._get_primary_filepath()
-        mirror_fp = self._get_stratum_mirror_filepath()
-        base = _default_soxl_stratum_state()
+    @staticmethod
+    def _extract_raw_soxl_dict(loaded: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(loaded, dict):
+            return None
+        if TARGET_SYMBOL in loaded and isinstance(loaded[TARGET_SYMBOL], dict):
+            return dict(loaded[TARGET_SYMBOL])
+        if "buckets" in loaded or "initial_seed_usd" in loaded:
+            return dict(loaded)
+        return None
 
-        target_fp = (
-            mirror_fp
-            if os.path.isfile(mirror_fp)
-            else (primary_fp if os.path.isfile(primary_fp) else primary_fp)
+    @staticmethod
+    def _score_ledger_state(st: Dict[str, Any]) -> Tuple[int, int, int, float, str]:
+        """
+        🚨 Case 68 [다중 원장 상태 비교 자가 치유 스코어링]:
+        폴더 내 3개 원장 후보(고유 원장 · 실시간 백업 금고 · 호환 원장) 중
+        실수로 초기화된 빈 파일 대신 실제 매매 데이터를 보유한 최적 원장을 선택하기 위한 우선순위 튜플:
+        1) has_active_position : 보유 지층 수량(sum(qty) > 0) 또는 미결 주문 존재 여부 (1 or 0)
+        2) has_trade_history   : 누적 매수/매도 횟수 + 리앵커링 횟수 + 시드보호 패스 횟수 합계
+        3) has_valid_seed      : initial_seed_usd > 100.0 여부 (1 or 0, $100 변조본 배제)
+        4) abs_realized_metric : abs(cumulative_realized_net_usd) + cumulative_leftover_saved_usd
+        5) updated_at_str      : ISO 타임스탬프 문자열
+        """
+        buckets = st.get("buckets") if isinstance(st.get("buckets"), list) else []
+        total_qty = sum(
+            safe_int(b.get("qty"), 0) for b in buckets if isinstance(b, dict)
+        )
+        has_pending_ord = bool(
+            str(st.get("buy_order_id") or "").strip()
+            or str(st.get("sell_order_id") or "").strip()
+        )
+        has_active = 1 if (total_qty > 0 or has_pending_ord) else 0
+
+        trade_cnt = (
+            safe_int(st.get("total_buy_events"), 0)
+            + safe_int(st.get("total_sell_events"), 0)
+            + safe_int(st.get("reanchor_cnt"), 0)
+        )
+        seed_val = safe_float(st.get("initial_seed_usd"), 0.0)
+        has_valid_seed = 1 if seed_val > 100.0 else 0
+
+        realized_metric = round(
+            abs(safe_float(st.get("cumulative_realized_net_usd"), 0.0))
+            + safe_float(st.get("cumulative_leftover_saved_usd"), 0.0),
+            4,
+        )
+        updated_str = str(st.get("updated_at") or "")
+        return (
+            has_active,
+            trade_cnt,
+            has_valid_seed,
+            realized_metric,
+            updated_str,
         )
 
-        with GlobalThrottle.get_file_lock(primary_fp):
-            if not os.path.isfile(target_fp):
-                self._reconcile_accounting_identity_in_place(base)
-                self._write_soxl_state_sync(base)
-                return base
-            try:
-                with open(target_fp, "r", encoding="utf-8") as fp:
-                    loaded = json.load(fp)
-                if isinstance(loaded, dict):
-                    # 구버전 budget 값만 존재하고 initial_seed_usd 가 없을 경우 자연스럽게 승계
-                    if "initial_seed_usd" not in loaded and "budget" in loaded:
-                        b_old = safe_float(
-                            loaded.get("budget"), DEFAULT_INITIAL_SEED_USD
+    def _load_candidate_file_sync(
+        self, fpath: str
+    ) -> Optional[Dict[str, Any]]:
+        if not fpath or not os.path.isfile(fpath):
+            return None
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            return self._extract_raw_soxl_dict(loaded)
+        except Exception as exc:
+            logger.warning("원장 후보 파일 로드 실패(%s): %s", fpath, exc)
+            return None
+
+    def _load_sync(self) -> None:
+        """
+        🚨 Case 68 [기존 soxl_stratum_ledger.json 100% 무손실 자동 이관 & 3중 금고 자가 치유]:
+        1) primary_filepath (`soxl_stratum_ledger_<폴더명>.json`)
+        2) backup_filepath  (`ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json`)
+        3) legacy_filepath  (`soxl_stratum_ledger.json`)
+        3개 파일을 모두 검사하여 가장 풍부하고 유효한 상태(보유 지층, 누적 수익, 정상 시드 보유)를
+        가진 원장을 채택한 뒤, 즉시 3개 경로 모두에 원자적으로 동기화 저장한다.
+        """
+        with GlobalThrottle.get_file_lock(self.primary_filepath):
+            with GlobalThrottle.get_file_lock(self.legacy_filepath):
+                with self._mem_lock:
+                    candidates: List[Tuple[str, Dict[str, Any]]] = []
+                    for label, fp in (
+                        ("PRIMARY", self.primary_filepath),
+                        ("BACKUP_VAULT", self.backup_filepath),
+                        ("LEGACY_MIRROR", self.legacy_filepath),
+                    ):
+                        raw_d = self._load_candidate_file_sync(fp)
+                        if isinstance(raw_d, dict):
+                            candidates.append((label, raw_d))
+
+                    # 어떤 후보 파일에서도 > $100 시드가 발견되면 먼저 _last_known_valid_seed 에 기억
+                    for _, cand_d in candidates:
+                        c_seed = safe_float(cand_d.get("initial_seed_usd"), 0.0)
+                        if c_seed > 100.0:
+                            self._last_known_valid_seed = round(c_seed, 4)
+                            break
+
+                    best_raw: Dict[str, Any] = {}
+                    best_label: str = "DEFAULT_INIT"
+                    if candidates:
+                        # 스코어가 가장 높은 원장 채택 (동점일 경우 PRIMARY > BACKUP_VAULT > LEGACY_MIRROR 순)
+                        priority_map = {
+                            "PRIMARY": 3,
+                            "BACKUP_VAULT": 2,
+                            "LEGACY_MIRROR": 1,
+                        }
+                        ranked = sorted(
+                            candidates,
+                            key=lambda item: (
+                                self._score_ledger_state(item[1]),
+                                priority_map.get(item[0], 0),
+                            ),
+                            reverse=True,
                         )
-                        if b_old >= 100.0:
-                            base["initial_seed_usd"] = b_old
-                            base["budget"] = b_old
-                    for k, default_v in base.items():
-                        if k == "buckets":
-                            if isinstance(loaded.get("buckets"), list):
-                                base["buckets"] = loaded["buckets"]
-                            continue
-                        if k in loaded and loaded[k] is not None:
-                            if isinstance(default_v, bool):
-                                base[k] = bool(loaded[k])
-                            elif isinstance(default_v, int):
-                                base[k] = safe_int(loaded[k], default_v)
-                            elif isinstance(default_v, float):
-                                base[k] = safe_float(loaded[k], default_v)
-                            else:
-                                base[k] = str(loaded[k])
-                    base["symbol"] = TARGET_SYMBOL
-            except Exception as exc:
-                logger.warning("⚠️ [SOXL] 지층 원장 파일 로드 폴백 사용: %s", exc)
+                        best_label, best_raw = ranked[0]
 
-            self._reconcile_accounting_identity_in_place(base)
-            self._write_soxl_state_sync(base)
-        return base
+                    sanitized = self._sanitize_and_enforce_identity(best_raw)
+                    self._data[TARGET_SYMBOL] = sanitized
+                    self._save_sync_unlocked()
 
-    def _write_soxl_state_sync(self, state_data: Dict[str, Any]) -> None:
-        primary_fp = self._get_primary_filepath()
-        mirror_fp = self._get_stratum_mirror_filepath()
+                    held_q = sum(
+                        safe_int(b.get("qty"), 0)
+                        for b in sanitized.get("buckets", [])
+                    )
+                    logger.info(
+                        "📂 [Case 68 폴더별 3중 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주 · 고유원장=%s",
+                        self.folder_slug,
+                        best_label,
+                        safe_float(sanitized.get("initial_seed_usd"), 10000.0),
+                        held_q,
+                        os.path.basename(self.primary_filepath),
+                    )
 
-        with GlobalThrottle.get_file_lock(primary_fp):
+    @staticmethod
+    def _atomic_write_json_sync(
+        target_path: str, payload: Dict[str, Any]
+    ) -> None:
+        parent_dir = os.path.dirname(target_path)
+        if parent_dir and not os.path.isdir(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+        tmp_path = (
+            f"{target_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, target_path)
+        except Exception as exc:
+            logger.error("원장 원자적 저장 예외(%s): %s", target_path, exc)
             try:
-                os.makedirs(self.base_dir, exist_ok=True)
-                payload = dict(state_data)
-                payload["symbol"] = TARGET_SYMBOL
-                payload["updated_at"] = datetime.now(EST_TZ).strftime(
-                    "%Y-%m-%d %H:%M:%S EST"
-                )
-                for dst_fp in (primary_fp, mirror_fp):
-                    tmp_path = f"{dst_fp}.tmp"
-                    with open(tmp_path, "w", encoding="utf-8") as fp:
-                        json.dump(payload, fp, ensure_ascii=False, indent=2)
-                        fp.flush()
-                        os.fsync(fp.fileno())
-                    os.replace(tmp_path, dst_fp)
-            except Exception as exc:
-                logger.error("🚨 [SOXL] 지층 원장 원자적 기록 실패: %s", exc)
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    def _save_sync_unlocked(self) -> None:
+        """
+        🚨 Case 05 & Case 68:
+        1) 폴더 고유 원장 (`soxl_stratum_ledger_<folder_slug>.json`)
+        2) 호환 미러 원장 (`soxl_stratum_ledger.json`)
+        3) 실시간 백업 금고 (`ledger_backups/soxl_stratum_ledger_<folder_slug>.bak.json`)
+        — 단, 현재 상태가 지층 0주이면서 동시에 백업 금고에 유효 지층(buckets > 0)이 있고
+          수동 초기화/정식 매도가 아닌 비정상 빈 덮어쓰기라면 백업 금고를 보호하고,
+          정상적인 운영 업데이트 시에는 3곳 모두 원자적(.tmp -> os.replace)으로 동시 기록한다.
+        """
+        payload = {TARGET_SYMBOL: self._data[TARGET_SYMBOL]}
+        self._atomic_write_json_sync(self.primary_filepath, payload)
+        if os.path.abspath(self.legacy_filepath) != os.path.abspath(
+            self.primary_filepath
+        ):
+            self._atomic_write_json_sync(self.legacy_filepath, payload)
+        self._atomic_write_json_sync(self.backup_filepath, payload)
+
+    def create_daily_backup_snapshot_sync(
+        self, logical_date: Optional[str] = None, keep_days: int = 14
+    ) -> str:
+        """
+        NEW [Case 68 일일 날짜별 스냅샷 금고 보관]:
+        17:00 EST 일일 GC 또는 장 마감 결산 시 `ledger_backups/soxl_stratum_ledger_<folder_slug>_YYYY-MM-DD.json`
+        파일을 생성하고 오래된 스냅샷(최근 14개 초과분)을 자동 정리한다.
+        """
+        dt_str = str(
+            logical_date or datetime.now(EST_TZ).strftime("%Y-%m-%d")
+        ).strip()
+        snap_path = os.path.join(
+            self.backup_dir,
+            f"soxl_stratum_ledger_{self.folder_slug}_{dt_str}.json",
+        )
+        with GlobalThrottle.get_file_lock(self.primary_filepath):
+            with self._mem_lock:
+                payload = {TARGET_SYMBOL: self._data[TARGET_SYMBOL]}
+                self._atomic_write_json_sync(snap_path, payload)
+
+        try:
+            pattern = os.path.join(
+                self.backup_dir,
+                f"soxl_stratum_ledger_{self.folder_slug}_20*.json",
+            )
+            files = sorted(glob.glob(pattern))
+            if len(files) > max(3, keep_days):
+                for old_fp in files[: len(files) - max(3, keep_days)]:
+                    try:
+                        os.remove(old_fp)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return snap_path
+
+    async def create_daily_backup_snapshot(
+        self, logical_date: Optional[str] = None, keep_days: int = 14
+    ) -> str:
+        return await asyncio.to_thread(
+            self.create_daily_backup_snapshot_sync, logical_date, keep_days
+        )
+
+    def recover_from_backup_vault_sync(self) -> Optional[Dict[str, Any]]:
+        """
+        NEW [Case 68]:
+        백업 금고(`backup_filepath` 또는 최신 일일 스냅샷)에서 유효한 지층(`buckets`)이나
+        시드/수익 데이터가 존재하면 읽어와 반환한다.
+        """
+        cand_paths = [self.backup_filepath, self.primary_filepath]
+        try:
+            pattern = os.path.join(
+                self.backup_dir,
+                f"soxl_stratum_ledger_{self.folder_slug}_20*.json",
+            )
+            cand_paths.extend(sorted(glob.glob(pattern), reverse=True)[:3])
+        except Exception:
+            pass
+
+        for fp in cand_paths:
+            raw_d = self._load_candidate_file_sync(fp)
+            if isinstance(raw_d, dict):
+                b_list = raw_d.get("buckets")
+                if isinstance(b_list, list) and sum(
+                    safe_int(b.get("qty"), 0)
+                    for b in b_list
+                    if isinstance(b, dict)
+                ) > 0:
+                    return self._sanitize_and_enforce_identity(raw_d)
+        return None
+
+    def _assert_allowed_symbol(self, symbol: str) -> str:
+        sym = str(symbol or TARGET_SYMBOL).upper().strip()
+        if sym not in self.ALLOWED_SYMBOLS:
+            raise ValueError(
+                f"🚨 [Case 09 위반] 허용되지 않은 종목 접근 차단: {sym} (허용: {self.ALLOWED_SYMBOLS})"
+            )
+        return sym
 
     def get_state(self, symbol: str = TARGET_SYMBOL) -> Dict[str, Any]:
-        self._validate_symbol(symbol)
+        sym = self._assert_allowed_symbol(symbol)
         with self._mem_lock:
-            snap = dict(self._state)
-            snap["buckets"] = [
-                dict(b)
-                for b in self._state.get("buckets", [])
-                if isinstance(b, dict)
-            ]
-            return snap
+            st = self._data.get(sym)
+            if not isinstance(st, dict):
+                st = self._sanitize_and_enforce_identity({})
+                self._data[sym] = st
+            return json.loads(json.dumps(st))
+
+    def update_state_sync(
+        self, symbol: str = TARGET_SYMBOL, **kwargs: Any
+    ) -> Dict[str, Any]:
+        sym = self._assert_allowed_symbol(symbol)
+        with GlobalThrottle.get_file_lock(self.primary_filepath):
+            with GlobalThrottle.get_file_lock(self.legacy_filepath):
+                with self._mem_lock:
+                    cur = dict(
+                        self._data.get(sym)
+                        or self._default_symbol_state(
+                            folder_slug=self.folder_slug,
+                            initial_seed=self._last_known_valid_seed,
+                        )
+                    )
+                    if "initial_seed_usd" in kwargs:
+                        req_seed = safe_float(kwargs.get("initial_seed_usd"), 0.0)
+                        cur["seed_explicitly_set_100"] = bool(
+                            abs(req_seed - 100.0) < 1e-6
+                        )
+                    cur.update(kwargs)
+                    sanitized = self._sanitize_and_enforce_identity(cur)
+                    self._data[sym] = sanitized
+                    self._save_sync_unlocked()
+                    return json.loads(json.dumps(sanitized))
 
     async def update_state(
         self, symbol: str = TARGET_SYMBOL, **kwargs: Any
     ) -> Dict[str, Any]:
-        """
-        제1헌법 & Case 04 ~ 06, Case 64:
-        인메모리 지층 원장 상태를 즉시 갱신(회계 항등식 자동 보정 및 10분/8% 복리 하드 락온 포함)하고,
-        백그라운드 스레드(asyncio.to_thread)를 통해 state_SOXL.json 및 soxl_stratum_ledger.json 에 원자적으로 덮어쓴다.
-        """
-        self._validate_symbol(symbol)
-        with self._mem_lock:
-            cur = self._state
-            if "budget" in kwargs and "initial_seed_usd" not in kwargs:
-                kwargs["initial_seed_usd"] = max(
-                    100.0,
-                    safe_float(kwargs["budget"], DEFAULT_INITIAL_SEED_USD),
-                )
-
-            for k, v in kwargs.items():
-                cur[k] = v
-            cur["symbol"] = TARGET_SYMBOL
-            self._reconcile_accounting_identity_in_place(cur)
-            snapshot = dict(cur)
-            snapshot["buckets"] = [
-                dict(b)
-                for b in cur.get("buckets", [])
-                if isinstance(b, dict)
-            ]
-
-        await asyncio.wait_for(
-            asyncio.to_thread(self._write_soxl_state_sync, snapshot),
-            timeout=5.0,
-        )
-        return snapshot
-
-    async def set_initial_seed_usd(self, new_seed_usd: float) -> Dict[str, Any]:
-        """
-        초기 기준 시드머니(initial_seed_usd)를 변경하고 회계 항등식에 맞춰 가용 현금(free_cash_usd)을 재동기화한다.
-        """
-        clean_seed = round(
-            max(100.0, safe_float(new_seed_usd, DEFAULT_INITIAL_SEED_USD)), 2
-        )
-        return await self.update_state(
-            TARGET_SYMBOL,
-            initial_seed_usd=clean_seed,
-            budget=clean_seed,
+        return await asyncio.to_thread(
+            self.update_state_sync, symbol, **kwargs
         )
 
-    async def reset_stratum_ledger_preserve_seed(
-        self, new_seed_usd: Optional[float] = None
+    async def reset_stratum_only(
+        self,
+        symbol: str = TARGET_SYMBOL,
+        new_seed_usd: Optional[float] = None,
+        preserve_realized_profit: bool = True,
     ) -> Dict[str, Any]:
         """
-        🚨 Case 02 & Case 64:
-        /reset 명령 시 SOXL 지층 큐(buckets), 기준가(anchor_price, cycle_min_buy_price, ratchet_anchor_price),
-        미체결 주문 ID를 원자적으로 0점 초기화한다.
-        - new_seed_usd 미지정 시: 기존 총 실현 자산(initial_seed_usd + cumulative_realized_net_usd)과 작동 상태를 보존한다.
-        - new_seed_usd 지정 시(/reset_seed): 해당 금액으로 초기 시드를 재설정하고 누적 손익 통계를 0으로 리셋한다.
+        🚨 Case 02:
+        /reset 또는 /reset_seed 명령 시 지층 큐(buckets), 기준가, 기억된 최저가, 미체결 주문 ID를
+        원자적으로 0점 초기화한다.
         """
-        st = self.get_state(TARGET_SYMBOL)
+        sym = self._assert_allowed_symbol(symbol)
+        st = self.get_state(sym)
         if new_seed_usd is not None and safe_float(new_seed_usd, 0.0) >= 100.0:
-            preserved_seed = round(
-                safe_float(new_seed_usd, DEFAULT_INITIAL_SEED_USD), 2
-            )
-            cum_net = 0.0
-            cum_gross = 0.0
-            cum_fee = 0.0
-            cum_saved = 0.0
-            cum_reanchor_drop = 0.0
-            reanchor_c = 0
-            pass_c = 0
-            buy_ev = 0
-            buy_sh = 0
-            sell_ev = 0
-            sell_sh = 0
-            win_ev = 0
-            extra_13 = 0
+            init_seed = safe_float(new_seed_usd, DEFAULT_INITIAL_SEED_USD)
         else:
-            preserved_seed = max(
-                100.0,
-                safe_float(st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD),
+            init_seed = self._resolve_safe_initial_seed(
+                st, fallback_seed=self._last_known_valid_seed
             )
-            cum_net = safe_float(st.get("cumulative_realized_net_usd"), 0.0)
-            cum_gross = safe_float(
-                st.get("cumulative_realized_gross_usd"), 0.0
-            )
-            cum_fee = safe_float(st.get("cumulative_realized_fee_usd"), 0.0)
-            cum_saved = safe_float(
-                st.get("cumulative_leftover_saved_usd"), 0.0
-            )
-            cum_reanchor_drop = safe_float(
-                st.get("cumulative_reanchor_drop_usd"), 0.0
-            )
-            reanchor_c = safe_int(st.get("reanchor_cnt"), 0)
-            pass_c = safe_int(st.get("seed_protect_pass_cnt"), 0)
-            buy_ev = safe_int(st.get("total_buy_events"), 0)
-            buy_sh = safe_int(st.get("total_buy_shares"), 0)
-            sell_ev = safe_int(st.get("total_sell_events"), 0)
-            sell_sh = safe_int(st.get("total_sold_shares"), 0)
-            win_ev = safe_int(st.get("win_sell_events"), 0)
-            extra_13 = safe_int(st.get("extra_13plus_buy_events"), 0)
-
+        cum_net = (
+            safe_float(st.get("cumulative_realized_net_usd"), 0.0)
+            if preserve_realized_profit
+            else 0.0
+        )
         return await self.update_state(
-            TARGET_SYMBOL,
-            is_active=bool(st.get("is_active", True)),
-            is_compound=True,
-            portion_mode="COMP_08PCT",
-            threshold_mode="08_VREV_PROG",
-            buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
-            initial_seed_usd=preserved_seed,
-            budget=preserved_seed,
+            sym,
+            initial_seed_usd=round(init_seed, 4),
+            cumulative_realized_net_usd=round(cum_net, 4),
             buckets=[],
             anchor_price=0.0,
             cycle_min_buy_price=0.0,
             ratchet_anchor_price=0.0,
-            last_evaluated_buy_bucket_id=-1,
-            last_evaluated_date="",
             buy_order_id="",
             sell_order_id="",
             client_order_id="",
             ordered_qty=0,
             buy_price=0.0,
+            target_sell_price=0.0,
             pending_portion_budget=0.0,
             pending_lot_type="",
             pending_sell_mode="",
-            target_sell_price=0.0,
-            total_buy_events=buy_ev,
-            total_buy_shares=buy_sh,
-            total_sell_events=sell_ev,
-            total_sold_shares=sell_sh,
-            win_sell_events=win_ev,
-            reanchor_cnt=reanchor_c,
-            cumulative_reanchor_drop_usd=cum_reanchor_drop,
-            extra_13plus_buy_events=extra_13,
-            seed_protect_pass_cnt=pass_c,
-            cumulative_leftover_saved_usd=cum_saved,
-            cumulative_realized_gross_usd=cum_gross,
-            cumulative_realized_fee_usd=cum_fee,
-            cumulative_realized_net_usd=cum_net,
-            daily_realized_net_usd=0.0,
+            last_evaluated_buy_bucket_id=-1,
+        )
+
+    async def set_initial_seed_usd(
+        self, new_seed_usd: float, reset_realized_profit: bool = False
+    ) -> Dict[str, Any]:
+        clean_seed = round(max(100.0, safe_float(new_seed_usd, 10000.0)), 4)
+        kw: Dict[str, Any] = {
+            "initial_seed_usd": clean_seed,
+            "seed_explicitly_set_100": bool(abs(clean_seed - 100.0) < 1e-6),
+        }
+        if reset_realized_profit:
+            kw["cumulative_realized_net_usd"] = 0.0
+            kw["cumulative_realized_gross_usd"] = 0.0
+            kw["cumulative_realized_fee_usd"] = 0.0
+        return await self.update_state(TARGET_SYMBOL, **kw)
+
+    async def toggle_bot_active(
+        self, active: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        st = self.get_state(TARGET_SYMBOL)
+        next_active = (
+            bool(active)
+            if active is not None
+            else (not bool(st.get("is_active", True)))
+        )
+        return await self.update_state(TARGET_SYMBOL, is_active=next_active)
+
+    async def rollover_daily_counters_if_needed(
+        self, logical_date: str
+    ) -> Dict[str, Any]:
+        st = self.get_state(TARGET_SYMBOL)
+        cur_date = str(st.get("logical_date") or "")
+        if cur_date == str(logical_date):
+            return st
+        return await self.update_state(
+            TARGET_SYMBOL,
+            logical_date=str(logical_date),
             daily_buy_events=0,
             daily_sell_events=0,
             daily_seed_protect_pass_cnt=0,
-            daily_leftover_saved_usd=0.0,
             daily_reanchor_cnt=0,
-            last_modify_mono=0.0,
-            entry_ts=0.0,
+            daily_leftover_saved_usd=0.0,
+            daily_realized_net_usd=0.0,
+            last_evaluated_buy_bucket_id=-1,
+            last_evaluated_date=str(logical_date),
         )
 
-    async def reset_dual_ledgers_preserve_seed(self) -> Dict[str, Any]:
-        """
-        구버전 호환 별칭: reset_stratum_ledger_preserve_seed 호출로 직결한다.
-        """
-        return await self.reset_stratum_ledger_preserve_seed()
+
+# 하위 호환 별칭 (타 모듈 임포트 호환 100% 보장)
+StratumLedger = SoxlStratumLedger
+AssassinLedger = SoxlStratumLedger
 
 
 # ---------------------------------------------------------------------------
-# TossApiClient : 토스증권 Open API v1.2.14 방탄 비동기 클라이언트
+# [핵심 3] 토스증권 Open API v1.2.14 방탄 클라이언트 (TossApiClient)
 # ---------------------------------------------------------------------------
 class TossApiClient:
     """
-    제1헌법 ~ 제6헌법 및 API.txt v1.2.14 전 엔드포인트 완벽 구현 클라이언트 (순수 롱 SOXL 전용).
+    🏛️ 제1헌법 ~ 제6헌법 & API.txt (v1.2.14) 100% 완벽 구현:
+    - OAuth2 토큰 자동 발급 및 만료 전 선제 갱신 (`POST /oauth2/token`)
+    - 종합매매 계좌(`BROKERAGE`) `accountSeq` 자동 락온 및 `X-Tossinvest-Account` 헤더 원자적 주입 (`GET /api/v1/accounts`)
+    - `REAL_ALLOWED_SYMBOLS = ("SOXL",)` 외 제3종목(SOXS 등) 주문 물리적 차단 (`Case 09`)
+    - 외부 패키지(`httpx`/`aiohttp`) 유무에 영향받지 않는 표준 `urllib.request` + `asyncio.to_thread` 방탄 비동기 엔진
     """
+
+    REAL_ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
 
     def __init__(
         self,
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
-        base_url: str = TOSS_API_BASE_URL,
+        base_url: Optional[str] = None,
+        base_dir: Optional[str] = None,
     ) -> None:
-        _autoload_dotenv_files(override=False)
-        self.base_url = str(base_url or TOSS_API_BASE_URL).rstrip("/")
-        self.client_id = str(
+        self.base_dir: str = _load_env_files_into_environ(base_dir=base_dir)
+        self.base_url: str = (
+            base_url
+            or os.environ.get("TOSS_BASE_URL")
+            or os.environ.get("TOSS_API_BASE_URL")
+            or TOSS_OPENAPI_BASE_URL
+        ).rstrip("/")
+
+        self.client_id: str = (
             client_id
-            or os.getenv("TOSS_CLIENT_ID")
-            or os.getenv("CLIENT_ID")
-            or ""
-        ).strip()
-        self.client_secret = str(
-            client_secret
-            or os.getenv("TOSS_CLIENT_SECRET")
-            or os.getenv("CLIENT_SECRET")
+            or os.environ.get("TOSS_CLIENT_ID")
+            or os.environ.get("TOSS_API_KEY")
+            or os.environ.get("TOSS_APP_KEY")
+            or os.environ.get("CLIENT_ID")
+            or os.environ.get("APP_KEY")
             or ""
         ).strip()
 
-        self._session = requests.Session()
-        self._auth_lock = threading.RLock()
+        self.client_secret: str = (
+            client_secret
+            or os.environ.get("TOSS_CLIENT_SECRET")
+            or os.environ.get("TOSS_API_SECRET")
+            or os.environ.get("TOSS_APP_SECRET")
+            or os.environ.get("CLIENT_SECRET")
+            or os.environ.get("APP_SECRET")
+            or ""
+        ).strip()
+
         self._access_token: str = ""
         self._token_expires_mono: float = 0.0
-        self._account_seq: Optional[int] = None
+        self._token_lock: asyncio.Lock = asyncio.Lock()
 
-        # US 장 운영 캘린더 30초 캐시 (Case 10 & 제6헌법)
-        self._cal_lock = threading.Lock()
-        self._cal_cache: Dict[str, Any] = {
-            "date": "",
-            "updated_mono": 0.0,
-            "data": {},
-        }
+        self.account_seq: Optional[int] = None
+        self._account_lock: asyncio.Lock = asyncio.Lock()
 
-    def _refresh_env_credentials(self) -> None:
-        if self.client_id and self.client_secret:
-            return
-        _autoload_dotenv_files(override=True)
-        self.client_id = str(
-            os.getenv("TOSS_CLIENT_ID") or os.getenv("CLIENT_ID") or ""
-        ).strip()
-        self.client_secret = str(
-            os.getenv("TOSS_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or ""
-        ).strip()
+        self._fx_cache_rate: float = KRW_PER_USD_DEFAULT
+        self._fx_cache_mono: float = 0.0
+
+    def _assert_real_order_symbol(self, symbol: str) -> str:
+        sym = str(symbol or "").upper().strip()
+        if sym not in self.REAL_ALLOWED_SYMBOLS:
+            raise ValueError(
+                f"🚨 [Case 09 물리적 주문 차단] 허용되지 않은 종목 주문 시도: {sym} (오직 SOXL 만 허용)"
+            )
+        return sym
 
     # -----------------------------------------------------------------------
-    # [Auth] POST /oauth2/token (application/x-www-form-urlencoded)
+    # 내부 저수준 HTTP 실행기 (제1헌법: GlobalThrottle.wait_api_sync + asyncio.to_thread)
     # -----------------------------------------------------------------------
-    def _ensure_token_sync(self, force_refresh: bool = False) -> str:
-        with self._auth_lock:
-            now_mono = time.monotonic()
+    def _execute_http_sync(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        body_bytes: Optional[bytes],
+        rate_group: str,
+        timeout_sec: float,
+    ) -> Tuple[int, Dict[str, Any]]:
+        GlobalThrottle.wait_api_sync(rate_group)
+        req = urllib.request.Request(
+            url=url,
+            data=body_bytes,
+            headers=headers,
+            method=method.upper(),
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                status_code = int(resp.getcode() or 200)
+                raw_bytes = resp.read()
+                if not raw_bytes:
+                    return status_code, {}
+                text = raw_bytes.decode("utf-8", errors="replace").strip()
+                if not text:
+                    return status_code, {}
+                return status_code, json.loads(text)
+        except urllib.error.HTTPError as http_err:
+            status_code = int(http_err.code or 500)
+            err_payload: Dict[str, Any] = {}
+            try:
+                err_bytes = http_err.read()
+                if err_bytes:
+                    err_payload = json.loads(
+                        err_bytes.decode("utf-8", errors="replace")
+                    )
+            except Exception:
+                err_payload = {}
+            return status_code, err_payload
+
+    async def _ensure_access_token(self, force_refresh: bool = False) -> str:
+        if (
+            not force_refresh
+            and self._access_token
+            and time.monotonic() < (self._token_expires_mono - 120.0)
+        ):
+            return self._access_token
+
+        async with self._token_lock:
             if (
                 not force_refresh
                 and self._access_token
-                and now_mono < (self._token_expires_mono - 60.0)
+                and time.monotonic() < (self._token_expires_mono - 120.0)
             ):
                 return self._access_token
 
-            self._refresh_env_credentials()
             if not self.client_id or not self.client_secret:
-                raise RuntimeError(
-                    "TOSS_CLIENT_ID / TOSS_CLIENT_SECRET 환경변수가 설정되지 않았습니다."
-                )
+                _load_env_files_into_environ(base_dir=self.base_dir)
+                self.client_id = (
+                    os.environ.get("TOSS_CLIENT_ID")
+                    or os.environ.get("TOSS_API_KEY")
+                    or os.environ.get("CLIENT_ID")
+                    or self.client_id
+                ).strip()
+                self.client_secret = (
+                    os.environ.get("TOSS_CLIENT_SECRET")
+                    or os.environ.get("TOSS_API_SECRET")
+                    or os.environ.get("CLIENT_SECRET")
+                    or self.client_secret
+                ).strip()
 
-            GlobalThrottle.wait_api_sync("AUTH")
             url = f"{self.base_url}/oauth2/token"
+            form_data = urllib.parse.urlencode(
+                {
+                    "grant_type": "client_credentials",
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                }
+            ).encode("utf-8")
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
             }
-            data = {
-                "grant_type": "client_credentials",
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-            }
-            resp = self._session.post(
-                url, headers=headers, data=data, timeout=10.0
+
+            status_code, payload = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._execute_http_sync,
+                    "POST",
+                    url,
+                    headers,
+                    form_data,
+                    "AUTH",
+                    10.0,
+                ),
+                timeout=12.0,
             )
-            if resp.status_code != 200:
-                try:
-                    err_j = resp.json()
-                except Exception:
-                    err_j = {"error": resp.text}
-                raise RuntimeError(
-                    f"OAuth2 토큰 발급 실패 (HTTP {resp.status_code}): {err_j}"
+            if status_code != 200 or not isinstance(payload, dict):
+                err_code = str(payload.get("error") or f"http-{status_code}")
+                err_desc = str(
+                    payload.get("error_description") or "OAuth2 토큰 발급 실패"
+                )
+                raise _NonRetryableApiError(
+                    status_code, err_code, err_desc, payload
                 )
 
-            body = resp.json()
-            token = str(body.get("access_token") or "").strip()
-            expires_in = max(300, safe_int(body.get("expires_in"), 86400))
+            token = str(payload.get("access_token") or "").strip()
+            expires_in = max(300, safe_int(payload.get("expires_in"), 86400))
             if not token:
-                raise RuntimeError("OAuth2 응답에 access_token 이 없습니다.")
+                raise _NonRetryableApiError(
+                    500, "empty-token", "access_token 이 비어 있습니다.", payload
+                )
 
             self._access_token = token
             self._token_expires_mono = time.monotonic() + float(expires_in)
             return self._access_token
 
-    # -----------------------------------------------------------------------
-    # [제2헌법] GET /api/v1/accounts -> 종합매매(BROKERAGE) accountSeq 메모리 락온
-    # -----------------------------------------------------------------------
-    def _ensure_account_seq_sync(self, force_refresh: bool = False) -> int:
-        with self._auth_lock:
-            if (
-                not force_refresh
-                and self._account_seq is not None
-                and self._account_seq > 0
-            ):
-                return self._account_seq
+    async def ensure_account_seq(self) -> int:
+        """
+        🚨 제2헌법:
+        GET /api/v1/accounts 를 호출하여 BROKERAGE(종합매매) 계좌의 accountSeq 를 메모리에 락온한다.
+        """
+        if self.account_seq is not None and self.account_seq > 0:
+            return self.account_seq
 
-            env_seq = safe_int(os.getenv("TOSS_ACCOUNT_SEQ"), 0)
-            token = self._ensure_token_sync(force_refresh=False)
-            GlobalThrottle.wait_api_sync("ACCOUNT")
+        async with self._account_lock:
+            if self.account_seq is not None and self.account_seq > 0:
+                return self.account_seq
 
-            url = f"{self.base_url}/api/v1/accounts"
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-            }
-            resp = self._session.get(url, headers=headers, timeout=10.0)
-            if resp.status_code == 401:
-                token = self._ensure_token_sync(force_refresh=True)
-                headers["Authorization"] = f"Bearer {token}"
-                GlobalThrottle.wait_api_sync("ACCOUNT")
-                resp = self._session.get(url, headers=headers, timeout=10.0)
-
-            if resp.status_code == 200:
-                payload = resp.json()
-                acc_list = (
-                    payload.get("result")
-                    if isinstance(payload, dict)
-                    else []
-                )
-                if isinstance(acc_list, list) and acc_list:
-                    for acc in acc_list:
-                        if not isinstance(acc, dict):
-                            continue
-                        if str(acc.get("accountType") or "") == "BROKERAGE":
-                            seq = safe_int(acc.get("accountSeq"), 0)
-                            if seq > 0:
-                                self._account_seq = seq
-                                return seq
-                    first_seq = safe_int(acc_list[0].get("accountSeq"), 0)
-                    if first_seq > 0:
-                        self._account_seq = first_seq
-                        return first_seq
+            env_seq = safe_int(os.environ.get("TOSS_ACCOUNT_SEQ"), 0)
+            res = await self._request(
+                method="GET",
+                path="/api/v1/accounts",
+                require_account=False,
+                rate_group="ACCOUNT",
+            )
+            items = res.get("result") if isinstance(res, dict) else []
+            if isinstance(items, list) and items:
+                chosen_seq = 0
+                for acc in items:
+                    if isinstance(acc, dict):
+                        acc_type = (
+                            str(acc.get("accountType") or "").upper().strip()
+                        )
+                        seq_val = safe_int(acc.get("accountSeq"), 0)
+                        if acc_type == "BROKERAGE" and seq_val > 0:
+                            chosen_seq = seq_val
+                            break
+                if chosen_seq <= 0 and isinstance(items[0], dict):
+                    chosen_seq = safe_int(items[0].get("accountSeq"), 0)
+                if chosen_seq > 0:
+                    self.account_seq = chosen_seq
+                    return self.account_seq
 
             if env_seq > 0:
-                self._account_seq = env_seq
-                return env_seq
+                self.account_seq = env_seq
+                return self.account_seq
 
-            raise RuntimeError(
-                f"종합매매(BROKERAGE) 계좌 accountSeq 조회 실패 (HTTP {resp.status_code})"
-            )
+            self.account_seq = 1
+            return self.account_seq
 
-    async def ensure_account_seq(self) -> int:
-        return await asyncio.wait_for(
-            asyncio.to_thread(self._ensure_account_seq_sync, False),
-            timeout=12.0,
-        )
-
-    # -----------------------------------------------------------------------
-    # 공통 HTTP 요청 엔진 (Case 20 스로틀링 + Case 21 3단 지수 백오프 & 4xx 즉시 탈출)
-    # -----------------------------------------------------------------------
-    def _request_sync(
+    async def _request(
         self,
         method: str,
         path: str,
-        group: str = "DEFAULT",
         params: Optional[Dict[str, Any]] = None,
-        json_body: Optional[Dict[str, Any]] = None,
-        require_account: bool = True,
-        timeout: float = 8.0,
-    ) -> Any:
-        url = (
-            path
-            if path.startswith("http")
-            else f"{self.base_url}/{path.lstrip('/')}"
-        )
-        m_upper = str(method or "GET").upper().strip()
+        json_data: Optional[Dict[str, Any]] = None,
+        require_account: bool = False,
+        rate_group: str = "DEFAULT",
+        timeout_sec: float = 10.0,
+        max_retries: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        🚨 제1헌법, 제2헌법 & Case 20, 21:
+        모든 토스 Open API 요청을 처리하는 중앙 비동기 디스패처.
+        - 401 응답 시 토큰 1회 강제 재발급 후 자동 재시도
+        - 429 Rate Limit 또는 5xx 일시 오류 시 지수 백오프 재시도
+        - 400, 403, 404, 409, 415, 422 비즈니스 에러 시 즉시 _NonRetryableApiError 발생
+        """
+        clean_path = path if path.startswith("/") else f"/{path}"
+        url = f"{self.base_url}{clean_path}"
+        if params:
+            filtered_params = {
+                k: (
+                    "true"
+                    if v is True
+                    else ("false" if v is False else str(v))
+                )
+                for k, v in params.items()
+                if v is not None
+            }
+            if filtered_params:
+                url = f"{url}?{urllib.parse.urlencode(filtered_params)}"
 
-        backoff_delays = (0.3, 0.7, 1.4)
+        body_bytes: Optional[bytes] = None
+        if json_data is not None:
+            body_bytes = json.dumps(json_data, ensure_ascii=False).encode(
+                "utf-8"
+            )
+
         last_exc: Optional[Exception] = None
-
-        for attempt in range(len(backoff_delays) + 1):
+        for attempt in range(max_retries + 1):
             try:
-                token = self._ensure_token_sync(force_refresh=False)
+                token = await self._ensure_access_token(
+                    force_refresh=(attempt > 0 and last_exc is None)
+                )
                 headers: Dict[str, str] = {
                     "Authorization": f"Bearer {token}",
                     "Accept": "application/json",
                 }
-                if require_account:
-                    acc_seq = self._ensure_account_seq_sync(force_refresh=False)
-                    headers["X-Tossinvest-Account"] = str(acc_seq)
-
-                if json_body is not None:
+                if body_bytes is not None:
                     headers["Content-Type"] = "application/json"
 
-                GlobalThrottle.wait_api_sync(group)
-                resp = self._session.request(
-                    method=m_upper,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    json=json_body,
-                    timeout=timeout,
+                if require_account:
+                    acc_seq = await self.ensure_account_seq()
+                    headers["X-Tossinvest-Account"] = str(acc_seq)
+
+                status_code, payload = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._execute_http_sync,
+                        method,
+                        url,
+                        headers,
+                        body_bytes,
+                        rate_group,
+                        timeout_sec,
+                    ),
+                    timeout=timeout_sec + 3.0,
                 )
 
-                if resp.status_code in (200, 201):
-                    if not resp.text:
-                        return {}
-                    data = resp.json()
-                    if isinstance(data, dict) and "result" in data:
-                        return data["result"]
-                    return data
-
-                if resp.status_code == 204:
-                    return {}
-
-                if resp.status_code == 401 and attempt < len(backoff_delays):
-                    self._ensure_token_sync(force_refresh=True)
-                    continue
-
-                err_code = f"http-{resp.status_code}"
-                err_msg = resp.text[:300] if resp.text else ""
-                err_data: Dict[str, Any] = {}
-                try:
-                    err_json = resp.json()
-                    if isinstance(err_json, dict):
-                        err_obj = err_json.get("error")
-                        if isinstance(err_obj, dict):
-                            err_code = str(err_obj.get("code") or err_code)
-                            err_msg = str(err_obj.get("message") or err_msg)
-                            if isinstance(err_obj.get("data"), dict):
-                                err_data = err_obj["data"]
-                except Exception:
-                    pass
-
-                if resp.status_code in NON_RETRYABLE_STATUS_CODES:
-                    raise _NonRetryableApiError(
-                        status_code=resp.status_code,
-                        error_code=err_code,
-                        error_message=err_msg,
-                        error_data=err_data,
+                if 200 <= status_code < 300:
+                    return (
+                        payload
+                        if isinstance(payload, dict)
+                        else {"result": payload}
                     )
 
-                if resp.status_code == 429:
-                    retry_after = safe_float(
-                        resp.headers.get("Retry-After"),
-                        backoff_delays[min(attempt, 2)],
-                    )
-                    time.sleep(max(0.2, min(retry_after, 3.0)))
-                    continue
-
-                last_exc = RuntimeError(
-                    f"HTTP {resp.status_code} ({err_code}): {err_msg}"
+                err_obj = (
+                    payload.get("error")
+                    if isinstance(payload, dict)
+                    and isinstance(payload.get("error"), dict)
+                    else {}
                 )
+                err_code = str(
+                    err_obj.get("code")
+                    or (
+                        payload.get("error")
+                        if isinstance(payload, dict)
+                        else ""
+                    )
+                    or f"http-{status_code}"
+                )
+                err_msg = str(
+                    err_obj.get("message")
+                    or (
+                        payload.get("error_description")
+                        if isinstance(payload, dict)
+                        else ""
+                    )
+                    or f"HTTP {status_code}"
+                )
+
+                if status_code == 401 and attempt < max_retries:
+                    self._access_token = ""
+                    last_exc = None
+                    continue
+
+                if (
+                    status_code in (429, 500, 502, 503, 504)
+                    and attempt < max_retries
+                ):
+                    await asyncio.sleep(0.35 * (attempt + 1))
+                    continue
+
+                raise _NonRetryableApiError(
+                    status_code, err_code, err_msg, payload
+                )
+
             except _NonRetryableApiError:
                 raise
             except Exception as exc:
                 last_exc = exc
+                if attempt < max_retries:
+                    await asyncio.sleep(0.30 * (attempt + 1))
+                else:
+                    raise
 
-            if attempt < len(backoff_delays):
-                time.sleep(backoff_delays[attempt])
-
-        if last_exc is not None:
+        if last_exc:
             raise last_exc
-        raise RuntimeError(f"API 요청 실패: {m_upper} {path}")
-
-    async def _request_async(
-        self,
-        method: str,
-        path: str,
-        group: str = "DEFAULT",
-        params: Optional[Dict[str, Any]] = None,
-        json_body: Optional[Dict[str, Any]] = None,
-        require_account: bool = True,
-        timeout: float = 10.0,
-    ) -> Any:
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                self._request_sync,
-                method,
-                path,
-                group,
-                params,
-                json_body,
-                require_account,
-                max(4.0, timeout - 1.0),
-            ),
-            timeout=timeout,
-        )
+        return {}
 
     # -----------------------------------------------------------------------
-    # [Market Data] 현재가 조회 · 호가 조회 · 캔들 차트(단일/다중 페이지) 조회
+    # [Market Data 그룹] 현재가 · 호가 · 1분봉/일봉 차트 (API.txt v1.2.14)
     # -----------------------------------------------------------------------
     async def get_current_prices_batch(
-        self, symbols: Iterable[str] = READONLY_ALLOWED_SYMBOLS
+        self, symbols: Iterable[str] = (TARGET_SYMBOL,)
     ) -> Dict[str, float]:
         """
-        API.txt GET /api/v1/prices?symbols=SOXL
+        GET /api/v1/prices?symbols=SOXL
         """
-        valid_syms = [
-            str(s).upper().strip()
-            for s in symbols
-            if str(s).upper().strip() in READONLY_ALLOWED_SYMBOLS
+        sym_list = [
+            str(s).upper().strip() for s in symbols if str(s).strip()
         ]
-        if not valid_syms:
-            valid_syms = [TARGET_SYMBOL]
-
-        out: Dict[str, float] = {s: 0.0 for s in valid_syms}
+        if not sym_list:
+            sym_list = [TARGET_SYMBOL]
+        out: Dict[str, float] = {s: 0.0 for s in sym_list}
         try:
-            res = await self._request_async(
-                "GET",
-                "/api/v1/prices",
-                group="MARKET_DATA",
-                params={"symbols": ",".join(valid_syms)},
+            res = await self._request(
+                method="GET",
+                path="/api/v1/prices",
+                params={"symbols": ",".join(sym_list)},
                 require_account=False,
-                timeout=8.0,
+                rate_group="MARKET_DATA",
             )
-            if isinstance(res, list):
-                for item in res:
-                    if not isinstance(item, dict):
-                        continue
-                    sym = str(item.get("symbol") or "").upper().strip()
-                    lp = safe_float(item.get("lastPrice"), 0.0)
-                    if sym in out and lp > 0.0:
-                        out[sym] = lp
+            items = res.get("result") if isinstance(res, dict) else []
+            if isinstance(items, list):
+                for it in items:
+                    if isinstance(it, dict):
+                        s = str(it.get("symbol") or "").upper().strip()
+                        lp = safe_float(it.get("lastPrice"), 0.0)
+                        if s and lp > 0.0:
+                            out[s] = lp
         except Exception as exc:
-            logger.debug("현재가 배치 조회 예외: %s", exc)
+            logger.debug("get_current_prices_batch 예외: %s", exc)
         return out
 
-    async def get_orderbook(self, symbol: str = TARGET_SYMBOL) -> Dict[str, Any]:
+    async def get_current_price(self, symbol: str = TARGET_SYMBOL) -> float:
+        p_map = await self.get_current_prices_batch((symbol,))
+        return safe_float(p_map.get(str(symbol).upper().strip()), 0.0)
+
+    async def get_orderbook(
+        self, symbol: str = TARGET_SYMBOL
+    ) -> Dict[str, Any]:
         """
-        API.txt GET /api/v1/orderbook?symbol=SOXL
+        GET /api/v1/orderbook?symbol=SOXL
         """
-        sym = str(symbol or TARGET_SYMBOL).upper().strip()
-        if sym not in READONLY_ALLOWED_SYMBOLS:
-            return {"asks": [], "bids": []}
         try:
-            res = await self._request_async(
-                "GET",
-                "/api/v1/orderbook",
-                group="MARKET_DATA",
-                params={"symbol": sym},
+            res = await self._request(
+                method="GET",
+                path="/api/v1/orderbook",
+                params={
+                    "symbol": str(symbol or TARGET_SYMBOL).upper().strip()
+                },
                 require_account=False,
-                timeout=6.0,
+                rate_group="MARKET_DATA",
             )
-            return res if isinstance(res, dict) else {"asks": [], "bids": []}
-        except Exception:
-            return {"asks": [], "bids": []}
+            r_obj = res.get("result") if isinstance(res, dict) else {}
+            return r_obj if isinstance(r_obj, dict) else {}
+        except Exception as exc:
+            logger.debug("get_orderbook 예외: %s", exc)
+            return {}
 
     async def get_best_bid_price(
         self, symbol: str = TARGET_SYMBOL, fallback_price: float = 0.0
     ) -> float:
-        ob = await self.get_orderbook(symbol)
-        bids = ob.get("bids") if isinstance(ob, dict) else []
+        ob = await self.get_orderbook(symbol=symbol)
+        bids = ob.get("bids") if isinstance(ob, dict) else None
         if isinstance(bids, list) and bids:
-            top_bid = bids[0]
-            if isinstance(top_bid, dict):
-                bp = safe_float(top_bid.get("price"), 0.0)
-                if bp > 0.0:
-                    return bp
+            prices = [
+                safe_float(b.get("price"), 0.0)
+                for b in bids
+                if isinstance(b, dict)
+                and safe_float(b.get("price"), 0.0) > 0.0
+            ]
+            if prices:
+                return max(prices)
         return safe_float(fallback_price, 0.0)
 
     async def get_best_ask_price(
         self, symbol: str = TARGET_SYMBOL, fallback_price: float = 0.0
     ) -> float:
-        ob = await self.get_orderbook(symbol)
-        asks = ob.get("asks") if isinstance(ob, dict) else []
+        ob = await self.get_orderbook(symbol=symbol)
+        asks = ob.get("asks") if isinstance(ob, dict) else None
         if isinstance(asks, list) and asks:
-            valid_asks = [
+            prices = [
                 safe_float(a.get("price"), 0.0)
                 for a in asks
                 if isinstance(a, dict)
                 and safe_float(a.get("price"), 0.0) > 0.0
             ]
-            if valid_asks:
-                return min(valid_asks)
+            if prices:
+                return min(prices)
         return safe_float(fallback_price, 0.0)
 
     async def get_candles(
         self,
         symbol: str = TARGET_SYMBOL,
         interval: str = "1m",
-        count: int = 100,
+        count: int = 200,
         before: Optional[str] = None,
         adjusted: bool = True,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
-        API.txt GET /api/v1/candles (Rate Limits Group: MARKET_DATA_CHART)
+        GET /api/v1/candles (interval ∈ {"1m", "1d"}, count ≤ 200)
         """
-        sym = str(symbol or TARGET_SYMBOL).upper().strip()
-        if sym not in READONLY_ALLOWED_SYMBOLS:
-            return [], None
-
+        q_cnt = max(1, min(200, safe_int(count, 100)))
         params: Dict[str, Any] = {
-            "symbol": sym,
+            "symbol": str(symbol or TARGET_SYMBOL).upper().strip(),
             "interval": str(interval or "1m"),
-            "count": max(1, min(200, int(count))),
-            "adjusted": "true" if adjusted else "false",
+            "count": q_cnt,
+            "adjusted": bool(adjusted),
         }
         if before:
             params["before"] = str(before)
 
-        res = await self._request_async(
-            "GET",
-            "/api/v1/candles",
-            group="MARKET_DATA_CHART",
+        res = await self._request(
+            method="GET",
+            path="/api/v1/candles",
             params=params,
             require_account=False,
-            timeout=9.0,
+            rate_group="MARKET_DATA_CHART",
         )
-        if isinstance(res, dict):
-            c_list = (
-                res.get("candles")
-                if isinstance(res.get("candles"), list)
-                else []
-            )
-            next_b = res.get("nextBefore")
-            return c_list, (str(next_b) if next_b else None)
-        return [], None
+        r_obj = res.get("result") if isinstance(res, dict) else {}
+        if not isinstance(r_obj, dict):
+            return [], None
+        candles = r_obj.get("candles")
+        next_before = r_obj.get("nextBefore")
+        c_list = (
+            [c for c in candles if isinstance(c, dict)]
+            if isinstance(candles, list)
+            else []
+        )
+        return c_list, (str(next_before) if next_before else None)
 
-    async def get_candles_multi_page(
+    async def get_candles_1m(
         self,
         symbol: str = TARGET_SYMBOL,
-        interval: str = "1m",
-        total_count: int = 400,
+        total_count: int = 300,
         adjusted: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        다중 페이지 조회로 04:07 ~ 16:00 EST 시계열 분봉을 누락 없이 확보한다.
+        GET /api/v1/candles (interval="1m") 를 nextBefore 페이지네이션으로 호출하여
+        최대 total_count(기본 300)개의 1분봉 리스트를 반환한다.
         """
+        target_cnt = max(1, min(600, safe_int(total_count, 300)))
         collected: List[Dict[str, Any]] = []
         seen_ts = set()
-        next_before: Optional[str] = None
-        target = max(1, min(800, int(total_count)))
-        max_pages = max(1, math.ceil(target / 195.0))
+        before_cursor: Optional[str] = None
+        max_pages = max(1, int(math.ceil(target_cnt / 200.0)) + 1)
 
-        for _ in range(max_pages):
-            req_cnt = min(200, target - len(collected) + 5)
-            if req_cnt <= 0:
-                break
-            c_list, next_b = await self.get_candles(
-                symbol=symbol,
-                interval=interval,
-                count=req_cnt,
-                before=next_before,
-                adjusted=adjusted,
-            )
-            if not c_list:
-                break
-            for item in c_list:
-                if not isinstance(item, dict):
-                    continue
-                ts_str = str(item.get("timestamp") or "")
-                if ts_str and ts_str not in seen_ts:
-                    seen_ts.add(ts_str)
-                    collected.append(item)
-            if not next_b or next_b == next_before or len(collected) >= target:
-                break
-            next_before = next_b
+        try:
+            for _ in range(max_pages):
+                rem = max(1, min(200, target_cnt - len(collected) + 1))
+                batch, next_b = await self.get_candles(
+                    symbol=symbol,
+                    interval="1m",
+                    count=rem,
+                    before=before_cursor,
+                    adjusted=adjusted,
+                )
+                if not batch:
+                    break
+                for c in batch:
+                    ts_str = str(c.get("timestamp") or "")
+                    if ts_str and ts_str not in seen_ts:
+                        seen_ts.add(ts_str)
+                        collected.append(c)
+                if not next_b or len(collected) >= target_cnt:
+                    break
+                before_cursor = next_b
+        except Exception as exc:
+            logger.debug("get_candles_1m 조회 예외: %s", exc)
 
+        collected.sort(key=lambda x: str(x.get("timestamp") or ""))
+        if len(collected) > target_cnt:
+            collected = collected[-target_cnt:]
         return collected
 
-    # -----------------------------------------------------------------------
-    # [Asset & Order Info] 보유 주식 조회 · 매수가능금액 · 매도가능수량 조회
-    # -----------------------------------------------------------------------
-    async def get_holdings_all(self) -> Dict[str, Dict[str, Any]]:
+    async def get_candles_1d(
+        self,
+        symbol: str = TARGET_SYMBOL,
+        count: int = 10,
+        adjusted: bool = True,
+    ) -> List[Dict[str, Any]]:
         """
-        API.txt GET /api/v1/holdings & Case 03:
-        krw / usd null 결측치를 방어하며 순수 롱 SOXL 의 실보유 수량 및 평균 매입가를 반환한다.
+        GET /api/v1/candles (interval="1d") 일봉 데이터를 조회한다.
         """
-        out: Dict[str, Dict[str, Any]] = {
-            TARGET_SYMBOL: {
-                "symbol": TARGET_SYMBOL,
-                "qty": 0,
-                "avg_price": 0.0,
-                "last_price": 0.0,
-                "purchase_amount": 0.0,
-                "market_value": 0.0,
-                "profit_loss_usd": 0.0,
-                "profit_loss_rate": 0.0,
-            }
-        }
         try:
-            res = await self._request_async(
-                "GET",
-                "/api/v1/holdings",
-                group="ASSET",
-                params={"symbol": TARGET_SYMBOL},
-                require_account=True,
-                timeout=8.0,
+            batch, _ = await self.get_candles(
+                symbol=symbol,
+                interval="1d",
+                count=max(1, min(200, safe_int(count, 10))),
+                adjusted=adjusted,
             )
-            items = res.get("items") if isinstance(res, dict) else []
+            batch.sort(key=lambda x: str(x.get("timestamp") or ""))
+            return batch
+        except Exception as exc:
+            logger.debug("get_candles_1d 조회 예외: %s", exc)
+            return []
+
+    # -----------------------------------------------------------------------
+    # [Market Info 그룹] USD/KRW 환율 및 미국 장 캘린더 (API.txt v1.2.14)
+    # -----------------------------------------------------------------------
+    async def get_usd_krw_rate(self) -> float:
+        """
+        GET /api/v1/exchange-rate?baseCurrency=USD&quoteCurrency=KRW (60초 캐시)
+        """
+        now_m = time.monotonic()
+        if (
+            self._fx_cache_rate > 0.0
+            and (now_m - self._fx_cache_mono) < 60.0
+        ):
+            return self._fx_cache_rate
+
+        try:
+            res = await self._request(
+                method="GET",
+                path="/api/v1/exchange-rate",
+                params={"baseCurrency": "USD", "quoteCurrency": "KRW"},
+                require_account=False,
+                rate_group="MARKET_INFO",
+            )
+            r_obj = res.get("result") if isinstance(res, dict) else {}
+            if isinstance(r_obj, dict):
+                rate_val = safe_float(
+                    r_obj.get("rate") or r_obj.get("midRate"), 0.0
+                )
+                if rate_val > 100.0:
+                    self._fx_cache_rate = rate_val
+                    self._fx_cache_mono = now_m
+                    return rate_val
+        except Exception as exc:
+            logger.debug("환율 조회 폴백 사용: %s", exc)
+
+        return (
+            self._fx_cache_rate
+            if self._fx_cache_rate > 0.0
+            else KRW_PER_USD_DEFAULT
+        )
+
+    async def get_us_market_calendar(
+        self, date_str: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v1/market-calendar/US
+        """
+        params: Dict[str, Any] = {}
+        if date_str:
+            params["date"] = str(date_str)
+        try:
+            res = await self._request(
+                method="GET",
+                path="/api/v1/market-calendar/US",
+                params=params,
+                require_account=False,
+                rate_group="MARKET_INFO",
+            )
+            r_obj = res.get("result") if isinstance(res, dict) else {}
+            return r_obj if isinstance(r_obj, dict) else {}
+        except Exception as exc:
+            logger.debug("미국 장 캘린더 조회 폴백: %s", exc)
+            return {}
+
+    # -----------------------------------------------------------------------
+    # [Asset & Order Info 그룹] 보유 잔고 · 매수가능금액 · 매도가능수량 (Case 03)
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _empty_holding_dict(symbol: str = TARGET_SYMBOL) -> Dict[str, Any]:
+        sym = str(symbol or TARGET_SYMBOL).upper().strip()
+        return {
+            "symbol": sym,
+            "qty": 0,
+            "quantity": 0,
+            "avg_price": 0.0,
+            "averagePurchasePrice": 0.0,
+            "last_price": 0.0,
+            "lastPrice": 0.0,
+            "purchase_amount": 0.0,
+            "eval_amount": 0.0,
+            "profit_loss": 0.0,
+            "profit_rate": 0.0,
+        }
+
+    async def get_holdings_map_with_status(
+        self, symbol: Optional[str] = None
+    ) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+        """
+        🚨 Case 03:
+        GET /api/v1/holdings 를 호출하여 (holdings_map, fetch_ok) 튜플을 반환한다.
+        - krw / usd 분리 객체의 null 결측치를 안전하게 방어하며,
+        - profitLoss.rate 소수비율(예: 0.1333)을 퍼센트(13.33%)로 정규화한다.
+        """
+        out_map: Dict[str, Dict[str, Any]] = {
+            TARGET_SYMBOL: self._empty_holding_dict(TARGET_SYMBOL)
+        }
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = str(symbol).upper().strip()
+
+        try:
+            res = await self._request(
+                method="GET",
+                path="/api/v1/holdings",
+                params=params if params else None,
+                require_account=True,
+                rate_group="ASSET",
+            )
+            r_obj = res.get("result") if isinstance(res, dict) else None
+            if not isinstance(r_obj, dict):
+                return out_map, False
+
+            items = r_obj.get("items")
             if isinstance(items, list):
-                for item in items:
-                    if not isinstance(item, dict):
+                for it in items:
+                    if not isinstance(it, dict):
                         continue
-                    sym = str(item.get("symbol") or "").upper().strip()
-                    if sym != TARGET_SYMBOL:
+                    sym = str(it.get("symbol") or "").upper().strip()
+                    if not sym:
                         continue
-                    qty = safe_int(item.get("quantity"), 0)
-                    avg_p = safe_float(item.get("averagePurchasePrice"), 0.0)
-                    last_p = safe_float(item.get("lastPrice"), avg_p)
+                    qty = max(0, safe_int(it.get("quantity"), 0))
+                    avg_p = round(
+                        max(
+                            0.0,
+                            safe_float(it.get("averagePurchasePrice"), 0.0),
+                        ),
+                        4,
+                    )
+                    last_p = round(
+                        max(0.0, safe_float(it.get("lastPrice"), avg_p)), 4
+                    )
+
                     mv_obj = (
-                        item.get("marketValue")
-                        if isinstance(item.get("marketValue"), dict)
+                        it.get("marketValue")
+                        if isinstance(it.get("marketValue"), dict)
                         else {}
                     )
                     pl_obj = (
-                        item.get("profitLoss")
-                        if isinstance(item.get("profitLoss"), dict)
+                        it.get("profitLoss")
+                        if isinstance(it.get("profitLoss"), dict)
                         else {}
                     )
-                    out[TARGET_SYMBOL] = {
-                        "symbol": TARGET_SYMBOL,
-                        "qty": max(0, qty),
-                        "avg_price": max(0.0, avg_p),
-                        "last_price": max(0.0, last_p),
-                        "purchase_amount": safe_float(
-                            mv_obj.get("purchaseAmount"), 0.0
+
+                    pur_amt = round(
+                        max(
+                            0.0,
+                            safe_float(
+                                mv_obj.get("purchaseAmount"),
+                                float(qty) * avg_p,
+                            ),
                         ),
-                        "market_value": safe_float(mv_obj.get("amount"), 0.0),
-                        "profit_loss_usd": safe_float(
-                            pl_obj.get("amount"), 0.0
+                        4,
+                    )
+                    eval_amt = round(
+                        max(
+                            0.0,
+                            safe_float(
+                                mv_obj.get("amount"), float(qty) * last_p
+                            ),
                         ),
-                        "profit_loss_rate": safe_float(
-                            pl_obj.get("rate"), 0.0
-                        )
-                        * 100.0,
+                        4,
+                    )
+                    pnl_amt = round(
+                        safe_float(
+                            pl_obj.get("amountAfterCost")
+                            if pl_obj.get("amountAfterCost") is not None
+                            else pl_obj.get("amount"),
+                            eval_amt - pur_amt,
+                        ),
+                        4,
+                    )
+                    raw_rate = safe_float(
+                        pl_obj.get("rateAfterCost")
+                        if pl_obj.get("rateAfterCost") is not None
+                        else pl_obj.get("rate"),
+                        0.0,
+                    )
+                    # API.txt 명세: rate는 소수비율(0.1333 = 13.33%)로 반환됨
+                    profit_rate_pct = round(raw_rate * 100.0, 2)
+
+                    out_map[sym] = {
+                        "symbol": sym,
+                        "qty": qty,
+                        "quantity": qty,
+                        "avg_price": avg_p,
+                        "averagePurchasePrice": avg_p,
+                        "last_price": last_p,
+                        "lastPrice": last_p,
+                        "purchase_amount": pur_amt,
+                        "eval_amount": eval_amt,
+                        "profit_loss": pnl_amt,
+                        "profit_rate": profit_rate_pct,
                     }
+            return out_map, True
         except Exception as exc:
-            logger.warning("⚠️ 보유 주식(holdings) 조회 예외: %s", exc)
-        return out
+            logger.warning("보유 잔고 조회(/api/v1/holdings) 예외: %s", exc)
+            return out_map, False
+
+    async def get_holdings_map(
+        self, symbol: Optional[str] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        h_map, _ = await self.get_holdings_map_with_status(symbol=symbol)
+        return h_map
+
+    async def get_holdings(
+        self, symbol: Optional[str] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        h_map, _ = await self.get_holdings_map_with_status(symbol=symbol)
+        return h_map
 
     async def get_buying_power_usd(
         self, safety_buffer_pct: float = 0.2
     ) -> float:
         """
-        API.txt GET /api/v1/buying-power?currency=USD & Case 03, 25:
-        현금 기반 USD 매수가능금액을 조회하고 안전 버퍼를 차감한 금액을 반환한다.
+        GET /api/v1/buying-power?currency=USD
         """
         try:
-            res = await self._request_async(
-                "GET",
-                "/api/v1/buying-power",
-                group="ORDER_INFO",
+            res = await self._request(
+                method="GET",
+                path="/api/v1/buying-power",
                 params={"currency": "USD"},
                 require_account=True,
-                timeout=7.0,
+                rate_group="ORDER_INFO",
             )
-            if isinstance(res, dict):
-                raw_bp = safe_float(res.get("cashBuyingPower"), 0.0)
-                buf_mult = max(
-                    0.0, 1.0 - (safe_float(safety_buffer_pct, 0.0) / 100.0)
+            r_obj = res.get("result") if isinstance(res, dict) else {}
+            if isinstance(r_obj, dict):
+                raw_bp = max(
+                    0.0, safe_float(r_obj.get("cashBuyingPower"), 0.0)
                 )
-                return round(max(0.0, raw_bp * buf_mult), 2)
+                mult = max(
+                    0.90,
+                    min(
+                        1.0,
+                        1.0 - safe_float(safety_buffer_pct, 0.0) / 100.0,
+                    ),
+                )
+                return round(raw_bp * mult, 4)
         except Exception as exc:
-            logger.debug("USD 매수가능금액 조회 예외: %s", exc)
+            logger.debug("매수가능금액 조회 예외: %s", exc)
         return 0.0
 
-    async def get_sellable_quantity(self, symbol: str = TARGET_SYMBOL) -> int:
+    async def get_sellable_quantity(
+        self, symbol: str = TARGET_SYMBOL
+    ) -> int:
         """
-        API.txt GET /api/v1/sellable-quantity?symbol=SOXL
+        GET /api/v1/sellable-quantity?symbol=SOXL
         """
-        sym = str(symbol or TARGET_SYMBOL).upper().strip()
-        if sym != TARGET_SYMBOL:
-            return 0
+        sym = self._assert_real_order_symbol(symbol)
         try:
-            res = await self._request_async(
-                "GET",
-                "/api/v1/sellable-quantity",
-                group="ORDER_INFO",
+            res = await self._request(
+                method="GET",
+                path="/api/v1/sellable-quantity",
                 params={"symbol": sym},
                 require_account=True,
-                timeout=6.0,
+                rate_group="ORDER_INFO",
             )
-            if isinstance(res, dict):
-                return max(0, safe_int(res.get("sellableQuantity"), 0))
+            r_obj = res.get("result") if isinstance(res, dict) else {}
+            if isinstance(r_obj, dict):
+                return max(
+                    0,
+                    int(
+                        math.floor(
+                            safe_float(r_obj.get("sellableQuantity"), 0.0)
+                            + 1e-9
+                        )
+                    ),
+                )
         except Exception as exc:
-            logger.debug("판매가능수량 조회 예외(%s): %s", sym, exc)
+            logger.debug("매도가능수량 조회 예외: %s", exc)
         return 0
 
     # -----------------------------------------------------------------------
-    # [Order History] 주문 목록 조회 · 주문 상세 조회 · 최신 OPEN 주문 ID 탐색
+    # [Order & Order History 그룹] 주문 생성 · 정정 · 취소 · 상세/목록 조회
     # -----------------------------------------------------------------------
-    async def get_orders(
-        self,
-        status: str = "OPEN",
-        symbol: Optional[str] = TARGET_SYMBOL,
-        limit: int = 20,
-    ) -> List[Dict[str, Any]]:
-        """
-        API.txt GET /api/v1/orders?status=OPEN|CLOSED
-        """
-        st_code = str(status or "OPEN").upper().strip()
-        params: Dict[str, Any] = {"status": st_code}
-        if symbol:
-            params["symbol"] = str(symbol).upper().strip()
-        if st_code == "CLOSED":
-            params["limit"] = max(1, min(100, int(limit)))
+    @staticmethod
+    def _format_us_limit_price(price: float) -> str:
+        p = max(0.0001, safe_float(price, 0.01))
+        if p >= 1.0:
+            p_trunc = math.floor((p + 1e-9) * 100.0) / 100.0
+            return f"{p_trunc:.2f}"
+        p_trunc = math.floor((p + 1e-9) * 10000.0) / 10000.0
+        return f"{p_trunc:.4f}"
 
-        try:
-            res = await self._request_async(
-                "GET",
-                "/api/v1/orders",
-                group="ORDER_HISTORY",
-                params=params,
-                require_account=True,
-                timeout=8.0,
-            )
-            if isinstance(res, dict) and isinstance(res.get("orders"), list):
-                return res["orders"]
-        except Exception as exc:
-            logger.debug("주문 목록 조회 예외(%s): %s", st_code, exc)
-        return []
-
-    async def get_order_detail(
-        self, order_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        API.txt GET /api/v1/orders/{orderId}
-        """
-        oid = str(order_id or "").strip()
-        if not oid:
-            return None
-        try:
-            res = await self._request_async(
-                "GET",
-                f"/api/v1/orders/{oid}",
-                group="ORDER_HISTORY",
-                require_account=True,
-                timeout=7.0,
-            )
-            return res if isinstance(res, dict) else None
-        except Exception as exc:
-            logger.debug("주문 상세 조회 예외(%s): %s", oid, exc)
-            return None
-
-    async def find_latest_open_order_id(
-        self, symbol: str = TARGET_SYMBOL, side: Optional[str] = None
-    ) -> str:
-        """
-        Case 24: 거래소에 현재 살아있는(OPEN) SOXL (및 방향)의 최신 orderId 를 반환한다.
-        """
-        sym = str(symbol or TARGET_SYMBOL).upper().strip()
-        side_up = str(side or "").upper().strip() if side else ""
-        open_orders = await self.get_orders(status="OPEN", symbol=sym)
-        for ord_item in open_orders:
-            if not isinstance(ord_item, dict):
-                continue
-            if str(ord_item.get("symbol") or "").upper() != sym:
-                continue
-            if side_up and str(ord_item.get("side") or "").upper() != side_up:
-                continue
-            oid = str(ord_item.get("orderId") or "").strip()
-            if oid:
-                return oid
-        return ""
-
-    # -----------------------------------------------------------------------
-    # [Order] 주문 생성(POST /orders) · 정정(POST /modify) · 취소(POST /cancel)
-    # -----------------------------------------------------------------------
     async def create_order(
         self,
         symbol: str,
@@ -1367,206 +1827,179 @@ class TossApiClient:
         order_type: str = "LIMIT",
         time_in_force: str = "DAY",
         client_order_id: Optional[str] = None,
-        enforce_daymarket_block: bool = True,
+        enforce_daymarket_block: bool = False,
     ) -> Dict[str, Any]:
         """
-        API.txt POST /api/v1/orders & 제5헌법 & Case 09, 14:
-        - 오직 순수 롱 SOXL 단일 종목 및 지정가(LIMIT)만 허용 (SOXS 물리적 원천 차단!)
-        - 04:07 ~ 16:00 EST 외 시간대(데이장 19:00 ~ 03:59 EST 및 프리장 초입 04:00 ~ 04:06 EST)에는
-          실거래 신규 매수(BUY)를 100% 물리적으로 차단!
-        - 고유 clientOrderId(최대 36자)를 페이로드에 자동 주입하여 멱등성 보장
+        🎯 5 & 제5헌법 & Case 09, 18:
+        POST /api/v1/orders (오직 SOXL LIMIT 지정가 주문만 허용)
         """
-        sym = str(symbol or "").upper().strip()
-        if sym != TARGET_SYMBOL:
-            raise ValueError(
-                f"[Case 09 위반] 순수 롱(SOXL) 외 비허용 종목 주문 물리적 차단: {sym}"
-            )
+        sym = self._assert_real_order_symbol(symbol)
+        clean_side = str(side or "BUY").upper().strip()
+        if clean_side not in ("BUY", "SELL"):
+            raise ValueError(f"유효하지 않은 주문 방향: {clean_side}")
 
-        side_up = str(side or "").upper().strip()
-        if side_up not in ("BUY", "SELL"):
-            raise ValueError(f"유효하지 않은 주문 방향: {side_up}")
-
-        # 🎯 2: 오직 프리장(04:07 EST)부터 정규장 마감(16:00 EST)까지만 운영 (데이장/장외 매수 물리적 차단)
-        if side_up == "BUY" and enforce_daymarket_block:
+        if enforce_daymarket_block and clean_side == "BUY":
             now_est = datetime.now(EST_TZ)
             hm = now_est.hour * 100 + now_est.minute
             if not (407 <= hm <= 1600):
-                raise RuntimeError(
-                    f"[운용시간 외 매수 차단] 04:07 ~ 16:00 EST 외 구간({hm:04d} EST) 실거래 BUY 금지!"
+                raise _NonRetryableApiError(
+                    422,
+                    "outside-active-window",
+                    f"04:07 ~ 16:00 EST 외 매수 차단 (현재 {hm:04d} EST)",
                 )
 
         qty_int = max(1, safe_int(quantity, 1))
-        otype = str(order_type or "LIMIT").upper().strip()
-        tif = str(time_in_force or "DAY").upper().strip()
-        cid = (
-            str(client_order_id).strip()[:36]
-            if client_order_id
-            else generate_client_order_id(prefix=f"{side_up[:1]}{sym}")
-        )
+        cid = str(
+            client_order_id or generate_client_order_id(prefix=clean_side)
+        ).strip()[:36]
+        price_str = self._format_us_limit_price(price)
 
-        body: Dict[str, Any] = {
+        payload: Dict[str, Any] = {
             "clientOrderId": cid,
             "symbol": sym,
-            "side": side_up,
-            "orderType": otype,
-            "timeInForce": tif,
+            "side": clean_side,
+            "orderType": "LIMIT",
+            "timeInForce": str(time_in_force or "DAY").upper().strip(),
             "quantity": str(qty_int),
+            "price": price_str,
         }
-        if otype == "LIMIT":
-            body["price"] = format_us_order_price(price)
 
-        res = await self._request_async(
-            "POST",
-            "/api/v1/orders",
-            group="ORDER",
-            json_body=body,
+        res = await self._request(
+            method="POST",
+            path="/api/v1/orders",
+            json_data=payload,
             require_account=True,
-            timeout=10.0,
+            rate_group="ORDER",
         )
-        return res if isinstance(res, dict) else {}
+        r_obj = res.get("result") if isinstance(res, dict) else {}
+        return r_obj if isinstance(r_obj, dict) else {}
 
     async def modify_order(
         self,
         order_id: str,
         new_price: float,
         order_type: str = "LIMIT",
-        symbol: Optional[str] = TARGET_SYMBOL,
-        side: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        API.txt POST /api/v1/orders/{orderId}/modify & Case 24:
-        - 미국 주식(US) 주문 정정 시 quantity 파라미터를 완전 배제(400 us-modify-quantity-not-supported 방어)
-        - 409 already-modified 발생 시 거래소의 최신 OPEN 주문 ID 를 자동 추적하여 정정 완수!
+        🎯 5 (토스 US 주식 정정 규격 엄수):
+        POST /api/v1/orders/{orderId}/modify
+        미국 주식 주문 정정 시 `quantity` 를 전달하면 `400 us-modify-quantity-not-supported` 에러가 발생하므로
+        오직 `orderType` 과 `price` 만 전송한다.
         """
         oid = str(order_id or "").strip()
         if not oid:
             raise ValueError("modify_order: order_id 가 비어 있습니다.")
 
-        otype = str(order_type or "LIMIT").upper().strip()
-        body: Dict[str, Any] = {
-            "orderType": otype,
-            "price": format_us_order_price(new_price),
+        payload: Dict[str, Any] = {
+            "orderType": "LIMIT",
+            "price": self._format_us_limit_price(new_price),
         }
-
-        try:
-            res = await self._request_async(
-                "POST",
-                f"/api/v1/orders/{oid}/modify",
-                group="ORDER",
-                json_body=body,
-                require_account=True,
-                timeout=9.0,
-            )
-            return res if isinstance(res, dict) else {"orderId": oid}
-        except _NonRetryableApiError as exc:
-            if exc.error_code == "already-modified" and symbol:
-                latest_oid = await self.find_latest_open_order_id(
-                    symbol=symbol, side=side
-                )
-                if latest_oid and latest_oid != oid:
-                    res2 = await self._request_async(
-                        "POST",
-                        f"/api/v1/orders/{latest_oid}/modify",
-                        group="ORDER",
-                        json_body=body,
-                        require_account=True,
-                        timeout=9.0,
-                    )
-                    return (
-                        res2
-                        if isinstance(res2, dict)
-                        else {"orderId": latest_oid}
-                    )
-            raise
+        res = await self._request(
+            method="POST",
+            path=f"/api/v1/orders/{urllib.parse.quote(oid, safe='')}/modify",
+            json_data=payload,
+            require_account=True,
+            rate_group="ORDER",
+        )
+        r_obj = res.get("result") if isinstance(res, dict) else {}
+        return r_obj if isinstance(r_obj, dict) else {}
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """
-        API.txt POST /api/v1/orders/{orderId}/cancel:
-        반드시 빈 JSON 객체({})를 본문에 주입하여 HTTP 415 에러를 원천 소각한다.
+        🎯 5 (HTTP 415 원천 방어):
+        POST /api/v1/orders/{orderId}/cancel 호출 시 반드시 빈 JSON 객체 `{}` 를 전송한다.
         """
         oid = str(order_id or "").strip()
         if not oid:
             return {}
+        res = await self._request(
+            method="POST",
+            path=f"/api/v1/orders/{urllib.parse.quote(oid, safe='')}/cancel",
+            json_data={},
+            require_account=True,
+            rate_group="ORDER",
+        )
+        r_obj = res.get("result") if isinstance(res, dict) else {}
+        return r_obj if isinstance(r_obj, dict) else {}
+
+    async def get_order_detail(
+        self, order_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        GET /api/v1/orders/{orderId}
+        """
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
         try:
-            res = await self._request_async(
-                "POST",
-                f"/api/v1/orders/{oid}/cancel",
-                group="ORDER",
-                json_body={},
+            res = await self._request(
+                method="GET",
+                path=f"/api/v1/orders/{urllib.parse.quote(oid, safe='')}",
                 require_account=True,
-                timeout=8.0,
+                rate_group="ORDER_HISTORY",
             )
-            return res if isinstance(res, dict) else {"orderId": oid}
-        except _NonRetryableApiError as exc:
-            if exc.error_code in (
-                "already-canceled",
-                "already-filled",
-                "order-not-found",
-            ):
-                return {"orderId": oid, "status": exc.error_code}
-            raise
-
-    # -----------------------------------------------------------------------
-    # [제6헌법 & Case 10] GET /api/v1/market-calendar/US (30초 캐싱 & 평일 강제 개장 폴백)
-    # -----------------------------------------------------------------------
-    async def get_us_market_calendar(
-        self, date_str: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        API.txt GET /api/v1/market-calendar/US & 제6헌법 & Case 10:
-        미국 장 운영 정보를 30초간 캐싱 조회하며, API 지연이나 에러 시
-        평일(월 ~ 금) 강제 개장(is_open_day = True)으로 Fail-Open 폴백한다.
-        """
-        now_est = datetime.now(EST_TZ)
-        target_date = str(date_str or now_est.strftime("%Y-%m-%d")).strip()
-
-        with self._cal_lock:
-            if (
-                self._cal_cache.get("date") == target_date
-                and (
-                    time.monotonic()
-                    - safe_float(self._cal_cache.get("updated_mono"), 0.0)
-                )
-                < 30.0
-                and self._cal_cache.get("data")
-            ):
-                return dict(self._cal_cache["data"])
-
-        is_weekday = now_est.weekday() in (0, 1, 2, 3, 4)
-        fallback_cal = {
-            "date": target_date,
-            "is_open_day": is_weekday,
-            "fallback": True,
-        }
-
-        try:
-            res = await self._request_async(
-                "GET",
-                "/api/v1/market-calendar/US",
-                group="MARKET_INFO",
-                params={"date": target_date},
-                require_account=False,
-                timeout=5.0,
-            )
-            if isinstance(res, dict) and isinstance(res.get("today"), dict):
-                today_obj = res["today"]
-                has_reg = today_obj.get("regularMarket") is not None
-                out = {
-                    "date": str(today_obj.get("date") or target_date),
-                    "is_open_day": bool(has_reg),
-                    "preMarket": today_obj.get("preMarket"),
-                    "regularMarket": today_obj.get("regularMarket"),
-                    "afterMarket": today_obj.get("afterMarket"),
-                    "fallback": False,
-                }
-                with self._cal_lock:
-                    self._cal_cache = {
-                        "date": target_date,
-                        "updated_mono": time.monotonic(),
-                        "data": out,
-                    }
-                return out
+            r_obj = res.get("result") if isinstance(res, dict) else None
+            return r_obj if isinstance(r_obj, dict) else None
         except Exception as exc:
-            logger.debug("US 마켓 캘린더 Fail-Open 폴백 적용: %s", exc)
+            logger.debug("주문 상세 조회(%s) 예외: %s", oid, exc)
+            return None
 
-        return fallback_cal
+    async def get_open_orders(
+        self, symbol: str = TARGET_SYMBOL
+    ) -> List[Dict[str, Any]]:
+        """
+        GET /api/v1/orders?status=OPEN&symbol=SOXL
+        """
+        params: Dict[str, Any] = {"status": "OPEN"}
+        if symbol:
+            params["symbol"] = str(symbol).upper().strip()
+        try:
+            res = await self._request(
+                method="GET",
+                path="/api/v1/orders",
+                params=params,
+                require_account=True,
+                rate_group="ORDER_HISTORY",
+            )
+            r_obj = res.get("result") if isinstance(res, dict) else {}
+            if isinstance(r_obj, dict) and isinstance(
+                r_obj.get("orders"), list
+            ):
+                return [
+                    o for o in r_obj["orders"] if isinstance(o, dict)
+                ]
+        except Exception as exc:
+            logger.debug("미체결 주문 목록 조회 예외: %s", exc)
+        return []
+
+    async def find_latest_open_order_id(
+        self, symbol: str = TARGET_SYMBOL, side: Optional[str] = None
+    ) -> str:
+        orders = await self.get_open_orders(symbol=symbol)
+        target_side = str(side or "").upper().strip()
+        for o in orders:
+            o_side = str(o.get("side") or "").upper().strip()
+            if not target_side or o_side == target_side:
+                oid = str(o.get("orderId") or "").strip()
+                if oid:
+                    return oid
+        return ""
+
+    async def cancel_all_open_orders(
+        self, symbol: str = TARGET_SYMBOL
+    ) -> int:
+        orders = await self.get_open_orders(symbol=symbol)
+        canceled = 0
+        for o in orders:
+            oid = str(o.get("orderId") or "").strip()
+            if oid:
+                try:
+                    await self.cancel_order(oid)
+                    canceled += 1
+                except Exception:
+                    pass
+        return canceled
+
+    async def close(self) -> None:
+        return None

@@ -2,7 +2,7 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 05 / 05)
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 06 / 06)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67) &
      자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
@@ -17,7 +17,11 @@
   7) 📡 [Case 11 & Case 62 부팅 중 SIGTERM 0.1초 고속 종료 가드 & 텔레그램 적체 큐 무조건부 일괄 소각]
      부팅 초기화 도중 SIGTERM 수신 시 0.1초 내에 즉시 탈출하여 systemd stop-sigterm 타임아웃을 원천 차단하고,
      기동 시 적체 큐 일괄 소각 및 무변경(changed == False) 시 무중단 가동 유지를 통해 9초 무한 재기동 루프를 영구 종결!
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 67 전수 락온
+  8) 🚨 [NEW · Case 68 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 시드 $100 변조 방어]
+     - "/home/pipiosToss" 고정 경로 하드코딩 100% 영구 제거 -> 오직 현재 실행 폴더(base_dir)의 .env 와 원장만 로드
+     - 기존 soxl_stratum_ledger.json 무손실 자동 이관 및 폴더별 3중 원장(고유 원장 · 호환 원장 · 백업 금고) 결속
+     - 평시 채팅창 숫자 오입력 시드 변조 잠금([💵 기준 시드머니($) 설정] 버튼 클릭 후 5분 내 또는 `/seed 금액` 만 허용)
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 68 전수 락온
 """
 
 from __future__ import annotations
@@ -85,6 +89,9 @@ from toss_api import (
     LOCKED_BUY_INTERVAL_MIN,
     TARGET_SYMBOL,
     TossApiClient,
+    get_bot_base_dir,
+    get_folder_slug,
+    resolve_folder_isolated_ledger_paths,
     safe_float,
     safe_int,
 )
@@ -103,6 +110,9 @@ logger = logging.getLogger("toss_sniper.main")
 NORMAL_LOOP_INTERVAL_SEC: float = 1.50
 FAST_SHIELD_LOOP_INTERVAL_SEC: float = 0.40
 KRW_PER_USD_DEFAULT: float = 1380.0
+
+# NEW (Case 68): [💵 기준 시드머니($) 설정] 버튼 클릭 후 일반 숫자 입력을 허용하는 유효 시간(초)
+SEED_INPUT_PROMPT_TIMEOUT_SEC: float = 300.0
 
 # URL("https://...") 오매칭을 100% 차단하는 엄격한 텔레그램 봇 토큰 정규식
 _TG_TOKEN_STRICT_RE = re.compile(r"\b(\d{8,12}:[A-Za-z0-9_-]{25,60})\b")
@@ -839,7 +849,13 @@ def _install_toss_api_compatibility_patches() -> None:
 _install_toss_api_compatibility_patches()
 
 
-def _instantiate_stratum_ledger(filepath: str) -> Any:
+def _instantiate_stratum_ledger(
+    filepath: str, base_dir: Optional[str] = None
+) -> Any:
+    """
+    🚨 Case 68:
+    폴더 위치(base_dir)와 원장 경로(filepath)를 주입하여 폴더별 3중 안전 원장을 초기화한다.
+    """
     ledger_cls = _resolve_module_attr(
         modules=(toss_api, quant_engine),
         candidate_names=(
@@ -862,8 +878,13 @@ def _instantiate_stratum_ledger(filepath: str) -> Any:
 
     try:
         sig = inspect.signature(ledger_cls.__init__)
+        kw: Dict[str, Any] = {}
         if "filepath" in sig.parameters:
-            return ledger_cls(filepath=filepath)
+            kw["filepath"] = filepath
+        if "base_dir" in sig.parameters and base_dir:
+            kw["base_dir"] = base_dir
+        if kw:
+            return ledger_cls(**kw)
         if len(sig.parameters) >= 2:
             return ledger_cls(filepath)
         return ledger_cls()
@@ -1145,7 +1166,7 @@ async def _compute_candle_metrics_dynamic(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1-D] 정밀 텔레그램 토큰·채팅방 ID 자동 탐색기 (URL 오매칭 100% 차단)
+# [핵심 1-D] 폴더 위치(base_dir) 전용 텔레그램 토큰·채팅방 ID 자동 탐색기 (Case 68)
 # ---------------------------------------------------------------------------
 def _extract_valid_tg_token(text: str) -> str:
     if not text or "://" in text:
@@ -1158,19 +1179,21 @@ def _discover_telegram_credentials(
     base_dir: str, api_obj: Any = None
 ) -> Tuple[str, str]:
     """
-    1) TOKEN_URL("https://...") 등 URL 상수가 봇 토큰으로 오매칭되는 버그를 100% 차단하고
+    🚨 Case 68:
+    1) "/home/pipiosToss" 고정 경로 하드코딩을 100% 영구 제거하고, 오직 현재 봇이 위치한
+       물리적 폴더(target_dir = get_bot_base_dir(base_dir))의 .env 와 설정 파일만 참조한다.
+    2) TOKEN_URL("https://...") 등 URL 상수가 봇 토큰으로 오매칭되는 버그를 100% 차단하고
        오직 _TG_TOKEN_STRICT_RE(\\d{8,12}:[A-Za-z0-9_-]{25,60}) 에 일치하는 토큰만 추출한다.
-    2) .env, os.environ, api_obj 속성, tg_ui_plugin / toss_api 모듈 변수 및 로컬 파일에서
-       (bot_token, chat_id) 를 탐색한다.
     """
-    candidate_dirs = [base_dir, "/home/pipiosToss", os.getcwd()]
+    target_dir = get_bot_base_dir(base_dir)
+    candidate_dirs = [target_dir]
     for d in candidate_dirs:
         if not d or not os.path.isdir(d):
             continue
         env_fp = os.path.join(d, ".env")
         if os.path.isfile(env_fp):
             try:
-                with open(env_fp, "r", encoding="utf-8") as f:
+                with open(env_fp, "r", encoding="utf-8", errors="ignore") as f:
                     for raw_line in f:
                         line = raw_line.strip()
                         if not line or line.startswith("#") or "=" not in line:
@@ -1251,7 +1274,7 @@ def _discover_telegram_credentials(
                     ):
                         chat_id = s_val
 
-    # 3) 모듈 소스 파일(.py / .json / .env) 텍스트 정규식 스캔 폴백
+    # 3) 현재 폴더(target_dir) 내 설정 파일(.env / .json / .py) 텍스트 정규식 스캔 폴백
     if not bot_token or not chat_id:
         chat_re = re.compile(
             r"(?:CHAT_ID|chat_id)\s*[:=]\s*['\"]?(-?\d{6,15})['\"]?"
@@ -1298,9 +1321,55 @@ def _get_dst_badge(now_est: Optional[datetime] = None) -> str:
     return "❄️서머타임 OFF (EST)"
 
 
+def _resolve_display_seed(st: Dict[str, Any]) -> float:
+    """
+    🚨 Case 68:
+    initial_seed_usd 가 0.0 또는 비정상 초기값일 때 $100.0 으로 잘못 표시되지 않도록 방어한다.
+    """
+    raw_s = safe_float((st or {}).get("initial_seed_usd"), 0.0)
+    explicit_100 = bool((st or {}).get("seed_explicitly_set_100", False))
+    if raw_s > 100.0:
+        return round(raw_s, 4)
+    if abs(raw_s - 100.0) < 1e-6 and explicit_100:
+        return 100.0
+    return DEFAULT_INITIAL_SEED_USD
+
+
+def _resolve_folder_identity_badge(
+    context: Optional[Any], st: Optional[Dict[str, Any]] = None
+) -> Tuple[str, str]:
+    """
+    NEW [Case 68]:
+    현재 봇이 가동 중인 폴더 식별자(folder_slug)와 고유 원장 파일명을 반환한다.
+    """
+    slug = ""
+    primary_name = ""
+    if context is not None and hasattr(context, "ledger"):
+        slug = str(getattr(context.ledger, "folder_slug", "") or "").strip()
+        p_fp = str(
+            getattr(context.ledger, "primary_filepath", "") or ""
+        ).strip()
+        if p_fp:
+            primary_name = os.path.basename(p_fp)
+
+    if not slug and isinstance(st, dict):
+        slug = str(st.get("folder_slug") or "").strip()
+
+    if not slug:
+        base_d = (
+            getattr(context, "base_dir", None) if context is not None else None
+        )
+        slug = get_folder_slug(base_d)
+
+    if not primary_name:
+        primary_name = f"soxl_stratum_ledger_{slug}.json"
+
+    return slug, primary_name
+
+
 def _format_case67_quota_badge(summary: Dict[str, Any]) -> str:
     """
-    NEW [Case 67]:
+    Case 67:
     기준가 고정 정량(anchor_quota_qty)과 현재가 기준 1회분 예산 상한 주수(budget_cap_qty)의
     min(budget_cap_qty, anchor_quota_qty) 캡핑 상태를 직관적인 문자열로 반환한다.
     """
@@ -1385,8 +1454,12 @@ class _AdaptiveTelegramBridge:
          즉시 소비 확정(Ack)하여 과거 적체된 /start, /update 를 100% 소멸시킨다.
       2) /update 실행 시 오프셋 선행 확정 후, 신규 커밋(changed == True)이 있을 때만 재기동(os._exit(0))하고
          변경 사항이 없을 때(changed == False)는 무중단 가동을 유지하여 9초 주기 무한 재기동 루프를 영구 차단한다.
-      3) NEW [Case 67]: /avwap 레이더 및 /settlement 제어반에서 min(1회분 예산 상한 주수, 기준가 고정 정량)
+      3) Case 67: /avwap 레이더 및 /settlement 제어반에서 min(1회분 예산 상한 주수, 기준가 고정 정량)
          캡핑 상태를 실시간 표출한다.
+      4) 🚨 [Case 68 폴더 식별 배지 표출 & 평시 숫자 오입력 시드 변조 잠금]:
+         기동 배너 및 4대 보드에 현재 폴더 식별자(📂 폴더명)와 격리 원장 파일명을 표출하고,
+         [💵 기준 시드머니($) 설정] 버튼 클릭 후 5분(300초) 이내이거나 `/seed 금액` 명령일 때만
+         시드머니 변경을 허용하여 평시 오입력으로 인한 $100 시드 변조를 원천 차단한다.
     """
 
     def __init__(self, context: Any) -> None:
@@ -1459,7 +1532,7 @@ class _AdaptiveTelegramBridge:
 
     async def _ack_telegram_offset(self, target_update_id: int) -> None:
         """
-        NEW: 텔레그램 본사 서버 큐에서 target_update_id 이하의 모든 메시지를 즉시 소비 확정(Ack)하고
+        텔레그램 본사 서버 큐에서 target_update_id 이하의 모든 메시지를 즉시 소비 확정(Ack)하고
         로컬 원장(last_tg_update_id)에 영속화하여 프로세스 재기동 후 동일 명령이 재실행되지 않게 한다.
         """
         uid = max(self._last_update_id, safe_int(target_update_id, 0))
@@ -1483,7 +1556,7 @@ class _AdaptiveTelegramBridge:
 
     async def _flush_stale_updates_on_startup(self) -> None:
         """
-        MODIFIED: 기동 직후 텔레그램 큐의 가장 마지막 항목(offset=-1)을 조회하여,
+        기동 직후 텔레그램 큐의 가장 마지막 항목(offset=-1)을 조회하여,
         메시지 종류나 발송 시각과 무관하게 부팅 전에 쌓여 있던 모든 적체 이벤트를 조건 없이
         즉시 소각(Ack)한다.
         """
@@ -1631,14 +1704,19 @@ class _AdaptiveTelegramBridge:
 
     async def send_startup_alive_banner(self) -> None:
         st = self.context.ledger.get_state(TARGET_SYMBOL)
-        init_seed = safe_float(
-            st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD
-        )
+        init_seed = _resolve_display_seed(st)
         free_cash = safe_float(st.get("free_cash_usd"), init_seed)
+        held_sh = sum(
+            safe_int(b.get("qty"), 0) for b in st.get("buckets", [])
+        )
+        folder_slug, primary_ledger_name = _resolve_folder_identity_badge(
+            self.context, st
+        )
         text = (
             "<b>✅ 서버가 정상 작동 중입니다.</b>\n"
-            "🔸 🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 &amp; 선행 체결정산 &amp; min(1회분,고정정량) 캡핑(Case 65/66/67) 가동 완료\n"
-            f"🔸 기준시드: <b>${init_seed:,.2f}</b> · 가용현금: <b>${free_cash:,.2f}</b> (📡 텔레그램 명령어 폴링 ON)"
+            f"🔸 폴더격리: 📂 <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code> · 3중 백업금고 ON)\n"
+            "🔸 🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 &amp; 선행 체결정산 &amp; min(1회분,고정정량) 캡핑 &amp; 장외업데이트 원장보호(Case 65~68) 가동 완료\n"
+            f"🔸 기준시드: <b>${init_seed:,.2f}</b> · 가용현금: <b>${free_cash:,.2f}</b> · 보유: <b>{held_sh}주</b>"
         )
         sent = await self.send_message(
             text=text, reply_markup=_build_main_reply_keyboard()
@@ -1646,7 +1724,10 @@ class _AdaptiveTelegramBridge:
         if not sent:
             await self.send_slim_alert(
                 title="✅ 서버가 정상 작동 중입니다.",
-                body="🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 & 선행 체결정산 & min(1회분,고정정량) 캡핑(Case 65/66/67) 가동 완료",
+                body=(
+                    f"📂 [{folder_slug}] ({primary_ledger_name}) · "
+                    f"기준시드 ${init_seed:,.2f} · 가용현금 ${free_cash:,.2f} · 보유 {held_sh}주"
+                ),
             )
 
     # -----------------------------------------------------------------------
@@ -1656,31 +1737,32 @@ class _AdaptiveTelegramBridge:
         self, st: Dict[str, Any], now_est: datetime
     ) -> str:
         dst_str = _get_dst_badge(now_est)
-        init_seed = max(
-            100.0,
-            safe_float(st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD),
+        init_seed = _resolve_display_seed(st)
+        folder_slug, primary_ledger_name = _resolve_folder_identity_badge(
+            self.context, st
         )
         lines = [
             f"🐂 <b>[ SOXL 지층관리 스나이퍼 ({_escape_html(dst_str)}) ]</b>",
+            f"▫️ 폴더격리: 📂 <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code> · 3중 백업금고 ON)",
             "▫️ 전략: 🛡️ 05_AF_WIDE_10_01 (8% 황금정량 · 눌림/돌파 독립 1층 재장전 · 기억저가 와이드 활주로)",
             "▫️ 정량: 📐 min(1회분 8% 예산 상한 주수, 기준가 고정 정량) 이중 캡핑으로 돌파 시 예산 초과 차단 (Case 67)",
             "▫️ 매수: 🛡️ 10분 고정 4단 와이드 게이트 (기억저가 대비 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%)",
             "▫️ 재장전: 🔥 0주 즉시 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
             "▫️ 매도: ⚡ 1분 상시 실물 스나이퍼 매도 (1층 +1.50% 익절&amp;리앵커링 / 2층 +1.00% 졸업)",
-            "▫️ 방어: ⏱️ 양방향 60초 타임쉴드 &amp; 순수 현재가 지정가(LIMIT) 락온 (Case 65/66/67)",
+            "▫️ 방어: ⏱️ 양방향 60초 타임쉴드 &amp; 장외업데이트 원장 철벽보존 (Case 65~68)",
             f"▫️ 기준 시드머니: <b>${init_seed:,.2f}</b> (1회 8% 정량 자동 산출)",
             "──────────────",
             "🔹 04:00 ~ 04:06: 🌅 프리장 호가 안정화 &amp; 오버나이트 지층 동기화",
             "🔹 04:07 ~ 09:29: 🔫 프리장 지층관리 가동 (10분 와이드매수게이트 · 1분 상시매도)",
             "🔹 09:30 ~ 16:00: 🔥 정규장 지층관리 가동 (10분 와이드매수게이트 · 1분 상시매도)",
             "🔹 16:00 ~ 16:59: 🌙 정규장 마감 일일 결산 &amp; 보유 지층 오버나이트 보존",
-            "🔹 17:00 ~ 03:59: 🧹 일일 GC 및 장외 대기 (강제 손절 MOC 없음)",
+            "🔹 17:00 ~ 03:59: 🧹 일일 GC · 날짜별 금고 백업 및 장외 대기",
             "──────────────",
             "📡 /avwap : 실시간 지층 스나이퍼 레이더 관제탑",
             "📜 /sync : 토스 실잔고 동기화 &amp; 지층 지시서",
             "⚙️ /settlement : 초슬림 전술 제어반 (작동 ON/OFF · 시드머니 설정)",
             "🧹 /reset : 지층 원장 0점 초기화 (/reset_seed 금액)",
-            "🚀 /update : 최신 깃허브 코드 검증 업데이트",
+            "🚀 /update : 최신 깃허브 코드 검증 업데이트 (원장 100% 보존)",
         ]
         return "\n".join(lines)
 
@@ -1708,6 +1790,7 @@ class _AdaptiveTelegramBridge:
             if getattr(self.context, "fast_shield_mode", False)
             else "⏱️1.5s 표준"
         )
+        folder_slug, _ = _resolve_folder_identity_badge(self.context, st)
 
         ma5_amp = safe_float(met.get("ma5_amp_pct"), 6.50)
         ha_badge = str(met.get("ha_badge") or "🕯️HA양봉")
@@ -1828,7 +1911,7 @@ class _AdaptiveTelegramBridge:
         m_sign = "+" if mark_roi >= 0.0 else ""
 
         lines = [
-            f"📡 <b>[SOXL 지층 스나이퍼 레이더]</b> ({active_badge} · {fast_badge})",
+            f"📡 <b>[SOXL 지층 스나이퍼 레이더 · 📂{_escape_html(folder_slug)}]</b> ({active_badge} · {fast_badge})",
             f"🐂 <b>SOXL</b> [{active_badge}] 현재가 <b>${lp:.2f}</b> · 5MA {ma5_amp:.2f}% · {_escape_html(ha_badge)}",
             f"🌅 프리장 VWAP ${pre_vwap:.2f} · 밴드 ${pre_l:.2f} ~ ${pre_h:.2f} ({pre_amp:.1f}%) · 예상 ${pre_el:.2f} ~ ${pre_eh:.2f}",
             f"🔥 정규장 VWAP ${reg_vwap:.2f} · 밴드 ${reg_l:.2f} ~ ${reg_h:.2f} ({reg_amp:.1f}%) · 예상 ${reg_el:.2f} ~ ${reg_eh:.2f}",
@@ -1874,6 +1957,9 @@ class _AdaptiveTelegramBridge:
         )
         summary = summarize_stratum_portfolio(st, live_price=lp)
         eff_fx = fx_rate if fx_rate > 100.0 else KRW_PER_USD_DEFAULT
+        folder_slug, primary_ledger_name = _resolve_folder_identity_badge(
+            self.context, st
+        )
 
         init_seed = safe_float(summary.get("initial_seed_usd"), 10000.0)
         free_cash = safe_float(summary.get("free_cash_usd"), 0.0)
@@ -1900,6 +1986,7 @@ class _AdaptiveTelegramBridge:
 
         lines = [
             "📜 <b>[SOXL 지층관리 스나이퍼 지시서 (실잔고 동기화)]</b>",
+            f"📂 운용 폴더: <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code>)",
             f"💵 설정 기준시드: <b>${init_seed:,.2f}</b> (환율 {eff_fx:,.1f}원/$)",
             f"🏦 스나이퍼 가용현금: <b>${free_cash:,.2f}</b> (토스 실주문가능: ${broker_bp_usd:,.2f})",
             f"📦 보유 지층 합계: <b>{held_sh}주</b> ({held_lots}회차 · 실매수원금 ${actual_inv:,.2f})",
@@ -1917,6 +2004,9 @@ class _AdaptiveTelegramBridge:
     ) -> str:
         lp = safe_float(live_price, safe_float(st.get("anchor_price"), 100.0))
         summary = summarize_stratum_portfolio(st, live_price=lp)
+        folder_slug, primary_ledger_name = _resolve_folder_identity_badge(
+            self.context, st
+        )
 
         is_active = bool(st.get("is_active", True))
         power_str = "🟢 가동 중 (ON)" if is_active else "🔴 일시정지 (OFF)"
@@ -1932,13 +2022,14 @@ class _AdaptiveTelegramBridge:
 
         lines = [
             "⚙️ <b>[SOXL 인피니트 스노우볼 v3.0 전술 제어반]</b>",
+            f"0️⃣ 격리 폴더: 📂 <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code>)",
             f"1️⃣ 마스터 전원: <b>{power_str}</b>",
             f"2️⃣ 기준 시드머니: <b>${init_seed:,.2f}</b> (실현기준 총자산 ${real_eq:,.2f})",
             "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 1분 지정가매도 · 60초 타임쉴드</b> (고정)",
             f"4️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str} (가용현금 ${free_cash:,.2f})",
             f"5️⃣ 현재 보유 지층: <b>{held_sh}주</b> ({held_lots}회차)",
             "──────────────",
-            "💡 시드머니를 변경하시려면 아래 <b>[💵 기준 시드머니($) 설정]</b> 버튼을 누르거나 채팅창에 숫자(예: <code>19000</code>)를 바로 입력하세요.",
+            "💡 시드머니를 변경하시려면 아래 <b>[💵 기준 시드머니($) 설정]</b> 버튼을 누른 뒤 숫자(예: <code>19000</code>)를 입력하거나, <code>/seed 19000</code> 명령어를 입력하세요.",
             f"🕒 기준 시각: {now_est.strftime('%m-%d %H:%M:%S EST')}",
         ]
         return "\n".join(lines)
@@ -2080,16 +2171,21 @@ class _AdaptiveTelegramBridge:
             )
         else:
             updated_st = await self.context.ledger.update_state(
-                TARGET_SYMBOL, initial_seed_usd=round(val, 4)
+                TARGET_SYMBOL,
+                initial_seed_usd=round(val, 4),
+                seed_explicitly_set_100=bool(abs(val - 100.0) < 1e-6),
             )
         self.context.wakeup_event.set()
         live_p, _ = await self._refresh_live_price_and_metrics()
         summary = summarize_stratum_portfolio(updated_st, live_price=live_p)
         quota_badge_str = _format_case67_quota_badge(summary)
+        folder_slug, _ = _resolve_folder_identity_badge(
+            self.context, updated_st
+        )
         await self.send_message(
             chat_id=chat_id,
             text=(
-                f"✅ <b>[기준 시드머니 설정 완료]</b>\n"
+                f"✅ <b>[기준 시드머니 설정 완료 · 📂{_escape_html(folder_slug)}]</b>\n"
                 f"🔸 새 기준 시드머니: <b>${val:,.2f}</b>\n"
                 f"🔸 가용 현금시드: <b>${safe_float(summary.get('free_cash_usd'), 0.0):,.2f}</b>\n"
                 f"🔸 차기 1회(8%) 예산: <b>${safe_float(summary.get('next_portion_budget'), 0.0):,.2f}</b> "
@@ -2102,17 +2198,23 @@ class _AdaptiveTelegramBridge:
 
     async def _execute_manual_update_command(self, chat_id: str) -> None:
         """
-        MODIFIED [무한 재기동 루프 및 `[]` 출력 버그 원천 종결]:
+        MODIFIED [무한 재기동 루프 및 원장 초기화 원천 종결 (Case 62 & Case 68)]:
         1) /update 명령 진입 즉시 _ack_telegram_offset() 을 호출하여 텔레그램 본사 서버 큐에서
            해당 update_id 를 즉시 소비 확정(Ack)하고 원장(last_tg_update_id)에 영속화한다.
-        2) execute_git_pull_and_preflight 반환 튜플에서 비어 있지 않은 문자열(msg)과 변경 여부(changed)를 추출한다.
+        2) execute_git_pull_and_preflight(base_dir) 호출 시 해당 폴더의 모든 원장(*ledger*.json) 및 .env 가
+           메모리 스냅샷으로 보존·즉시 복원된다.
         3) 원격 저장소에 새로운 커밋이 없어 변경 사항이 없을 때(changed == False)는 os._exit(0) 를 호출하지 않고
            현재 프로세스를 무중단 유지한다!
         """
         await self._ack_telegram_offset(self._last_update_id)
+        folder_slug, _ = _resolve_folder_identity_badge(self.context)
         await self.send_message(
             chat_id=chat_id,
-            text="⏳ <b>[시스템 업데이트 개시]</b> GitHub 최신 코드 동기화 및 9대 코어 모듈 프리플라이트 검증 중...",
+            text=(
+                f"⏳ <b>[시스템 업데이트 개시 · 📂{_escape_html(folder_slug)}]</b>\n"
+                "🔸 로컬 3중 원장 및 .env 보호 스냅샷 잠금 완료\n"
+                "🔸 GitHub 최신 코드 동기화 및 9대 코어 모듈 프리플라이트 검증 중..."
+            ),
         )
         fn_upd = getattr(
             plugin_updater, "execute_git_pull_and_preflight", None
@@ -2134,11 +2236,11 @@ class _AdaptiveTelegramBridge:
                 msg = (
                     " · ".join(str_parts)
                     if str_parts
-                    else "✅ 9대 코어 모듈 py_compile 및 AST 심볼 정합성 100% 통과"
+                    else "✅ 9대 코어 모듈 py_compile 및 AST 심볼 정합성 100% 통과 · 원장 보존"
                 )
             else:
                 ok = bool(upd_res)
-                msg = "✅ 9대 코어 모듈 py_compile 및 AST 심볼 정합성 100% 통과"
+                msg = "✅ 9대 코어 모듈 py_compile 및 AST 심볼 정합성 100% 통과 · 원장 보존"
         else:
             ok, msg = verify_all_modules_compile(self.context.base_dir)
 
@@ -2147,7 +2249,7 @@ class _AdaptiveTelegramBridge:
         if not ok:
             await self.send_message(
                 chat_id=chat_id,
-                text=f"⚠️ <b>[업데이트 중단]</b>\n{_escape_html(msg)}",
+                text=f"⚠️ <b>[업데이트 중단 · 기존 원장 안전 보존]</b>\n{_escape_html(msg)}",
             )
             return
 
@@ -2157,14 +2259,18 @@ class _AdaptiveTelegramBridge:
                 text=(
                     f"✅ <b>[최신 버전 검증 완료 · 무중단 가동 유지]</b>\n"
                     f"🔸 {_escape_html(msg)}\n"
-                    "🔸 원격 변경사항이 없으므로 재기동 없이 현재 스나이퍼 엔진을 계속 가동합니다."
+                    "🔸 원격 변경사항이 없으므로 재기동 없이 현재 스나이퍼 엔진과 원장을 계속 유지합니다."
                 ),
             )
             return
 
         await self.send_message(
             chat_id=chat_id,
-            text=f"🚀 <b>[신규 업데이트 검증 통과]</b> {_escape_html(msg)}\n잠시 후 스나이퍼 데몬을 재기동합니다...",
+            text=(
+                f"🚀 <b>[신규 업데이트 검증 통과 · 📂{_escape_html(folder_slug)}]</b>\n"
+                f"🔸 {_escape_html(msg)}\n"
+                "🔸 원장 데이터 100% 보존 상태로 잠시 후 스나이퍼 데몬을 재기동합니다..."
+            ),
         )
         await asyncio.sleep(0.5)
         os._exit(0)
@@ -2195,6 +2301,9 @@ class _AdaptiveTelegramBridge:
             }
             if new_seed_usd is not None and new_seed_usd >= 100.0:
                 kw["initial_seed_usd"] = round(new_seed_usd, 4)
+                kw["seed_explicitly_set_100"] = bool(
+                    abs(new_seed_usd - 100.0) < 1e-6
+                )
                 kw["cumulative_realized_net_usd"] = 0.0
             st_reset = await self.context.ledger.update_state(
                 TARGET_SYMBOL, **kw
@@ -2227,8 +2336,28 @@ class _AdaptiveTelegramBridge:
             text.replace(",", "").replace("$", "").replace(".", "").strip()
         )
         if clean_num_check.isdigit():
-            self._awaiting_seed_input_chats.pop(chat_id, None)
-            await self._apply_new_seed_value(chat_id, text)
+            # 🚨 Case 68: [💵 기준 시드머니($) 설정] 버튼을 누른 후 5분(300초) 이내일 때만 일반 숫자 입력을 시드 변경으로 허용!
+            prompt_ts = safe_float(
+                self._awaiting_seed_input_chats.get(chat_id), 0.0
+            )
+            if (
+                prompt_ts > 0.0
+                and (time.monotonic() - prompt_ts)
+                <= SEED_INPUT_PROMPT_TIMEOUT_SEC
+            ):
+                self._awaiting_seed_input_chats.pop(chat_id, None)
+                await self._apply_new_seed_value(chat_id, text)
+            else:
+                self._awaiting_seed_input_chats.pop(chat_id, None)
+                await self.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "🔒 <b>[시드머니 오입력 방지 잠금 안내]</b>\n"
+                        "🔸 평시 숫자 오입력으로 인해 시드머니가 변조되는 것을 막기 위해 잠금 상태입니다.\n"
+                        "🔸 시드를 변경하시려면 <b>⚙️ 전술 제어반(/settlement)</b> 에서 <b>[💵 기준 시드머니($) 설정]</b> 버튼을 먼저 누르거나, "
+                        f"<code>/seed {_escape_html(clean_num_check)}</code> 명령어로 입력해 주세요."
+                    ),
+                )
             return
 
         first_token = text.split()[0].lower()
@@ -2271,8 +2400,10 @@ class _AdaptiveTelegramBridge:
         if first_token == "/seed":
             parts = text.split(maxsplit=1)
             if len(parts) >= 2:
+                self._awaiting_seed_input_chats.pop(chat_id, None)
                 await self._apply_new_seed_value(chat_id, parts[1])
             else:
+                self._awaiting_seed_input_chats[chat_id] = time.monotonic()
                 await self._render_and_send_settlement(chat_id=chat_id)
             return
 
@@ -2372,12 +2503,13 @@ class _AdaptiveTelegramBridge:
             )
         elif data == "prompt_seed_input":
             self._awaiting_seed_input_chats[chat_id] = time.monotonic()
+            folder_slug, _ = _resolve_folder_identity_badge(self.context)
             await self.send_message(
                 chat_id=chat_id,
                 text=(
-                    "💵 <b>[기준 시드머니($) 입력 안내]</b>\n"
-                    "운용할 기준 달러 시드머니 금액을 숫자만 채팅창에 입력해 주세요.\n"
-                    "예시: <code>10000</code> 또는 <code>19000</code>"
+                    f"💵 <b>[기준 시드머니($) 입력 안내 · 📂{_escape_html(folder_slug)}]</b>\n"
+                    "🔸 지금부터 <b>5분 이내</b>에 운용할 기준 달러 시드머니 금액을 숫자만 채팅창에 입력해 주세요.\n"
+                    "🔸 예시: <code>10000</code> 또는 <code>19000</code>"
                 ),
             )
 
@@ -2395,7 +2527,8 @@ class _AdaptiveTelegramBridge:
 
         if not _extract_valid_tg_token(self.bot_token):
             logger.error(
-                "🚨 유효한 텔레그램 봇 토큰(숫자:영숫자)을 찾을 수 없습니다! .env 의 TELEGRAM_BOT_TOKEN 을 확인하세요."
+                "🚨 유효한 텔레그램 봇 토큰(숫자:영숫자)을 찾을 수 없습니다! 현재 폴더(%s)의 .env 내 TELEGRAM_BOT_TOKEN 을 확인하세요.",
+                self.context.base_dir,
             )
             while not self.context.shutdown_event.is_set():
                 await asyncio.sleep(10.0)
@@ -2406,7 +2539,8 @@ class _AdaptiveTelegramBridge:
         )
         await self._flush_stale_updates_on_startup()
         logger.info(
-            "📡 [텔레그램 관제탑 폴링 루프 가동 완료] (chat_id=%s)",
+            "📡 [텔레그램 관제탑 폴링 루프 가동 완료] (폴더=%s · chat_id=%s)",
+            getattr(self.context, "folder_slug", "default"),
             self.chat_id or "auto-detect",
         )
 
@@ -2508,25 +2642,26 @@ async def _run_auto_update_loop_dynamic(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 스나이퍼 애플리케이션 전역 컨텍스트 (SniperAppContext)
+# [핵심 2] 스나이퍼 애플리케이션 전역 컨텍스트 (SniperAppContext — Case 68 폴더별 3중 원장 결속)
 # ---------------------------------------------------------------------------
 class SniperAppContext:
     """
-    9대 코어 모듈이 공유하는 단일 런타임 상태 컨텍스트.
+    9대 코어 모듈이 공유하는 단일 런타임 상태 컨텍스트 (Case 68 폴더 위치 기반 격리 적용).
     """
 
     def __init__(self, base_dir: Optional[str] = None) -> None:
         _install_toss_api_compatibility_patches()
-        self.base_dir: str = os.path.abspath(
-            base_dir or os.path.dirname(os.path.abspath(__file__)) or "."
-        )
-        self.ledger_path: str = os.path.join(
-            self.base_dir, "soxl_stratum_ledger.json"
-        )
+        self.base_dir: str = get_bot_base_dir(base_dir)
+        (
+            self.primary_ledger_path,
+            self.ledger_path,
+            self.backup_ledger_path,
+            self.folder_slug,
+        ) = resolve_folder_isolated_ledger_paths(base_dir=self.base_dir)
 
-        self.api: TossApiClient = TossApiClient()
+        self.api: TossApiClient = TossApiClient(base_dir=self.base_dir)
         self.ledger: Any = _instantiate_stratum_ledger(
-            filepath=self.ledger_path
+            filepath=self.ledger_path, base_dir=self.base_dir
         )
 
         self.in_memory_ordering_lock: asyncio.Lock = asyncio.Lock()
@@ -2763,7 +2898,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                         now_est=now_est,
                     )
 
-                # 3-1) 로컬 지층 원장 ↔ 토스 실보유 잔고 무결성 화해 (Case 66 가드 내장)
+                # 3-1) 로컬 지층 원장 ↔ 토스 실보유 잔고 무결성 화해 (Case 66/68 가드 내장)
                 await _call_plugin_adaptive(
                     reconcile_stratum_with_broker_holdings_plugin,
                     context=context,
@@ -2851,7 +2986,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# [핵심 5] 백그라운드 태스크 3 : 17:00 EST 일일 GC 및 논리 거래일 롤오버 루프
+# [핵심 5] 백그라운드 태스크 3 : 17:00 EST 일일 GC · 날짜별 금고 백업 및 롤오버 루프
 # ---------------------------------------------------------------------------
 async def daily_gc_and_rollover_loop(context: SniperAppContext) -> None:
     last_gc_date = ""
@@ -2894,7 +3029,7 @@ async def _run_init_step_with_cancel_guard(
     timeout_sec: float = 8.0,
 ) -> Any:
     """
-    NEW [Case 11 부팅 중 SIGTERM 0.1초 고속 종료 가드]:
+    Case 11 [부팅 중 SIGTERM 0.1초 고속 종료 가드]:
     부팅 초기화 네트워크 I/O 도중 SIGTERM / SIGINT 시그널이 유입되면
     블로킹 대기 없이 0.1초 이내에 즉시 코루틴을 취소하고 탈출하여
     systemd 의 'State stop-sigterm timed out. Killing.' 현상을 100% 원천 차단한다.
@@ -2929,7 +3064,7 @@ async def _run_init_step_with_cancel_guard(
 
 
 async def async_main() -> None:
-    base_dir = os.path.dirname(os.path.abspath(__file__)) or "."
+    base_dir = get_bot_base_dir()
 
     purged = purge_deprecated_legacy_files(base_dir)
     if purged:
@@ -2944,7 +3079,7 @@ async def async_main() -> None:
 
     run_quant_engine_tdd()
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · Case 67 min(1회분, 고정정량) 캡핑 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60/65/66/67) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · Case 67 min(1회분, 고정정량) 캡핑 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60/65/66/67/68) 검증 완료"
     )
 
     context = SniperAppContext(base_dir=base_dir)
@@ -2974,7 +3109,9 @@ async def async_main() -> None:
         )
         if acc_seq is not None:
             logger.info(
-                "🏛️ [제2헌법 AccountSeq 락온 완료] accountSeq=%d", acc_seq
+                "🏛️ [제2헌법 AccountSeq 락온 완료 · 폴더=%s] accountSeq=%d",
+                context.folder_slug,
+                acc_seq,
             )
     except Exception as exc:
         logger.warning(
@@ -3055,7 +3192,8 @@ async def async_main() -> None:
     ]
 
     logger.info(
-        "🚀 [SOXL 지층관리 스나이퍼 가동 완료] 04:07 ~ 16:00 EST · 전술 A (🛡️ 05_AF_WIDE_10_01) · 8%% 황금정량 · Case 67 min(1회분,고정정량) 캡핑 · 10분 4단 와이드 매수게이트 · 1분 상시 매도 · 양방향 60초 타임쉴드 & 선행 체결정산(Case 65/66/67)"
+        "🚀 [SOXL 지층관리 스나이퍼 가동 완료 · 폴더=%s] 04:07 ~ 16:00 EST · 전술 A (🛡️ 05_AF_WIDE_10_01) · 8%% 황금정량 · Case 67 min(1회분,고정정량) 캡핑 · 10분 4단 와이드 매수게이트 · 1분 상시 매도 · 양방향 60초 타임쉴드 & 폴더별 3중 원장 금고(Case 65/66/67/68)",
+        context.folder_slug,
     )
 
     try:

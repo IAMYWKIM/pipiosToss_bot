@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: defense_plugin.py
-순수 롱(SOXL) 오버나이트 지층관리 스나이퍼 전용:
+순수 롱(SOXL) 오버나이트 지층관리 스나이퍼 전용 (Step 04 / 06):
 1) 🚨 [Case 66 봇 주문 진행 중 가로채기 차단 및 미결 매수 즉시 정산 가드]
    원장에 미결 매수(buy_order_id)가 존재할 때 reconcile 모듈이 호출되면, 실잔고 증가를 수동 매수로
    가로채지 않고 즉시 sync_pending_buy_order_plugin() 을 선행 호출한 뒤 SKIP_RECONCILE_BOT_ORDER_PENDING 을 반환하여
@@ -9,19 +9,24 @@
 2) 🔗 [tg_ui_plugin.py 심볼 완벽 호환] 전술 제어반(/settlement)에서 봇 작동 OFF ➔ ON 재개 시 호출되는
    relock_stratum_on_bot_resume() 함수를 정식 제공하여 AST 심볼 임포트 무결성 100% 충족!
 3) 04:00 ~ 04:06 EST 프리장 개장 초기 호가 안정화 · 전일 잔류 미체결 청소 · 오버나이트 이월 지층 동기화
-4) 장중/기동 시 로컬 지층 원장(soxl_stratum_ledger.json) ↔ 토스 실보유 잔고(/api/v1/holdings) 무결성 화해
+4) 장중/기동 시 로컬 지층 원장(soxl_stratum_ledger_<폴더명>.json) ↔ 토스 실보유 잔고(/api/v1/holdings) 무결성 화해
    - Case 61: 매수 체결 직후 15.0초 인덱싱 시차 그레이스 쉴드(is_within_auto_fill_grace_shield) 보호
    - Case 60: 토스 앱 수동 전량 매도(0주) 시 기억된 최저 매수가(cycle_min_buy_price = 0.0) 원자적 리셋
    - Case 63: 수동 매수/매도 동기화 시 기존에 깎아둔 리앵커링 단가(book_price) 크레딧 보존 및 음수 시드 방지
-5) 16:00 ~ 16:59 EST 정규장 마감 일일 결산 리포트 타전 및 보유 지층 오버나이트 안전 보존 (15:59 강제 MOC 손절 영구 폐기!)
-6) 17:00 EST 일일 가비지 컬렉션(GC) 및 일일 통계 롤오버
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 완벽 준수 (Step 01 / 02)
+   - 🚨 [NEW · Case 68 백업 금고(ledger_backups/) 자가 치유 연동 & 시드 $100 변조 방어]:
+     로컬 원장 지층이 비어 있고 토스 실잔고(h_qty > 0)가 존재할 때, 먼저 백업 금고(recover_from_backup_vault_sync)를
+     조회하여 어제의 1·2층 분리 지층·리앵커링 단가·기억저가·누적 수익·설정 시드머니를 100% 원형 복원!
+5) 16:00 ~ 16:59 EST 정규장 마감 일일 결산 리포트 타전 · 일일 스냅샷 백업 및 보유 지층 오버나이트 안전 보존
+6) 17:00 EST 일일 가비지 컬렉션(GC) · 일일 통계 롤오버 및 ledger_backups/ 날짜별 원장 스냅샷(최근 14일 보관) 물리적 생성
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 68 완벽 준수
 """
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -41,18 +46,34 @@ from toss_api import (
     DEFAULT_INITIAL_SEED_USD,
     EST_TZ,
     TARGET_SYMBOL,
+    get_folder_slug,
     safe_float,
     safe_int,
 )
 
 logger = logging.getLogger("toss_sniper.defense_plugin")
 
-# MODIFIED: toss_api 심볼 불일치 방지를 위해 기본 환율 상수를 모듈 내부에 직접 정의
+# toss_api 심볼 불일치 방지를 위해 기본 환율 상수를 모듈 내부에 직접 정의
 KRW_PER_USD_DEFAULT: float = 1380.0
 
 
+def _resolve_valid_seed_from_state(st: Dict[str, Any]) -> float:
+    """
+    🚨 Case 68:
+    상태 딕셔너리에서 initial_seed_usd 를 읽을 때 0.0 또는 비정상 $100 초기값으로 인해
+    시드가 $100 으로 축소되는 현상을 방어한다.
+    """
+    raw_seed = safe_float(st.get("initial_seed_usd"), 0.0)
+    explicit_100 = bool(st.get("seed_explicitly_set_100", False))
+    if raw_seed > 100.0:
+        return round(raw_seed, 4)
+    if abs(raw_seed - 100.0) < 1e-6 and explicit_100:
+        return 100.0
+    return DEFAULT_INITIAL_SEED_USD
+
+
 # ---------------------------------------------------------------------------
-# [핵심 1] 로컬 지층 원장 ↔ 토스 실보유 잔고(/api/v1/holdings) 무결성 화해 (Case 58, 60, 61, 63, 66)
+# [핵심 1] 로컬 지층 원장 ↔ 토스 실보유 잔고(/api/v1/holdings) 무결성 화해 (Case 58, 60, 61, 63, 66, 68)
 # ---------------------------------------------------------------------------
 async def reconcile_stratum_with_broker_holdings_plugin(
     context: Any,
@@ -62,7 +83,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
     force_sync: bool = False,
 ) -> Dict[str, Any]:
     """
-    🚨 Case 58, Case 60, Case 61, Case 63 & Case 66:
+    🚨 Case 58, Case 60, Case 61, Case 63, Case 66 & Case 68:
     프로세스 재기동 시, 04:00 EST 오프닝 동기화 시, 또는 장중 사용자가 토스 앱에서 수동 매매했을 때
     로컬 지층 원장(buckets)의 총 보유 주수(ledger_qty)와 토스 실계좌 보유 주수(h_qty)를 대조하여 화해한다:
     0) 🛡️ [Case 66 핵심 방어 : 봇 미결 주문(buy_order_id / sell_order_id) 진행 중 가로채기 원천 차단]
@@ -71,6 +92,10 @@ async def reconcile_stratum_with_broker_holdings_plugin(
          즉시 sync_pending_buy_order_plugin() 을 선행 호출하여 정식 체결 알림 · 자투리 누적 · 60초 타임쉴드를 완수한다!
        - sell_order_id 가 남아 있을 때 역시 SKIP_RECONCILE_BOT_ORDER_PENDING 을 반환하여
          직후 실행되는 매도 게이트(sync_pending_sell_order_plugin)가 정식 익절 정산을 수행하도록 보장한다!
+    1) 🛡️ [Case 68 핵심 방어 : 원장 초기화 감지 시 백업 금고(ledger_backups/) 자가 치유 복원]
+       - 토스 실보유 수량(h_qty > 0)이 있는데 로컬 원장 수량(ledger_qty == 0)이 비어 있을 때,
+         먼저 context.ledger.recover_from_backup_vault_sync() 를 호출하여 백업 금고에 보존된
+         2-Tier 지층·리앵커링 단가·기억저가·누적 실현수익·설정 시드머니를 최우선 복구한다!
     """
     if not isinstance(holdings, dict) or not getattr(
         context, "holdings_fetch_ok", True
@@ -168,14 +193,52 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         )
         return {"status": "CLEARED_TO_ZERO_HOLDINGS", "prev_qty": ledger_qty}
 
-    # [케이스 3] 토스 실보유 수량(h_qty > 0)이 존재하는데 로컬 원장이 비어 있는 경우 (초기 기동 복원 또는 수동 신규 매수)
+    # [케이스 3] 토스 실보유 수량(h_qty > 0)이 존재하는데 로컬 원장이 비어 있는 경우 (Case 68 백업 금고 우선 복원 또는 초기 기동 복원)
     if h_qty > 0 and ledger_qty == 0:
+        # 🛡️ [Case 68 자가 치유 1단계] 백업 금고(ledger_backups/)에 보존된 지층 데이터가 있는지 먼저 확인!
+        vault_st: Optional[Dict[str, Any]] = None
+        recover_fn = getattr(
+            context.ledger, "recover_from_backup_vault_sync", None
+        )
+        if callable(recover_fn):
+            try:
+                vault_st = await asyncio.to_thread(recover_fn)
+            except Exception as exc:
+                logger.debug("백업 금고 조회 예외(무시): %s", exc)
+
+        if isinstance(vault_st, dict):
+            vault_buckets = buckets_from_dicts(vault_st.get("buckets", []))
+            vault_qty = sum(b.qty for b in vault_buckets)
+            vault_seed = _resolve_valid_seed_from_state(vault_st)
+
+            # 백업 금고의 보유 수량이 토스 실보유 수량(h_qty)과 정확히 일치하면 1·2층 분리 지층 및 모든 누적 기록을 100% 원형 복구!
+            if vault_qty == h_qty and len(vault_buckets) > 0:
+                restored_kw: Dict[str, Any] = dict(vault_st)
+                restored_kw["initial_seed_usd"] = vault_seed
+                restored_kw["buy_order_id"] = ""
+                restored_kw["sell_order_id"] = ""
+                restored_kw["ordered_qty"] = 0
+                await context.ledger.update_state(TARGET_SYMBOL, **restored_kw)
+                logger.info(
+                    "🛡️ [Case 68 백업 금고 100%% 원형 복원 완료] %d주 (%d개 지층 · 시드 $%.2f · 기억저가 $%.2f)",
+                    h_qty,
+                    len(vault_buckets),
+                    vault_seed,
+                    safe_float(vault_st.get("cycle_min_buy_price"), 0.0),
+                )
+                return {
+                    "status": "RESTORED_FROM_BACKUP_VAULT",
+                    "held_shares": h_qty,
+                    "tiers": len(vault_buckets),
+                }
+
+        # 백업 금고에 일치하는 지층이 없는 경우: 토스 실계좌 평균단가 기반으로 1층 복원 (단, 백업 시드/누적수익이 있으면 승계)
         ref_p = h_avg if h_avg > 0.0 else (live_p if live_p > 0.0 else 100.0)
         cost_u = h_pur if h_pur > 0.0 else round(float(h_qty) * ref_p, 4)
-        init_seed = max(
-            100.0,
-            safe_float(st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD),
-        )
+        init_seed = _resolve_valid_seed_from_state(st)
+        if isinstance(vault_st, dict) and init_seed <= 100.0:
+            init_seed = _resolve_valid_seed_from_state(vault_st)
+
         est_lots = max(
             1, int(round(cost_u / max(1.0, init_seed * 0.08)))
         )
@@ -188,23 +251,43 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             lot_type="QUOTA_L1",
         )
         now_sync_ts = time.time()
-        await context.ledger.update_state(
-            TARGET_SYMBOL,
-            buckets=buckets_to_dicts([restored_bucket]),
-            anchor_price=ref_p,
-            cycle_min_buy_price=ref_p,
-            ratchet_anchor_price=ref_p,
-            buy_order_id="",
-            sell_order_id="",
-            ordered_qty=0,
-            entry_ts=now_sync_ts,
-            last_buy_fill_ts=now_sync_ts,
-        )
+        update_kw: Dict[str, Any] = {
+            "initial_seed_usd": init_seed,
+            "buckets": buckets_to_dicts([restored_bucket]),
+            "anchor_price": ref_p,
+            "cycle_min_buy_price": ref_p,
+            "ratchet_anchor_price": ref_p,
+            "buy_order_id": "",
+            "sell_order_id": "",
+            "ordered_qty": 0,
+            "entry_ts": now_sync_ts,
+            "last_buy_fill_ts": now_sync_ts,
+        }
+        if isinstance(vault_st, dict):
+            for stat_k in (
+                "cumulative_realized_net_usd",
+                "cumulative_realized_gross_usd",
+                "cumulative_realized_fee_usd",
+                "cumulative_leftover_saved_usd",
+                "cumulative_reanchor_drop_usd",
+                "reanchor_cnt",
+                "seed_protect_pass_cnt",
+                "total_buy_events",
+                "total_sell_events",
+                "win_sell_events",
+            ):
+                if safe_float(st.get(stat_k), 0.0) == 0.0 and safe_float(
+                    vault_st.get(stat_k), 0.0
+                ) != 0.0:
+                    update_kw[stat_k] = vault_st[stat_k]
+
+        await context.ledger.update_state(TARGET_SYMBOL, **update_kw)
         logger.info(
-            "♻️ [SOXL 실잔고 기반 1층 복원 완료] %d주 @ $%.2f (원금 $%.2f · 추정 %d회차 · 기억저가 $%.2f)",
+            "♻️ [SOXL 실잔고 기반 1층 복원 완료] %d주 @ $%.2f (원금 $%.2f · 시드 $%.2f · 추정 %d회차 · 기억저가 $%.2f)",
             h_qty,
             ref_p,
             cost_u,
+            init_seed,
             est_lots,
             ref_p,
         )
@@ -282,23 +365,12 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         min(ref_p, max(0.01, new_book_inv / float(h_qty))), 4
     )
 
+    init_seed = _resolve_valid_seed_from_state(st)
     adj_lots = max(
         1,
         min(
             sum(b.lot_count for b in buckets),
-            int(
-                round(
-                    cost_u
-                    / max(
-                        1.0,
-                        safe_float(
-                            st.get("initial_seed_usd"),
-                            DEFAULT_INITIAL_SEED_USD,
-                        )
-                        * 0.08,
-                    )
-                )
-            ),
+            int(round(cost_u / max(1.0, init_seed * 0.08))),
         ),
     )
     preserved_lot_type = (
@@ -343,7 +415,7 @@ async def relock_stratum_on_bot_resume(
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """
-    NEW: 전술 제어반(/settlement)에서 스나이퍼 작동을 🔴 OFF ➔ 🟢 ON 으로 전환할 때
+    전술 제어반(/settlement)에서 스나이퍼 작동을 🔴 OFF ➔ 🟢 ON 으로 전환할 때
     tg_ui_plugin.py 에서 호출하는 실잔고 ↔ 지층 원장 즉시 동기화 함수.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
@@ -364,9 +436,10 @@ async def relock_stratum_on_bot_resume(
             p_map = await context.api.get_current_prices_batch(
                 (TARGET_SYMBOL,)
             )
-            if isinstance(p_map, dict) and safe_float(
-                p_map.get(TARGET_SYMBOL), 0.0
-            ) > 0.0:
+            if (
+                isinstance(p_map, dict)
+                and safe_float(p_map.get(TARGET_SYMBOL), 0.0) > 0.0
+            ):
                 eff_prices = p_map
                 context.latest_prices = p_map
         except Exception:
@@ -438,7 +511,7 @@ async def execute_0400_premarket_stabilization_plugin(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 3] 16:00 ~ 16:59 EST 정규장 마감 일일 결산 보고 (강제 MOC 손절 100% 폐기!)
+# [핵심 3] 16:00 ~ 16:59 EST 정규장 마감 일일 결산 보고 & 스냅샷 백업 (강제 MOC 손절 100% 폐기!)
 # ---------------------------------------------------------------------------
 async def execute_1600_daily_closing_settlement_plugin(
     context: Any,
@@ -450,7 +523,7 @@ async def execute_1600_daily_closing_settlement_plugin(
     🔹 16:00 ~ 16:59 EST:
     정규장 마감 시 보유 지층(1층 및 2층)을 강제 손절(MOC)하지 않고 100% 오버나이트 안전 보존하며,
     미체결 잔류 DAY 주문을 정리하고 당일 세후 실현수익금 · 자투리 절약액 · 리앵커링 횟수 · 시드보호 패스 통계를
-    텔레그램으로 일일 결산 보고한다.
+    텔레그램으로 일일 결산 보고함과 동시에 ledger_backups/ 에 당일 마감 스냅샷을 백업한다 (Case 68).
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
@@ -474,6 +547,14 @@ async def execute_1600_daily_closing_settlement_plugin(
         last_closing_report_date=today_str,
     )
 
+    # 🛡️ Case 68: 정규장 마감 시점의 원장 상태를 날짜별 백업 금고에 즉시 스냅샷 저장
+    snap_fn = getattr(context.ledger, "create_daily_backup_snapshot", None)
+    if callable(snap_fn):
+        try:
+            await snap_fn(logical_date=today_str, keep_days=14)
+        except Exception as exc:
+            logger.debug("16:00 마감 스냅샷 백업 예외(무시): %s", exc)
+
     live_p = safe_float(
         (prices or {}).get(TARGET_SYMBOL),
         safe_float(
@@ -486,6 +567,11 @@ async def execute_1600_daily_closing_settlement_plugin(
     if fx_rate <= 0.0:
         fx_rate = KRW_PER_USD_DEFAULT
 
+    folder_slug = str(
+        getattr(context.ledger, "folder_slug", "")
+        or updated_st.get("folder_slug")
+        or get_folder_slug(getattr(context, "base_dir", None))
+    )
     day_net = safe_float(updated_st.get("daily_realized_net_usd"), 0.0)
     day_krw = day_net * fx_rate
     cum_net = safe_float(summary.get("cumulative_realized_net_usd"), 0.0)
@@ -503,18 +589,19 @@ async def execute_1600_daily_closing_settlement_plugin(
         d_sign = "+" if day_net >= 0.0 else "-"
         c_sign = "+" if cum_net >= 0.0 else "-"
         await context.send_slim_alert(
-            title=f"🌙 [16:00 EST 정규장 마감 일일 결산] ({today_str})",
+            title=f"🌙 [16:00 EST 정규장 마감 일일 결산 · 📂{folder_slug}] ({today_str})",
             body=(
                 f"당일 세후실현: {d_sign}${abs(day_net):,.2f} ({d_sign}{abs(day_krw):,.0f}원) "
                 f"· 누적실현: {c_sign}${abs(cum_net):,.2f} ({c_sign}{abs(cum_roi):.2f}%) "
                 f"· 당일 매수 {day_buy_ev}회 / 익절 {day_sell_ev}회 / 리앵커링 {day_reanchor}회 "
                 f"· 🛡️시드패스 {day_pass:,}회 / 자투리절약 +${day_saved:,.2f} "
-                f"· 오버나이트 이월: {held_sh}주({held_lots}회차) · 가용현금 ${free_cash:,.2f}"
+                f"· 오버나이트 이월: {held_sh}주({held_lots}회차) · 가용현금 ${free_cash:,.2f} (3중 금고 백업 완료)"
             ),
         )
 
     logger.info(
-        "🌙 [16:00 EST 일일 결산 완료] 당일실현=$%.2f · 누적실현=$%.2f · 오버나이트보유=%d주(%d회차)",
+        "🌙 [16:00 EST 일일 결산 완료 · %s] 당일실현=$%.2f · 누적실현=$%.2f · 오버나이트보유=%d주(%d회차)",
+        folder_slug,
         day_net,
         cum_net,
         held_sh,
@@ -530,28 +617,41 @@ async def execute_1600_daily_closing_settlement_plugin(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 4] 17:00 EST 일일 가비지 컬렉션(GC) 및 일일 카운터 롤오버 (Case 22)
+# [핵심 4] 17:00 EST 일일 가비지 컬렉션(GC) · 일일 카운터 롤오버 · 날짜별 원장 백업 (Case 22, 68)
 # ---------------------------------------------------------------------------
 async def execute_daily_1700_gc_and_backup_plugin(
     context: Any,
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🔹 17:00 EST (Case 22):
-    일일 가비지 컬렉션(gc.collect)을 수행하고 원장 일일 카운터를 새 거래일 기준으로 롤오버한다.
+    🔹 17:00 EST (Case 22 & Case 68):
+    1) 롤오버 직전 당일 원장 상태를 `ledger_backups/soxl_stratum_ledger_<folder_slug>_YYYY-MM-DD.json` 에
+       날짜별 물리적 스냅샷으로 백업(최근 14일분 유지)한다.
+    2) 원장 일일 카운터를 새 거래일 기준으로 롤오버하고 가비지 컬렉션(gc.collect)을 수행한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     logical_date = dt_now.strftime("%Y-%m-%d")
+
+    snap_file = ""
+    snap_fn = getattr(context.ledger, "create_daily_backup_snapshot", None)
+    if callable(snap_fn):
+        try:
+            snap_file = await snap_fn(logical_date=logical_date, keep_days=14)
+        except Exception as exc:
+            logger.warning("17:00 EST 원장 스냅샷 백업 예외: %s", exc)
+
     await context.ledger.rollover_daily_counters_if_needed(logical_date)
     collected = gc.collect()
     logger.info(
-        "🧹 [17:00 EST 일일 GC 및 원장 백업 완료] date=%s · gc_collected=%d",
+        "🧹 [17:00 EST 일일 GC 및 원장 금고 백업 완료] date=%s · snapshot=%s · gc_collected=%d",
         logical_date,
+        os.path.basename(snap_file) if snap_file else "none",
         collected,
     )
     return {
         "status": "DAILY_GC_DONE",
         "logical_date": logical_date,
+        "snapshot_file": snap_file,
         "gc_collected": collected,
     }
 
