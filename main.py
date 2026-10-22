@@ -2,7 +2,7 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 및 비동기 이벤트 루프 컨트롤러 (Step 03 / 03)
+메인 오케스트레이터 및 비동기 이벤트 루프 컨트롤러 (SyntaxError 무결점 교정판)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & 자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
@@ -345,7 +345,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     pass
                 continue
 
-            # 1) SOXL 실시간 현재가 및 보유 잔고 조회
+            # 1) SOXL 실시간 현재가 및 보유 잔고 조회 (MODIFIED: 함수명 오타 완전 교정)
             price_map = await context.api.get_current_prices_batch(
                 (TARGET_SYMBOL,)
             )
@@ -354,9 +354,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                 context.latest_prices[TARGET_SYMBOL] = live_p
 
             holdings_map, fetch_ok = (
-                await context.api.get_holdings_ map_with_status()
-                if hasattr(context.api, "get_holdings_map_with_status")
-                else await context.api.get_holdings_map_with_status()
+                await context.api.get_holdings_map_with_status()
             )
             context.holdings_fetch_ok = fetch_ok
             if fetch_ok and isinstance(holdings_map, dict):
@@ -625,7 +623,7 @@ async def async_main() -> None:
         ),
         asyncio.create_task(
             run_auto_update_loop(context, interval_sec=3600.0),
-            name="auto_updater",
+            name="auto_updater"
         ),
     ]
 
