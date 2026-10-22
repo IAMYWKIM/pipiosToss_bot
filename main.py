@@ -2,7 +2,7 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 03 / 03)
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 04 / 04)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & 자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
@@ -12,10 +12,9 @@
   5) 매수 후 60초 타임쉴드 & 1분 상시 순수 현재가 지정가 스나이퍼 매도(1층 +1.50% 익절 & 2층 리앵커링 / 2층 +1.00% 전량 졸업)
   6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
-  7) 📡 [내장형 텔레그램 적체 큐 무조건부 일괄 소각 & 무변경 시 무중단 가동 유지]
-     기동 직후 _flush_stale_updates_on_startup() 에서 큐의 마지막 update_id 까지 조건 없이 즉시 소비 확정(Ack)하고,
-     /update 실행 시 신규 커밋이 없을 때(changed == False)는 os._exit(0) 를 호출하지 않고 무중단 가동을 유지하여
-     9초 주기 무한 재기동 루프 및 `[]` 빈 리스트 출력 버그를 100% 영구 종결!
+  7) 📡 [Case 11 & Case 62 부팅 중 SIGTERM 0.1초 고속 종료 가드 & 텔레그램 적체 큐 무조건부 일괄 소각]
+     부팅 초기화 도중 SIGTERM 수신 시 0.1초 내에 즉시 탈출하여 systemd stop-sigterm 타임아웃을 원천 차단하고,
+     기동 시 적체 큐 일괄 소각 및 무변경(changed == False) 시 무중단 가동 유지를 통해 9초 무한 재기동 루프를 영구 종결!
 - 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 전수 락온
 """
 
@@ -36,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -2867,8 +2866,48 @@ async def daily_gc_and_rollover_loop(context: SniperAppContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# [핵심 6] 시스템 부트스트랩 · 프리플라이트 TDD · 시그널 핸들러 (Case 11, 16)
+# [핵심 6] 시스템 부트스트랩 · 프리플라이트 TDD · Case 11 시그널 0.1초 고속 종료 가드
 # ---------------------------------------------------------------------------
+async def _run_init_step_with_cancel_guard(
+    context: SniperAppContext,
+    coro: Awaitable[Any],
+    timeout_sec: float = 8.0,
+) -> Any:
+    """
+    NEW [Case 11 부팅 중 SIGTERM 0.1초 고속 종료 가드]:
+    부팅 초기화 네트워크 I/O 도중 SIGTERM / SIGINT 시그널이 유입되면
+    블로킹 대기 없이 0.1초 이내에 즉시 코루틴을 취소하고 탈출하여
+    systemd 의 'State stop-sigterm timed out. Killing.' 현상을 100% 원천 차단한다.
+    """
+    if context.shutdown_event.is_set():
+        try:
+            coro.close()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return None
+
+    work_task = asyncio.create_task(coro)
+    stop_task = asyncio.create_task(context.shutdown_event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {work_task, stop_task},
+            timeout=timeout_sec,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_task in done or context.shutdown_event.is_set():
+            work_task.cancel()
+            return None
+        if work_task in done:
+            return work_task.result()
+        work_task.cancel()
+        return None
+    finally:
+        if not stop_task.done():
+            stop_task.cancel()
+        if not work_task.done():
+            work_task.cancel()
+
+
 async def async_main() -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__)) or "."
 
@@ -2905,41 +2944,80 @@ async def async_main() -> None:
         except NotImplementedError:
             pass
 
+    if context.shutdown_event.is_set():
+        logger.info("✅ [SOXL 지층관리 스나이퍼 안전 종료 완료]")
+        return
+
     try:
-        acc_seq = await context.api.ensure_account_seq()
-        logger.info("🏛️ [제2헌법 AccountSeq 락온 완료] accountSeq=%d", acc_seq)
+        acc_seq = await _run_init_step_with_cancel_guard(
+            context, context.api.ensure_account_seq(), timeout_sec=8.0
+        )
+        if acc_seq is not None:
+            logger.info(
+                "🏛️ [제2헌법 AccountSeq 락온 완료] accountSeq=%d", acc_seq
+            )
     except Exception as exc:
         logger.warning(
             "⚠️ 초기 AccountSeq 조회 지연 (루프 내 자동 재시도): %s", exc
         )
 
+    if context.shutdown_event.is_set():
+        logger.info("✅ [SOXL 지층관리 스나이퍼 안전 종료 완료]")
+        return
+
     try:
-        price_map = await context.api.get_current_prices_batch(
-            (TARGET_SYMBOL,)
+        price_map = await _run_init_step_with_cancel_guard(
+            context,
+            context.api.get_current_prices_batch((TARGET_SYMBOL,)),
+            timeout_sec=6.0,
         )
-        if safe_float(price_map.get(TARGET_SYMBOL), 0.0) > 0.0:
+        if (
+            isinstance(price_map, dict)
+            and safe_float(price_map.get(TARGET_SYMBOL), 0.0) > 0.0
+        ):
             context.latest_prices[TARGET_SYMBOL] = safe_float(
                 price_map.get(TARGET_SYMBOL), 0.0
             )
-        holdings_map, fetch_ok = (
-            await context.api.get_holdings_map_with_status()
+        h_res = await _run_init_step_with_cancel_guard(
+            context,
+            context.api.get_holdings_map_with_status(),
+            timeout_sec=6.0,
         )
-        context.holdings_fetch_ok = fetch_ok
-        if fetch_ok:
-            context.latest_holdings = holdings_map
-            await reconcile_stratum_with_broker_holdings_plugin(
-                context=context,
-                holdings=holdings_map,
-                prices=context.latest_prices,
-                now_est=datetime.now(EST_TZ),
-                force_sync=True,
-            )
+        if isinstance(h_res, tuple) and len(h_res) == 2:
+            holdings_map, fetch_ok = h_res
+            context.holdings_fetch_ok = bool(fetch_ok)
+            if fetch_ok and isinstance(holdings_map, dict):
+                context.latest_holdings = holdings_map
+                await _run_init_step_with_cancel_guard(
+                    context,
+                    reconcile_stratum_with_broker_holdings_plugin(
+                        context=context,
+                        holdings=holdings_map,
+                        prices=context.latest_prices,
+                        now_est=datetime.now(EST_TZ),
+                        force_sync=True,
+                    ),
+                    timeout_sec=6.0,
+                )
     except Exception as exc:
         logger.warning("초기 잔고/시세 동기화 폴백: %s", exc)
 
+    if context.shutdown_event.is_set():
+        logger.info("✅ [SOXL 지층관리 스나이퍼 안전 종료 완료]")
+        return
+
     # 기동 배너 발송 전에 텔레그램 적체 큐를 먼저 소각하여 과거 /update 재발동을 100% 차단
-    await context.tg._flush_stale_updates_on_startup()
-    await context.tg.send_startup_alive_banner()
+    await _run_init_step_with_cancel_guard(
+        context, context.tg._flush_stale_updates_on_startup(), timeout_sec=6.0
+    )
+    if not context.shutdown_event.is_set():
+        await _run_init_step_with_cancel_guard(
+            context, context.tg.send_startup_alive_banner(), timeout_sec=6.0
+        )
+
+    if context.shutdown_event.is_set():
+        logger.info("✅ [SOXL 지층관리 스나이퍼 안전 종료 완료]")
+        return
 
     tasks = [
         asyncio.create_task(candle_radar_loop(context), name="candle_radar"),

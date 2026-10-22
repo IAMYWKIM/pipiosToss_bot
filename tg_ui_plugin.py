@@ -2,15 +2,17 @@
 """
 # MODIFIED: tg_ui_plugin.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-텔레그램 관제탑 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 02 / 03)
+텔레그램 관제탑 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 03 / 04)
 - 제1헌법: 모든 텔레그램 HTTP API 호출을 asyncio.to_thread 로 비동기 격리 및 타임아웃 적용
 - 제4헌법: 모든 논리 시계열은 미국 동부 시간(EST/EDT) 100% 락온
+- Case 11 & Case 62:
+  1) MODIFIED: toss_api 심볼 불일치(KRW_PER_USD_DEFAULT) 방지를 위해 모듈 내부 자체 상수로 직접 정의하여
+     `python3 plugin_updater.py --verify-only` AST 심볼 교차 검증 100% 통과 보장!
+  2) 기동 직후 _flush_stale_updates_on_startup() 에서 조건 없이 큐의 마지막 update_id 까지 일괄 소각(Ack)
+  3) /update 실행 시 오프셋 선행 확정 후 신규 커밋(changed == True)이 있을 때만 재기동(os._exit(0))하고,
+     이미 최신 코드(changed == False)일 때는 재기동 없이 무중단 가동 유지!
 - Case 15 & Case 16: 모바일 가독성 최적화, html.escape 전역 적용, 세로바 대신 가운뎃점(·) 사용,
   기동 완료 시 "✅ 서버가 정상 작동 중입니다." 생존 신호 자동 타전
-- Case 62 & 무한 재기동 원천 봉쇄:
-  1) 기동 직후 _flush_stale_updates_on_startup() 에서 조건 없이 큐의 마지막 update_id 까지 일괄 소각(Ack)
-  2) /update 실행 시 오프셋 선행 확정 후 신규 커밋(changed == True)이 있을 때만 재기동(os._exit(0))하고,
-     이미 최신 코드(changed == False)일 때는 재기동 없이 무중단 가동 유지!
 - Case 64: 전술 제어반(/settlement) 내 30분 옵션 완전 제거 -> 오직 [작동 ON/OFF 버튼]과 [시드머니 설정 버튼] 2가지 옵션만 유지
 - Case 65 & Case 66: /avwap 레이더 내 양방향 60초 타임쉴드(매수 후 60초 / 매도 후 60초) 상태 및 4단 와이드 활주로 실시간 표출
 """
@@ -48,7 +50,6 @@ from sniper_exit_plugin import (
 from toss_api import (
     DEFAULT_INITIAL_SEED_USD,
     EST_TZ,
-    KRW_PER_USD_DEFAULT,
     LOCKED_BUY_INTERVAL_MIN,
     TARGET_SYMBOL,
     safe_float,
@@ -56,6 +57,9 @@ from toss_api import (
 )
 
 logger = logging.getLogger("toss_sniper.tg_ui_plugin")
+
+# MODIFIED: toss_api.py 와의 AST 심볼 임포트 불일치를 원천 차단하기 위해 기본 환율 상수를 모듈 내부에 직접 정의
+KRW_PER_USD_DEFAULT: float = 1380.0
 
 
 # ---------------------------------------------------------------------------

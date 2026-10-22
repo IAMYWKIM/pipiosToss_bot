@@ -2,11 +2,11 @@
 """
 # MODIFIED: quant_indicators_plugin.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(SOXL) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-시계열 100% 벡터화 지표 엔진 및 10분 고정 매수 게이트 버킷 산출 코어 모듈 (Step 01 / 05)
+시계열 100% 벡터화 지표 엔진 및 10분 고정 매수 게이트 버킷 산출 코어 모듈 (Step 01 / 04)
 - 제4헌법 & Case 01: 모든 시계열 및 세션 경계 연산은 미국 동부 시간(EST_TZ = ZoneInfo('America/New_York')) 단일 소스 락온
 - Case 36 & Case 64: 04:07 ~ 16:00 EST 구간 10분 고정 매수 게이트(LOCKED_BUY_INTERVAL_MIN = 10) 버킷 산출 및
   동일 버킷 내 중복 평가 원천 차단(evaluate_buy_gate_bucket_status)
-- MODIFIED: 모바일 복사·붙여넣기 시 발생했던 최상위 상수(GATE_START_MIN_OF_DAY) 및 RSI 시리즈(s_close) 홀수 공백 들여쓰기 오타 원천 제거
+- MODIFIED: 최상위 상수(GATE_START_MIN_OF_DAY) 및 RSI 시리즈(s_close) 홀수 공백 들여쓰기 오타 원천 제거
 - 벡터화 강제: Pandas DataFrame / NumPy 배열 연산 시 for 루프를 100% 배제하고 벡터화 수식으로만
   프리장(04:00 ~ 09:29 EST) / 정규장(09:30 ~ 16:00 EST) 누적 VWAP, 고/저가 진폭, 5일 이동평균(5MA) 진폭 기반
   예상 변동 밴드, 실시간 하이킨 아시(Heikin-Ashi) 양/음봉 배지 및 Wilder's RSI(14)를 고속 산출한다.
@@ -32,7 +32,7 @@ from toss_api import (
 
 logger = logging.getLogger("toss_sniper.quant_indicators_plugin")
 
-# MODIFIED: 최상위 상수 0칸 표준 들여쓰기 고정 (04:07 EST = 247분 / 16:00 EST = 960분)
+# MODIFIED: 04:07 EST 기준 분(minute of day = 4 * 60 + 7 = 247) 및 16:00 EST 마감 분(16 * 60 = 960) 0칸 표준 정렬
 GATE_START_MIN_OF_DAY: int = 4 * 60 + 7   # 247 (04:07 EST)
 GATE_END_MIN_OF_DAY: int = 16 * 60        # 960 (16:00 EST)
 REGULAR_START_MIN_OF_DAY: int = 9 * 60 + 30  # 570 (09:30 EST)
@@ -183,7 +183,6 @@ def _compute_5ma_intraday_amp_pct_vectorized(
                 h_v = h_s[valid].to_numpy(dtype=float)
                 l_v = l_s[valid].to_numpy(dtype=float)
                 if len(l_v) >= 2:
-                    # 당일 미완성 일봉을 제외한 직전 5영업일 우선 사용
                     if len(l_v) > 5:
                         h_sub = h_v[-6:-1]
                         l_sub = l_v[-6:-1]
@@ -245,7 +244,6 @@ def _compute_vectorized_heikin_ashi_and_rsi(
         }
 
     ha_close_arr = (opens + highs + lows + closes) * 0.25
-    # Heikin-Ashi Open 은 직전 (HA_Open + HA_Close)/2 의 지수이동평균(alpha=0.5, adjust=False)과 수학적으로 동치
     ha_seed = (opens[0] + closes[0]) * 0.5
     shifted_hc = np.empty(n, dtype=float)
     shifted_hc[0] = ha_seed
@@ -264,7 +262,7 @@ def _compute_vectorized_heikin_ashi_and_rsi(
     prev_ha_close = float(ha_close_arr[-2]) if n >= 2 else cur_ha_close
     is_bull = bool(cur_ha_close >= cur_ha_open)
 
-    # MODIFIED: Wilder's RSI(14) 벡터화 연산 (8칸 표준 들여쓰기 정밀 교정)
+    # MODIFIED: Wilder's RSI(14) 벡터화 연산 (8칸 표준 들여쓰기 고정)
     rsi_val = 50.0
     if n >= 3:
         s_close = pd.Series(closes)
@@ -462,7 +460,6 @@ def compute_soxl_quant_metrics_1m(
 
         ma5_amp = _compute_5ma_intraday_amp_pct_vectorized(daily_candles, df)
 
-        # 전체 시계열 기반 Heikin-Ashi 및 Wilder's RSI(14) 산출
         opens = df["O"].to_numpy(dtype=float)
         highs = df["H"].to_numpy(dtype=float)
         lows = df["L"].to_numpy(dtype=float)
@@ -476,7 +473,6 @@ def compute_soxl_quant_metrics_1m(
             opens, highs, lows, closes
         )
 
-        # 당일(또는 가장 최근 영업일) 프리장(04:00 ~ 09:29 EST) 및 정규장(09:30 ~ 16:00 EST) 분리 집계
         target_date = (
             today_str
             if (df["Date"] == today_str).any()

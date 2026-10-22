@@ -2,18 +2,18 @@
 """
 # MODIFIED: plugin_updater.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-9대 코어 모듈 프리플라이트 컴파일 · AST 심볼 교차 검증 · 텔레그램 잔류 큐 선제 소각 및 무인 Git 업데이트 코어 모듈 (Step 01 / 03)
+9대 코어 모듈 프리플라이트 컴파일 · AST 심볼 교차 검증 · 4배수 선제 스냅 치유기 · 텔레그램 잔류 큐 소각 및 무인 Git 업데이트 코어 모듈 (Step 02 / 04)
 - 제1헌법: 모든 파일 I/O 및 git/python 서브프로세스 실행을 asyncio.to_thread 로 비동기 격리 및 타임아웃 적용
 - 제3헌법: 구버전 폐기 파일(daymarket_sim_plugin.py, whipsaw_plugin.py, state_SOXS.json 등) 디스크 영구 소각
 - Case 07: 평일 04:00 ~ 16:05 EST 장중 백그라운드 무인 업데이트 재기동 전면 차단 및 systemd ExecStartPre 장중 락다운 지원
 - Case 11 & Case 62:
   1) 9대 필수 코어 모듈(REQUIRED_CORE_MODULES) py_compile 문법 검증 + AST ImportFrom 심볼 테이블 정적 교차 검증
-  2) 모바일 복사·붙여넣기 과정에서 발생한 홀수 공백(1칸/9칸 등) IndentationError 자동 치유기(_auto_heal_indentation_glitches) 내장
+  2) NEW: 모바일 복사·붙여넣기 과정에서 발생한 마크다운 펜스 및 홀수 공백(1칸 -> 0칸, 9칸 -> 8칸)을
+     AST 파싱 전에 4배수로 선제 스냅 교정하여 다음 줄이 오염되는 현상을 100% 원천 차단(_auto_heal_indentation_glitches)
   3) /update 실행 시 구버전 RAM 캐시(sys.modules) 간섭을 막기 위해 `python3 plugin_updater.py --verify-only` 를
      독립 서브프로세스로 호출하고 실패 시 직전 정상 커밋 해시로 즉시 원자적 롤백 수행
   4) NEW: 프리플라이트 및 업데이트 시점에 텔레그램 서버의 미확인 적체 큐(getUpdates offset = max_uid + 1)를
-     즉시 강제 소각(_flush_telegram_pending_updates_sync)하고, 원격 저장소에 신규 커밋이 없을 때 로컬 SFTP 수정본이
-     git reset --hard 로 유실되는 현상을 원천 차단!
+     즉시 강제 소각(_flush_telegram_pending_updates_sync)하고, 원격 저장소에 신규 커밋이 없을 때 로컬 수정본을 안전 보존!
 """
 
 from __future__ import annotations
@@ -107,7 +107,6 @@ def _flush_telegram_pending_updates_sync(
     텔레그램 서버 큐에 남아 있는 모든 미확인 메시지(/start, /update, callback_query 등)의
     최대 update_id 를 조회하여 즉시 `offset = max_update_id + 1` 로 소비 확정(Ack)하고
     로컬 원장(soxl_stratum_ledger.json)의 `last_tg_update_id` 에 기록한다.
-    이를 통해 재기동 시 과거 `/update` 명령이 재실행되는 9초 무한 루프를 물리적으로 100% 차단한다!
     """
     target_dir = os.path.abspath(
         base_dir or os.path.dirname(os.path.abspath(__file__)) or "."
@@ -212,26 +211,66 @@ def purge_deprecated_legacy_files(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 모바일 복사·붙여넣기 공백 오타 자동 치유기 (_auto_heal_indentation_glitches)
+# [핵심 2] 4배수 선제 스냅 및 마크다운 펜스 자동 치유기 (_auto_heal_indentation_glitches)
 # ---------------------------------------------------------------------------
 def _auto_heal_indentation_glitches(
-    filepath: str, max_passes: int = 10
+    filepath: str, max_passes: int = 6
 ) -> bool:
     """
-    스마트폰/모바일 환경에서 코드를 복사해 붙여넣을 때 특정 줄 앞에 공백 1칸이 추가되거나 밀려서
-    발생하는 IndentationError(예: 0칸이어야 할 최상위 상수가 1칸 들여쓰기 된 경우,
-    8칸이어야 할 줄이 9칸 들여쓰기 된 경우)를 AST 파서 기반으로 자동 감지하여
-    표준 4배수 들여쓰기(또는 직전/직후 라인 들여쓰기)로 즉시 교정 저장한다.
+    MODIFIED [역방향 들여쓰기 오염 원천 차단]:
+    1) 파일 상단에 복사 시 섞여 들어간 텍스트나 마크다운 코드펜스(```)를 먼저 제거한다.
+    2) AST 파싱 결과 SyntaxError / IndentationError 가 감지될 경우,
+       먼저 코드 라인 중 4의 배수가 아닌 비정상 홀수 공백(예: 1칸 -> 0칸, 9칸 -> 8칸)을
+       가장 가까운 4의 배수로 일괄 선제 스냅 교정한다!
+       (블록 첫 줄이 9칸일 때 파이썬 파서가 다음 줄 8칸에서 에러를 발생시켜 정상 라인들이 9칸으로
+        도미노 오염되던 현상을 100% 원천 방지!)
     """
     if not os.path.isfile(filepath):
         return False
 
+    fence_prefix = chr(96) * 3
+    coding_marker = "# -*- coding: utf-8 -*-"
+
     try:
         with GlobalThrottle.get_file_lock(filepath):
-            with open(filepath, "r", encoding="utf-8") as f:
-                src = f.read()
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                orig_src = f.read()
 
-            healed_any = False
+            src = orig_src
+
+            # 0단계: 이미 문법적으로 완벽하면 즉시 통과
+            try:
+                ast.parse(src, filename=filepath)
+                return False
+            except (IndentationError, SyntaxError):
+                pass
+
+            # 1단계: 상단 불필요 프리픽스 및 마크다운 코드펜스 제거 + 홀수 공백(1칸, 9칸 등) 4배수 선제 스냅
+            if coding_marker in src and not src.lstrip().startswith(
+                coding_marker
+            ):
+                src = src[src.index(coding_marker) :]
+
+            pre_lines = src.splitlines()
+            snapped_lines: List[str] = []
+            for line in pre_lines:
+                if line.strip().startswith(fence_prefix):
+                    continue
+                stripped = line.lstrip(" ")
+                lead = len(line) - len(stripped)
+                if (
+                    stripped
+                    and not stripped.startswith(
+                        ("#", '"', "'", ")", "]", "}")
+                    )
+                    and (lead % 4 != 0)
+                ):
+                    lead = int(round(lead / 4.0)) * 4
+                snapped_lines.append((" " * lead) + stripped)
+
+            src = "\n".join(snapped_lines) + "\n"
+
+            # 2단계: 선제 스냅 후에도 남은 IndentationError 미세 교정
             for _ in range(max_passes):
                 try:
                     ast.parse(src, filename=filepath)
@@ -262,13 +301,12 @@ def _auto_heal_indentation_glitches(
                                 prev_indent += 4
                             break
 
-                    if lead_len % 4 != 0:
-                        nearest_4 = int(round(lead_len / 4.0)) * 4
-                        new_indent = (
-                            prev_indent
-                            if abs(lead_len - prev_indent) <= 2
-                            else nearest_4
-                        )
+                    if stripped.startswith(
+                        ("else:", "elif ", "except", "finally:")
+                    ):
+                        new_indent = max(0, prev_indent - 4)
+                    elif lead_len % 4 != 0:
+                        new_indent = int(round(lead_len / 4.0)) * 4
                     else:
                         new_indent = prev_indent
 
@@ -277,11 +315,15 @@ def _auto_heal_indentation_glitches(
 
                     lines[idx] = (" " * max(0, new_indent)) + stripped
                     src = "".join(lines)
-                    healed_any = True
                 except SyntaxError:
                     break
 
-            if healed_any:
+            if src != orig_src:
+                try:
+                    ast.parse(src, filename=filepath)
+                except SyntaxError:
+                    return False
+
                 tmp_fp = f"{filepath}.heal.tmp"
                 with open(tmp_fp, "w", encoding="utf-8") as wf:
                     wf.write(src)
@@ -289,7 +331,7 @@ def _auto_heal_indentation_glitches(
                     os.fsync(wf.fileno())
                 os.replace(tmp_fp, filepath)
                 logger.info(
-                    "🔧 [들여쓰기 공백 오타 자동 치유 완료] %s",
+                    "🔧 [들여쓰기/코드펜스 자동 정규화 완료] %s",
                     os.path.basename(filepath),
                 )
                 return True
@@ -449,7 +491,6 @@ def _execute_git_pull_and_preflight_sync(
         base_dir or os.path.dirname(os.path.abspath(__file__)) or "."
     )
 
-    # 1) 텔레그램 미확인 업데이트 큐 선제 소각 (무한 /update 루프 즉시 차단)
     _flush_telegram_pending_updates_sync(target_dir)
 
     try:
@@ -467,7 +508,7 @@ def _execute_git_pull_and_preflight_sync(
         if rc_b != 0 or not branch_name or branch_name == "HEAD":
             branch_name = "main"
 
-        rc_f, _, err_f = _run_cmd_sync(
+        rc_f, _, _ = _run_cmd_sync(
             ["git", "fetch", "--all", "--prune"],
             cwd=target_dir,
             timeout_sec=25.0,
@@ -485,7 +526,6 @@ def _execute_git_pull_and_preflight_sync(
         if rc_ref != 0:
             target_ref = "origin/main"
 
-        # 원격 브랜치에 로컬 HEAD 보다 새로운 커밋이 있는지 확인
         rc_cnt, cnt_str, _ = _run_cmd_sync(
             ["git", "rev-list", "--count", f"HEAD..{target_ref}"],
             cwd=target_dir,
@@ -660,7 +700,6 @@ def _cli_main() -> int:
 
     purge_deprecated_legacy_files(args.base_dir)
 
-    # 1) --verify-only 플래그가 지정된 경우: 텔레그램 잔류 큐 선제 소각 + 컴파일 및 AST 심볼 정합성 검증
     if args.verify_only:
         _flush_telegram_pending_updates_sync(args.base_dir)
         ok, msg = verify_all_modules_compile(args.base_dir)
@@ -670,8 +709,6 @@ def _cli_main() -> int:
         print(msg, file=sys.stderr)
         return 1
 
-    # 2) 인자 없이 호출된 경우 (systemd ExecStartPre 등):
-    # 기동 직전 텔레그램 적체 큐를 무조건 선제 소각하여 /update 재기동 루프를 원천 봉쇄!
     _flush_telegram_pending_updates_sync(args.base_dir)
 
     now_est = datetime.now(EST_TZ)
