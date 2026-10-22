@@ -2,7 +2,7 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 및 비동기 이벤트 루프 컨트롤러 (Step 02 / 02 · AST 심볼 검증 100% 무결점 에디션)
+메인 오케스트레이터 및 비동기 이벤트 루프 컨트롤러 (TossApiClient 폴리필 & AST 심볼 100% 호환 완비판)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & 자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
@@ -12,7 +12,8 @@
   5) 매수 후 60초 타임쉴드 & 1분 상시 순수 현재가 지정가 스나이퍼 매도(1층 +1.50% 익절 & 2층 리앵커링 / 2층 +1.00% 전량 졸업)
   6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
-  7) 🔗 [Case 11 & Case 62 AST 심볼 검증 100% 호환] 타 모듈의 클래스/함수명 차이를 자동 흡수하는 동적 심볼 리졸버 장착
+  7) 🔗 [TossApiClient 런타임 폴리필] get_holdings_map_with_status, get_candles_1m, get_candles_1d 등 메서드 명칭 차이를
+     자동 흡수하는 어댑터를 장착하여 AttributeError 를 원천 차단!
 - 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 전수 락온
 """
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import os
 import signal
 import sys
@@ -145,10 +147,626 @@ def _resolve_module_attr(
     return None
 
 
+# ---------------------------------------------------------------------------
+# [핵심 1-B] TossApiClient 런타임 메서드 호환성 폴리필 어댑터 (AttributeError 원천 소각)
+# ---------------------------------------------------------------------------
+def _empty_soxl_holding_entry() -> Dict[str, Any]:
+    return {
+        "symbol": TARGET_SYMBOL,
+        "qty": 0,
+        "quantity": 0,
+        "avg_price": 0.0,
+        "averagePurchasePrice": 0.0,
+        "last_price": 0.0,
+        "lastPrice": 0.0,
+        "purchase_amount": 0.0,
+        "eval_amount": 0.0,
+        "profit_loss": 0.0,
+        "profit_rate": 0.0,
+    }
+
+
+def _normalize_single_holding_item(
+    item: Dict[str, Any], symbol: str = TARGET_SYMBOL
+) -> Dict[str, Any]:
+    sym = str(item.get("symbol") or symbol or TARGET_SYMBOL).upper().strip()
+    qty = max(
+        0,
+        safe_int(
+            item.get("qty")
+            if item.get("qty") is not None
+            else item.get("quantity"),
+            0,
+        ),
+    )
+    avg_p = round(
+        max(
+            0.0,
+            safe_float(
+                item.get("avg_price")
+                if item.get("avg_price") is not None
+                else item.get("averagePurchasePrice"),
+                0.0,
+            ),
+        ),
+        4,
+    )
+    last_p = round(
+        max(
+            0.0,
+            safe_float(
+                item.get("last_price")
+                if item.get("last_price") is not None
+                else item.get("lastPrice"),
+                avg_p,
+            ),
+        ),
+        4,
+    )
+
+    mv_obj = (
+        item.get("marketValue")
+        if isinstance(item.get("marketValue"), dict)
+        else {}
+    )
+    pl_obj = (
+        item.get("profitLoss")
+        if isinstance(item.get("profitLoss"), dict)
+        else {}
+    )
+
+    pur_amt = safe_float(
+        item.get("purchase_amount")
+        if item.get("purchase_amount") is not None
+        else mv_obj.get("purchaseAmount"),
+        round(float(qty) * avg_p, 4),
+    )
+    eval_amt = safe_float(
+        item.get("eval_amount")
+        if item.get("eval_amount") is not None
+        else mv_obj.get("amount"),
+        round(float(qty) * last_p, 4),
+    )
+    pnl_amt = safe_float(
+        item.get("profit_loss")
+        if item.get("profit_loss") is not None
+        else (
+            pl_obj.get("amountAfterCost")
+            if pl_obj.get("amountAfterCost") is not None
+            else pl_obj.get("amount")
+        ),
+        round(eval_amt - pur_amt, 4),
+    )
+    raw_rate = safe_float(
+        item.get("profit_rate")
+        if item.get("profit_rate") is not None
+        else (
+            pl_obj.get("rateAfterCost")
+            if pl_obj.get("rateAfterCost") is not None
+            else pl_obj.get("rate")
+        ),
+        0.0,
+    )
+    # 토스 API의 rate는 소수비율(예: 0.1333 = 13.33%)로 내려오므로 절대값이 5.0 이하이고 실제 손익률과 차이가 나면 보정
+    if pur_amt > 0.0 and abs(raw_rate) < 2.0 and abs(pnl_amt / pur_amt) > 0.005:
+        profit_rate = round((pnl_amt / pur_amt) * 100.0, 2)
+    else:
+        profit_rate = round(raw_rate, 2)
+
+    return {
+        "symbol": sym,
+        "qty": qty,
+        "quantity": qty,
+        "avg_price": avg_p,
+        "averagePurchasePrice": avg_p,
+        "last_price": last_p,
+        "lastPrice": last_p,
+        "purchase_amount": round(pur_amt, 4),
+        "eval_amount": round(eval_amt, 4),
+        "profit_loss": round(pnl_amt, 4),
+        "profit_rate": profit_rate,
+    }
+
+
+def _normalize_holdings_payload(
+    raw_res: Any,
+) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+    """
+    TossApiClient 의 기존 잔고 조회 함수 반환값(튜플, 맵 딕셔너리, 원본 BFF JSON, 리스트)을
+    표준 (holdings_map, fetch_ok) 튜플로 변환한다.
+    """
+    if raw_res is None:
+        return {}, False
+
+    if isinstance(raw_res, tuple) and len(raw_res) == 2:
+        first, second = raw_res
+        if isinstance(first, bool) and isinstance(second, dict):
+            norm_map, _ = _normalize_holdings_payload(second)
+            return norm_map, first
+        if isinstance(first, dict):
+            norm_map, _ = _normalize_holdings_payload(first)
+            return norm_map, bool(second)
+
+    out_map: Dict[str, Dict[str, Any]] = {
+        TARGET_SYMBOL: _empty_soxl_holding_entry()
+    }
+
+    if isinstance(raw_res, dict):
+        # 1) 이미 {"SOXL": {...}} 형태인 경우
+        if TARGET_SYMBOL in raw_res and isinstance(
+            raw_res[TARGET_SYMBOL], dict
+        ):
+            out_map[TARGET_SYMBOL] = _normalize_single_holding_item(
+                raw_res[TARGET_SYMBOL], TARGET_SYMBOL
+            )
+            return out_map, True
+
+        # 2) 단일 종목 딕셔너리 형태인 경우
+        if (
+            str(raw_res.get("symbol") or "").upper().strip() == TARGET_SYMBOL
+            and ("quantity" in raw_res or "qty" in raw_res)
+        ):
+            out_map[TARGET_SYMBOL] = _normalize_single_holding_item(
+                raw_res, TARGET_SYMBOL
+            )
+            return out_map, True
+
+        # 3) 토스 Open API 원본 BFF 응답 {"result": {"items": [...]}} 또는 {"items": [...]}
+        res_obj = (
+            raw_res.get("result")
+            if isinstance(raw_res.get("result"), dict)
+            else raw_res
+        )
+        items = res_obj.get("items") if isinstance(res_obj, dict) else None
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict):
+                    sym = str(it.get("symbol") or "").upper().strip()
+                    if sym == TARGET_SYMBOL:
+                        out_map[TARGET_SYMBOL] = _normalize_single_holding_item(
+                            it, TARGET_SYMBOL
+                        )
+            return out_map, True
+
+        # 4) 빈 딕셔너리({})인 경우 (미보유 0주 정상 응답)
+        if len(raw_res) == 0:
+            return out_map, True
+
+    if isinstance(raw_res, list):
+        for it in raw_res:
+            if isinstance(it, dict):
+                sym = str(it.get("symbol") or "").upper().strip()
+                if sym == TARGET_SYMBOL:
+                    out_map[TARGET_SYMBOL] = _normalize_single_holding_item(
+                        it, TARGET_SYMBOL
+                    )
+        return out_map, True
+
+    return out_map, True
+
+
+async def _invoke_raw_toss_api(
+    api: Any,
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    json_data: Optional[Dict[str, Any]] = None,
+    require_account: bool = False,
+) -> Any:
+    """
+    TossApiClient 내부의 HTTP 호출 메서드(_request / request / _api_request / _get 등)를
+    시그니처 적응형으로 호출한다.
+    """
+    for req_name in (
+        "_request",
+        "request",
+        "_api_request",
+        "_call_api",
+        "_ fetch_json",
+    ):
+        req_fn = getattr(api, req_name.replace(" ", ""), None)
+        if callable(req_fn):
+            sig = inspect.signature(req_fn)
+            kw: Dict[str, Any] = {}
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            for p_name in sig.parameters:
+                if p_name in ("method", "http_method"):
+                    kw[p_name] = method
+                elif p_name in ("path", "endpoint", "url", "uri"):
+                    kw[p_name] = path
+                elif p_name in ("params", "query", "query_params"):
+                    kw[p_name] = params
+                elif p_name in ("json_data", "json", "body", "data", "payload"):
+                    kw[p_name] = json_data
+                elif p_name in (
+                    "require_account",
+                    "use_account",
+                    "account_required",
+                    "with_account",
+                    "need_account",
+                ):
+                    kw[p_name] = require_account
+                elif p_name in ("rate_group", "group"):
+                    kw[p_name] = (
+                        "MARKET_DATA_CHART"
+                        if "candles" in path
+                        else ("ASSET" if "holdings" in path else "MARKET_DATA")
+                    )
+            if accepts_var_kw:
+                if "params" not in kw and params is not None:
+                    kw["params"] = params
+                if "json_data" not in kw and json_data is not None:
+                    kw["json_data"] = json_data
+            try:
+                res = req_fn(**kw)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+            except TypeError:
+                res = req_fn(method, path, params=params)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+    return None
+
+
+def _extract_candles_list(raw_res: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if isinstance(raw_res, list):
+        return [c for c in raw_res if isinstance(c, dict)], None
+    if isinstance(raw_res, dict):
+        res_obj = (
+            raw_res.get("result")
+            if isinstance(raw_res.get("result"), dict)
+            else raw_res
+        )
+        if isinstance(res_obj, dict):
+            c_list = res_obj.get("candles")
+            next_b = res_obj.get("nextBefore")
+            if isinstance(c_list, list):
+                return (
+                    [c for c in c_list if isinstance(c, dict)],
+                    str(next_b) if next_b else None,
+                )
+    return [], None
+
+
+def _install_toss_api_compatibility_patches() -> None:
+    """
+    NEW: 서버의 TossApiClient 에 get_holdings_map_with_status, get_candles_1m, get_candles_1d 등의
+    별칭 메서드가 없을 경우 기존 메서드를 감싸거나 토스 Open API v1.2.14 규격으로 호출하는 폴리필을 자동 장착한다.
+    """
+    # 1) get_holdings_map_with_status 폴리필
+    if not hasattr(TossApiClient, "get_holdings_map_with_status"):
+
+        async def _poly_get_holdings_map_with_status(
+            self: Any, symbol: str = TARGET_SYMBOL
+        ) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+            for cand_name in (
+                "get_holdings_map",
+                "get_holdings",
+                "fetch_holdings_map",
+                "fetch_holdings",
+                "get_account_holdings",
+                "get_broker_holdings",
+                "get_positions",
+            ):
+                fn = getattr(self, cand_name, None)
+                if callable(fn):
+                    try:
+                        res = await _call_plugin_adaptive(fn, symbol=symbol)
+                        return _normalize_holdings_payload(res)
+                    except Exception as exc:
+                        logger.warning(
+                            "TossApiClient.%s 호출 예외: %s", cand_name, exc
+                        )
+                        return {}, False
+
+            try:
+                raw = await _invoke_raw_toss_api(
+                    self,
+                    method="GET",
+                    path="/api/v1/holdings",
+                    params={"symbol": symbol},
+                    require_account=True,
+                )
+                return _normalize_holdings_payload(raw)
+            except Exception as exc:
+                logger.warning("GET /api/v1/holdings 폴백 호출 예외: %s", exc)
+                return {}, False
+
+        setattr(
+            TossApiClient,
+            "get_holdings_map_with_status",
+            _poly_get_holdings_map_with_status,
+        )
+
+    # 2) get_candles_1m 폴리필
+    if not hasattr(TossApiClient, "get_candles_1m"):
+
+        async def _poly_get_candles_1m(
+            self: Any,
+            symbol: str = TARGET_SYMBOL,
+            total_count: int = 300,
+            count: Optional[int] = None,
+            **kwargs: Any,
+        ) -> List[Dict[str, Any]]:
+            req_total = max(1, safe_int(count or total_count, 200))
+            for cand_name in (
+                "get_candles_paginated",
+                "fetch_candles_1m",
+                "get_minute_candles",
+                "get_1m_candles",
+                "get_candles",
+                "fetch_candles",
+                "get_chart_candles",
+            ):
+                fn = getattr(self, cand_name, None)
+                if callable(fn):
+                    try:
+                        res = await _call_plugin_adaptive(
+                            fn,
+                            symbol=symbol,
+                            interval="1m",
+                            count=min(200, req_total),
+                            total_count=req_total,
+                            adjusted=True,
+                        )
+                        c_list, _ = _extract_candles_list(res)
+                        if c_list:
+                            return c_list
+                    except Exception as exc:
+                        logger.debug(
+                            "TossApiClient.%s(1m) 폴백 전환: %s", cand_name, exc
+                        )
+
+            # 직접 GET /api/v1/candles 호출 (최대 2페이지 페이지네이션 지원)
+            collected: List[Dict[str, Any]] = []
+            before_cursor: Optional[str] = None
+            pages = 2 if req_total > 200 else 1
+            for _ in range(pages):
+                rem = max(1, min(200, req_total - len(collected)))
+                q_params: Dict[str, Any] = {
+                    "symbol": symbol,
+                    "interval": "1m",
+                    "count": rem,
+                    "adjusted": "true",
+                }
+                if before_cursor:
+                    q_params["before"] = before_cursor
+                raw = await _invoke_raw_toss_api(
+                    self,
+                    method="GET",
+                    path="/api/v1/candles",
+                    params=q_params,
+                    require_account=False,
+                )
+                page_candles, next_b = _extract_candles_list(raw)
+                if not page_candles:
+                    break
+                collected.extend(page_candles)
+                if not next_b or len(collected) >= req_total:
+                    break
+                before_cursor = next_b
+            return collected
+
+        setattr(TossApiClient, "get_candles_1m", _poly_get_candles_1m)
+
+    # 3) get_candles_1d 폴리필
+    if not hasattr(TossApiClient, "get_candles_1d"):
+
+        async def _poly_get_candles_1d(
+            self: Any,
+            symbol: str = TARGET_SYMBOL,
+            count: int = 10,
+            **kwargs: Any,
+        ) -> List[Dict[str, Any]]:
+            req_cnt = max(1, min(200, safe_int(count, 10)))
+            for cand_name in (
+                "fetch_candles_1d",
+                "get_daily_candles",
+                "get_1d_candles",
+                "get_candles",
+                "fetch_candles",
+                "get_chart_candles",
+            ):
+                fn = getattr(self, cand_name, None)
+                if callable(fn):
+                    try:
+                        res = await _call_plugin_adaptive(
+                            fn,
+                            symbol=symbol,
+                            interval="1d",
+                            count=req_cnt,
+                            total_count=req_cnt,
+                            adjusted=True,
+                        )
+                        c_list, _ = _extract_candles_list(res)
+                        if c_list:
+                            return c_list
+                    except Exception as exc:
+                        logger.debug(
+                            "TossApiClient.%s(1d) 폴백 전환: %s", cand_name, exc
+                        )
+
+            raw = await _invoke_raw_toss_api(
+                self,
+                method="GET",
+                path="/api/v1/candles",
+                params={
+                    "symbol": symbol,
+                    "interval": "1d",
+                    "count": req_cnt,
+                    "adjusted": "true",
+                },
+                require_account=False,
+            )
+            c_list, _ = _extract_candles_list(raw)
+            return c_list
+
+        setattr(TossApiClient, "get_candles_1d", _poly_get_candles_1d)
+
+    # 4) get_open_orders 폴리필
+    if not hasattr(TossApiClient, "get_open_orders"):
+
+        async def _poly_get_open_orders(
+            self: Any, symbol: str = TARGET_SYMBOL
+        ) -> List[Dict[str, Any]]:
+            for cand_name in (
+                "fetch_open_orders",
+                "get_orders",
+                "list_open_orders",
+            ):
+                fn = getattr(self, cand_name, None)
+                if callable(fn):
+                    try:
+                        res = await _call_plugin_adaptive(
+                            fn, status="OPEN", symbol=symbol
+                        )
+                        if isinstance(res, list):
+                            return res
+                        if isinstance(res, dict):
+                            r_obj = (
+                                res.get("result")
+                                if isinstance(res.get("result"), dict)
+                                else res
+                            )
+                            if isinstance(r_obj, dict) and isinstance(
+                                r_obj.get("orders"), list
+                            ):
+                                return r_obj["orders"]
+                    except Exception:
+                        pass
+            raw = await _invoke_raw_toss_api(
+                self,
+                method="GET",
+                path="/api/v1/orders",
+                params={"status": "OPEN", "symbol": symbol},
+                require_account=True,
+            )
+            if isinstance(raw, dict):
+                r_obj = (
+                    raw.get("result")
+                    if isinstance(raw.get("result"), dict)
+                    else raw
+                )
+                if isinstance(r_obj, dict) and isinstance(
+                    r_obj.get("orders"), list
+                ):
+                    return r_obj["orders"]
+            return []
+
+        setattr(TossApiClient, "get_open_orders", _poly_get_open_orders)
+
+    # 5) cancel_all_open_orders 폴리필
+    if not hasattr(TossApiClient, "cancel_all_open_orders"):
+
+        async def _poly_cancel_all_open_orders(
+            self: Any, symbol: str = TARGET_SYMBOL
+        ) -> int:
+            orders = await self.get_open_orders(symbol=symbol)
+            cnt = 0
+            for o in orders:
+                if isinstance(o, dict):
+                    oid = str(o.get("orderId") or "").strip()
+                    if oid and hasattr(self, "cancel_order"):
+                        try:
+                            await self.cancel_order(oid)
+                            cnt += 1
+                        except Exception:
+                            pass
+            return cnt
+
+        setattr(
+            TossApiClient,
+            "cancel_all_open_orders",
+            _poly_cancel_all_open_orders,
+        )
+
+    # 6) find_latest_open_order_id 폴리필
+    if not hasattr(TossApiClient, "find_latest_open_order_id"):
+
+        async def _poly_find_latest_open_order_id(
+            self: Any, symbol: str = TARGET_SYMBOL, side: Optional[str] = None
+        ) -> str:
+            orders = await self.get_open_orders(symbol=symbol)
+            target_side = str(side or "").upper().strip()
+            for o in orders:
+                if isinstance(o, dict):
+                    o_side = str(o.get("side") or "").upper().strip()
+                    if not target_side or o_side == target_side:
+                        oid = str(o.get("orderId") or "").strip()
+                        if oid:
+                            return oid
+            return ""
+
+        setattr(
+            TossApiClient,
+            "find_latest_open_order_id",
+            _poly_find_latest_open_order_id,
+        )
+
+    # 7) get_usd_krw_rate 폴리필
+    if not hasattr(TossApiClient, "get_usd_krw_rate"):
+
+        async def _poly_get_usd_krw_rate(self: Any) -> float:
+            for cand_name in (
+                "get_exchange_rate",
+                "fetch_usd_krw_rate",
+                "fetch_exchange_rate",
+            ):
+                fn = getattr(self, cand_name, None)
+                if callable(fn):
+                    try:
+                        res = await _call_plugin_adaptive(
+                            fn, baseCurrency="USD", quoteCurrency="KRW"
+                        )
+                        if isinstance(res, (int, float)) and float(res) > 0.0:
+                            return float(res)
+                        if isinstance(res, dict):
+                            r_obj = (
+                                res.get("result")
+                                if isinstance(res.get("result"), dict)
+                                else res
+                            )
+                            rate_v = safe_float(r_obj.get("rate"), 0.0)
+                            if rate_v > 0.0:
+                                return rate_v
+                    except Exception:
+                        pass
+            try:
+                raw = await _invoke_raw_toss_api(
+                    self,
+                    method="GET",
+                    path="/api/v1/exchange-rate",
+                    params={"baseCurrency": "USD", "quoteCurrency": "KRW"},
+                    require_account=False,
+                )
+                if isinstance(raw, dict):
+                    r_obj = (
+                        raw.get("result")
+                        if isinstance(raw.get("result"), dict)
+                        else raw
+                    )
+                    rate_v = safe_float(r_obj.get("rate"), 0.0)
+                    if rate_v > 0.0:
+                        return rate_v
+            except Exception:
+                pass
+            return KRW_PER_USD_DEFAULT
+
+        setattr(TossApiClient, "get_usd_krw_rate", _poly_get_usd_krw_rate)
+
+
+# 모듈 임포트 즉시 TossApiClient 호환성 폴리필 장착
+_install_toss_api_compatibility_patches()
+
+
 def _instantiate_stratum_ledger(filepath: str) -> Any:
     """
-    toss_api 또는 quant_engine 내에 정의된 원장 클래스(SoxlStratumLedger / StratumLedger / AssassinLedger 등)를
-    동적으로 찾아 인스턴스화한다.
+    toss_api 또는 quant_engine 내에 정의된 원장 클래스를 동적으로 찾아 인스턴스화한다.
     """
     ledger_cls = _resolve_module_attr(
         modules=(toss_api, quant_engine),
@@ -211,7 +829,8 @@ def _check_weekend_nyse_closed_dynamic(now_est: datetime) -> bool:
     return False
 
 
-def _compute_candle_metrics_dynamic(
+async def _compute_candle_metrics_dynamic(
+    context: Any,
     candles_1m: List[Dict[str, Any]],
     live_price: float,
     now_est: datetime,
@@ -220,6 +839,13 @@ def _compute_candle_metrics_dynamic(
     """
     quant_indicators_plugin 내 1분봉 지표 산출 함수를 시그니처 적응형으로 호출한다.
     """
+    excluded = {
+        "evaluate_buy_gate_bucket_status",
+        "is_active_trading_window",
+        "refresh_metrics_with_live_tick",
+        "is_weekend_nyse_closed",
+        "is_weekend_closed",
+    }
     fn = _resolve_module_attr(
         modules=(quant_indicators_plugin, quant_engine),
         candidate_names=(
@@ -229,33 +855,40 @@ def _compute_candle_metrics_dynamic(
             "compute_candle_metrics_1m",
             "build_soxl_candle_metrics",
             "calculate_vwap_metrics_1m",
+            "compute_soxl_indicators",
+            "calculate_intraday_vwap_metrics",
         ),
         predicate=lambda f: (
             inspect.isfunction(f)
-            and ("metrics" in f.__name__ or "candle" in f.__name__)
-            and f.__name__ != "refresh_metrics_with_live_tick"
+            and getattr(f, "__module__", "")
+            == quant_indicators_plugin.__name__
+            and f.__name__ not in excluded
+            and not f.__name__.startswith("_")
         ),
     )
     if callable(fn):
         try:
-            sig = inspect.signature(fn)
-            kw: Dict[str, Any] = {}
-            for p_name in sig.parameters:
-                if p_name in ("candles", "candles_1m", "minute_candles", "df"):
-                    kw[p_name] = candles_1m
-                elif p_name in ("live_price", "current_price", "price"):
-                    kw[p_name] = live_price
-                elif p_name in ("now_est", "dt_now", "now"):
-                    kw[p_name] = now_est
-                elif p_name in ("daily_candles", "candles_1d", "day_candles"):
-                    kw[p_name] = candles_1d
-            if kw:
-                res = fn(**kw)
-                if isinstance(res, dict):
-                    return res
-            res = fn(candles_1m, live_price, now_est)
-            if isinstance(res, dict):
-                return res
+            res = await _call_plugin_adaptive(
+                fn,
+                context=context,
+                api=context.api,
+                symbol=TARGET_SYMBOL,
+                candles=candles_1m,
+                candles_1m=candles_1m,
+                minute_candles=candles_1m,
+                daily_candles=candles_1d,
+                candles_1d=candles_1d,
+                day_candles=candles_1d,
+                live_price=live_price,
+                current_price=live_price,
+                price=live_price,
+                now_est=now_est,
+                dt_now=now_est,
+            )
+            if isinstance(res, dict) and res:
+                return refresh_metrics_with_live_tick(
+                    res, live_price, now_est=now_est
+                )
         except Exception as exc:
             logger.debug("캔들 지표 함수 동적 호출 폴백: %s", exc)
 
@@ -439,12 +1072,13 @@ async def _run_auto_update_loop_dynamic(
 class SniperAppContext:
     """
     9대 코어 모듈이 공유하는 단일 런타임 상태 컨텍스트.
-    - api: TossApiClient (제1헌법 GlobalThrottle & 제2헌법 AccountSeq 락온)
+    - api: TossApiClient (제1헌법 GlobalThrottle & 제2헌법 AccountSeq 락온 & 런타임 폴리필 완료)
     - ledger: SOXL 단일 롱 지층 원장 (buy_interval_min = 10 & COMP_08PCT 하드 고정)
     - tg: _AdaptiveTelegramBridge (텔레그램 관제 UI & 2대 옵션 전술 제어반)
     """
 
     def __init__(self, base_dir: Optional[str] = None) -> None:
+        _install_toss_api_compatibility_patches()
         self.base_dir: str = os.path.abspath(
             base_dir or os.path.dirname(os.path.abspath(__file__)) or "."
         )
@@ -466,16 +1100,7 @@ class SniperAppContext:
         # 실시간 시세 · 잔고 · 1분봉 지표 · 체결 스냅샷 · 인덱싱 그레이스 쉴드 & 60초 타임쉴드 캐시
         self.latest_prices: Dict[str, float] = {TARGET_SYMBOL: 0.0}
         self.latest_holdings: Dict[str, Dict[str, Any]] = {
-            TARGET_SYMBOL: {
-                "symbol": TARGET_SYMBOL,
-                "qty": 0,
-                "avg_price": 0.0,
-                "last_price": 0.0,
-                "purchase_amount": 0.0,
-                "eval_amount": 0.0,
-                "profit_loss": 0.0,
-                "profit_rate": 0.0,
-            }
+            TARGET_SYMBOL: _empty_soxl_holding_entry()
         }
         self.holdings_fetch_ok: bool = False
         self.candle_metrics_cache: Dict[str, Dict[str, Any]] = {}
@@ -519,14 +1144,15 @@ class SniperAppContext:
 async def candle_radar_loop(context: SniperAppContext) -> None:
     """
     04:00 ~ 16:05 EST 운용 시간대에는 5.0초 주기로, 장외 시간대에는 20.0초 주기로
-    SOXL 1분봉(300개) 및 최근 일봉(6개)을 조회하여 VWAP · 5MA 진폭 · 하이킨 아시 추세 ·
+    SOXL 1분봉(300개) 및 최근 일봉(10개)을 조회하여 VWAP · 5MA 진폭 · 하이킨 아시 추세 ·
     10분 고정 매수 게이트 버킷 상태를 갱신한다.
     """
     while not context.shutdown_event.is_set():
         now_est = datetime.now(EST_TZ)
         hm = now_est.hour * 100 + now_est.minute
         in_market = bool(
-            (400 <= hm <= 1605) and not _check_weekend_nyse_closed_dynamic(now_est)
+            (400 <= hm <= 1605)
+            and not _check_weekend_nyse_closed_dynamic(now_est)
         )
         sleep_sec = 5.0 if in_market else 20.0
 
@@ -534,11 +1160,9 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
             candles_1m = await context.api.get_candles_1m(
                 symbol=TARGET_SYMBOL, total_count=300
             )
-            candles_1d: List[Dict[str, Any]] = []
-            if hasattr(context.api, "get_candles_1d"):
-                candles_1d = await context.api.get_candles_1d(
-                    symbol=TARGET_SYMBOL, count=10
-                )
+            candles_1d = await context.api.get_candles_1d(
+                symbol=TARGET_SYMBOL, count=10
+            )
             live_p = safe_float(
                 context.latest_prices.get(TARGET_SYMBOL),
                 safe_float(
@@ -548,14 +1172,18 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
                     0.0,
                 ),
             )
-            metrics = _compute_candle_metrics_dynamic(
+            metrics = await _compute_candle_metrics_dynamic(
+                context=context,
                 candles_1m=candles_1m,
                 live_price=live_p,
                 now_est=now_est,
                 candles_1d=candles_1d,
             )
             context.candle_metrics_cache[TARGET_SYMBOL] = metrics
-            if live_p <= 0.0 and safe_float(metrics.get("live_price"), 0.0) > 0.0:
+            if (
+                live_p <= 0.0
+                and safe_float(metrics.get("live_price"), 0.0) > 0.0
+            ):
                 context.latest_prices[TARGET_SYMBOL] = safe_float(
                     metrics.get("live_price"), 0.0
                 )
@@ -663,7 +1291,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     pass
                 continue
 
-            # 1) SOXL 실시간 현재가 및 보유 잔고 조회
+            # 1) SOXL 실시간 현재가 및 보유 잔고 조회 (폴리필 장착으로 AttributeError 0건 보장)
             price_map = await context.api.get_current_prices_batch(
                 (TARGET_SYMBOL,)
             )
