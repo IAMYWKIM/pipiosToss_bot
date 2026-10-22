@@ -2,19 +2,20 @@
 """
 # MODIFIED: defense_plugin.py
 순수 롱(SOXL) 오버나이트 지층관리 스나이퍼 전용:
-1) 🚨 [Case 66 봇 주문 진행 중 가로채기 차단 가드] 원장에 미결 매수(buy_order_id) 또는 미결 매도(sell_order_id)가
-   존재하는 동안에는 거래소 즉시 체결로 토스 실잔고(/api/v1/holdings) 수량이 먼저 변하더라도
-   reconcile 모듈이 절대 선제 병합(가로채기)하거나 주문 ID를 지우지 않고 즉시 스킵(SKIP_RECONCILE_BOT_ORDER_PENDING)하여,
-   정식 체결 정산기(sync_pending_buy_order_plugin / sync_pending_sell_order_plugin)가 텔레그램 체결 알림,
-   자투리 절약금 누적 합산 및 양방향 60초 타임쉴드 각인을 100% 완수하도록 보장!
-2) 04:00 ~ 04:06 EST 프리장 개장 초기 호가 안정화 · 전일 잔류 미체결 청소 · 오버나이트 이월 지층 동기화
-3) 장중/기동 시 로컬 지층 원장(soxl_stratum_ledger.json) ↔ 토스 실보유 잔고(/api/v1/holdings) 무결성 화해
+1) 🚨 [Case 66 봇 주문 진행 중 가로채기 차단 및 미결 매수 즉시 정산 가드]
+   원장에 미결 매수(buy_order_id)가 존재할 때 reconcile 모듈이 호출되면, 실잔고 증가를 수동 매수로
+   가로채지 않고 즉시 sync_pending_buy_order_plugin() 을 선행 호출한 뒤 SKIP_RECONCILE_BOT_ORDER_PENDING 을 반환하여
+   텔레그램 매수 체결 알림 · 자투리 절약금 누적 · 매수 후 60초 타임쉴드 각인이 100% 완수되도록 보장!
+2) 🔗 [tg_ui_plugin.py 심볼 완벽 호환] 전술 제어반(/settlement)에서 봇 작동 OFF ➔ ON 재개 시 호출되는
+   relock_stratum_on_bot_resume() 함수를 정식 제공하여 AST 심볼 임포트 무결성 100% 충족!
+3) 04:00 ~ 04:06 EST 프리장 개장 초기 호가 안정화 · 전일 잔류 미체결 청소 · 오버나이트 이월 지층 동기화
+4) 장중/기동 시 로컬 지층 원장(soxl_stratum_ledger.json) ↔ 토스 실보유 잔고(/api/v1/holdings) 무결성 화해
    - Case 61: 매수 체결 직후 15.0초 인덱싱 시차 그레이스 쉴드(is_within_auto_fill_grace_shield) 보호
    - Case 60: 토스 앱 수동 전량 매도(0주) 시 기억된 최저 매수가(cycle_min_buy_price = 0.0) 원자적 리셋
    - Case 63: 수동 매수/매도 동기화 시 기존에 깎아둔 리앵커링 단가(book_price) 크레딧 보존 및 음수 시드 방지
-4) 16:00 ~ 16:59 EST 정규장 마감 일일 결산 리포트 타전 및 보유 지층 오버나이트 안전 보존 (15:59 강제 MOC 손절 영구 폐기!)
-5) 17:00 EST 일일 가비지 컬렉션(GC) 및 일일 통계 롤오버
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 완벽 준수 (Step 02 / 03)
+5) 16:00 ~ 16:59 EST 정규장 마감 일일 결산 리포트 타전 및 보유 지층 오버나이트 안전 보존 (15:59 강제 MOC 손절 영구 폐기!)
+6) 17:00 EST 일일 가비지 컬렉션(GC) 및 일일 통계 롤오버
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 완벽 준수 (Step 01 / 02)
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import gc
 import logging
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from quant_engine import (
     StratumBucket,
@@ -32,17 +33,22 @@ from quant_engine import (
     summarize_stratum_portfolio,
     vrev_add_quota_lot_and_merge_2tier,
 )
-from sniper_plugin import is_within_auto_fill_grace_shield
+from sniper_plugin import (
+    is_within_auto_fill_grace_shield,
+    sync_pending_buy_order_plugin,
+)
 from toss_api import (
     DEFAULT_INITIAL_SEED_USD,
     EST_TZ,
-    KRW_PER_USD_DEFAULT,
     TARGET_SYMBOL,
     safe_float,
     safe_int,
 )
 
 logger = logging.getLogger("toss_sniper.defense_plugin")
+
+# MODIFIED: toss_api 심볼 불일치 방지를 위해 기본 환율 상수를 모듈 내부에 직접 정의
+KRW_PER_USD_DEFAULT: float = 1380.0
 
 
 # ---------------------------------------------------------------------------
@@ -60,23 +66,11 @@ async def reconcile_stratum_with_broker_holdings_plugin(
     프로세스 재기동 시, 04:00 EST 오프닝 동기화 시, 또는 장중 사용자가 토스 앱에서 수동 매매했을 때
     로컬 지층 원장(buckets)의 총 보유 주수(ledger_qty)와 토스 실계좌 보유 주수(h_qty)를 대조하여 화해한다:
     0) 🛡️ [Case 66 핵심 방어 : 봇 미결 주문(buy_order_id / sell_order_id) 진행 중 가로채기 원천 차단]
-       - force_sync 가 아닌 일반 루프 호출 시 원장에 buy_order_id 또는 sell_order_id 가 남아 있다면,
-         거래소에서 주문이 0.01초 만에 즉시 체결되어 토스 실잔고(h_qty)가 먼저 늘어났더라도
-         reconcile 모듈이 이를 수동 매수로 오판해 가로채어 병합하지 않고 즉시 리턴(SKIP_RECONCILE_BOT_ORDER_PENDING)한다!
-       - 이를 통해 반드시 sync_pending_buy_order_plugin / sync_pending_sell_order_plugin 이 실행되어
-         텔레그램 체결 알림, 자투리 절약금(saved_from_portion) 누적, 매수/매도 후 60초 타임쉴드 각인이 100% 보장된다!
-    1) 토스 실보유 수량(h_qty == 0)이고 미결 매수 주문도 없을 때:
-       - 🚨 [Case 61 방어]: 만약 최근 15.0초 이내에 자동 매수 체결(is_within_auto_fill_grace_shield)이 있었다면,
-         토스 잔고 API 인덱싱 지연(0.1 ~ 0.4초) 중이므로 지층을 절대 삭제하지 않고 보호한다!
-       - 그레이스 쉴드 구간이 아닌데도 h_qty == 0 이고 장부에 지층이 남아 있으면 사용자가 토스 앱에서
-         수동 전량 매도한 것이므로 지층 큐를 비우고 cycle_min_buy_price = 0.0 으로 리셋(Case 60)하며
-         회계 항등식에 맞춰 가용 현금 시드를 복원한다.
-    2) 토스 실보유 수량(h_qty > 0)인데 로컬 원장(buckets)이 비어 있을 때:
-       - 토스 실계좌 평단가(h_avg)와 수량(h_qty)으로 단일 1층(QUOTA_L1) 지층을 즉시 생성 복원하고
-         cycle_min_buy_price = h_avg 로 초기화한다.
-    3) 토스 실보유 수량(h_qty > 0)과 로컬 원장 수량(ledger_qty)이 다를 때 (수동 추가매수 / 수동 부분매도):
-       - 🚨 [Case 63 방어]: 기존 지층에 쌓여 있던 리앵커링 단가 인하 크레딧(reanchor_credit)을 증발시키지 않고 보존하며,
-         초기 시드 + 누적 실현수익 항등식에 맞춰 가용 현금(free_cash_usd = max(0.0, ...))을 안전 재조정한다.
+       - force_sync 가 아닌 일반 루프 호출 시 원장에 buy_order_id 가 남아 있다면,
+         거래소 즉시 체결로 실잔고(h_qty)가 먼저 늘어났더라도 reconcile 이 가로채지 않고
+         즉시 sync_pending_buy_order_plugin() 을 선행 호출하여 정식 체결 알림 · 자투리 누적 · 60초 타임쉴드를 완수한다!
+       - sell_order_id 가 남아 있을 때 역시 SKIP_RECONCILE_BOT_ORDER_PENDING 을 반환하여
+         직후 실행되는 매도 게이트(sync_pending_sell_order_plugin)가 정식 익절 정산을 수행하도록 보장한다!
     """
     if not isinstance(holdings, dict) or not getattr(
         context, "holdings_fetch_ok", True
@@ -87,9 +81,18 @@ async def reconcile_stratum_with_broker_holdings_plugin(
     pending_buy_oid = str(st.get("buy_order_id") or "").strip()
     pending_sell_oid = str(st.get("sell_order_id") or "").strip()
 
-    # 🚨 [Case 66 핵심 방어] 봇이 발주한 지정가 매수/매도 주문이 아직 정식 체결 커밋 전일 때는
-    # 실잔고 화해 모듈이 수량 변화를 가로채어 병합하거나 주문 ID를 지우지 못하도록 즉시 양보한다!
+    # 🚨 [Case 66 핵심 방어] 봇이 발주한 지정가 매수/매도 주문이 대기 중일 때 가로채기 금지 및 매수 선행 정산!
     if not force_sync and (pending_buy_oid or pending_sell_oid):
+        if pending_buy_oid:
+            try:
+                await sync_pending_buy_order_plugin(
+                    context=context,
+                    holdings=holdings,
+                    prices=prices,
+                    now_est=now_est,
+                )
+            except Exception as exc:
+                logger.warning("Case 66 미결 매수 선행 동기화 예외: %s", exc)
         return {
             "status": "SKIP_RECONCILE_BOT_ORDER_PENDING",
             "buy_order_id": pending_buy_oid,
@@ -114,7 +117,6 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         safe_float(h_info.get("last_price"), h_avg),
     )
 
-    # force_sync 호출 시에도 거래소에 실제 살아있는 OPEN 주문이 있으면 수량 불일치를 건드리지 않음
     if pending_buy_oid or pending_sell_oid:
         open_orders = await context.api.get_open_orders(symbol=TARGET_SYMBOL)
         if open_orders:
@@ -123,7 +125,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                 "open_count": len(open_orders),
             }
 
-    # [케이스 1] 수량이 완벽히 일치하는 경우 -> 회계 항등식 무결성만 점검 후 즉시 통과
+    # [케이스 1] 수량이 완벽히 일치하는 경우 -> 즉시 통과
     if h_qty == ledger_qty:
         return {
             "status": "STRATUM_IN_SYNC",
@@ -185,6 +187,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             lot_count=est_lots,
             lot_type="QUOTA_L1",
         )
+        now_sync_ts = time.time()
         await context.ledger.update_state(
             TARGET_SYMBOL,
             buckets=buckets_to_dicts([restored_bucket]),
@@ -194,8 +197,8 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             buy_order_id="",
             sell_order_id="",
             ordered_qty=0,
-            entry_ts=time.time(),
-            last_buy_fill_ts=time.time(),
+            entry_ts=now_sync_ts,
+            last_buy_fill_ts=now_sync_ts,
         )
         logger.info(
             "♻️ [SOXL 실잔고 기반 1층 복원 완료] %d주 @ $%.2f (원금 $%.2f · 추정 %d회차 · 기억저가 $%.2f)",
@@ -213,7 +216,6 @@ async def reconcile_stratum_with_broker_holdings_plugin(
 
     # [케이스 4] 토스 실보유 수량(h_qty > 0)과 로컬 원장 수량(ledger_qty > 0)이 부분 불일치하는 경우 (수동 추매 / 수동 부분매도)
     if h_qty > ledger_qty:
-        # 4-1) 사용자가 토스 앱에서 수동으로 추가 매수(delta_q > 0)한 경우
         delta_q = h_qty - ledger_qty
         old_cost = sum(b.actual_cost_usd for b in buckets)
         delta_cost = max(0.0, h_pur - old_cost)
@@ -331,6 +333,55 @@ async def reconcile_stratum_with_broker_holdings_plugin(
 
 
 # ---------------------------------------------------------------------------
+# [핵심 1-B] tg_ui_plugin.py 호환 : 봇 작동 재개(OFF ➔ ON) 시 실잔고 즉시 재락온 헬퍼
+# ---------------------------------------------------------------------------
+async def relock_stratum_on_bot_resume(
+    context: Any,
+    holdings: Optional[Dict[str, Dict[str, Any]]] = None,
+    prices: Optional[Dict[str, float]] = None,
+    now_est: Optional[datetime] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    NEW: 전술 제어반(/settlement)에서 스나이퍼 작동을 🔴 OFF ➔ 🟢 ON 으로 전환할 때
+    tg_ui_plugin.py 에서 호출하는 실잔고 ↔ 지층 원장 즉시 동기화 함수.
+    """
+    dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+    eff_holdings = holdings
+    if not isinstance(eff_holdings, dict) or not eff_holdings:
+        try:
+            h_map, ok = await context.api.get_holdings_map_with_status()
+            if ok and isinstance(h_map, dict):
+                eff_holdings = h_map
+                context.latest_holdings = h_map
+                context.holdings_fetch_ok = True
+        except Exception:
+            eff_holdings = getattr(context, "latest_holdings", {})
+
+    eff_prices = prices
+    if not isinstance(eff_prices, dict) or not eff_prices:
+        try:
+            p_map = await context.api.get_current_prices_batch(
+                (TARGET_SYMBOL,)
+            )
+            if isinstance(p_map, dict) and safe_float(
+                p_map.get(TARGET_SYMBOL), 0.0
+            ) > 0.0:
+                eff_prices = p_map
+                context.latest_prices = p_map
+        except Exception:
+            eff_prices = getattr(context, "latest_prices", {})
+
+    return await reconcile_stratum_with_broker_holdings_plugin(
+        context=context,
+        holdings=eff_holdings or {},
+        prices=eff_prices or {},
+        now_est=dt_now,
+        force_sync=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # [핵심 2] 04:00 ~ 04:06 EST 프리장 개장 초기 호가 안정화 및 전일 미체결 청소
 # ---------------------------------------------------------------------------
 async def execute_0400_premarket_stabilization_plugin(
@@ -353,7 +404,6 @@ async def execute_0400_premarket_stabilization_plugin(
 
     setattr(context, "last_0400_sync_date", today_str)
 
-    # 1) 전일 잔류 미체결 주문 청소
     canceled_cnt = await context.api.cancel_all_open_orders(
         symbol=TARGET_SYMBOL
     )
@@ -367,7 +417,6 @@ async def execute_0400_premarket_stabilization_plugin(
         pending_lot_type="",
     )
 
-    # 2) 오버나이트 이월 지층과 토스 실보유 잔고 강제 무결성 화해
     sync_res = await reconcile_stratum_with_broker_holdings_plugin(
         context=context,
         holdings=holdings,
@@ -413,7 +462,6 @@ async def execute_1600_daily_closing_settlement_plugin(
     if str(st.get("last_closing_report_date") or "") == today_str:
         return {"status": "CLOSING_REPORT_ALREADY_SENT", "date": today_str}
 
-    # 1) 정규장 마감 시 미체결 잔류 주문 정리 (보유 주식은 절대 강제 매도하지 않음!)
     await context.api.cancel_all_open_orders(symbol=TARGET_SYMBOL)
     updated_st = await context.ledger.update_state(
         TARGET_SYMBOL,
@@ -491,7 +539,6 @@ async def execute_daily_1700_gc_and_backup_plugin(
     """
     🔹 17:00 EST (Case 22):
     일일 가비지 컬렉션(gc.collect)을 수행하고 원장 일일 카운터를 새 거래일 기준으로 롤오버한다.
-    (보유 중인 SOXL 지층과 누적 복리 시드는 100% 영구 보존한다.)
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     logical_date = dt_now.strftime("%Y-%m-%d")

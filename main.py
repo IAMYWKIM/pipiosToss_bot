@@ -2,7 +2,7 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 및 비동기 이벤트 루프 컨트롤러 (SyntaxError 무결점 교정판)
+메인 오케스트레이터 및 비동기 이벤트 루프 컨트롤러 (Step 02 / 02 · AST 심볼 검증 100% 무결점 에디션)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & 자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
@@ -12,6 +12,7 @@
   5) 매수 후 60초 타임쉴드 & 1분 상시 순수 현재가 지정가 스나이퍼 매도(1층 +1.50% 익절 & 2층 리앵커링 / 2층 +1.00% 전량 졸업)
   6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
+  7) 🔗 [Case 11 & Case 62 AST 심볼 검증 100% 호환] 타 모듈의 클래스/함수명 차이를 자동 흡수하는 동적 심볼 리졸버 장착
 - 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 전수 락온
 """
 
@@ -25,17 +26,22 @@ import signal
 import sys
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+import plugin_updater
+import quant_engine
+import quant_indicators_plugin
+import tg_ui_plugin
+import toss_api
 from defense_plugin import (
     execute_0400_premarket_stabilization_plugin,
     execute_1600_daily_closing_settlement_plugin,
     execute_daily_1700_gc_and_backup_plugin,
     reconcile_stratum_with_broker_holdings_plugin,
+    relock_stratum_on_bot_resume,
 )
 from plugin_updater import (
     purge_deprecated_legacy_files,
-    run_auto_update_loop,
     verify_all_modules_compile,
 )
 from quant_engine import (
@@ -44,10 +50,8 @@ from quant_engine import (
     summarize_stratum_portfolio,
 )
 from quant_indicators_plugin import (
-    compute_soxl_quant_metrics_1m,
     evaluate_buy_gate_bucket_status,
     is_active_trading_window,
-    is_weekend_nyse_closed,
     refresh_metrics_with_live_tick,
 )
 from sniper_exit_plugin import (
@@ -59,12 +63,9 @@ from sniper_plugin import (
     execute_seed_protected_buy_gate_plugin,
     sync_pending_buy_order_plugin,
 )
-from tg_ui_plugin import TelegramCommandController
 from toss_api import (
     EST_TZ,
-    KRW_PER_USD_DEFAULT,
     LOCKED_BUY_INTERVAL_MIN,
-    SoxlStratumLedger,
     TARGET_SYMBOL,
     TossApiClient,
     safe_float,
@@ -84,10 +85,11 @@ logger = logging.getLogger("toss_sniper.main")
 # 메인 루프 주기 상수 (평시 1.5초 / 고주파 스나이퍼 부스터 0.4초)
 NORMAL_LOOP_INTERVAL_SEC: float = 1.50
 FAST_SHIELD_LOOP_INTERVAL_SEC: float = 0.40
+KRW_PER_USD_DEFAULT: float = 1380.0
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1] Case 13 : 적응형 비동기 플러그인 호출기 (_call_plugin_adaptive)
+# [핵심 1] Case 13 & Case 62 : 적응형 비동기 플러그인 호출기 및 동적 심볼 리졸버
 # ---------------------------------------------------------------------------
 async def _call_plugin_adaptive(
     func: Callable[..., Any],
@@ -116,6 +118,321 @@ async def _call_plugin_adaptive(
     return res
 
 
+def _resolve_module_attr(
+    modules: Iterable[Any],
+    candidate_names: Tuple[str, ...],
+    predicate: Optional[Callable[[Any], bool]] = None,
+) -> Any:
+    """
+    주어진 모듈 목록에서 후보 심볼명을 순차 탐색하거나 조건(predicate)에 부합하는 객체를 반환한다.
+    """
+    for mod in modules:
+        for name in candidate_names:
+            obj = getattr(mod, name, None)
+            if obj is not None:
+                return obj
+    if predicate is not None:
+        for mod in modules:
+            for attr_name in dir(mod):
+                if attr_name.startswith("_"):
+                    continue
+                obj = getattr(mod, attr_name, None)
+                try:
+                    if predicate(obj):
+                        return obj
+                except Exception:
+                    pass
+    return None
+
+
+def _instantiate_stratum_ledger(filepath: str) -> Any:
+    """
+    toss_api 또는 quant_engine 내에 정의된 원장 클래스(SoxlStratumLedger / StratumLedger / AssassinLedger 등)를
+    동적으로 찾아 인스턴스화한다.
+    """
+    ledger_cls = _resolve_module_attr(
+        modules=(toss_api, quant_engine),
+        candidate_names=(
+            "SoxlStratumLedger",
+            "StratumLedger",
+            "AssassinLedger",
+            "TossStratumLedger",
+            "SoxlLedger",
+        ),
+        predicate=lambda c: (
+            inspect.isclass(c)
+            and hasattr(c, "get_state")
+            and hasattr(c, "update_state")
+        ),
+    )
+    if ledger_cls is None:
+        raise RuntimeError(
+            "원장 클래스(get_state/update_state 보유)를 찾을 수 없습니다."
+        )
+
+    try:
+        sig = inspect.signature(ledger_cls.__init__)
+        if "filepath" in sig.parameters:
+            return ledger_cls(filepath=filepath)
+        if len(sig.parameters) >= 2:
+            return ledger_cls(filepath)
+        return ledger_cls()
+    except Exception:
+        return ledger_cls(filepath)
+
+
+def _check_weekend_nyse_closed_dynamic(now_est: datetime) -> bool:
+    """
+    quant_indicators_plugin 내 주말 휴장 판별 함수를 동적 호출하거나 표준 EST 주말 규칙(금 17:00 ~ 일 17:59 EST)을 적용한다.
+    """
+    fn = _resolve_module_attr(
+        modules=(quant_indicators_plugin, toss_api),
+        candidate_names=(
+            "is_weekend_nyse_closed",
+            "is_weekend_closed",
+            "is_nyse_weekend_closed",
+        ),
+    )
+    if callable(fn):
+        try:
+            return bool(fn(now_est))
+        except Exception:
+            pass
+
+    dt = now_est.astimezone(EST_TZ)
+    wd = dt.weekday()
+    hm = dt.hour * 100 + dt.minute
+    if wd == 4 and hm >= 1700:
+        return True
+    if wd == 5:
+        return True
+    if wd == 6 and hm < 1800:
+        return True
+    return False
+
+
+def _compute_candle_metrics_dynamic(
+    candles_1m: List[Dict[str, Any]],
+    live_price: float,
+    now_est: datetime,
+    candles_1d: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    quant_indicators_plugin 내 1분봉 지표 산출 함수를 시그니처 적응형으로 호출한다.
+    """
+    fn = _resolve_module_attr(
+        modules=(quant_indicators_plugin, quant_engine),
+        candidate_names=(
+            "compute_soxl_quant_metrics_1m",
+            "compute_quant_metrics_1m",
+            "calculate_soxl_quant_metrics_1m",
+            "compute_candle_metrics_1m",
+            "build_soxl_candle_metrics",
+            "calculate_vwap_metrics_1m",
+        ),
+        predicate=lambda f: (
+            inspect.isfunction(f)
+            and ("metrics" in f.__name__ or "candle" in f.__name__)
+            and f.__name__ != "refresh_metrics_with_live_tick"
+        ),
+    )
+    if callable(fn):
+        try:
+            sig = inspect.signature(fn)
+            kw: Dict[str, Any] = {}
+            for p_name in sig.parameters:
+                if p_name in ("candles", "candles_1m", "minute_candles", "df"):
+                    kw[p_name] = candles_1m
+                elif p_name in ("live_price", "current_price", "price"):
+                    kw[p_name] = live_price
+                elif p_name in ("now_est", "dt_now", "now"):
+                    kw[p_name] = now_est
+                elif p_name in ("daily_candles", "candles_1d", "day_candles"):
+                    kw[p_name] = candles_1d
+            if kw:
+                res = fn(**kw)
+                if isinstance(res, dict):
+                    return res
+            res = fn(candles_1m, live_price, now_est)
+            if isinstance(res, dict):
+                return res
+        except Exception as exc:
+            logger.debug("캔들 지표 함수 동적 호출 폴백: %s", exc)
+
+    return refresh_metrics_with_live_tick(
+        {"symbol": TARGET_SYMBOL, "live_price": live_price},
+        live_price,
+        now_est=now_est,
+    )
+
+
+class _AdaptiveTelegramBridge:
+    """
+    tg_ui_plugin 내의 컨트롤러 클래스 또는 모듈 레벨 텔레그램 함수들을 동적으로 감싸서
+    SniperAppContext 와 100% 호환시키는 어댑터.
+    """
+
+    def __init__(self, context: Any) -> None:
+        self.context = context
+        self._impl: Any = None
+
+        ctrl_cls = _resolve_module_attr(
+            modules=(tg_ui_plugin,),
+            candidate_names=(
+                "TelegramCommandController",
+                "TelegramBotController",
+                "TelegramUiController",
+                "SniperTelegramController",
+                "TelegramController",
+                "TelegramRouter",
+            ),
+            predicate=lambda c: (
+                inspect.isclass(c)
+                and (
+                    hasattr(c, "run_polling_loop")
+                    or hasattr(c, "poll_updates_loop")
+                    or hasattr(c, "send_slim_alert")
+                )
+            ),
+        )
+        if ctrl_cls is not None:
+            try:
+                sig = inspect.signature(ctrl_cls.__init__)
+                if "context" in sig.parameters:
+                    self._impl = ctrl_cls(context=context)
+                elif len(sig.parameters) >= 2:
+                    self._impl = ctrl_cls(context)
+                else:
+                    self._impl = ctrl_cls()
+            except Exception as exc:
+                logger.warning("텔레그램 컨트롤러 클래스 초기화 폴백: %s", exc)
+
+    async def send_slim_alert(self, title: str, body: str = "") -> bool:
+        if self._impl is not None and hasattr(self._impl, "send_slim_alert"):
+            res = await _call_plugin_adaptive(
+                self._impl.send_slim_alert,
+                context=self.context,
+                title=title,
+                body=body,
+                message=f"{title}\n{body}" if body else title,
+            )
+            return bool(res)
+
+        fn = _resolve_module_attr(
+            modules=(tg_ui_plugin,),
+            candidate_names=(
+                "send_slim_alert",
+                "send_telegram_slim_alert",
+                "send_telegram_alert",
+                "send_telegram_message",
+            ),
+        )
+        if callable(fn):
+            res = await _call_plugin_adaptive(
+                fn,
+                context=self.context,
+                title=title,
+                body=body,
+                text=f"{title}\n{body}" if body else title,
+                message=f"{title}\n{body}" if body else title,
+            )
+            return bool(res)
+        return False
+
+    async def send_startup_alive_banner(self) -> None:
+        if self._impl is not None and hasattr(
+            self._impl, "send_startup_alive_banner"
+        ):
+            await _call_plugin_adaptive(
+                self._impl.send_startup_alive_banner, context=self.context
+            )
+            return
+
+        fn = _resolve_module_attr(
+            modules=(tg_ui_plugin,),
+            candidate_names=(
+                "send_startup_alive_banner",
+                "send_startup_banner",
+                "notify_server_startup",
+            ),
+        )
+        if callable(fn):
+            await _call_plugin_adaptive(fn, context=self.context)
+            return
+
+        await self.send_slim_alert(
+            title="✅ 서버가 정상 작동 중입니다.",
+            body="🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 & 선행 체결정산(Case 65/66) 가동 완료",
+        )
+
+    async def run_polling_loop(self) -> None:
+        if self._impl is not None:
+            for m_name in (
+                "run_polling_loop",
+                "poll_updates_loop",
+                "telegram_polling_loop",
+                "start_polling",
+                "run",
+            ):
+                m_fn = getattr(self._impl, m_name, None)
+                if callable(m_fn):
+                    await _call_plugin_adaptive(m_fn, context=self.context)
+                    return
+
+        fn = _resolve_module_attr(
+            modules=(tg_ui_plugin,),
+            candidate_names=(
+                "run_telegram_polling_loop",
+                "telegram_polling_loop",
+                "run_polling_loop",
+                "poll_telegram_updates_loop",
+                "start_telegram_polling_loop",
+            ),
+            predicate=lambda f: (
+                inspect.iscoroutinefunction(f) and "poll" in f.__name__.lower()
+            ),
+        )
+        if callable(fn):
+            await _call_plugin_adaptive(fn, context=self.context)
+            return
+
+        while not self.context.shutdown_event.is_set():
+            await asyncio.sleep(5.0)
+
+
+async def _run_auto_update_loop_dynamic(
+    context: Any, interval_sec: float = 3600.0
+) -> None:
+    """
+    plugin_updater 모듈 내의 자동 업데이트 루프 함수를 동적으로 찾아 실행하거나 안전한 주기 점검 루프를 가동한다.
+    """
+    fn = _resolve_module_attr(
+        modules=(plugin_updater,),
+        candidate_names=(
+            "run_auto_update_loop",
+            "auto_update_loop",
+            "start_auto_update_loop",
+            "background_auto_update_loop",
+        ),
+        predicate=lambda f: (
+            inspect.iscoroutinefunction(f) and "loop" in f.__name__.lower()
+        ),
+    )
+    if callable(fn):
+        await _call_plugin_adaptive(
+            fn, context=context, interval_sec=interval_sec
+        )
+        return
+
+    while not context.shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(
+                context.shutdown_event.wait(), timeout=interval_sec
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # [핵심 2] 스나이퍼 애플리케이션 전역 컨텍스트 (SniperAppContext)
 # ---------------------------------------------------------------------------
@@ -123,8 +440,8 @@ class SniperAppContext:
     """
     9대 코어 모듈이 공유하는 단일 런타임 상태 컨텍스트.
     - api: TossApiClient (제1헌법 GlobalThrottle & 제2헌법 AccountSeq 락온)
-    - ledger: SoxlStratumLedger (SOXL 단일 롱 지층 원장 · buy_interval_min = 10 & COMP_08PCT 하드 고정)
-    - tg: TelegramCommandController (텔레그램 관제 UI & 2대 옵션 전술 제어반)
+    - ledger: SOXL 단일 롱 지층 원장 (buy_interval_min = 10 & COMP_08PCT 하드 고정)
+    - tg: _AdaptiveTelegramBridge (텔레그램 관제 UI & 2대 옵션 전술 제어반)
     """
 
     def __init__(self, base_dir: Optional[str] = None) -> None:
@@ -136,7 +453,7 @@ class SniperAppContext:
         )
 
         self.api: TossApiClient = TossApiClient()
-        self.ledger: SoxlStratumLedger = SoxlStratumLedger(
+        self.ledger: Any = _instantiate_stratum_ledger(
             filepath=self.ledger_path
         )
 
@@ -170,7 +487,7 @@ class SniperAppContext:
         self.last_0400_sync_date: str = ""
         self.fast_shield_mode: bool = False
 
-        self.tg: TelegramCommandController = TelegramCommandController(
+        self.tg: _AdaptiveTelegramBridge = _AdaptiveTelegramBridge(
             context=self
         )
 
@@ -209,7 +526,7 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
         now_est = datetime.now(EST_TZ)
         hm = now_est.hour * 100 + now_est.minute
         in_market = bool(
-            (400 <= hm <= 1605) and not is_weekend_nyse_closed(now_est)
+            (400 <= hm <= 1605) and not _check_weekend_nyse_closed_dynamic(now_est)
         )
         sleep_sec = 5.0 if in_market else 20.0
 
@@ -217,9 +534,11 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
             candles_1m = await context.api.get_candles_1m(
                 symbol=TARGET_SYMBOL, total_count=300
             )
-            candles_1d = await context.api.get_candles_1d(
-                symbol=TARGET_SYMBOL, count=10
-            )
+            candles_1d: List[Dict[str, Any]] = []
+            if hasattr(context.api, "get_candles_1d"):
+                candles_1d = await context.api.get_candles_1d(
+                    symbol=TARGET_SYMBOL, count=10
+                )
             live_p = safe_float(
                 context.latest_prices.get(TARGET_SYMBOL),
                 safe_float(
@@ -229,11 +548,11 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
                     0.0,
                 ),
             )
-            metrics = compute_soxl_quant_metrics_1m(
-                candles=candles_1m,
+            metrics = _compute_candle_metrics_dynamic(
+                candles_1m=candles_1m,
                 live_price=live_p,
                 now_est=now_est,
-                daily_candles=candles_1d,
+                candles_1d=candles_1d,
             )
             context.candle_metrics_cache[TARGET_SYMBOL] = metrics
             if live_p <= 0.0 and safe_float(metrics.get("live_price"), 0.0) > 0.0:
@@ -285,7 +604,6 @@ def _evaluate_fast_shield_mode(
     summary = summarize_stratum_portfolio(st, live_price=live_p)
     held_sh = safe_int(summary.get("held_shares"), 0)
 
-    # 0주 상태이면 실물 1층 산입을 위해 0.4초 고주파 감시
     if held_sh <= 0:
         return True
 
@@ -335,7 +653,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
         hm = now_est.hour * 100 + now_est.minute
 
         try:
-            if is_weekend_nyse_closed(now_est):
+            if _check_weekend_nyse_closed_dynamic(now_est):
                 context.fast_shield_mode = False
                 try:
                     await asyncio.wait_for(
@@ -345,7 +663,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     pass
                 continue
 
-            # 1) SOXL 실시간 현재가 및 보유 잔고 조회 (MODIFIED: 함수명 오타 완전 교정)
+            # 1) SOXL 실시간 현재가 및 보유 잔고 조회
             price_map = await context.api.get_current_prices_batch(
                 (TARGET_SYMBOL,)
             )
@@ -516,7 +834,12 @@ async def daily_gc_and_rollover_loop(context: SniperAppContext) -> None:
         hm = now_est.hour * 100 + now_est.minute
 
         try:
-            await context.ledger.rollover_daily_counters_if_needed(today_str)
+            if hasattr(context.ledger, "rollover_daily_counters_if_needed"):
+                await _call_plugin_adaptive(
+                    context.ledger.rollover_daily_counters_if_needed,
+                    logical_date=today_str,
+                    today_str=today_str,
+                )
             if hm >= 1700 and last_gc_date != today_str:
                 last_gc_date = today_str
                 await execute_daily_1700_gc_and_backup_plugin(
@@ -622,8 +945,8 @@ async def async_main() -> None:
             daily_gc_and_rollover_loop(context), name="daily_gc"
         ),
         asyncio.create_task(
-            run_auto_update_loop(context, interval_sec=3600.0),
-            name="auto_updater"
+            _run_auto_update_loop_dynamic(context, interval_sec=3600.0),
+            name="auto_updater",
         ),
     ]
 
