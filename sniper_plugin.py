@@ -2,15 +2,17 @@
 """
 # MODIFIED: sniper_plugin.py
 순수 롱(SOXL) 전용 '04:07 ~ 16:00 EST 8%(12.5분할) 황금비율 정액제 기반 정량 매수 ·
-0주 졸업 즉시 현재가 1회분 1층 산입(Zero-Exposure Lag 제거) ·
-10분(또는 30분) 시드보호 매수 게이트(Seed Protection Gate : 1~6회 -1.0% / 7~11회 -1.5% / 12회+ -2.0% 미달 시 패스) ·
-무팽창 True Always-L1(ANTI_BLOAT 신저가 한정 추매) 및 체결 시 2-Tier 가중병합·자투리 시드 귀속' 코어 플러그인 (Step 04 / 09)
-- MODIFIED: 제3헌법에 의거하여 구버전 프리장 추세 주도주(SOXS/SOXL) 선정 및 동적 VWAP -0.50% 매수덫 데드코드 100% 영구 소각
-- NEW: 직전 매매 기준가(anchor_price)로 8% 정량 주수(target_qty)를 먼저 고정한 뒤 하락한 현재가(price_t)에 매수하여
-  남는 자투리 절약금(portion_budget - actual_spent)을 가용 현금 시드(free_cash_usd)에 실시간 복리 산입(Case 25 ~ 35)
-- NEW: 동일 10분/30분 버킷 내 중복 매수 판정을 원천 차단(last_evaluated_buy_bucket_id 락온, Case 36)하고,
-  하락 조건 미충족 시 매수를 100% 패스하여 seed_protect_pass_cnt 를 정밀 집계
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 58 완벽 준수
+1층 공석(0주 상태 또는 1층 익절 직후 2층 MERGED_UPPER 단독 잔존) 시 대기 없는 현재가 즉시 실물 1층(REENTRY_1FL) 산입 ·
+기억된 사이클 최저 매수가(cycle_min_buy_price) 잠금 기반 10분 고정 시드보호 매수 게이트(Real-Cash ANTI_BLOAT :
+기억된 최저가 대비 1~6회 -1.0% / 7~11회 -1.5% / 12회+ -2.0% 신저가 미달 시 100% 매수 패스) 및
+체결 시 2-Tier 병합·자투리 시드 귀속' 코어 플러그인 (Step 02 / 04)
+- MODIFIED (Case 59): 0주일 때뿐만 아니라 1층이 팔려 2층(MERGED_UPPER)만 단독 보유 중일 때도
+  즉시 현재가로 실물 1층(REENTRY_1FL)을 매수하여(2층 비병합 독립 배치) 계단식 상승 수익을 실물 수확!
+- MODIFIED (Case 60): REENTRY_1FL 체결 시 기억된 최저 매수가(cycle_min_buy_price)를 절대 현재 매수가로
+  상향 덮어쓰지 않고 잠금 유지하며, 10분 매수 게이트에서는 반드시 기억된 최저가 대비 신저가 도달 시에만
+  정량 추매(DIP_1FL)를 허용하여 박스권 재고 팽창을 100% 원천 봉쇄!
+- MODIFIED (Case 64): 매수 게이트 주기를 10분(LOCKED_BUY_INTERVAL_MIN = 10)으로 하드 고정
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 64 완벽 준수
 """
 
 from __future__ import annotations
@@ -48,16 +50,19 @@ from toss_api import (
 
 logger = logging.getLogger("toss_sniper.sniper_plugin")
 
+# Case 64: 시드보호 매수 게이트 주기는 10분으로 하드 고정 (30분 옵션 배제)
+LOCKED_BUY_INTERVAL_MIN: int = 10
+
 # 미체결 지정가 매수 주문 체결 유도 정정 대기 시간(초) 및 최대 유지 시간(초)
 BUY_ORDER_MODIFY_CHASE_SEC: float = 10.0
 BUY_ORDER_MAX_WAIT_SEC: float = 45.0
 
-# 매수 FILLED 직후 토스 잔고 API(/api/v1/holdings) 인덱싱 시차(0.1 ~ 0.4초) 보호 그레이스 쉴드 유지 시간(초)
+# Case 61: 매수 FILLED 직후 토스 잔고 API(/api/v1/holdings) 인덱싱 시차(0.1 ~ 0.4초) 보호 그레이스 쉴드(초)
 AUTO_FILL_GRACE_SHIELD_SEC: float = 15.0
 
 
 # ---------------------------------------------------------------------------
-# 내부 헬퍼 : 매수 체결 직후 잔고 인덱싱 시차 보호 그레이스 쉴드 (Case 58)
+# 내부 헬퍼 : 매수 체결 직후 잔고 인덱싱 시차 보호 그레이스 쉴드 (Case 58, Case 61)
 # ---------------------------------------------------------------------------
 def mark_auto_fill_grace_shield(
     context: Any,
@@ -67,9 +72,9 @@ def mark_auto_fill_grace_shield(
     filled_qty: int = 0,
 ) -> None:
     """
-    🚨 Case 58:
+    🚨 Case 61:
     매수 주문이 거래소에서 FILLED 된 직후 토스 잔고 API(/api/v1/holdings) 인덱싱 시차(0.1 ~ 0.4초) 동안
-    잔고 동기화 모듈이 장부를 오판하지 않도록 15.0초 그레이스 쉴드 타임스탬프를 각인한다.
+    잔고 동기화 모듈이 방금 산 1층을 수동 매도(0주)로 오판하지 않도록 15.0초 그레이스 쉴드를 각인한다.
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
     guard_map = getattr(context, "indexing_grace_cache", None)
@@ -127,7 +132,7 @@ def _get_live_soxl_price(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1] 미체결 매수 주문 체결 확인 · 2-Tier 가중병합 · 자투리 절약금 시드 귀속
+# [핵심 1] 매수 체결(FILLED) 커밋 · 2-Tier 배치 · 기억된 저가 잠금 · 자투리 시드 귀속
 # ---------------------------------------------------------------------------
 async def _commit_filled_buy_to_stratum_ledger(
     context: Any,
@@ -137,14 +142,16 @@ async def _commit_filled_buy_to_stratum_ledger(
     lot_type: str,
 ) -> Dict[str, Any]:
     """
-    🎯 1 & 🎯 3 & Case 25, 46, 53:
+    🎯 1 & 🎯 3 & 🎯 4 & Case 25, 46, 53, 59, 60, 61:
     매수 주문 체결(FILLED)이 확인된 즉시:
     1) 실제 소요 원금(actual_spent = filled_qty * avg_fill_price)과
        1회분 정액 예산 대비 절약된 자투리 금액(saved_from_portion = max(0, portion_budget - actual_spent))을 산출한다.
-    2) vrev_add_quota_lot_and_merge_2tier() 를 호출하여 신규 매수분은 1층(L1)에 순수 단가로 보존하고,
-       기존 지층들은 단일 상위 2층(L2, MERGED_UPPER)으로 원자적 가중평균 병합한다.
-    3) anchor_price, cycle_min_buy_price, ratchet_anchor_price 및 누적 통계를 갱신하고
-       AssassinLedger.update_state() 로 회계 항등식(free_cash_usd 자동 반영)과 함께 원자적 영속화한다.
+    2) vrev_add_quota_lot_and_merge_2tier() 를 호출하여:
+       - 2층(MERGED_UPPER) 단독 보유 중 REENTRY_1FL 체결 시에는 2층을 병합하지 않고 [L1(REENTRY_1FL), L2] 로 독립 배치(Case 59)하고,
+       - 신저가 추매(DIP_1FL / QUOTA_L1) 체결 시에는 신규 매수분을 1층에 두고 기존 지층들을 단일 2층으로 가중평균 병합한다.
+    3) 🚨 Case 60: 기억된 사이클 최저 매수가(cycle_min_buy_price)는 0주에서 첫 진입(was_empty)이거나
+       기존 최저가보다 더 낮게 산 경우에만 갱신(min(old_min_p, fill_p))하며,
+       REENTRY_1FL 고점 재매수가로 절대 상향 덮어쓰지 않고 기존 최저가를 철벽 잠금 유지한다!
     """
     st = context.ledger.get_state(TARGET_SYMBOL)
     old_buckets = buckets_from_dicts(st.get("buckets", []))
@@ -152,6 +159,7 @@ async def _commit_filled_buy_to_stratum_ledger(
     q_int = max(1, safe_int(filled_qty, 1))
     fill_p = round(max(0.01, safe_float(avg_fill_price, 0.01)), 4)
     actual_spent = round(float(q_int) * fill_p, 4)
+    tag = str(lot_type or "QUOTA_L1").upper().strip()
 
     eff_portion_budget = safe_float(portion_budget, 0.0)
     if eff_portion_budget <= 0.0:
@@ -159,14 +167,22 @@ async def _commit_filled_buy_to_stratum_ledger(
     saved_from_portion = round(max(0.0, eff_portion_budget - actual_spent), 4)
 
     was_empty = len(old_buckets) == 0
+    was_l2_only = bool(
+        len(old_buckets) == 1
+        and str(old_buckets[0].lot_type).upper() == "MERGED_UPPER"
+    )
+
     new_buckets = vrev_add_quota_lot_and_merge_2tier(
         queue=old_buckets,
         buy_qty=q_int,
         buy_price=fill_p,
         actual_spent_usd=actual_spent,
-        lot_type=str(lot_type or "QUOTA_L1"),
+        lot_type=tag,
     )
 
+    # 🚨 Case 60: 기억된 최저 매수가(cycle_min_buy_price) 잠금!
+    # 0주에서 첫 진입이거나 old_min_p 가 없을 때만 fill_p 로 초기화하고,
+    # 2층이 있을 때 REENTRY_1FL 로 고점 재매수한 경우에는 기존 최저 매수가(old_min_p)를 그대로 보존한다!
     old_min_p = safe_float(st.get("cycle_min_buy_price"), 0.0)
     if was_empty or old_min_p <= 0.0:
         new_cycle_min_p = fill_p
@@ -196,7 +212,7 @@ async def _commit_filled_buy_to_stratum_ledger(
     mark_auto_fill_grace_shield(
         context=context,
         symbol=TARGET_SYMBOL,
-        lot_type=lot_type,
+        lot_type=tag,
         fill_price=fill_p,
         filled_qty=q_int,
     )
@@ -225,27 +241,41 @@ async def _commit_filled_buy_to_stratum_ledger(
     free_cash_now = safe_float(updated_st.get("free_cash_usd"), 0.0)
     summary = summarize_stratum_portfolio(updated_st, live_price=fill_p)
     l1_target = safe_float(summary.get("l1_target_price"), 0.0)
+    trig_buy_p = safe_float(summary.get("trigger_buy_price"), 0.0)
 
     if hasattr(context, "send_slim_alert"):
-        l2_note = ""
-        if len(new_buckets) >= 2:
+        if was_l2_only and tag == "REENTRY_1FL" and len(new_buckets) >= 2:
             b2 = new_buckets[1]
-            l2_note = f" · 2층({b2.qty}주@${b2.book_price:.2f}) 병합"
-        await context.send_slim_alert(
-            title=f"🔵 [SOXL {new_held_lots}회차 8% 정량 매수 체결] {q_int}주 @ ${fill_p:.2f}",
-            body=(
+            title_str = (
+                f"🔥 [SOXL 실물 1층 상시 재매수 체결] {q_int}주 @ ${fill_p:.2f} (2층 비병합)"
+            )
+            body_str = (
+                f"1층목표 ${l1_target:.2f}(+1.5%) · 2층({b2.qty}주@${b2.book_price:.2f}) 유지 · "
+                f"🛡️기억저가 ${new_cycle_min_p:.2f}(추매가 ${trig_buy_p:.2f} 이하) · 가용현금 ${free_cash_now:,.2f}"
+            )
+        else:
+            l2_note = ""
+            if len(new_buckets) >= 2:
+                b2 = new_buckets[1]
+                l2_note = f" · 2층({b2.qty}주@${b2.book_price:.2f}) 병합"
+            title_str = (
+                f"🔵 [SOXL {new_held_lots}회차 8% 정량 매수 체결] {q_int}주 @ ${fill_p:.2f}"
+            )
+            body_str = (
                 f"실사용 ${actual_spent:,.2f} (자투리 +${saved_from_portion:.2f} 시드보존) "
                 f"· 1층목표 ${l1_target:.2f}{l2_note} · 가용현금 ${free_cash_now:,.2f} (총 {new_held_shares}주)"
-            ),
-        )
+            )
+        await context.send_slim_alert(title=title_str, body=body_str)
 
     return {
         "status": "BUY_FILLED_AND_MERGED",
         "symbol": TARGET_SYMBOL,
+        "lot_type": tag,
         "filled_qty": q_int,
         "fill_price": fill_p,
         "actual_spent_usd": actual_spent,
         "saved_from_portion_usd": saved_from_portion,
+        "cycle_min_buy_price": round(new_cycle_min_p, 4),
         "held_lots": new_held_lots,
         "held_shares": new_held_shares,
         "free_cash_usd": free_cash_now,
@@ -259,11 +289,11 @@ async def sync_pending_buy_order_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 1 & 🎯 5 & Case 19, 24, 58:
+    🎯 1 & 🎯 5 & Case 19, 24, 59, 60, 61:
     장부에 대기 중인 미체결 매수 주문(buy_order_id)이 존재할 때:
     1) GET /api/v1/orders/{orderId} 로 실제 체결 상태(FILLED / PARTIAL_FILLED / PENDING / CANCELED)를 조회한다.
     2) FILLED 확인 즉시 실제 평균 체결가(execution.averageFilledPrice)와 체결 수량(filledQuantity)으로
-       2-Tier 지층 병합 및 자투리 시드 귀속을 완료한다.
+       2-Tier 지층 배치/병합 및 자투리 시드 귀속을 완료한다.
     3) PENDING 상태로 10초 이상 미체결 표류 시 현재 매도 1호가(Ask 1) 또는 현재가로 주문 단가를
        즉시 정정(modify_order)하여 정량 매수 누락을 방지한다.
     """
@@ -291,7 +321,7 @@ async def sync_pending_buy_order_plugin(
         filled_q = safe_int(exec_obj.get("filledQuantity"), 0)
         avg_fill_p = safe_float(exec_obj.get("averageFilledPrice"), 0.0)
 
-        # 1) 전량 체결 완료(FILLED) 또는 부분 체결 후 취소 완료된 경우
+        # 1) 전량 체결 완료(FILLED) 또는 부분 체결 후 종료된 경우
         if ord_status == "FILLED" or (
             filled_q > 0 and ord_status in ("CANCELED", "REJECTED", "REPLACED")
         ):
@@ -311,7 +341,6 @@ async def sync_pending_buy_order_plugin(
                 st.get("last_modify_mono"), time.monotonic()
             )
             if elapsed >= BUY_ORDER_MAX_WAIT_SEC:
-                # 45초 경과 시 잔여 미체결분 취소 후 체결된 수량만큼 즉시 지층에 반영 (Case 58)
                 try:
                     await context.api.cancel_order(buy_oid)
                 except Exception:
@@ -394,7 +423,7 @@ async def sync_pending_buy_order_plugin(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 04:07 ~ 16:00 EST 0주 즉시 1층 산입 & 10분(30분) 시드보호 매수 게이트
+# [핵심 2] 04:07 ~ 16:00 EST 1층 공석 즉시 실물 매수 & 기억된 저가 기준 10분 시드보호 게이트
 # ---------------------------------------------------------------------------
 async def execute_seed_protected_buy_gate_plugin(
     context: Any,
@@ -403,21 +432,27 @@ async def execute_seed_protected_buy_gate_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 1 & 🎯 2 & 🎯 4 & Case 25 ~ 58:
+    🎯 1 & 🎯 2 & 🎯 4 & Case 25 ~ 64:
     04:07:00 ~ 16:00:00 EST 운용 구간에서:
     1) 미체결 매수/매도 주문이 대기 중이면 중복 매수 발사를 차단한다.
-    2) [0주 즉시 1층 산입 (True Always-L1)] :
-       보유 지층이 0주(len(buckets) == 0)이고 실보유 잔고도 0주이면,
-       10분/30분 게이트나 -1% 하락을 기다리지 않고 즉시 현재가 기준으로 8% 정량을 산출하여
-       첫 1층(REENTRY_1FL) 지정가 매수 주문을 발사한다!
-    3) [10분 / 30분 시드보호 매수 게이트 (Seed Protection Gate)] :
-       이미 지층(1층 또는 2층)을 보유 중일 때는 오직 04:07 EST 기점 10분(또는 30분) 신규 버킷
-       오픈 시에만(동일 버킷 중복 판정 100% 차단) 기준가 대비 등락률(chg_for_buy_pct)을 계산한다:
-       - 1 ~  6회차 보유 중 : -1.00% 이하 하락 시에만 매수
-       - 7 ~ 11회차 보유 중 : -1.50% 이하 하락 시에만 매수
-       - 12회차 이상 보유 중: -2.00% 이하 하락 시에만 매수
-       * 조건 미충족 시: 매수를 100% 패스하고 seed_protect_pass_cnt += 1 기록하여 현금 시드를 보호한다!
-       * 조건 충족 시: 직전 기준가(ref_buy_anchor)로 확정한 8% 정량 주수를 하락한 현재가에 지정가 매수한다!
+    2) 🔥 [분기 A : 1층 공격수 공석 상태 — 대기 없이 즉시 현재가 실물 1층(REENTRY_1FL) 매수! (Case 59)]
+       - 조건 A-1: 보유 지층이 0주(len(buckets) == 0 and h_qty == 0)일 때
+       - 조건 A-2: 1층이 실물 익절되어 장부에 상위 2층(len(buckets) == 1 and buckets[0].lot_type == "MERGED_UPPER")만
+                   단독 잔존하여 하부 1층 공격수가 비어 있을 때
+       - 동작: 10분 게이트나 하락을 기다리지 않고 즉시 현재가 기준으로 8% 정량을 산출하여
+               실물 1층(REENTRY_1FL) 지정가 매수 주문을 발사한다!
+               (체결 시 2층과 병합하지 않고 독립된 1층으로 배치하며, 기억된 최저 매수가 cycle_min_buy_price 는
+                절대 상향 덮어쓰지 않고 잠금 유지한다!)
+    3) 🛡️ [분기 B : 실물 1층 보유 중 — 10분 고정 시드보호 매수 게이트 & 기억된 최저가 기준 판정! (Case 60, 64)]
+       - 이미 1층 공격수를 보유 중일 때는 오직 04:07 EST 기점 10분 간격 신규 버킷 오픈 시에만 판정한다.
+       - 이때 하락률 계산 기준가(ref_buy_anchor)는 방금 산 1층 단가가 아니라
+         반드시 기억된 사이클 최저 매수가(min(buckets[0].book_price, anchor_price, cycle_min_buy_price))로 고정한다!
+       - 기억된 최저 매수가 대비 등락률(chg_for_buy_pct)을 계산하여:
+         * 1 ~  6회차 보유 중 : -1.00% 이하 신저가 도달 시에만 추매
+         * 7 ~ 11회차 보유 중 : -1.50% 이하 신저가 도달 시에만 추매
+         * 12회차 이상 보유 중: -2.00% 이하 신저가 도달 시에만 추매
+       - 조건 미충족 시: 매수를 100% 패스(seed_protect_pass_cnt += 1)하여 박스권 재고 팽창을 원천 차단하고 시드를 보호한다!
+       - 조건 충족 시: 기억된 최저가(ref_buy_anchor)로 확정한 8% 정량 주수를 하락한 현재가에 실물 추매(DIP_1FL)한다!
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
@@ -439,7 +474,7 @@ async def execute_seed_protected_buy_gate_plugin(
     if not bool(st.get("is_active", True)):
         return {"status": "BOT_INACTIVE"}
 
-    # 미체결 매도 주문이 진행 중이면 매도 완료까지 대기 (동일 틱 자전거래 방지, Case 38)
+    # 미체결 매도 주문이 진행 중이면 매도 완료까지 대기 (동일 틱 자전거래 방지, Case 44)
     if str(st.get("sell_order_id") or "").strip():
         return {"status": "SELL_ORDER_IN_PROGRESS"}
 
@@ -459,20 +494,35 @@ async def execute_seed_protected_buy_gate_plugin(
     cost_equity = free_cash + actual_invested
     portion_mode = str(st.get("portion_mode") or "COMP_08PCT").upper()
     threshold_mode = str(st.get("threshold_mode") or "08_VREV_PROG").upper()
-    buy_interval_min = safe_int(st.get("buy_interval_min"), 10)
+    buy_interval_min = LOCKED_BUY_INTERVAL_MIN
+
+    is_zero_shares = bool(len(buckets) == 0 and h_qty == 0)
+    is_l2_only_vacant_l1 = bool(
+        len(buckets) == 1
+        and str(buckets[0].lot_type).upper() == "MERGED_UPPER"
+    )
 
     # -----------------------------------------------------------------------
-    # [분기 A : 0주 상태 (len(buckets) == 0 and h_qty == 0)]
-    # -> 대기 없이 즉시 현재가로 1회분(8% 정량) 매수하여 1층에 산입! (🎯 4)
+    # [분기 A : 1층 공격수 공석 상태 (0주 상태 OR 1층 익절 직후 2층 단독 잔존)]
+    # -> 대기 없이 즉시 현재가로 1회분(8% 정량) 실물 매수하여 독립 1층(REENTRY_1FL)에 산입! (Case 59)
     # -----------------------------------------------------------------------
-    if len(buckets) == 0 and h_qty == 0:
+    if is_zero_shares or is_l2_only_vacant_l1:
         async with context.in_memory_ordering_lock:
             async with context.dual_strike_mutex:
                 st_now = context.ledger.get_state(TARGET_SYMBOL)
-                if str(st_now.get("buy_order_id") or "").strip() or len(
-                    st_now.get("buckets", [])
-                ) > 0:
-                    return {"status": "ALREADY_ENTERED_IN_MUTEX"}
+                if str(st_now.get("buy_order_id") or "").strip() or str(
+                    st_now.get("sell_order_id") or ""
+                ).strip():
+                    return {"status": "ALREADY_ORDERING_IN_MUTEX"}
+
+                now_buckets = buckets_from_dicts(st_now.get("buckets", []))
+                now_zero = len(now_buckets) == 0
+                now_l2_only = bool(
+                    len(now_buckets) == 1
+                    and str(now_buckets[0].lot_type).upper() == "MERGED_UPPER"
+                )
+                if not (now_zero or now_l2_only):
+                    return {"status": "L1_ALREADY_FILLED_IN_MUTEX"}
 
                 ask1_p = await context.api.get_best_ask_price(
                     TARGET_SYMBOL, fallback_price=live_p
@@ -504,7 +554,9 @@ async def execute_seed_protected_buy_gate_plugin(
                 )
 
                 if buy_qty <= 0:
-                    if hasattr(context, "send_strike_hold_alert_once"):
+                    if now_zero and hasattr(
+                        context, "send_strike_hold_alert_once"
+                    ):
                         await context.send_strike_hold_alert_once(
                             symbol=TARGET_SYMBOL,
                             reason_key="INIT_CASH_SHORT",
@@ -513,9 +565,15 @@ async def execute_seed_protected_buy_gate_plugin(
                                 f"예주문가(${exec_order_p:.2f}) 부족"
                             ),
                         )
-                    return {"status": "INSUFFICIENT_CASH_FOR_0SH_ENTRY"}
+                    return {
+                        "status": (
+                            "INSUFFICIENT_CASH_FOR_0SH_ENTRY"
+                            if now_zero
+                            else "HOLD_L2_ONLY_NO_CASH_FOR_REENTRY"
+                        )
+                    }
 
-                # 현재 10m/30m 버킷도 평가 완료로 마킹하여 진입 직후 동일 버킷 중복 추매 방지
+                # 현재 10분 버킷도 평가 완료로 마킹하여 실물 1층 진입 직후 동일 버킷 내 중복 추매 방지
                 _, cur_bucket_id, today_str, _ = evaluate_buy_gate_bucket_status(
                     now_est=dt_now,
                     buy_interval_min=buy_interval_min,
@@ -527,7 +585,8 @@ async def execute_seed_protected_buy_gate_plugin(
                     ),
                 )
 
-                cid = generate_client_order_id(prefix="INI1FL")
+                cid_prefix = "INI1FL" if now_zero else "RE1FL"
+                cid = generate_client_order_id(prefix=cid_prefix)
                 try:
                     ord_res = await context.api.create_order(
                         symbol=TARGET_SYMBOL,
@@ -540,7 +599,7 @@ async def execute_seed_protected_buy_gate_plugin(
                         enforce_daymarket_block=True,
                     )
                 except Exception as exc:
-                    logger.warning("0주 즉시 1층 매수 주문 예외: %s", exc)
+                    logger.warning("즉시 실물 1층(REENTRY_1FL) 매수 주문 예외: %s", exc)
                     return {"status": "ORDER_ERROR", "error": str(exc)}
 
                 oid = str(ord_res.get("orderId") or "").strip()
@@ -558,15 +617,19 @@ async def execute_seed_protected_buy_gate_plugin(
                 )
                 context.wakeup_event.set()
                 return {
-                    "status": "ZERO_SHARES_IMMEDIATE_1FL_ORDERED",
+                    "status": (
+                        "ZERO_SHARES_IMMEDIATE_1FL_ORDERED"
+                        if now_zero
+                        else "L2_HELD_IMMEDIATE_REAL_1FL_ORDERED"
+                    ),
                     "orderId": oid,
                     "qty": buy_qty,
                     "price": exec_order_p,
                 }
 
     # -----------------------------------------------------------------------
-    # [분기 B : 지층 보유 중 (len(buckets) > 0)]
-    # -> 오직 10분(또는 30분) 매수 게이트 신규 버킷 도래 시에만 하락 조건 검사! (🎯 2 & Case 36)
+    # [분기 B : 실물 1층 보유 중 (len(buckets) > 0)]
+    # -> 오직 10분 고정 매수 게이트 신규 버킷 도래 시에만 '기억된 최저가' 기준으로 하락 조건 검사! (Case 36, 60)
     # -----------------------------------------------------------------------
     is_gate_open, cur_bucket_id, today_str, b_info = (
         evaluate_buy_gate_bucket_status(
@@ -592,22 +655,14 @@ async def execute_seed_protected_buy_gate_plugin(
 
     anchor_p = safe_float(st.get("anchor_price"), buckets[0].book_price)
     cycle_min_p = safe_float(st.get("cycle_min_buy_price"), anchor_p)
-    ratchet_p = safe_float(st.get("ratchet_anchor_price"), anchor_p)
 
-    # 무팽창 Always-L1 (ANTI_BLOAT): 2층 단독 보유 중에는 사이클 신저가(dip_ref) 기준 판정!
-    if len(buckets) == 1 and buckets[0].lot_type == "MERGED_UPPER":
-        valid_refs = [p for p in (cycle_min_p, ratchet_p) if p > 0.0]
-        ref_buy_anchor = (
-            min(valid_refs) if valid_refs else buckets[0].book_price
-        )
-        lot_tag = "DIP_1FL"
-    else:
-        ref_buy_anchor = (
-            min(buckets[0].book_price, anchor_p)
-            if anchor_p > 0.0
-            else buckets[0].book_price
-        )
-        lot_tag = "QUOTA_L1"
+    # 🚨 Case 60: 추가 매수(물타기) 판정 기준가는 방금 재매수한 1층 가격이 아니라
+    # 반드시 기억된 사이클 최저 매수가(min(buckets[0].book_price, anchor_p, cycle_min_p))로 잠금!
+    valid_refs = [
+        p for p in (buckets[0].book_price, anchor_p, cycle_min_p) if p > 0.0
+    ]
+    ref_buy_anchor = min(valid_refs) if valid_refs else buckets[0].book_price
+    lot_tag = "DIP_1FL"
 
     chg_for_buy_pct = (
         ((live_p - ref_buy_anchor) / ref_buy_anchor) * 100.0
@@ -615,7 +670,7 @@ async def execute_seed_protected_buy_gate_plugin(
         else 0.0
     )
 
-    # 🛡️ [시드보호 패스 판정] 하락 임계치(-1.0% / -1.5% / -2.0%) 미충족 시 매수 100% 패스!
+    # 🛡️ [시드보호 패스 판정] 기억된 최저가 대비 하락 임계치(-1.0% / -1.5% / -2.0%) 미충족 시 100% 패스!
     if chg_for_buy_pct > drop_buy_pct:
         new_pass_cnt = safe_int(st.get("seed_protect_pass_cnt"), 0) + 1
         new_day_pass = safe_int(st.get("daily_seed_protect_pass_cnt"), 0) + 1
@@ -628,12 +683,13 @@ async def execute_seed_protected_buy_gate_plugin(
         )
         return {
             "status": "SEED_PROTECT_PASSED",
+            "ref_buy_anchor": round(ref_buy_anchor, 4),
             "chg_pct": round(chg_for_buy_pct, 2),
             "required_drop_pct": drop_buy_pct,
             "seed_protect_pass_cnt": new_pass_cnt,
         }
 
-    # 🎯 [하락 조건 충족] 직전 매매 기준가(ref_buy_anchor)로 8% 목표 정량(target_qty)을 확정한 뒤
+    # 🎯 [신저가 하락 조건 충족] 기억된 최저가(ref_buy_anchor)로 8% 목표 정량(target_qty)을 확정한 뒤
     # 실제 매수는 하락한 현재가(exec_order_p)로 집행하여 남는 자투리를 시드에 보존한다!
     async with context.in_memory_ordering_lock:
         async with context.dual_strike_mutex:
@@ -688,7 +744,7 @@ async def execute_seed_protected_buy_gate_plugin(
                         symbol=TARGET_SYMBOL,
                         reason_key="CASH_EXHAUSTED_SKIP",
                         message=(
-                            f"하락 조건({chg_for_buy_pct:.2f}% <= {drop_buy_pct:.2f}%) 도달했으나 "
+                            f"기억저가(${ref_buy_anchor:.2f}) 대비 신저가({chg_for_buy_pct:.2f}% <= {drop_buy_pct:.2f}%) 도달했으나 "
                             f"가용현금(${free_cash:.2f}) 부족으로 추매 보류 (보유 {held_lots}회차)"
                         ),
                     )
@@ -707,7 +763,7 @@ async def execute_seed_protected_buy_gate_plugin(
                     enforce_daymarket_block=True,
                 )
             except Exception as exc:
-                logger.error("SOXL 정량 추매 주문 발사 예외: %s", exc)
+                logger.error("SOXL 신저가 정량 추매 주문 발사 예외: %s", exc)
                 return {"status": "BUY_ORDER_ERROR", "error": str(exc)}
 
             oid = str(ord_res.get("orderId") or "").strip()
@@ -729,6 +785,7 @@ async def execute_seed_protected_buy_gate_plugin(
                 "orderId": oid,
                 "qty": buy_qty,
                 "price": exec_order_p,
+                "ref_buy_anchor": round(ref_buy_anchor, 4),
                 "chg_pct": round(chg_for_buy_pct, 2),
                 "drop_threshold_pct": drop_buy_pct,
             }

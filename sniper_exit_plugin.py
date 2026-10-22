@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: sniper_exit_plugin.py
-순수 롱(SOXL) 전용 '04:07 ~ 16:00 EST 시간 제약 없는 1분 상시(실시간) 스나이퍼 매도 게이트(오팔 :
-08_VREV_PROG 기준 1층 +1.50% / 2층 통합층 +1.00% · 01_PROG_LOT 기준 +1.0% / +1.5% / +2.0%) ·
-단일 지층 수익금 리앵커링(vrev_reanchor_single_tier_quota · 0.994 버퍼) ·
-무팽창 True Always-L1(ANTI_BLOAT 상승 래칫 계단 익절 & 2층 연쇄 졸업) ·
-2단계 방탄 매도 스윕(Case 24) 및 실물 원가(actual_cost_usd) 분리 회계 복리 정산' 코어 플러그인 (Step 05 / 09)
-- MODIFIED: 제3헌법에 의거하여 구버전 하이킨 아시 콜백 트레일링, 07:15 후반부 VWAP 탈출(PRE_VWAP_ESC),
-  1주 휩소 익절 및 RE_BOT_TRAIL 데드코드를 100% 영구 소각
-- NEW: 1층 단독 익절(SELL_L1_ONLY) 시 세후 실현 순수익금(net_pnl * 0.994)으로 2층 장부 단가(book_price)를
-  즉시 강제 인하하고, 원금 + 세후 순수익금 전액을 가용 현금 시드(free_cash_usd)에 실시간 복리 산입
-- NEW: 2층(MERGED_UPPER) 단독 보유 중 무팽창 True Always-L1(ANTI_BLOAT) 상승 래칫 계단 수확 및
-  리앵커링 직후 2층 목표가 도달 시 동일 틱 즉시 전량 졸업(SELL_L2_GRAD) 구현
-- 제1헌법 ~ 제6헌법 및 Case 19 ~ 24, 36 ~ 58 완벽 준수
+순수 롱(SOXL) 전용 '04:07 ~ 16:00 EST 시간 제약 없는 1분 상시(실시간) 실물 스나이퍼 매도 게이트(오팔 :
+08_VREV_PROG 기준 1층 +1.50% 실물 익절 / 2층 통합층 +1.00% 전량 졸업) ·
+단일 지층 실물 수익금 리앵커링(vrev_reanchor_single_tier_quota · 0.994 버퍼) ·
+전량 졸업 시 기억된 최저 매수가(cycle_min_buy_price) 리셋 및 1층 단독 익절 시 최저가 잠금 보존(Case 59, 60) ·
+2단계 방탄 매도 스윕(Case 24) 및 실물 원가(actual_cost_usd) 분리 회계 복리 정산' 코어 플러그인 (Step 03 / 04)
+- MODIFIED (Case 59 & 제3헌법): 실물 주식 매수 없이 장부상으로만 계단 상승 차익을 계산해 2층 단가를 낮추던
+  구버전 가상 래칫(ANTI_BLOAT_RATCHET_STEP_EXECUTED) 데드코드를 100% 영구 소각!
+  이제 오직 실제 토스 계좌에서 매도 체결(FILLED)된 1층 실물 수익금으로만 2층 장부 단가를 리앵커링하며,
+  1층 익절 직후 다음 루프에서 sniper_plugin 이 즉시 현재가로 새 실물 1층(REENTRY_1FL)을 매수한다!
+- MODIFIED (Case 60): 1층만 익절되고 2층이 남을 때는 cycle_min_buy_price 를 그대로 보존하여
+  재매수된 1층에서 박스권 추매가 일어나지 않도록 잠그고, 0주로 전량 졸업할 때만 cycle_min_buy_price = 0.0 으로 리셋한다.
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 64 완벽 준수
 """
 
 from __future__ import annotations
@@ -22,17 +22,14 @@ import logging
 import math
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from quant_engine import (
-    ROUND_TRIP_FEE_RATE_PCT,
     StratumBucket,
     buckets_from_dicts,
     buckets_to_dicts,
     calc_sell_realized_pnl,
-    compute_golden8_quota_qty,
     get_golden8_prog_thresholds,
-    resolve_affordable_buy_qty,
     vrev_reanchor_single_tier_quota,
 )
 from quant_indicators_plugin import (
@@ -40,7 +37,6 @@ from quant_indicators_plugin import (
     refresh_metrics_with_live_tick,
 )
 from toss_api import (
-    DEFAULT_INITIAL_SEED_USD,
     EST_TZ,
     TARGET_SYMBOL,
     _NonRetryableApiError,
@@ -88,7 +84,7 @@ def update_exit_snapshot_on_hold(
     live_price: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Case 19: 보유 중 매 틱마다 _EXIT_SNAPSHOT_CACHE["SOXL"] 에 실보유 수량과 평단가,
+    Case 19: 보유 중 매 틱마다 exit_snapshot_cache["SOXL"] 에 실보유 수량과 평단가,
     현재가를 백업하여 체결 확인 시 데이터 결측을 방어한다.
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
@@ -141,7 +137,10 @@ async def execute_bulletproof_sell_sweep(
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
     target_sell_qty = max(1, safe_int(holdings_qty, 1))
-    sp = max(0.01, math.floor((safe_float(sweep_price, 0.0) + 1e-9) * 100.0) / 100.0)
+    sp = max(
+        0.01,
+        math.floor((safe_float(sweep_price, 0.0) + 1e-9) * 100.0) / 100.0,
+    )
 
     snap_map: Dict[str, Dict[str, Any]] = getattr(
         context, "exit_snapshot_cache", {}
@@ -293,7 +292,7 @@ async def execute_bulletproof_sell_sweep(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 매도 FILLED 정산 · 세후 순익 시드 복리 산입 · 단일지층(2층) 리앵커링 커밋
+# [핵심 2] 실물 매도 FILLED 정산 · 세후 순익 시드 복리 산입 · 2층 리앵커링 커밋
 # ---------------------------------------------------------------------------
 async def _commit_filled_sell_and_reanchor_ledger(
     context: Any,
@@ -302,23 +301,29 @@ async def _commit_filled_sell_and_reanchor_ledger(
     sell_mode: str,
 ) -> Dict[str, Any]:
     """
-    🎯 1 & 🎯 3 & 🎯 4 & Case 19, 47:
-    스나이퍼 매도 주문이 체결(FILLED)되었을 때:
+    🎯 1 & 🎯 3 & 🎯 4 & Case 19, 47, 59, 60:
+    스나이퍼 실물 매도 주문이 체결(FILLED)되었을 때:
     1) 매도 모드(SELL_L1_ONLY vs SELL_ALL_GRAD / SELL_L2_GRAD)에 따라 매도된 지층(sold_buckets)과
        남은 지층(rem_buckets)을 분리한다.
     2) 매도된 지층의 실제 매수 원금(sold_actual_cost_usd)과 실제 매도 체결가(avg_fill_price)로
-       왕복 수수료(0.14%) 차감 후 세후 실현 순수익금(net_pnl_usd)을 산출한다.
-    3) 만약 1층만 팔리고 2층(단일 지층)이 남은 경우(len(rem_buckets) == 1 and net_pnl_usd > 0),
-       vrev_reanchor_single_tier_quota() 를 호출하여 net_pnl_usd * 0.994 만큼 2층의 장부 투자원금
-       (book_invested_usd)을 즉시 차감해 2층 목표 탈출 단가(book_price)를 강제 인하한다!
-    4) 회수된 원금과 세후 순수익금은 AssassinLedger.update_state() 의 회계 항등식을 통해
-       가용 현금 시드(free_cash_usd)에 100% 실시간 복리 귀속된다.
+       왕복 수수료(0.14%) 차감 후 세후 실물 실현 순수익금(net_pnl_usd)을 산출한다.
+    3) ♻️ [Case 59 실물 수익금 리앵커링]:
+       1층만 팔리고 2층(단일 지층)이 남은 경우(len(rem_buckets) == 1 and net_pnl_usd > 0),
+       vrev_reanchor_single_tier_quota() 를 호출하여 실제로 회수된 net_pnl_usd * 0.994 만큼만
+       2층의 장부 투자원금(book_invested_usd)을 차감해 2층 목표 탈출 단가(book_price)를 강제 인하한다!
+       직후 다음 루프에서 sniper_plugin 이 즉시 현재가로 새 실물 1층(REENTRY_1FL)을 매수한다!
+    4) 🚨 [Case 60 기억된 최저 매수가 잠금 및 졸업 리셋]:
+       - 2층이 남아 있는 경우(len(rem_buckets) > 0): 기존 기억된 최저 매수가(cycle_min_buy_price)를
+         절대 변경하지 않고 그대로 잠금 유지한다!
+       - 전량 졸업하여 0주가 된 경우(len(rem_buckets) == 0): cycle_min_buy_price = 0.0 으로 리셋한다!
     """
     st = context.ledger.get_state(TARGET_SYMBOL)
     buckets = buckets_from_dicts(st.get("buckets", []))
     fill_p = round(max(0.01, safe_float(avg_fill_price, 0.01)), 4)
     q_filled = max(1, safe_int(filled_qty, 1))
-    mode = str(sell_mode or st.get("pending_sell_mode") or "SELL_L1_ONLY").upper()
+    mode = str(
+        sell_mode or st.get("pending_sell_mode") or "SELL_L1_ONLY"
+    ).upper()
 
     if not buckets:
         await context.ledger.update_state(
@@ -334,13 +339,11 @@ async def _commit_filled_sell_and_reanchor_ledger(
     rem_buckets: List[StratumBucket] = []
 
     if mode in ("SELL_ALL_GRAD", "SELL_L2_GRAD") or len(buckets) == 1:
-        # 전량 졸업 또는 단일 지층 매도
         total_b_qty = sum(b.qty for b in buckets)
         if q_filled >= total_b_qty:
             sold_buckets = list(buckets)
             rem_buckets = []
         else:
-            # 부분 체결된 경우 비율만큼 원금 분할 정산
             b0 = buckets[0]
             ratio = min(1.0, float(q_filled) / float(b0.qty))
             sold_cost_part = round(b0.actual_cost_usd * ratio, 4)
@@ -360,8 +363,12 @@ async def _commit_filled_sell_and_reanchor_ledger(
                 rem_b0 = StratumBucket(
                     qty=rem_q,
                     book_price=b0.book_price,
-                    book_invested_usd=max(0.01 * rem_q, b0.book_invested_usd - sold_book_part),
-                    actual_cost_usd=max(0.01 * rem_q, b0.actual_cost_usd - sold_cost_part),
+                    book_invested_usd=max(
+                        0.01 * rem_q, b0.book_invested_usd - sold_book_part
+                    ),
+                    actual_cost_usd=max(
+                        0.01 * rem_q, b0.actual_cost_usd - sold_cost_part
+                    ),
                     lot_count=max(1, b0.lot_count),
                     lot_type=b0.lot_type,
                 )
@@ -392,8 +399,12 @@ async def _commit_filled_sell_and_reanchor_ledger(
             rem_b1 = StratumBucket(
                 qty=rem_q,
                 book_price=b1.book_price,
-                book_invested_usd=max(0.01 * rem_q, b1.book_invested_usd - sold_book_part),
-                actual_cost_usd=max(0.01 * rem_q, b1.actual_cost_usd - sold_cost_part),
+                book_invested_usd=max(
+                    0.01 * rem_q, b1.book_invested_usd - sold_book_part
+                ),
+                actual_cost_usd=max(
+                    0.01 * rem_q, b1.actual_cost_usd - sold_cost_part
+                ),
                 lot_count=1,
                 lot_type=b1.lot_type,
             )
@@ -416,7 +427,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
     new_l2_book_p = 0.0
     reanchor_inc = 0
 
-    # ♻️ [단일 지층 마법 : 1층 익절 후 2층 단독 잔존 시 세후 순익으로 2층 장부단가 즉시 리앵커링!]
+    # ♻️ [Case 59 단일 지층 마법 : 1층 실물 익절 후 2층 단독 잔존 시 실물 세후 순익으로 2층 장부단가 즉시 리앵커링!]
     if len(rem_buckets) == 1 and net_pnl > 0.0:
         old_l2_book_p = rem_buckets[0].book_price
         rem_buckets, reanchor_drop_amt = vrev_reanchor_single_tier_quota(
@@ -426,6 +437,13 @@ async def _commit_filled_sell_and_reanchor_ledger(
         new_l2_book_p = rem_buckets[0].book_price
         if reanchor_drop_amt > 0.0:
             reanchor_inc = 1
+
+    # 🚨 Case 60: 2층이 남아 있으면 기억된 최저 매수가(cycle_min_buy_price)를 절대 지우지 않고 보존하고,
+    # 전량 졸업(len(rem_buckets) == 0) 시에만 0.0 으로 리셋한다!
+    old_cycle_min_p = safe_float(st.get("cycle_min_buy_price"), 0.0)
+    next_cycle_min_p = (
+        round(old_cycle_min_p, 4) if len(rem_buckets) > 0 else 0.0
+    )
 
     tot_sell_ev = safe_int(st.get("total_sell_events"), 0) + 1
     tot_sold_sh = safe_int(st.get("total_sold_shares"), 0) + sold_q
@@ -459,6 +477,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
         TARGET_SYMBOL,
         buckets=buckets_to_dicts(rem_buckets),
         anchor_price=fill_p,
+        cycle_min_buy_price=next_cycle_min_p,
         ratchet_anchor_price=fill_p,
         sell_order_id="",
         ordered_qty=0,
@@ -484,17 +503,18 @@ async def _commit_filled_sell_and_reanchor_ledger(
         sign = "+" if net_pnl >= 0.0 else "-"
         r_sign = "+" if net_rate >= 0.0 else ""
         if len(rem_buckets) == 0:
-            note_str = "🎓 전량 졸업 완료(0주 ➔ 즉시 현재가 1층 재산입 가동!)"
+            note_str = "🎓 전량 졸업 완료(0주 ➔ 즉시 현재가 실물 1층 재산입 가동!)"
         elif reanchor_drop_amt > 0.0:
             note_str = (
-                f"♻️ 2층({rem_buckets[0].qty}주) 단가 리앵커링: "
-                f"${old_l2_book_p:.2f}➔${new_l2_book_p:.2f}(-${reanchor_drop_amt:.2f})"
+                f"♻️ 2층({rem_buckets[0].qty}주) 실물수익 리앵커링: "
+                f"${old_l2_book_p:.2f}➔${new_l2_book_p:.2f}(-${reanchor_drop_amt:.2f}) "
+                f"· 즉시 새 실물 1층 재매수 가동(기억저가 ${next_cycle_min_p:.2f} 잠금)"
             )
         else:
             note_str = f"잔여 {sum(b.qty for b in rem_buckets)}주 보유"
 
         await context.send_slim_alert(
-            title=f"🔴 [SOXL 1분 스나이퍼 익절 체결] {sold_q}주 @ ${fill_p:.2f} ({r_sign}{net_rate:.2f}%)",
+            title=f"🔴 [SOXL 1분 스나이퍼 실물 익절 체결] {sold_q}주 @ ${fill_p:.2f} ({r_sign}{net_rate:.2f}%)",
             body=(
                 f"세후순익 {sign}${abs(net_pnl):,.2f} 시드 복리산입! · "
                 f"{note_str} · 가용현금 ${free_cash_now:,.2f}"
@@ -608,7 +628,7 @@ async def sync_pending_sell_order_plugin(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 3] 04:07 ~ 16:00 EST 1분 상시 스나이퍼 매도 게이트 & 무팽창 True Always-L1
+# [핵심 3] 04:07 ~ 16:00 EST 1분 상시(실시간) 실물 스나이퍼 매도 게이트 (Case 59, 60)
 # ---------------------------------------------------------------------------
 async def execute_1m_sniper_sell_and_reanchor_plugin(
     context: Any,
@@ -617,23 +637,22 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 2 [Step 2] & 🎯 3 & 🎯 4 & Case 24, 44, 46 ~ 58:
-    04:07:00 ~ 16:00:00 EST 전 구간에서 매 루프(실시간 상시)마다 작동하는 스나이퍼 매도(오팔) 엔진:
+    🎯 2 [Step 2] & 🎯 3 & 🎯 4 & Case 24, 44, 46 ~ 60:
+    04:07:00 ~ 16:00:00 EST 전 구간에서 매 루프(실시간 상시)마다 작동하는 100% 실물 기반 스나이퍼 매도(오팔) 엔진:
+    - 🚨 Case 59: 실물 주식 매수 없이 장부상으로만 계단 상승 차익을 계산하던 구버전 가상 래칫을 100% 영구 소각!
     1) 대기 중인 미체결 매도 주문(sell_order_id)이 있으면 즉시 체결/정정 동기화를 수행한다.
-    2) [모드 A : 2층(MERGED_UPPER) 단독 보유 중 무팽창 True Always-L1 (ANTI_BLOAT)]
-       - A-1) 현재가(live_p)가 리앵커링된 2층 장부단가 대비 +rise_sell_l2_pct (+1.00% 또는 +1~2%) 이상 도달 시:
-              즉시 2층 전량 스나이퍼 매도(SELL_L2_GRAD)를 발사하여 사이클 완전 졸업을 집행한다!
-       - A-2) 현재가(live_p)가 ratchet_anchor_price 대비 +rise_sell_l1_pct (+1.50% 또는 +1~2%) 이상 도달 시:
-              가용 현금(free_cash_usd) 한도 내에서 ratchet_anchor_price 기준 1회분 정량(step_q)의
-              계단 상승 차익(net_pnl)을 즉시 실현하여 free_cash_usd 에 복리 산입하고,
-              그 수익금으로 2층 장부 단가를 즉시 리앵커링한 뒤 ratchet_anchor_price = live_p 로 한 계단 상향한다!
-              만약 이 리앵커링으로 낮아진 2층 단가 대비 현재가가 +rise_sell_l2_pct 에 도달하면
-              동일 틱에서 즉시 2층 전량 졸업 매도(SELL_L2_GRAD)까지 연쇄 발사한다!
-    3) [모드 B : 일반 1층(buckets[0]) 보유 중 1분 상시 스나이퍼 매도]
-       - 현재가(live_p)가 1층 장부단가(buckets[0].book_price) 대비 +rise_sell_l1_pct 이상 도달 시:
-         * 만약 2층(buckets[1])도 존재하고 2층 장부단가 대비 +rise_sell_l2_pct 이상 도달했다면:
-           (1층 + 2층) 전량 동시 스나이퍼 매도(SELL_ALL_GRAD)를 발사한다!
-         * 그렇지 않으면 1층 수량(buckets[0].qty)만 단독 스나이퍼 매도(SELL_L1_ONLY)를 발사한다!
+    2) [모드 A : 2층(MERGED_UPPER) 단독 보유 상태 (가용현금 부족 등으로 1층 재매수 보류 시 또는 재매수 직전 틱)]
+       - 현재가(live_p)가 리앵커링된 2층 장부단가 대비 +rise_sell_l2_pct (+1.00%) 이상 도달 시:
+         즉시 2층 전량 스나이퍼 매도(SELL_L2_GRAD)를 발사하여 사이클 완전 졸업을 집행한다!
+       - 아직 2층 졸업가에 도달하지 않았다면 did_sell_or_ratchet = False 를 반환하여,
+         동일 루프 직후 sniper_plugin 이 즉시 현재가로 새 실물 1층(REENTRY_1FL)을 매수하도록 넘긴다!
+    3) [모드 B : 실물 1층(buckets[0]) 보유 상태 ([1층] 단독 또는 [1층, 2층] 2-Tier)]
+       - B-1) 만약 2층(buckets[1])이 존재하고, 리앵커링으로 낮아진 2층 장부단가 대비 현재가가
+              이미 +rise_sell_l2_pct (+1.00%) 이상에 도달했으며 1층도 수익 구간(live_p >= buckets[0].book_price)이면:
+              1층이 +1.50% 에 닿기를 기다릴 필요 없이 (1층 + 2층) 전량 동시 졸업 매도(SELL_ALL_GRAD)를 발사한다!
+       - B-2) 현재가(live_p)가 1층 장부단가(buckets[0].book_price) 대비 +rise_sell_l1_pct (+1.50%) 이상 도달 시:
+              * 상위 2층도 +rise_sell_l2_pct (+1.00%) 이상 도달했다면 (1층 + 2층) 전량 동시 매도(SELL_ALL_GRAD)를 발사한다!
+              * 그렇지 않으면 1층 수량(buckets[0].qty)만 단독 스나이퍼 매도(SELL_L1_ONLY)를 발사한다!
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
@@ -680,49 +699,41 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
 
     held_lots = sum(b.lot_count for b in buckets)
     threshold_mode = str(st.get("threshold_mode") or "08_VREV_PROG").upper()
-    portion_mode = str(st.get("portion_mode") or "COMP_08PCT").upper()
-    init_seed = max(
-        100.0,
-        safe_float(st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD),
-    )
-    free_cash = max(0.0, safe_float(st.get("free_cash_usd"), 0.0))
-    actual_invested = sum(b.actual_cost_usd for b in buckets)
-    cost_equity = free_cash + actual_invested
-
     _, rise_sell_l1_pct, rise_sell_l2_pct = get_golden8_prog_thresholds(
         held_lots=held_lots, threshold_mode=threshold_mode
     )
 
     # -----------------------------------------------------------------------
-    # [분기 A : 2층(MERGED_UPPER) 단독 보유 상태 — 무팽창 True Always-L1 (ANTI_BLOAT)]
+    # [분기 A : 2층(MERGED_UPPER) 단독 보유 상태 — 2층 졸업 감시 & 1층 즉시 실물 재매수 위임]
     # -----------------------------------------------------------------------
-    if len(buckets) == 1 and buckets[0].lot_type == "MERGED_UPPER":
+    if len(buckets) == 1 and str(buckets[0].lot_type).upper() == "MERGED_UPPER":
         upper_b = buckets[0]
         upper_gain_pct = (
             ((live_p - upper_b.book_price) / upper_b.book_price) * 100.0
             if upper_b.book_price > 0.0
             else 0.0
         )
-        ratchet_anchor_p = safe_float(
-            st.get("ratchet_anchor_price"),
-            safe_float(st.get("anchor_price"), upper_b.book_price),
-        )
-        ratchet_gain_pct = (
-            ((live_p - ratchet_anchor_p) / ratchet_anchor_p) * 100.0
-            if ratchet_anchor_p > 0.0
-            else 0.0
-        )
 
-        # A-1) 2층 통합층 자체가 목표 수익률(+rise_sell_l2_pct)에 도달하면 즉시 2층 전량 매도 졸업!
         if upper_gain_pct >= rise_sell_l2_pct:
             bid1_p = await context.api.get_best_bid_price(
                 TARGET_SYMBOL, fallback_price=live_p
             )
-            sweep_p = (
+            min_l2_target_p = (
+                math.ceil(
+                    (
+                        upper_b.book_price * (1.0 + rise_sell_l2_pct / 100.0)
+                        - 1e-9
+                    )
+                    * 100.0
+                )
+                / 100.0
+            )
+            raw_sweep_p = (
                 math.floor((min(live_p, bid1_p) + 1e-9) * 100.0) / 100.0
                 if bid1_p > 0.0
                 else math.floor((live_p + 1e-9) * 100.0) / 100.0
             )
+            sweep_p = max(min_l2_target_p, raw_sweep_p)
             sweep_res = await execute_bulletproof_sell_sweep(
                 context=context,
                 symbol=TARGET_SYMBOL,
@@ -738,170 +749,15 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
                 "result": sweep_res,
             }
 
-        # A-2) 무팽창 상승 래칫 계단 익절(ratchet_gain_pct >= rise_sell_l1_pct) & 2층 연속 리앵커링!
-        if ratchet_gain_pct >= rise_sell_l1_pct and ratchet_anchor_p > 0.0:
-            raw_step_q, _step_bud = compute_golden8_quota_qty(
-                anchor_price=ratchet_anchor_p,
-                current_total_equity=cost_equity,
-                initial_seed_usd=init_seed,
-                portion_mode=portion_mode,
-            )
-            step_q, step_cost = resolve_affordable_buy_qty(
-                target_qty=raw_step_q,
-                price_t=ratchet_anchor_p,
-                free_cash_usd=free_cash,
-            )
-
-            if step_q > 0:
-                pnl_step = calc_sell_realized_pnl(
-                    sold_qty=step_q,
-                    sell_exec_price=live_p,
-                    sold_actual_cost_usd=step_cost,
-                )
-                gross_pnl = pnl_step["gross_pnl_usd"]
-                fee_usd = pnl_step["fee_usd"]
-                net_pnl = pnl_step["net_pnl_usd"]
-
-                old_l2_bp = upper_b.book_price
-                reanchor_drop = 0.0
-                if net_pnl > 0.0:
-                    buckets, reanchor_drop = vrev_reanchor_single_tier_quota(
-                        queue=buckets,
-                        net_realized_cash_profit=net_pnl,
-                    )
-                new_l2_bp = buckets[0].book_price
-
-                tot_buy_ev = safe_int(st.get("total_buy_events"), 0) + 1
-                tot_buy_sh = safe_int(st.get("total_buy_shares"), 0) + step_q
-                day_buy_ev = safe_int(st.get("daily_buy_events"), 0) + 1
-
-                tot_sell_ev = safe_int(st.get("total_sell_events"), 0) + 1
-                tot_sold_sh = safe_int(st.get("total_sold_shares"), 0) + step_q
-                win_ev = safe_int(st.get("win_sell_events"), 0) + (
-                    1 if net_pnl > 0.0 else 0
-                )
-                day_sell_ev = safe_int(st.get("daily_sell_events"), 0) + 1
-
-                re_inc = 1 if reanchor_drop > 0.0 else 0
-                reanchor_cnt = safe_int(st.get("reanchor_cnt"), 0) + re_inc
-                day_reanchor_cnt = (
-                    safe_int(st.get("daily_reanchor_cnt"), 0) + re_inc
-                )
-                cum_reanchor_drop = round(
-                    safe_float(st.get("cumulative_reanchor_drop_usd"), 0.0)
-                    + reanchor_drop,
-                    4,
-                )
-
-                cum_gross = round(
-                    safe_float(st.get("cumulative_realized_gross_usd"), 0.0)
-                    + gross_pnl,
-                    4,
-                )
-                cum_fee = round(
-                    safe_float(st.get("cumulative_realized_fee_usd"), 0.0)
-                    + fee_usd,
-                    4,
-                )
-                cum_net = round(
-                    safe_float(st.get("cumulative_realized_net_usd"), 0.0)
-                    + net_pnl,
-                    4,
-                )
-                day_net = round(
-                    safe_float(st.get("daily_realized_net_usd"), 0.0)
-                    + net_pnl,
-                    4,
-                )
-
-                updated_st = await context.ledger.update_state(
-                    TARGET_SYMBOL,
-                    buckets=buckets_to_dicts(buckets),
-                    anchor_price=live_p,
-                    ratchet_anchor_price=live_p,
-                    total_buy_events=tot_buy_ev,
-                    total_buy_shares=tot_buy_sh,
-                    daily_buy_events=day_buy_ev,
-                    total_sell_events=tot_sell_ev,
-                    total_sold_shares=tot_sold_sh,
-                    win_sell_events=win_ev,
-                    daily_sell_events=day_sell_ev,
-                    reanchor_cnt=reanchor_cnt,
-                    daily_reanchor_cnt=day_reanchor_cnt,
-                    cumulative_reanchor_drop_usd=cum_reanchor_drop,
-                    cumulative_realized_gross_usd=cum_gross,
-                    cumulative_realized_fee_usd=cum_fee,
-                    cumulative_realized_net_usd=cum_net,
-                    daily_realized_net_usd=day_net,
-                )
-
-                if hasattr(context, "send_slim_alert"):
-                    await context.send_slim_alert(
-                        title=f"🔥 [무팽창 Always-L1 계단익절 & 리앵커링] {step_q}주 (+{ratchet_gain_pct:.2f}%)",
-                        body=(
-                            f"기준 ${ratchet_anchor_p:.2f}➔${live_p:.2f} · 세후 +${net_pnl:.2f} 시드산입 · "
-                            f"♻️2층단가 ${old_l2_bp:.2f}➔${new_l2_bp:.2f}(-${reanchor_drop:.2f})"
-                        ),
-                    )
-
-                # 🎯 [핵심 4-2] 리앵커링 직후 낮아진 2층 단가 대비 +rise_sell_l2_pct 도달 시 동일 틱 즉시 졸업!
-                new_upper_gain_pct = (
-                    ((live_p - new_l2_bp) / new_l2_bp) * 100.0
-                    if new_l2_bp > 0.0
-                    else 0.0
-                )
-                if new_upper_gain_pct >= rise_sell_l2_pct:
-                    bid1_p = await context.api.get_best_bid_price(
-                        TARGET_SYMBOL, fallback_price=live_p
-                    )
-                    sweep_p = (
-                        math.floor((min(live_p, bid1_p) + 1e-9) * 100.0) / 100.0
-                        if bid1_p > 0.0
-                        else math.floor((live_p + 1e-9) * 100.0) / 100.0
-                    )
-                    await execute_bulletproof_sell_sweep(
-                        context=context,
-                        symbol=TARGET_SYMBOL,
-                        holdings_qty=buckets[0].qty,
-                        sweep_price=sweep_p,
-                        reason_tag="SELL_L2_GRAD",
-                    )
-                    return {
-                        "status": "RATCHET_AND_L2_GRADUATION_ORDERED",
-                        "did_sell_or_ratchet": True,
-                        "net_pnl_usd": net_pnl,
-                        "sweep_price": sweep_p,
-                    }
-
-                return {
-                    "status": "ANTI_BLOAT_RATCHET_STEP_EXECUTED",
-                    "did_sell_or_ratchet": True,
-                    "step_qty": step_q,
-                    "net_pnl_usd": net_pnl,
-                    "new_l2_book_price": new_l2_bp,
-                    "free_cash_usd": safe_float(
-                        updated_st.get("free_cash_usd"), 0.0
-                    ),
-                }
-            else:
-                # 가용 현금이 부족하여 래칫 수량이 0인 경우 기준점만 현재가로 갱신
-                await context.ledger.update_state(
-                    TARGET_SYMBOL,
-                    ratchet_anchor_price=live_p,
-                    anchor_price=live_p,
-                )
-                return {
-                    "status": "RATCHET_ANCHOR_SHIFTED_NO_CASH",
-                    "did_sell_or_ratchet": True,
-                }
-
+        # did_sell_or_ratchet=False 반환 -> 직후 sniper_plugin 이 현재가로 실물 1층(REENTRY_1FL) 즉시 매수!
         return {
-            "status": "MONITORING_L2_ANTI_BLOAT",
+            "status": "AWAITING_REAL_L1_REENTRY",
             "did_sell_or_ratchet": False,
+            "l2_gain_pct": round(upper_gain_pct, 2),
         }
 
     # -----------------------------------------------------------------------
-    # [분기 B : 일반 1층(buckets[0]) 보유 상태 — 1분 상시 스나이퍼 매도 판정]
+    # [분기 B : 실물 1층(buckets[0]) 보유 상태 — 1분 상시 스나이퍼 매도 판정]
     # -----------------------------------------------------------------------
     floor1_b = buckets[0]
     chg_from_l1_pct = (
@@ -910,8 +766,58 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         else 0.0
     )
 
+    # B-1) 2층이 존재할 때 리앵커링된 2층 목표가(+1.00%)에 도달했고 1층도 본전 이상이면 즉시 전량 졸업!
+    if len(buckets) >= 2 and live_p >= floor1_b.book_price:
+        all_upper_grad = True
+        for b_up in buckets[1:]:
+            up_gain = (
+                ((live_p - b_up.book_price) / b_up.book_price) * 100.0
+                if b_up.book_price > 0.0
+                else 0.0
+            )
+            if up_gain < rise_sell_l2_pct:
+                all_upper_grad = False
+                break
+        if all_upper_grad:
+            sell_qty = sum(b.qty for b in buckets)
+            bid1_p = await context.api.get_best_bid_price(
+                TARGET_SYMBOL, fallback_price=live_p
+            )
+            min_l2_target_p = (
+                math.ceil(
+                    (
+                        buckets[1].book_price
+                        * (1.0 + rise_sell_l2_pct / 100.0)
+                        - 1e-9
+                    )
+                    * 100.0
+                )
+                / 100.0
+            )
+            raw_sweep_p = (
+                math.floor((min(live_p, bid1_p) + 1e-9) * 100.0) / 100.0
+                if bid1_p > 0.0
+                else math.floor((live_p + 1e-9) * 100.0) / 100.0
+            )
+            sweep_p = max(min_l2_target_p, raw_sweep_p)
+            sweep_res = await execute_bulletproof_sell_sweep(
+                context=context,
+                symbol=TARGET_SYMBOL,
+                holdings_qty=sell_qty,
+                sweep_price=sweep_p,
+                reason_tag="SELL_ALL_GRAD",
+            )
+            return {
+                "status": "SNIPER_1M_ALL_GRAD_SELL_ORDERED",
+                "did_sell_or_ratchet": True,
+                "sell_mode": "SELL_ALL_GRAD",
+                "qty": sell_qty,
+                "sweep_price": sweep_p,
+                "result": sweep_res,
+            }
+
+    # B-2) 1층 목표 수익률(+1.50%) 도달 시 1층 단독 익절(SELL_L1_ONLY) 또는 전량 졸업(SELL_ALL_GRAD)
     if chg_from_l1_pct >= rise_sell_l1_pct:
-        # 상위 2층(buckets[1:])도 목표 수익률(+rise_sell_l2_pct)에 도달했는지 동시 검사
         sell_all_grad = True
         for b_up in buckets[1:]:
             up_gain = (
