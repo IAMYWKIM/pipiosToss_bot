@@ -2,7 +2,7 @@
 """
 # MODIFIED: tg_ui_plugin.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-텔레그램 관제탑 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 03 / 04)
+텔레그램 관제탑 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 04 / 05)
 - 제1헌법: 모든 텔레그램 HTTP API 호출을 asyncio.to_thread 로 비동기 격리 및 타임아웃 적용
 - 제4헌법: 모든 논리 시계열은 미국 동부 시간(EST/EDT) 100% 락온
 - Case 11 & Case 62:
@@ -15,6 +15,8 @@
   기동 완료 시 "✅ 서버가 정상 작동 중입니다." 생존 신호 자동 타전
 - Case 64: 전술 제어반(/settlement) 내 30분 옵션 완전 제거 -> 오직 [작동 ON/OFF 버튼]과 [시드머니 설정 버튼] 2가지 옵션만 유지
 - Case 65 & Case 66: /avwap 레이더 내 양방향 60초 타임쉴드(매수 후 60초 / 매도 후 60초) 상태 및 4단 와이드 활주로 실시간 표출
+- NEW (Case 67): /avwap 레이더 및 /settlement 전술 제어반에서 차기 8% 정량 표출 시
+  min(1회분 예산 상한 주수 budget_cap_qty, 기준가 고정 정량 anchor_quota_qty) 캡핑 상태를 실시간 반영!
 """
 
 from __future__ import annotations
@@ -75,6 +77,20 @@ def _get_dst_badge(now_est: Optional[datetime] = None) -> str:
     if "EDT" in tz_name.upper():
         return "☀️서머타임 ON (EDT)"
     return "❄️서머타임 OFF (EST)"
+
+
+def _format_case67_quota_badge(summary: Dict[str, Any]) -> str:
+    """
+    NEW [Case 67]:
+    기준가 고정 정량(anchor_quota_qty)과 현재가 기준 1회분 예산 상한 주수(budget_cap_qty)의
+    min(budget_cap_qty, anchor_quota_qty) 캡핑 상태를 직관적인 문자열로 반환한다.
+    """
+    next_qty = safe_int(summary.get("next_target_qty"), 1)
+    anc_qty = safe_int(summary.get("anchor_quota_qty"), next_qty)
+    cap_qty = safe_int(summary.get("budget_cap_qty"), next_qty)
+    if next_qty < anc_qty:
+        return f"<b>{next_qty}주</b> (🛡️min(1회분 {cap_qty}주, 고정 {anc_qty}주) 예산초과 차단)"
+    return f"<b>{next_qty}주</b> (min(1회분, 고정 {anc_qty}주) 대기)"
 
 
 def _build_main_reply_keyboard() -> Dict[str, Any]:
@@ -163,10 +179,11 @@ def build_start_schedule_message(
     lines = [
         f"🐂 <b>[ SOXL 지층관리 스나이퍼 ({escape_html(dst_str)}) ]</b>",
         "▫️ 전략: 🛡️ 05_AF_WIDE_10_01 (8% 황금정량 · 눌림/돌파 독립 1층 재장전 · 기억저가 와이드 활주로)",
+        "▫️ 정량: 📐 min(1회분 8% 예산 상한 주수, 기준가 고정 정량) 이중 캡핑으로 돌파 시 예산 초과 차단 (Case 67)",
         "▫️ 매수: 🛡️ 10분 고정 4단 와이드 게이트 (기억저가 대비 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%)",
         "▫️ 재장전: 🔥 0주 즉시 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
         "▫️ 매도: ⚡ 1분 상시 현재가 지정가 매도 (1층 +1.50% 익절&amp;리앵커링 / 2층 +1.00% 졸업)",
-        "▫️ 방어: ⏱️ 양방향 60초 강제 타임쉴드 &amp; 순수 현재가 지정가(LIMIT) 락온 (Case 65/66)",
+        "▫️ 방어: ⏱️ 양방향 60초 강제 타임쉴드 &amp; 순수 현재가 지정가(LIMIT) 락온 (Case 65/66/67)",
         f"▫️ 기준 시드머니: <b>${init_seed:,.2f}</b> (1회 8% 정량 자동 산출)",
         "──────────────",
         "🔹 04:00 ~ 04:06: 🌅 프리장 호가 안정화 &amp; 오버나이트 지층 동기화",
@@ -192,7 +209,7 @@ def build_avwap_radar_message(
     now_est: Optional[datetime] = None,
 ) -> str:
     """
-    📡 /avwap 스나이퍼 레이더 관제탑 메시지 생성 (Case 15, 59, 60, 64, 65, 66)
+    📡 /avwap 스나이퍼 레이더 관제탑 메시지 생성 (Case 15, 59, 60, 64, 65, 66, 67)
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     met = refresh_metrics_with_live_tick(metrics, live_price, now_est=dt_now)
@@ -294,7 +311,7 @@ def build_avwap_radar_message(
     )
     next_gate_str = str(gate_info.get("next_gate_hm_str") or "04:07 EST")
     next_bud = safe_float(summary.get("next_portion_budget"), 800.0)
-    next_qty = safe_int(summary.get("next_target_qty"), 1)
+    quota_badge_str = _format_case67_quota_badge(summary)
     ref_anchor = safe_float(summary.get("ref_buy_anchor"), lp)
     chg_anchor = safe_float(summary.get("chg_from_buy_anchor_pct"), 0.0)
     c_sign = "+" if chg_anchor >= 0.0 else ""
@@ -346,7 +363,7 @@ def build_avwap_radar_message(
             "──────────────",
             f"🛡️ <b>[10분 고정 와이드 시드보호 매수 게이트]</b> (차기검문: {escape_html(next_gate_str)})",
             gate_cond_line,
-            f"▫️ 차기 8% 정량: 예산 ${next_bud:,.2f} ➔ <b>{next_qty}주</b> 고정 대기",
+            f"▫️ 차기 8% 정량: 예산 ${next_bud:,.2f} ➔ {quota_badge_str}",
             "──────────────",
             f"♻️ 평단 리앵커링: {reanchor_cnt}회 (누적 -${reanchor_drop:.2f} 단가인하)",
             f"🛡️ 시드보호 패스: {pass_cnt:,}회 · 🔥 13회차+ 확장매수: {extra_13}회",
@@ -424,7 +441,7 @@ def build_settlement_control_message(
     now_est: Optional[datetime] = None,
 ) -> str:
     """
-    ⚙️ /settlement 초단순 전술 제어반 메시지 생성 (Case 64: 오직 ON/OFF 와 시드설정 2가지만 표출)
+    ⚙️ /settlement 초단순 전술 제어반 메시지 생성 (Case 64: 오직 ON/OFF 와 시드설정 2가지만 표출 + Case 67 캡핑 표시)
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     lp = safe_float(live_price, safe_float(st.get("anchor_price"), 100.0))
@@ -438,7 +455,7 @@ def build_settlement_control_message(
     next_bud = safe_float(
         summary.get("next_portion_budget"), init_seed * 0.08
     )
-    next_qty = safe_int(summary.get("next_target_qty"), 1)
+    quota_badge_str = _format_case67_quota_badge(summary)
     held_sh = safe_int(summary.get("held_shares"), 0)
     held_lots = safe_int(summary.get("held_lots"), 0)
 
@@ -446,8 +463,8 @@ def build_settlement_control_message(
         "⚙️ <b>[SOXL 인피니트 스노우볼 v3.0 전술 제어반]</b>",
         f"1️⃣ 마스터 전원: <b>{power_str}</b>",
         f"2️⃣ 기준 시드머니: <b>${init_seed:,.2f}</b> (실현기준 총자산 ${real_eq:,.2f})",
-        "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · 10분 4단 와이드 · 1분 현재가 지정가 매도 · 60초 타임쉴드</b> (고정)",
-        f"4️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ <b>{next_qty}주</b> (가용현금 ${free_cash:,.2f})",
+        "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 1분 지정가매도 · 60초 타임쉴드</b> (고정)",
+        f"4️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str} (가용현금 ${free_cash:,.2f})",
         f"5️⃣ 현재 보유 지층: <b>{held_sh}주</b> ({held_lots}회차)",
         "──────────────",
         "💡 시드머니를 변경하시려면 아래 <b>[💵 기준 시드머니($) 설정]</b> 버튼을 누르거나 채팅창에 숫자(예: <code>19000</code>)를 바로 입력하세요.",
@@ -461,7 +478,7 @@ def build_settlement_control_message(
 # ---------------------------------------------------------------------------
 class TelegramCommandController:
     """
-    🚨 제1헌법 & Case 02, 15, 16, 62, 64, 65, 66:
+    🚨 제1헌법 & Case 02, 15, 16, 62, 64, 65, 66, 67:
     main.py 의 SniperAppContext 와 정식 결속되는 텔레그램 봇 컨트롤러.
     - MODIFIED: 기동 직후 _flush_stale_updates_on_startup() 에서 조건 없이 큐의 마지막 update_id 를
       즉시 소비 확정(Ack)하고, /update 실행 시 변경 사항이 없으면(changed == False) 재기동하지 않고
@@ -675,7 +692,7 @@ class TelegramCommandController:
 
     async def send_startup_alive_banner(self) -> bool:
         """
-        🚨 Case 16:
+        🚨 Case 16 & Case 67:
         기동 완료 후 "✅ 서버가 정상 작동 중입니다." 생존 신호를 타전한다.
         """
         st = self.context.ledger.get_state(TARGET_SYMBOL)
@@ -683,8 +700,8 @@ class TelegramCommandController:
         free_cash = safe_float(st.get("free_cash_usd"), init_seed)
         text = (
             "<b>✅ 서버가 정상 작동 중입니다.</b>\n"
-            "🔸 전략: 🛡️ 05_AF_WIDE_10_01 (8% 동적복리 · 10분 4단 와이드 · 1분 현재가 지정가 매도)\n"
-            "🔸 방어: ⏱️ 양방향 60초 타임쉴드 &amp; 미결 매수 선행 정산(Case 65/66) 락온 완료\n"
+            "🔸 전략: 🛡️ 05_AF_WIDE_10_01 (8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 1분 현재가 지정가 매도)\n"
+            "🔸 방어: ⏱️ 양방향 60초 타임쉴드 &amp; 미결 매수 선행 정산 &amp; 예산초과 차단(Case 65/66/67) 락온 완료\n"
             f"🔸 기준시드: ${init_seed:,.2f} · 가용현금: ${free_cash:,.2f}"
         )
         return await self.send_message(
@@ -825,6 +842,7 @@ class TelegramCommandController:
         self.context.wakeup_event.set()
         live_p, _ = await self._refresh_live_price_and_metrics()
         summary = summarize_stratum_portfolio(updated_st, live_price=live_p)
+        quota_badge_str = _format_case67_quota_badge(summary)
         await self.send_message(
             chat_id=chat_id,
             text=(
@@ -832,7 +850,7 @@ class TelegramCommandController:
                 f"🔸 새 기준 시드머니: <b>${val:,.2f}</b>\n"
                 f"🔸 가용 현금시드: <b>${safe_float(summary.get('free_cash_usd'), 0.0):,.2f}</b>\n"
                 f"🔸 차기 1회(8%) 예산: <b>${safe_float(summary.get('next_portion_budget'), 0.0):,.2f}</b> "
-                f"(현재가 기준 <b>{safe_int(summary.get('next_target_qty'), 1)}주</b>)"
+                f"➔ {quota_badge_str}"
             ),
             reply_markup=_build_settlement_inline_keyboard(
                 bool(updated_st.get("is_active", True))

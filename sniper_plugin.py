@@ -6,8 +6,9 @@
 매도 1호가(Ask 1) 참조 및 10초 후 상향 추격 정정 100% 영구 소각(Case 65) ·
 전술 A 챔피언(🛡️ 05_AF_WIDE_10_01) : 0주 상태 현재가 지정가 실물 1층(REENTRY_1FL) 산입 ·
 2층(MERGED_UPPER) 단독 잔존 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 실물 1층(REENTRY_1FL) 재장전 ·
+상승 돌파 매수 시 1회분(8%) 예산 초과 원천 차단을 위한 min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67) ·
 기억된 사이클 최저 매수가(cycle_min_buy_price) 잠금 기반 10분 고정 4단 와이드 활주로 시드보호 매수 게이트(WIDE_RUNWAY :
-1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%) 및 체결 시 2-Tier 병합·자투리 시드 귀속' 코어 플러그인 (Step 03 / 03)
+1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%) 및 체결 시 2-Tier 병합·자투리 시드 귀속' 코어 플러그인 (Step 03 / 05)
 - MODIFIED (Case 65 핵심 1): 매도 체결 후 60.0초(is_within_post_sell_time_shield) 및 직전 매수 체결 후 60.0초
   (is_within_post_buy_time_shield) 타임쉴드가 경과하기 전에는 일체의 매수 주문 발사를 원천 차단!
   (10분 게이트 도래 시 60초 타임쉴드 중이면 버킷을 소모하지 않고 대기했다가 60초 경과 직후 현재가를 조회해 즉시 판정!)
@@ -15,7 +16,11 @@
   실시간 현재가(fresh_live_p)를 직접 조회하여, 매도 1호가(ask1_p) 참조 없이 오직 '현재가 지정가(LIMIT)'로만 매수 발주!
 - MODIFIED (Case 65 핵심 3): 미체결 매수 주문을 10초 뒤 매도 1호가(ask1_p)로 상향 추격 정정하던 루틴을 100% 영구 소각하고,
   60.0초(BUY_ORDER_MAX_WAIT_SEC = 60.0) 미체결 시 안전하게 주문 취소(cancel_order) 후 복귀!
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 65 완벽 준수
+- MODIFIED (Case 67 핵심 4): 정액제를 기반으로 한 정량제에서 상승 돌파 매수(exec_order_p > anchor_price) 시
+  고정된 주수로 인해 1회분(8%) 시드 예산(portion_budget)을 초과하는 현상을 원천 차단하기 위해
+  compute_golden8_quota_qty(..., exec_price=exec_order_p) 및 resolve_affordable_buy_qty(..., max_portion_budget_usd=portion_budget)로
+  min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑을 전 구간 강제!
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 67 완벽 준수
 """
 
 from __future__ import annotations
@@ -183,7 +188,7 @@ async def _commit_filled_buy_to_stratum_ledger(
     lot_type: str,
 ) -> Dict[str, Any]:
     """
-    🎯 1 & 🎯 3 & 🎯 4 & Case 25, 46, 53, 59, 60, 61, 65:
+    🎯 1 & 🎯 3 & 🎯 4 & Case 25, 46, 53, 59, 60, 61, 65, 67:
     매수 주문 체결(FILLED)이 확인된 즉시:
     1) 실제 소요 원금(actual_spent = filled_qty * avg_fill_price)과
        1회분 정액 예산 대비 절약된 자투리 금액(saved_from_portion = max(0, portion_budget - actual_spent))을 산출한다.
@@ -294,6 +299,7 @@ async def _commit_filled_buy_to_stratum_ledger(
                 f"🔥 [SOXL 현재가 지정가 1층 재장전 체결] {q_int}주 @ ${fill_p:.2f} (2층 비병합)"
             )
             body_str = (
+                f"실사용 ${actual_spent:,.2f} (자투리 +${saved_from_portion:.2f} 시드보존) · "
                 f"🛡️60초 타임쉴드 후 1층목표 ${l1_target:.2f}(+1.5%) 감시 · 2층({b2.qty}주@${b2.book_price:.2f}) 유지 · "
                 f"기억저가 ${new_cycle_min_p:.2f}(와이드 {drop_req_p:.1f}% 추매가 ${trig_buy_p:.2f}) · "
                 f"가용현금 ${free_cash_now:,.2f}"
@@ -464,7 +470,7 @@ async def sync_pending_buy_order_plugin(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 전술 A (05_AF_WIDE_10_01) : 매도 후 60초 타임쉴드 & 현재가 지정가 매수 게이트
+# [핵심 2] 전술 A (05_AF_WIDE_10_01) : 매도 후 60초 타임쉴드 & 현재가 지정가 매수 게이트 (Case 67 탑재)
 # ---------------------------------------------------------------------------
 async def execute_seed_protected_buy_gate_plugin(
     context: Any,
@@ -473,7 +479,7 @@ async def execute_seed_protected_buy_gate_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 1, 🎯 2, 🎯 4 & Case 25 ~ 65 (전술 A 챔피언 : 🛡️ 05_AF_WIDE_10_01 + 60초 타임쉴드 & 현재가 지정가):
+    🎯 1, 🎯 2, 🎯 4 & Case 25 ~ 67 (전술 A 챔피언 : 🛡️ 05_AF_WIDE_10_01 + 60초 타임쉴드 & 현재가 지정가 & Case 67 이중 캡핑):
     04:07:00 ~ 16:00:00 EST 운용 구간에서:
     1) 미체결 매수/매도 주문이 대기 중이면 중복 매수 발사를 차단한다.
     2) 🛡️ [Case 65 : 매도 후 60.0초 타임쉴드 & 직전 매수 후 60.0초 타임쉴드 강제 검문]
@@ -484,14 +490,16 @@ async def execute_seed_protected_buy_gate_plugin(
          60.0초가 경과하는 즉시 최신 현재가를 조회하여 매수 판정을 수행한다!
     3) 🔥 [분기 A : 보유 잔고 0주 상태 (is_zero_shares) — 60초 타임쉴드 경과 후 현재가 조회 및 현재가 지정가 실물 1층 산입]
        - 60초 경과 후 _fetch_fresh_current_soxl_price() 로 실시간 현재가(fresh_live_p)를 직접 조회하여,
-         매도 1호가(Ask 1) 참조 없이 오직 '현재가(fresh_live_p)를 지정가(LIMIT)'로 8% 정량을 매수 발주한다!
-    4) 🛡️ [분기 B : 지층 보유 상태 (len(buckets) > 0) — 10분 고정 시드보호 매수 게이트 검문 (Case 36, 64, 65)]
+         매도 1호가(Ask 1) 참조 없이 오직 '현재가(fresh_live_p)를 지정가(LIMIT)'로 8% 정량(min(1회분 예산 상한 주수, 기준가 정량))을 매수 발주한다!
+    4) 🛡️ [분기 B : 지층 보유 상태 (len(buckets) > 0) — 10분 고정 시드보호 매수 게이트 검문 (Case 36, 64, 65, 67)]
        - 60초 타임쉴드가 경과한 상태에서 10분 게이트 오픈 시 _fetch_fresh_current_soxl_price() 로
          실시간 현재가(fresh_live_p)를 새로 조회한다.
-       - ♻️ [하위 분기 B-1 : 2층(MERGED_UPPER) 단독 보유 상태 (Case 59)]
+       - ♻️ [하위 분기 B-1 : 2층(MERGED_UPPER) 단독 보유 상태 (Case 59 & Case 67)]
          * 조회된 현재가(fresh_live_p)가 직전 익절가 대비 -1.00% 이하 눌림목 OR +1.00% 이상 상승돌파 시에만
            매도 1호가 참조 없이 '현재가(fresh_live_p)를 지정가(LIMIT)'로 REENTRY_1FL 독립 1층 주문을 발주한다!
-       - 📐 [하위 분기 B-2 : 실물 1층 보유 중 — 기억된 최저가 기준 4단 와이드 활주로 추매 (WIDE_RUNWAY, Case 60)]
+         * 이때 상승돌파로 단가가 올라가 1회분(8%) 예산을 초과하는 것을 막기 위해 반드시
+           target_qty = min(budget_cap_qty, anchor_quota_qty) (Case 67) 이중 캡핑을 적용한다!
+       - 📐 [하위 분기 B-2 : 실물 1층 보유 중 — 기억된 최저가 기준 4단 와이드 활주로 추매 (WIDE_RUNWAY, Case 60 & Case 67)]
          * 조회된 현재가(fresh_live_p)가 기억된 최저가 대비 4단 와이드 단차(-1.0% / -2.0% / -3.5% / -5.5%) 이하
            신저가에 도달했을 때만 '현재가(fresh_live_p)를 지정가(LIMIT)'로 DIP_1FL 추매 주문을 발주한다!
     """
@@ -601,11 +609,17 @@ async def execute_seed_protected_buy_gate_plugin(
                     0.01, math.floor((fresh_live_p + 1e-9) * 100.0) / 100.0
                 )
 
+                # 🚨 Case 67: 0주 진입 시에도 직전 anchor_price 가 있으면 min(1회분 상한, 기준가 정량) 적용
+                prev_anchor_p = safe_float(st_now.get("anchor_price"), 0.0)
+                ref_zero_anchor = (
+                    prev_anchor_p if prev_anchor_p > 0.0 else exec_order_p
+                )
                 target_qty, portion_budget = compute_golden8_quota_qty(
-                    anchor_price=exec_order_p,
+                    anchor_price=ref_zero_anchor,
                     current_total_equity=cost_equity,
                     initial_seed_usd=init_seed,
                     portion_mode=portion_mode,
+                    exec_price=exec_order_p,
                 )
                 bp_usd = await context.api.get_buying_power_usd(
                     safety_buffer_pct=0.2
@@ -615,6 +629,7 @@ async def execute_seed_protected_buy_gate_plugin(
                     price_t=exec_order_p,
                     free_cash_usd=free_cash,
                     broker_buying_power_usd=(bp_usd if bp_usd > 0.0 else None),
+                    max_portion_budget_usd=portion_budget,
                 )
 
                 if buy_qty <= 0:
@@ -674,9 +689,10 @@ async def execute_seed_protected_buy_gate_plugin(
                 )
                 context.wakeup_event.set()
                 logger.info(
-                    "🔵 [SOXL 0주 현재가 지정가 1층 매수 발주] %d주 @ 지정가 $%.2f (orderId=%s)",
+                    "🔵 [SOXL 0주 현재가 지정가 1층 매수 발주] %d주 @ 지정가 $%.2f (1회예산 $%.2f · orderId=%s)",
                     buy_qty,
                     exec_order_p,
+                    portion_budget,
                     oid,
                 )
                 return {
@@ -715,7 +731,7 @@ async def execute_seed_protected_buy_gate_plugin(
         return {"status": "NO_FRESH_LIVE_PRICE"}
 
     # -----------------------------------------------------------------------
-    # [하위 분기 B-1 : 2층(MERGED_UPPER) 단독 보유 상태 — 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 재장전 (Case 59, 65)]
+    # [하위 분기 B-1 : 2층(MERGED_UPPER) 단독 보유 상태 — 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 재장전 (Case 59, 65, 67)]
     # -----------------------------------------------------------------------
     if is_l2_only_vacant_l1:
         anchor_p = safe_float(st.get("anchor_price"), buckets[0].book_price)
@@ -758,10 +774,13 @@ async def execute_seed_protected_buy_gate_plugin(
                     0.01, math.floor((fresh_live_p + 1e-9) * 100.0) / 100.0
                 )
 
+                # 🚨 Case 67: 직전 익절 기준가(ref_anchor) 기반 고정 정량(anchor_quota_qty)과
+                # 실제 매수가(exec_order_p) 기준 1회분 예산 상한 주수(budget_cap_qty) 중 작은 값 min() 적용!
                 quota_ref_p = max(
                     0.01,
                     safe_float(
-                        reentry_sig.get("quota_ref_price"), exec_order_p
+                        reentry_sig.get("ref_anchor"),
+                        anchor_p if anchor_p > 0.0 else exec_order_p,
                     ),
                 )
                 target_qty, portion_budget = compute_golden8_quota_qty(
@@ -769,6 +788,7 @@ async def execute_seed_protected_buy_gate_plugin(
                     current_total_equity=cost_equity,
                     initial_seed_usd=init_seed,
                     portion_mode=portion_mode,
+                    exec_price=exec_order_p,
                 )
 
                 bp_usd = await context.api.get_buying_power_usd(
@@ -779,6 +799,7 @@ async def execute_seed_protected_buy_gate_plugin(
                     price_t=exec_order_p,
                     free_cash_usd=free_cash,
                     broker_buying_power_usd=(bp_usd if bp_usd > 0.0 else None),
+                    max_portion_budget_usd=portion_budget,
                 )
 
                 if buy_qty <= 0:
@@ -832,10 +853,12 @@ async def execute_seed_protected_buy_gate_plugin(
                 )
                 context.wakeup_event.set()
                 logger.info(
-                    "🔥 [SOXL 2층 보유 중 현재가 지정가 1층 재장전(%s) 발주] %d주 @ 지정가 $%.2f (orderId=%s)",
+                    "🔥 [SOXL 2층 보유 중 현재가 지정가 1층 재장전(%s) 발주] %d주 @ 지정가 $%.2f (1회예산 $%.2f · 기준가 $%.2f · orderId=%s)",
                     reentry_sig.get("signal_type"),
                     buy_qty,
                     exec_order_p,
+                    portion_budget,
+                    quota_ref_p,
                     oid,
                 )
                 return {
@@ -847,7 +870,7 @@ async def execute_seed_protected_buy_gate_plugin(
                 }
 
     # -----------------------------------------------------------------------
-    # [하위 분기 B-2 : 실물 1층 보유 중 — 기억된 최저가 기준 4단 와이드 신저가 추매 (WIDE_RUNWAY, Case 60, 65)]
+    # [하위 분기 B-2 : 실물 1층 보유 중 — 기억된 최저가 기준 4단 와이드 신저가 추매 (WIDE_RUNWAY, Case 60, 65, 67)]
     # -----------------------------------------------------------------------
     held_lots = sum(b.lot_count for b in buckets)
     drop_buy_pct, _, _ = get_golden8_prog_thresholds(
@@ -890,19 +913,12 @@ async def execute_seed_protected_buy_gate_plugin(
         }
 
     # 🎯 [4단 와이드 신저가 하락 조건 충족] 기억된 최저가(ref_buy_anchor)로 8% 목표 정량(target_qty)을 확정한 뒤
-    # 실제 매수는 매도 1호가(ask1_p) 참조 없이 '조회된 현재가(fresh_live_p)를 지정가(LIMIT)'로 발주한다!
+    # Case 67 이중 캡핑 및 '조회된 현재가(fresh_live_p) 지정가(LIMIT)'로 발주한다!
     async with context.in_memory_ordering_lock:
         async with context.dual_strike_mutex:
             st_now = context.ledger.get_state(TARGET_SYMBOL)
             if str(st_now.get("buy_order_id") or "").strip():
                 return {"status": "ALREADY_ORDERING_IN_MUTEX"}
-
-            target_qty, portion_budget = compute_golden8_quota_qty(
-                anchor_price=ref_buy_anchor,
-                current_total_equity=cost_equity,
-                initial_seed_usd=init_seed,
-                portion_mode=portion_mode,
-            )
 
             max_trigger_p = (
                 math.floor(
@@ -919,6 +935,15 @@ async def execute_seed_protected_buy_gate_plugin(
             )
             exec_order_p = max(0.01, min(cur_limit_p, max_trigger_p))
 
+            # 🚨 Case 67: min(1회분 예산 상한 주수, 기준가 고정 정량) 산출
+            target_qty, portion_budget = compute_golden8_quota_qty(
+                anchor_price=ref_buy_anchor,
+                current_total_equity=cost_equity,
+                initial_seed_usd=init_seed,
+                portion_mode=portion_mode,
+                exec_price=exec_order_p,
+            )
+
             bp_usd = await context.api.get_buying_power_usd(
                 safety_buffer_pct=0.2
             )
@@ -927,6 +952,7 @@ async def execute_seed_protected_buy_gate_plugin(
                 price_t=exec_order_p,
                 free_cash_usd=free_cash,
                 broker_buying_power_usd=(bp_usd if bp_usd > 0.0 else None),
+                max_portion_budget_usd=portion_budget,
             )
 
             if buy_qty <= 0:

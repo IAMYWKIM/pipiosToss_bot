@@ -2,11 +2,13 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 04 / 04)
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 05 / 05)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
-  1) 8%(12.5분할) 황금비율 정액 기반 정량제 & 자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
+  1) 8%(12.5분할) 황금비율 정액 기반 정량제 & min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67) &
+     자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
   3) 2층(MERGED_UPPER) 단독 보유 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 실물 1층(REENTRY_1FL) 재장전
+     (상승돌파 시 Case 67 이중 캡핑으로 1회분 8% 시드 예산 초과 원천 차단!)
   4) 기억된 사이클 최저 매수가(cycle_min_buy_price) 잠금 기반 10분 고정 4단 와이드 활주로 시드보호 매수 게이트
      (WIDE_RUNWAY : 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 신저가 도달 시에만 현재가 지정가 추매)
   5) 매수 후 60초 타임쉴드 & 1분 상시 순수 현재가 지정가 스나이퍼 매도(1층 +1.50% 익절 & 2층 리앵커링 / 2층 +1.00% 전량 졸업)
@@ -15,7 +17,7 @@
   7) 📡 [Case 11 & Case 62 부팅 중 SIGTERM 0.1초 고속 종료 가드 & 텔레그램 적체 큐 무조건부 일괄 소각]
      부팅 초기화 도중 SIGTERM 수신 시 0.1초 내에 즉시 탈출하여 systemd stop-sigterm 타임아웃을 원천 차단하고,
      기동 시 적체 큐 일괄 소각 및 무변경(changed == False) 시 무중단 가동 유지를 통해 9초 무한 재기동 루프를 영구 종결!
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 전수 락온
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 67 전수 락온
 """
 
 from __future__ import annotations
@@ -1296,6 +1298,20 @@ def _get_dst_badge(now_est: Optional[datetime] = None) -> str:
     return "❄️서머타임 OFF (EST)"
 
 
+def _format_case67_quota_badge(summary: Dict[str, Any]) -> str:
+    """
+    NEW [Case 67]:
+    기준가 고정 정량(anchor_quota_qty)과 현재가 기준 1회분 예산 상한 주수(budget_cap_qty)의
+    min(budget_cap_qty, anchor_quota_qty) 캡핑 상태를 직관적인 문자열로 반환한다.
+    """
+    next_qty = safe_int(summary.get("next_target_qty"), 1)
+    anc_qty = safe_int(summary.get("anchor_quota_qty"), next_qty)
+    cap_qty = safe_int(summary.get("budget_cap_qty"), next_qty)
+    if next_qty < anc_qty:
+        return f"<b>{next_qty}주</b> (🛡️min(1회분 {cap_qty}주, 고정 {anc_qty}주) 예산초과 차단)"
+    return f"<b>{next_qty}주</b> (min(1회분, 고정 {anc_qty}주) 대기)"
+
+
 def _build_main_reply_keyboard() -> Dict[str, Any]:
     return {
         "keyboard": [
@@ -1369,6 +1385,8 @@ class _AdaptiveTelegramBridge:
          즉시 소비 확정(Ack)하여 과거 적체된 /start, /update 를 100% 소멸시킨다.
       2) /update 실행 시 오프셋 선행 확정 후, 신규 커밋(changed == True)이 있을 때만 재기동(os._exit(0))하고
          변경 사항이 없을 때(changed == False)는 무중단 가동을 유지하여 9초 주기 무한 재기동 루프를 영구 차단한다.
+      3) NEW [Case 67]: /avwap 레이더 및 /settlement 제어반에서 min(1회분 예산 상한 주수, 기준가 고정 정량)
+         캡핑 상태를 실시간 표출한다.
     """
 
     def __init__(self, context: Any) -> None:
@@ -1619,7 +1637,7 @@ class _AdaptiveTelegramBridge:
         free_cash = safe_float(st.get("free_cash_usd"), init_seed)
         text = (
             "<b>✅ 서버가 정상 작동 중입니다.</b>\n"
-            "🔸 🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 &amp; 선행 체결정산(Case 65/66) 가동 완료\n"
+            "🔸 🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 &amp; 선행 체결정산 &amp; min(1회분,고정정량) 캡핑(Case 65/66/67) 가동 완료\n"
             f"🔸 기준시드: <b>${init_seed:,.2f}</b> · 가용현금: <b>${free_cash:,.2f}</b> (📡 텔레그램 명령어 폴링 ON)"
         )
         sent = await self.send_message(
@@ -1628,7 +1646,7 @@ class _AdaptiveTelegramBridge:
         if not sent:
             await self.send_slim_alert(
                 title="✅ 서버가 정상 작동 중입니다.",
-                body="🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 & 선행 체결정산(Case 65/66) 가동 완료",
+                body="🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 & 선행 체결정산 & min(1회분,고정정량) 캡핑(Case 65/66/67) 가동 완료",
             )
 
     # -----------------------------------------------------------------------
@@ -1645,10 +1663,11 @@ class _AdaptiveTelegramBridge:
         lines = [
             f"🐂 <b>[ SOXL 지층관리 스나이퍼 ({_escape_html(dst_str)}) ]</b>",
             "▫️ 전략: 🛡️ 05_AF_WIDE_10_01 (8% 황금정량 · 눌림/돌파 독립 1층 재장전 · 기억저가 와이드 활주로)",
+            "▫️ 정량: 📐 min(1회분 8% 예산 상한 주수, 기준가 고정 정량) 이중 캡핑으로 돌파 시 예산 초과 차단 (Case 67)",
             "▫️ 매수: 🛡️ 10분 고정 4단 와이드 게이트 (기억저가 대비 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%)",
             "▫️ 재장전: 🔥 0주 즉시 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
             "▫️ 매도: ⚡ 1분 상시 실물 스나이퍼 매도 (1층 +1.50% 익절&amp;리앵커링 / 2층 +1.00% 졸업)",
-            "▫️ 방어: ⏱️ 양방향 60초 타임쉴드 &amp; 순수 현재가 지정가(LIMIT) 락온 (Case 65/66)",
+            "▫️ 방어: ⏱️ 양방향 60초 타임쉴드 &amp; 순수 현재가 지정가(LIMIT) 락온 (Case 65/66/67)",
             f"▫️ 기준 시드머니: <b>${init_seed:,.2f}</b> (1회 8% 정량 자동 산출)",
             "──────────────",
             "🔹 04:00 ~ 04:06: 🌅 프리장 호가 안정화 &amp; 오버나이트 지층 동기화",
@@ -1773,7 +1792,7 @@ class _AdaptiveTelegramBridge:
         )
         next_gate_str = str(gate_info.get("next_gate_hm_str") or "04:07 EST")
         next_bud = safe_float(summary.get("next_portion_budget"), 800.0)
-        next_qty = safe_int(summary.get("next_target_qty"), 1)
+        quota_badge_str = _format_case67_quota_badge(summary)
         ref_anchor = safe_float(summary.get("ref_buy_anchor"), lp)
         chg_anchor = safe_float(summary.get("chg_from_buy_anchor_pct"), 0.0)
         c_sign = "+" if chg_anchor >= 0.0 else ""
@@ -1825,7 +1844,7 @@ class _AdaptiveTelegramBridge:
                 "──────────────",
                 f"🛡️ <b>[10분 고정 와이드 시드보호 매수 게이트]</b> (차기검문: {_escape_html(next_gate_str)})",
                 gate_cond_line,
-                f"▫️ 차기 8% 정량: 예산 ${next_bud:,.2f} ➔ <b>{next_qty}주</b> 고정 대기",
+                f"▫️ 차기 8% 정량: 예산 ${next_bud:,.2f} ➔ {quota_badge_str}",
                 "──────────────",
                 f"♻️ 평단 리앵커링: {reanchor_cnt}회 (누적 -${reanchor_drop:.2f} 단가인하)",
                 f"🛡️ 시드보호 패스: {pass_cnt:,}회 · 🔥 13회차+ 확장매수: {extra_13}회",
@@ -1907,7 +1926,7 @@ class _AdaptiveTelegramBridge:
         next_bud = safe_float(
             summary.get("next_portion_budget"), init_seed * 0.08
         )
-        next_qty = safe_int(summary.get("next_target_qty"), 1)
+        quota_badge_str = _format_case67_quota_badge(summary)
         held_sh = safe_int(summary.get("held_shares"), 0)
         held_lots = safe_int(summary.get("held_lots"), 0)
 
@@ -1915,8 +1934,8 @@ class _AdaptiveTelegramBridge:
             "⚙️ <b>[SOXL 인피니트 스노우볼 v3.0 전술 제어반]</b>",
             f"1️⃣ 마스터 전원: <b>{power_str}</b>",
             f"2️⃣ 기준 시드머니: <b>${init_seed:,.2f}</b> (실현기준 총자산 ${real_eq:,.2f})",
-            "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · 10분 4단 와이드 · 1분 현재가 지정가 매도 · 60초 타임쉴드</b> (고정)",
-            f"4️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ <b>{next_qty}주</b> (가용현금 ${free_cash:,.2f})",
+            "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 1분 지정가매도 · 60초 타임쉴드</b> (고정)",
+            f"4️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str} (가용현금 ${free_cash:,.2f})",
             f"5️⃣ 현재 보유 지층: <b>{held_sh}주</b> ({held_lots}회차)",
             "──────────────",
             "💡 시드머니를 변경하시려면 아래 <b>[💵 기준 시드머니($) 설정]</b> 버튼을 누르거나 채팅창에 숫자(예: <code>19000</code>)를 바로 입력하세요.",
@@ -2066,6 +2085,7 @@ class _AdaptiveTelegramBridge:
         self.context.wakeup_event.set()
         live_p, _ = await self._refresh_live_price_and_metrics()
         summary = summarize_stratum_portfolio(updated_st, live_price=live_p)
+        quota_badge_str = _format_case67_quota_badge(summary)
         await self.send_message(
             chat_id=chat_id,
             text=(
@@ -2073,7 +2093,7 @@ class _AdaptiveTelegramBridge:
                 f"🔸 새 기준 시드머니: <b>${val:,.2f}</b>\n"
                 f"🔸 가용 현금시드: <b>${safe_float(summary.get('free_cash_usd'), 0.0):,.2f}</b>\n"
                 f"🔸 차기 1회(8%) 예산: <b>${safe_float(summary.get('next_portion_budget'), 0.0):,.2f}</b> "
-                f"(현재가 기준 <b>{safe_int(summary.get('next_target_qty'), 1)}주</b>)"
+                f"➔ {quota_badge_str}"
             ),
             reply_markup=_build_settlement_inline_keyboard(
                 bool(updated_st.get("is_active", True))
@@ -2924,7 +2944,7 @@ async def async_main() -> None:
 
     run_quant_engine_tdd()
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60/65/66) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · Case 67 min(1회분, 고정정량) 캡핑 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60/65/66/67) 검증 완료"
     )
 
     context = SniperAppContext(base_dir=base_dir)
@@ -3035,7 +3055,7 @@ async def async_main() -> None:
     ]
 
     logger.info(
-        "🚀 [SOXL 지층관리 스나이퍼 가동 완료] 04:07 ~ 16:00 EST · 전술 A (🛡️ 05_AF_WIDE_10_01) · 8%% 황금정량 · 10분 4단 와이드 매수게이트 · 1분 상시 매도 · 양방향 60초 타임쉴드 & 선행 체결정산(Case 65/66)"
+        "🚀 [SOXL 지층관리 스나이퍼 가동 완료] 04:07 ~ 16:00 EST · 전술 A (🛡️ 05_AF_WIDE_10_01) · 8%% 황금정량 · Case 67 min(1회분,고정정량) 캡핑 · 10분 4단 와이드 매수게이트 · 1분 상시 매도 · 양방향 60초 타임쉴드 & 선행 체결정산(Case 65/66/67)"
     )
 
     try:

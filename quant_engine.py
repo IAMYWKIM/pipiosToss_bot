@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: quant_engine.py
-순수 롱(SOXL) 전용 '8%(12.5분할) 황금비율 정액제 기반 정량 산출기 ·
+순수 롱(SOXL) 전용 '8%(12.5분할) 황금비율 정액제 기반 정량 산출기(min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑 Case 67 탑재) ·
 자투리 절약금 및 세후 실물 수익금 실시간 시드 풀 복리 산입 ·
 전술 A 챔피언(🛡️ 05_AF_WIDE_10_01) 보유 회차별 4단 와이드 점진 활주로(1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 및 1층 +1.50% / 2층 +1.00%) ·
 2층 단독 보유 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 1층(REENTRY_1FL) 재장전 판정기 ·
 프롬프트 2-Tier 가중평균 자동 병합(REENTRY_1FL 독립 1층 배치 vs DIP_1FL 2층 통합 · Case 53 하드 캡핑) ·
 단일 지층 실물 수익금 리앵커링(0.994 버퍼) · 기억된 최저 매수가(cycle_min_buy_price) 잠금 요약 및 TDD 검증' 코어 모듈 (Step 02 / 05)
+- MODIFIED (🎯 1 & Case 67): 정액제를 기반으로 한 정량제에서 상승 돌파 매수(exec_price > anchor_price) 시
+  기존 고정 주수(anchor_quota_qty)로 인해 1회분(8%) 시드 예산(portion_budget)을 초과하는 현상을 원천 차단하기 위해
+  target_qty = min(budget_cap_qty, anchor_quota_qty) 이중 캡핑 공식을 compute_golden8_quota_qty 및
+  resolve_affordable_buy_qty, summarize_stratum_portfolio, run_quant_engine_tdd 에 100% 탑재!
 - MODIFIED (🎯 2 & Case 36 ~ 45, 60): 보유 회차별 요구 하락 단차를 4단 와이드 활주로(1~4회 -1.00% / 5~8회 -2.00% /
-  9~10회 -3.50% / 11회+ -5.50%)로 전면 개편하여 대폭락장 시드 조기 고갈 및 무리셋 장기 동결을 원천 차단!
+  9~10회 -3.50% / 11회+ -5.50%)로 유지하여 대폭락장 시드 조기 고갈 및 무리셋 장기 동결을 원천 차단!
 - MODIFIED (🎯 4 & Case 59): 2층(MERGED_UPPER) 단독 보유 시 직전 익절가(anchor_price) 대비 -1.00% 이하 눌림목(PULLBACK_RELOAD)
   또는 +1.00% 이상 상승 돌파(BREAKOUT_RELOAD) 시에만 독립 실물 1층(REENTRY_1FL) 재장전을 승인하는
   evaluate_l2_only_hybrid_reentry_signal() 함수 및 관제탑(main.py / tg_ui_plugin.py / defense_plugin.py) 전 필드 100% 매핑!
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 완벽 준수
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 67 완벽 준수
 """
 
 from __future__ import annotations
@@ -158,21 +162,26 @@ def buckets_to_dicts(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 8%(12.5분할) 황금비율 정액 기반 정량 주수 산출 및 가용현금 캡핑 (🎯 1 & Case 25 ~ 35)
+# [핵심 2] 8%(12.5분할) 황금비율 정액 기반 정량 주수 산출 및 min(1회분, 고정정량) 캡핑 (🎯 1 & Case 25 ~ 35, 67)
 # ---------------------------------------------------------------------------
 def compute_golden8_quota_qty(
     anchor_price: float,
     current_total_equity: float,
     initial_seed_usd: float = DEFAULT_INITIAL_SEED_USD,
     portion_mode: str = "COMP_08PCT",
+    exec_price: Optional[float] = None,
 ) -> Tuple[int, float]:
     """
-    🎯 1 & Case 25 ~ 35:
+    🎯 1 & Case 25 ~ 35 & Case 67:
     직전 매매 기준가(anchor_price)를 기반으로 8%(12.5분할) 황금비율 1회분 예산(portion_budget)과
-    고정 목표 매수 주수(target_qty)를 산출한다.
+    고정 목표 매수 주수(anchor_quota_qty)를 산출하되, 실제 매수 지정가(exec_price)가 제공된 경우
+    상승 돌파 등으로 인해 1회분(8%) 예산을 초과하지 않도록 min(budget_cap_qty, anchor_quota_qty)로 캡핑한다.
     - COMP_08PCT (챔피언 고정 모드):
       portion_budget = round(max(initial_seed_usd, current_total_equity) * 0.08, 4)
-    - target_qty = max(1, int(math.floor(portion_budget / max(0.01, anchor_price))))
+    - anchor_quota_qty = max(1, int(math.floor((portion_budget + 1e-9) / max(0.01, anchor_price))))
+    - NEW [Case 67]: exec_price > 0 일 때
+      budget_cap_qty = max(1, int(math.floor((portion_budget + 1e-9) / max(0.01, exec_price))))
+      target_qty = min(budget_cap_qty, anchor_quota_qty)
     반환값: (target_qty, portion_budget)
     """
     init_seed = max(
@@ -187,8 +196,18 @@ def compute_golden8_quota_qty(
         portion_budget = round(tot_eq * PORTION_RATIO_LOCKED, 4)
 
     ref_p = max(0.01, safe_float(anchor_price, 0.01))
-    raw_qty = int(math.floor((portion_budget + 1e-9) / ref_p))
-    target_qty = max(1, raw_qty)
+    anchor_quota_qty = max(1, int(math.floor((portion_budget + 1e-9) / ref_p)))
+
+    # 🚨 Case 67: 실제 매수가(exec_price)가 기준가보다 높을 때 1회분(8%) 예산 초과 원천 차단!
+    if exec_price is not None and safe_float(exec_price, 0.0) > 0.0:
+        eff_exec_p = max(0.01, safe_float(exec_price, ref_p))
+        budget_cap_qty = max(
+            1, int(math.floor((portion_budget + 1e-9) / eff_exec_p))
+        )
+        target_qty = min(budget_cap_qty, anchor_quota_qty)
+    else:
+        target_qty = anchor_quota_qty
+
     return target_qty, portion_budget
 
 
@@ -197,19 +216,32 @@ def resolve_affordable_buy_qty(
     price_t: float,
     free_cash_usd: float,
     broker_buying_power_usd: Optional[float] = None,
+    max_portion_budget_usd: Optional[float] = None,
 ) -> Tuple[int, float]:
     """
-    🚨 Case 25 ~ 35:
-    직전 기준가로 산출된 목표 정량(target_qty)을 실제 주문가(price_t)로 매수하기 직전,
-    왕복 수수료 버퍼(0.14%)를 감안한 가용 현금(free_cash_usd) 및 토스 실계좌 매수가능금액
-    (broker_buying_power_usd) 한도 내 매수 가능 정수 주수로 캡핑하여
-    422 insufficient-buying-power 에러를 100% 원천 차단한다.
+    🚨 Case 25 ~ 35 & Case 67:
+    직전 기준가로 산출된 목표 정량(target_qty)을 실제 주문가(price_t)로 매수하기 직전:
+    1) NEW [Case 67]: max_portion_budget_usd(1회분 8% 예산)가 지정된 경우,
+       budget_cap_qty = max(1, int(math.floor((max_portion_budget_usd + 1e-9) / price_t))) 와
+       target_qty 중 작은 값인 min(budget_cap_qty, target_qty) 로 1회분 예산 초과를 한 번 더 하드 캡핑한다.
+    2) 왕복 수수료 버퍼(0.14%)를 감안한 가용 현금(free_cash_usd) 및 토스 실계좌 매수가능금액
+       (broker_buying_power_usd) 한도 내 매수 가능 정수 주수로 캡핑하여
+       422 insufficient-buying-power 에러를 100% 원천 차단한다.
     반환값: (buy_qty, actual_spent_usd)
     """
     t_qty = max(0, safe_int(target_qty, 0))
     exec_p = safe_float(price_t, 0.0)
     if t_qty <= 0 or exec_p <= 0.0:
         return 0, 0.0
+
+    # 🚨 Case 67: 1회분(8%) 예산 상한 주수(budget_cap_qty) 하드 캡핑
+    if (
+        max_portion_budget_usd is not None
+        and safe_float(max_portion_budget_usd, 0.0) > 0.0
+    ):
+        p_bud = safe_float(max_portion_budget_usd, 0.0)
+        budget_cap_qty = max(1, int(math.floor((p_bud + 1e-9) / exec_p)))
+        t_qty = min(budget_cap_qty, t_qty)
 
     avail_cash = max(0.0, safe_float(free_cash_usd, 0.0))
     if broker_buying_power_usd is not None:
@@ -231,7 +263,7 @@ def resolve_affordable_buy_qty(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 3] 전술 A 보유 회차별 4단 와이드 점진 단차 & 하이브리드 재장전 판정기 (🎯 2, 🎯 4 & Case 36 ~ 60)
+# [핵심 3] 전술 A 보유 회차별 4단 와이드 점진 단차 & 하이브리드 재장전 판정기 (🎯 2, 🎯 4 & Case 36 ~ 60, 67)
 # ---------------------------------------------------------------------------
 def get_golden8_prog_thresholds(
     held_lots: int,
@@ -272,13 +304,16 @@ def evaluate_l2_only_hybrid_reentry_signal(
     l2_book_price: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    NEW [🎯 4 & Case 59 : 2층(MERGED_UPPER) 단독 보유 시 눌림목(-1.00%) OR 상승돌파(+1.00%) 독립 1층 재장전 판정기]:
+    MODIFIED [🎯 4 & Case 59, Case 67 : 2층(MERGED_UPPER) 단독 보유 시 눌림목(-1.00%) OR 상승돌파(+1.00%) 독립 1층 재장전 판정기]:
     1층이 실물 익절되어 장부에 상위 2층만 단독으로 남아 있을 때,
     반등 고점에서의 이중 현금 소진을 막기 위해 회수 현금을 보유하다가 10분 매수 게이트에서:
     - 조건 A (눌림목 재장전 : chg_from_exit <= -1.00%):
-      직전 익절가(ref_anchor) 기준으로 8% 정량을 확정하여 더 싸진 현재가에 REENTRY_1FL 매수 승인!
+      직전 익절가(ref_anchor) 기준으로 8% 고정 정량을 확정하고 min(1회분 예산 상한 주수, 기준가 정량)을 적용하여
+      더 싸진 현재가에 REENTRY_1FL 매수 승인!
     - 조건 B (상승돌파 재장전 : chg_from_exit >= +1.00%):
-      눌림 없이 위로 치고 나가는 상승 추세 돌파로 판정하여 현재가(live_price) 기준으로 REENTRY_1FL 매수 승인!
+      눌림 없이 위로 치고 나가는 상승 추세 돌파로 판정하되, Case 67 에 따라 직전 익절가(ref_anchor) 기준 고정 정량과
+      현재가(live_price) 기준 1회분 예산 상한 주수 중 작은 값(min(budget_cap_qty, anchor_quota_qty))을 적용하여
+      1회분(8%) 시드 예산 초과 없이 REENTRY_1FL 매수 승인!
     - 불발 시 (-1.00% < chg_from_exit < +1.00%):
       고점 부근 횡보 구간으로 판정하여 매수를 패스(HOLD_WAIT_GATE)하고 현금 시드를 보호한다.
     """
@@ -327,7 +362,7 @@ def evaluate_l2_only_hybrid_reentry_signal(
             "should_buy": True,
             "signal_type": "BREAKOUT_RELOAD",
             "ref_anchor": round(ref_anchor, 4),
-            "quota_ref_price": round(lp, 4),
+            "quota_ref_price": round(ref_anchor, 4),
             "chg_from_exit_pct": round(chg_from_exit_pct, 2),
             "pullback_target_price": pullback_target_p,
             "breakout_target_price": breakout_target_p,
@@ -534,20 +569,22 @@ def calc_sell_realized_pnl(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 5] 포트폴리오 · 지층 · 기억된 최저가 · 하이브리드 1층 재장전 통합 요약기 (Case 59, 60)
+# [핵심 5] 포트폴리오 · 지층 · 기억된 최저가 · 하이브리드 1층 재장전 · Case 67 통합 요약기
 # ---------------------------------------------------------------------------
 def summarize_stratum_portfolio(
     state_dict: Dict[str, Any],
     live_price: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    🎯 2, 🎯 4, 🎯 5 & Case 59, 60:
+    🎯 1, 🎯 2, 🎯 4, 🎯 5 & Case 59, 60, 67:
     원장 상태(state_dict)와 현재가(live_price)를 받아:
     - 1층(L1) 및 2층(MERGED_UPPER) 보유 현황, 목표 익절가(l1_target_price, l2_target_price) 및 실시간 수익률(l1_gain_pct, l2_gain_pct)
     - 2층 단독 보유(is_l2_only_anti_bloat) 시 직전 익절가(reentry_ref_anchor) 대비
       눌림목 재장전 타점(reentry_pullback_price, -1.00%) 및 상승돌파 재장전 타점(reentry_breakout_price, +1.00%)
     - 1층 보유 중 기억된 사이클 최저 매수가(cycle_min_buy_price)를 반영한 4단 와이드 활주로
       추가 매수 기준가(active_buy_anchor / ref_buy_anchor) 및 신저가 매수 트리거 가격(trigger_buy_price)
+    - NEW [Case 67]: 기준가 기반 고정 정량(anchor_quota_qty), 현재가 기준 1회분 예산 상한 주수(budget_cap_qty),
+      그리고 min(budget_cap_qty, anchor_quota_qty) 가 적용된 최종 목표 매수 주수(next_target_qty)
     - 회계 항등식 기반 총자산(mark_equity_usd / total_mark_equity_usd), 가용현금(free_cash_usd),
       실현기준 총자산(realized_equity_usd), 평가손익, 실현/총 ROI 및 누적 통계 필드를 100% 반환한다.
     """
@@ -673,7 +710,7 @@ def summarize_stratum_portfolio(
         else 0.0
     )
 
-    # MODIFIED: 관제 보드(/avwap)용 ref_buy_anchor 및 chg_from_buy_anchor_pct 정밀 산출
+    # 관제 보드(/avwap)용 ref_buy_anchor 및 chg_from_buy_anchor_pct 정밀 산출
     if is_l2_only:
         ref_buy_anchor = (
             reentry_ref_anchor
@@ -693,19 +730,27 @@ def summarize_stratum_portfolio(
     if len(buckets) == 0:
         ref_for_quota = lp if lp > 0.0 else max(anchor_p, 1.0)
     elif is_l2_only:
-        ref_for_quota = safe_float(
-            reentry_sig.get("quota_ref_price"),
-            reentry_ref_anchor if reentry_ref_anchor > 0.0 else lp,
+        ref_for_quota = (
+            reentry_ref_anchor
+            if reentry_ref_anchor > 0.0
+            else (lp if lp > 0.0 else active_buy_anchor)
         )
     else:
         ref_for_quota = active_buy_anchor
 
-    next_target_qty, next_portion_budget = compute_golden8_quota_qty(
+    # NEW [Case 67]: 기준가 기반 고정 정량(anchor_quota_qty)과 현재가(lp) 기준 1회분 예산 상한 주수(budget_cap_qty)의 min() 산출
+    anchor_quota_qty, next_portion_budget = compute_golden8_quota_qty(
         anchor_price=max(0.01, ref_for_quota),
         current_total_equity=cost_equity,
         initial_seed_usd=init_seed,
         portion_mode=portion_mode,
+        exec_price=None,
     )
+    eff_exec_for_cap = lp if lp > 0.0 else max(0.01, ref_for_quota)
+    budget_cap_qty = max(
+        1, int(math.floor((next_portion_budget + 1e-9) / eff_exec_for_cap))
+    )
+    next_target_qty = min(budget_cap_qty, anchor_quota_qty)
 
     market_eval_usd = (
         round(float(held_shares) * lp, 4)
@@ -781,6 +826,8 @@ def summarize_stratum_portfolio(
         "reentry_breakout_price": reentry_breakout_price,
         "chg_from_reentry_anchor_pct": chg_from_reentry_anchor_pct,
         "next_target_qty": next_target_qty,
+        "anchor_quota_qty": anchor_quota_qty,
+        "budget_cap_qty": budget_cap_qty,
         "next_portion_budget": next_portion_budget,
         "reanchor_cnt": reanchor_cnt,
         "cumulative_reanchor_drop_usd": cum_reanchor_drop,
@@ -791,11 +838,12 @@ def summarize_stratum_portfolio(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 66 & 전술 A 4단 와이드 활주로 전수 검증)
+# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 67 & 전술 A 4단 와이드 활주로 전수 검증)
 # ---------------------------------------------------------------------------
 def run_quant_engine_tdd() -> bool:
     """
-    기동 직전 8% 황금정량 산출, 4단 와이드 활주로(-1.0% / -2.0% / -3.5% / -5.5%),
+    기동 직전 8% 황금정량 산출, Case 67 min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑,
+    4단 와이드 활주로(-1.0% / -2.0% / -3.5% / -5.5%),
     2층 단독 시 눌림/돌파 하이브리드 독립 1층 재장전(Case 59), 기억된 최저가 잠금(Case 60) 및
     관제 UI 필수 요약 필드를 전수 검증한다.
     """
@@ -805,6 +853,31 @@ def run_quant_engine_tdd() -> bool:
     )
     assert q1 == 8 and abs(bud1 - 800.0) < 1e-6, (
         f"TDD 실패: q1={q1}, bud1={bud1}"
+    )
+
+    # 1-B) 🚨 Case 67: min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑 검증
+    # $19,155.74 총자산 -> 1회(8%) 예산 $1,532.4592, 직전 익절 기준가 $82.39 -> 고정 정량 18주
+    # - 하락 매수($79.52): budget_cap_qty(19주) vs anchor_quota_qty(18주) -> min(19, 18) = 18주 고정
+    # - 급등 돌파($86.00): budget_cap_qty(17주) vs anchor_quota_qty(18주) -> min(17, 18) = 17주로 캡핑하여 예산 초과 차단!
+    q_dip, bud_c67 = compute_golden8_quota_qty(
+        82.39, 19155.74, 19000.0, "COMP_08PCT", exec_price=79.52
+    )
+    q_brk, _ = compute_golden8_quota_qty(
+        82.39, 19155.74, 19000.0, "COMP_08PCT", exec_price=86.00
+    )
+    assert q_dip == 18, f"TDD 실패(Case 67 하락 고정정량): q_dip={q_dip}"
+    assert q_brk == 17 and (q_brk * 86.00) <= bud_c67, (
+        f"TDD 실패(Case 67 상승돌파 예산초과 차단): q_brk={q_brk}, bud={bud_c67}"
+    )
+
+    aff_brk_q, spent_brk = resolve_affordable_buy_qty(
+        target_qty=18,
+        price_t=86.00,
+        free_cash_usd=8909.61,
+        max_portion_budget_usd=bud_c67,
+    )
+    assert aff_brk_q == 17 and abs(spent_brk - 1462.0) < 1e-4, (
+        f"TDD 실패(Case 67 resolve_affordable_buy_qty 캡핑): aff_brk_q={aff_brk_q}"
     )
 
     # 2) 하락가 매수 시 자투리 시드 보존 및 가용현금 캡핑 검증
@@ -866,7 +939,7 @@ def run_quant_engine_tdd() -> bool:
     assert (
         sig_brk["should_buy"]
         and sig_brk["signal_type"] == "BREAKOUT_RELOAD"
-        and abs(sig_brk["quota_ref_price"] - 92.30) < 1e-4
+        and abs(sig_brk["quota_ref_price"] - 91.35) < 1e-4
     ), "TDD 실패: 상승돌파 독립 1층 재장전 신호 오류"
 
     # 6) 🚨 Case 59 & Case 60: 2층 단독 상태에서 실물 1층(REENTRY_1FL @ $90.40) 재장전 시
@@ -898,10 +971,13 @@ def run_quant_engine_tdd() -> bool:
     assert abs(sum_info["active_buy_anchor"] - 90.00) < 1e-4, (
         f"TDD 실패(Case 60): 기억된 최저가($90.00) 잠금 풀림 -> {sum_info['active_buy_anchor']}"
     )
-    assert "mark_equity_usd" in sum_info and "ref_buy_anchor" in sum_info, (
-        "TDD 실패: 관제 보드 필수 요약 키 누락"
-    )
+    assert (
+        "mark_equity_usd" in sum_info
+        and "ref_buy_anchor" in sum_info
+        and "anchor_quota_qty" in sum_info
+        and "budget_cap_qty" in sum_info
+    ), "TDD 실패: 관제 보드 필수 요약 키 누락"
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · Case 67 min(1회분, 고정정량) 캡핑 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60) 검증 완료"
     )
     return True
