@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: main.py
-순수 롱(SOXL) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼 메인 오케스트레이터 및 비동기 스케줄러 (Step 09 / 09)
-- MODIFIED: 데이장(daymarket_sim_plugin.py), 1주 휩소(whipsaw_plugin.py), 인버스 숏(SOXS),
-  08:15 선제 컷오프 및 15:59 강제 손절 MOC 청산 루틴을 100% 영구 폐기
-- NEW: 오직 프리장 개시(04:07 EST)부터 정규장 마감(16:00 EST)까지만 연속 가동하며,
-  '8% 황금비율 정액 기반 정량제 + 자투리/수익금 복리 산입 + 10분 고정 시드보호 매수 게이트 +
-  1분 상시 스나이퍼 매도 + 무팽창 True Always-L1 리앵커링' 단일 아키텍처로 구동
-- NEW: 기동 직전 폐기 파일 자동 청소(purge_deprecated_legacy_files), 9대 코어 모듈 py_compile 검증,
-  TDD 수리 공식 검증(run_quant_engine_tdd) 및 오버나이트 지층-실잔고 화해 선행 실행
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 58 완벽 준수
+순수 롱(SOXL) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼 메인 오케스트레이터 및 비동기 스케줄러 (Step 04 / 04)
+- MODIFIED (제3헌법): 데이장(daymarket_sim_plugin.py), 1주 휩소(whipsaw_plugin.py), 인버스 숏(SOXS),
+  08:15 선제 컷오프, 15:59 강제 손절 MOC 청산 및 구버전 가상 래칫 부스터 잔재를 100% 영구 폐기
+- MODIFIED (Case 59, 60, 64): 오직 프리장 개시(04:07 EST)부터 정규장 마감(16:00 EST)까지만 연속 가동하며,
+  '8% 황금비율 정액 기반 정량제(COMP_08PCT 고정) + 자투리/수익금 복리 산입 + 10분 고정 시드보호 매수 게이트 +
+  1분 상시 실물 스나이퍼 매도(08_VREV_PROG 고정) + 실물 기반 무팽창 True Always-L1 리앵커링' 단일 아키텍처로 구동
+- NEW: 1층 실물 익절 직후 2층(MERGED_UPPER) 단독 잔존(1층 공석) 시 0.4초 고주파 스나이퍼 부스터를 즉시 가동하여
+  지연 없이 현재가 실물 1층(REENTRY_1FL)을 재산입하도록 결속
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 64 완벽 준수
 """
 
 from __future__ import annotations
@@ -68,11 +68,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("toss_sniper.main")
 
+# Case 64: 시드보호 매수 게이트 주기 10분 하드 고정 상수
+LOCKED_BUY_INTERVAL_MIN: int = 10
+
 # 메인 루프 주기 상수 (평시 1.5초 / 고주파 스나이퍼 부스터 가동 시 0.4초)
 NORMAL_LOOP_INTERVAL_SEC: float = 1.5
 FAST_BOOSTER_INTERVAL_SEC: float = 0.4
 
-# 백그라운드 1분봉 캔들 레이더 주기 상수 (04:00 ~ 16:00 EST 운용 중 5.0초 / 장외 20.0초)
+# 백그라운드 1분봉 캔들 레이더 주기 상수 (04:00 ~ 16:05 EST 운용 중 5.0초 / 장외 20.0초)
 ACTIVE_CANDLE_POLL_SEC: float = 5.0
 IDLE_CANDLE_POLL_SEC: float = 20.0
 
@@ -144,7 +147,7 @@ def is_weekend_market_closed(now_est: Optional[datetime] = None) -> bool:
 # ---------------------------------------------------------------------------
 class SniperContext:
     """
-    제1헌법 ~ 제6헌법 및 Case 01 ~ 58:
+    제1헌법 ~ 제6헌법 및 Case 01 ~ 64:
     순수 롱(SOXL) 지층관리 스나이퍼의 API 클라이언트, 로컬 원장(AssassinLedger),
     1분봉 지표 캐시, 체결 그레이스 쉴드 및 비동기 타격 뮤텍스를 통합 관리하는 컨텍스트.
     """
@@ -196,7 +199,7 @@ class SniperContext:
         total_count: int = 300,
     ) -> None:
         """
-        SOXL 의 1분봉 시계열을 조회하여 당일 프리장(04:00~09:29) 및 정규장(09:30~16:00)
+        SOXL 의 1분봉 시계열을 조회하여 당일 프리장(04:00 ~ 09:29) 및 정규장(09:30 ~ 16:00)
         고/저가, 진폭, VWAP, 하이킨 아시 및 10분 매수 게이트 버킷 상태를 갱신한다.
         """
         now_est = datetime.now(EST_TZ)
@@ -230,7 +233,7 @@ class SniperContext:
 
 
 # ---------------------------------------------------------------------------
-# 0.4초 고주파 스나이퍼 부스터 (_evaluate_fast_shield_mode) 판별기
+# 0.4초 고주파 스나이퍼 부스터 (_evaluate_fast_shield_mode) 판별기 (Case 59, 64)
 # ---------------------------------------------------------------------------
 def _evaluate_fast_shield_mode(
     context: SniperContext,
@@ -238,13 +241,15 @@ def _evaluate_fast_shield_mode(
     now_est: datetime,
 ) -> bool:
     """
+    MODIFIED (Case 59 & Case 64):
     04:07 ~ 16:00 EST 운용 구간에서 아래 조건 중 하나라도 충족하면
     메인 루프 주기를 1.5초에서 0.4초 고주파 모드(fast_shield_mode = True)로 즉시 가속한다:
     ① 미체결 매수 주문(buy_order_id) 또는 미체결 매도 주문(sell_order_id)이 대기 중일 때
-    ② 보유 지층이 0주여서 즉시 첫 1층 진입을 준비 중일 때
-    ③ 10분 시드보호 매수 게이트 정각 분봉(is_exact_boundary_min == True)에 진입했을 때
-    ④ 현재가(live_p)가 1층 익절 목표가(+1.50%), 2층 졸업 목표가(+1.00%), 또는
-       무팽창 상승 래칫 목표가(+1.50%) 대비 0.30% 이내로 근접했을 때
+    ② 보유 지층이 0주이거나 1층 실물 익절 직후 2층(MERGED_UPPER)만 단독 잔존하여
+       즉시 현재가 실물 1층(REENTRY_1FL) 진입을 준비 중일 때 (가용 현금이 1주 이상 매수 가능할 때)
+    ③ 10분 고정 시드보호 매수 게이트 정각 분봉(is_exact_boundary_min == True)에 진입했을 때
+    ④ 현재가(live_p)가 1층 실물 익절 목표가(+1.50%) 또는 2층 졸업 목표가(+1.00%) 대비
+       0.30% 이내로 근접했을 때 (구버전 가상 래칫 조건문 영구 소각 완료!)
     """
     hm = now_est.hour * 100 + now_est.minute
     if not is_active_trading_window(hm):
@@ -262,10 +267,19 @@ def _evaluate_fast_shield_mode(
 
     live_p = safe_float((prices or {}).get(TARGET_SYMBOL), 0.0)
     summary = summarize_stratum_portfolio(st, live_price=live_p)
+    free_cash = safe_float(summary.get("free_cash_usd"), 0.0)
+
+    # 0주 상태이거나 2층 단독 보유(1층 공석) 상태에서 1주 이상 실물 매수 여력이 있으면 0.4초 즉시 부스터 가동
     if safe_int(summary.get("held_shares"), 0) == 0:
         return True
+    if bool(summary.get("is_l2_only_anti_bloat")) and (
+        live_p <= 0.0 or free_cash >= (live_p * 1.0014)
+    ):
+        return True
 
-    gate_info = compute_buy_gate_bucket_info(now_est, buy_interval_min=10)
+    gate_info = compute_buy_gate_bucket_info(
+        now_est, buy_interval_min=LOCKED_BUY_INTERVAL_MIN
+    )
     if bool(gate_info.get("is_exact_boundary_min")):
         return True
 
@@ -276,10 +290,6 @@ def _evaluate_fast_shield_mode(
             return True
         if l2_target > 0.0 and live_p >= (l2_target * 0.9970):
             return True
-        if bool(summary.get("is_l2_only_anti_bloat")):
-            ratchet_p = safe_float(summary.get("ratchet_anchor_price"), 0.0)
-            if ratchet_p > 0.0 and live_p >= (ratchet_p * 1.0120):
-                return True
 
     return False
 
@@ -298,7 +308,7 @@ async def candle_radar_loop(context: SniperContext) -> None:
             await asyncio.sleep(30.0)
             continue
 
-        hm = now_est.hour * 100 + now_est.minute
+        hm = now_est.hour * 100 + dt_minute if (dt_minute := now_est.minute) >= 0 else now_est.hour * 100
         in_focus_window = bool(400 <= hm <= 1605)
         poll_interval = (
             ACTIVE_CANDLE_POLL_SEC
@@ -323,10 +333,10 @@ async def candle_radar_loop(context: SniperContext) -> None:
 # ---------------------------------------------------------------------------
 async def daily_gc_and_rollover_loop(context: SniperContext) -> None:
     """
-    Case 01 & Case 22:
+    Case 01 & Case 22 & Case 64:
     - 17:00 EST 정각 일일 가비지 컬렉션(GC) 파이프라인 실행
-    - 새 거래일 진입 시 오버나이트 지층(buckets)과 누적 시드는 100% 그대로 보존하고
-      일일 결산 카운터(daily_*)와 게이트 버킷 인덱스만 새 거래일 기준으로 준비시킨다.
+    - 새 거래일 진입 시 오버나이트 지층(buckets)과 기억된 최저가(cycle_min_buy_price), 누적 시드는
+      100% 그대로 보존하고 일일 결산 카운터(daily_*)와 게이트 버킷 인덱스만 새 거래일 기준으로 준비시킨다.
     """
     while context.running:
         try:
@@ -346,13 +356,13 @@ async def daily_gc_and_rollover_loop(context: SniperContext) -> None:
                     collected,
                 )
 
-            # 2) 논리 거래일 롤오버 감지 시 일일 통계 카운터 초기화 (지층 및 시드 100% 보존!)
+            # 2) 논리 거래일 롤오버 감지 시 일일 통계 카운터 초기화 (지층·기억저가·시드 100% 보존!)
             if logical_date != context.last_rollover_date:
                 prev_logical = context.last_rollover_date
                 context.last_rollover_date = logical_date
                 await context.ledger.update_state(
                     TARGET_SYMBOL,
-                    buy_interval_min=10,
+                    buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
                     portion_mode="COMP_08PCT",
                     threshold_mode="08_VREV_PROG",
                     is_compound=True,
@@ -365,7 +375,7 @@ async def daily_gc_and_rollover_loop(context: SniperContext) -> None:
                     daily_reanchor_cnt=0,
                 )
                 logger.info(
-                    "🌐 [신규 거래일 롤오버 완료] %s -> %s (SOXL 오버나이트 지층 및 복리 시드 100%% 보존)",
+                    "🌐 [신규 거래일 롤오버 완료] %s -> %s (SOXL 오버나이트 지층 · 기억저가 · 복리 시드 100%% 보존)",
                     prev_logical,
                     logical_date,
                 )
@@ -383,11 +393,11 @@ async def daily_gc_and_rollover_loop(context: SniperContext) -> None:
 # ---------------------------------------------------------------------------
 async def main_sniper_loop(context: SniperContext) -> None:
     """
-    제1헌법 ~ 제6헌법 & 🎯 1 ~ 🎯 5:
-    데이장(19:00 ~ 03:59 EST) 및 1주 휩소, 15:59 MOC 없이
+    제1헌법 ~ 제6헌법 & 🎯 1 ~ 🎯 5 & Case 01 ~ 64:
+    데이장(19:00 ~ 03:59 EST) 및 1주 휩소, 15:59 MOC, 가상 래칫 없이
     오직 프리장(04:00 호가안정화 / 04:07 개시)부터 정규장 마감(16:00 EST)까지만
     '8% 황금비율 정액 기반 정량제 × 자투리/수익금 복리 산입 × 10분 고정 시드보호 매수 게이트 ×
-    1분 상시 스나이퍼 매도 × 무팽창 True Always-L1 리앵커링'을 구동하는 메인 루프.
+    1분 상시 실물 스나이퍼 매도 × 실물 기반 무팽창 True Always-L1 리앵커링'을 구동하는 메인 루프.
     """
     while context.running:
         loop_start_mono = time.monotonic()
@@ -429,7 +439,7 @@ async def main_sniper_loop(context: SniperContext) -> None:
 
             # 3. [04:07 ~ 16:00 EST] 프리장 + 정규장 전 구간 연속 지층관리 스나이퍼 가동
             elif is_active_trading_window(hm):
-                # 3-1) 로컬 지층 원장 ↔ 토스 실보유 잔고 무결성 화해 (Case 29 & Case 58)
+                # 3-1) 로컬 지층 원장 ↔ 토스 실보유 잔고 무결성 화해 (Case 29, 58, 60, 61, 63)
                 await _call_plugin_adaptive(
                     reconcile_stratum_with_broker_holdings_plugin,
                     context=context,
@@ -438,7 +448,7 @@ async def main_sniper_loop(context: SniperContext) -> None:
                     now_est=now_est,
                 )
 
-                # 3-2) ⚡ [1분 상시(실시간) 스나이퍼 매도 게이트 & 무팽창 Always-L1 리앵커링 선행 실행]
+                # 3-2) ⚡ [1분 상시(실시간) 실물 스나이퍼 매도 게이트 & 실물 수익금 2층 리앵커링 선행 실행]
                 sell_res = await _call_plugin_adaptive(
                     execute_1m_sniper_sell_and_reanchor_plugin,
                     context=context,
@@ -446,14 +456,14 @@ async def main_sniper_loop(context: SniperContext) -> None:
                     prices=prices,
                     now_est=now_est,
                 )
-                did_sell_or_ratchet = bool(
+                did_sell_in_tick = bool(
                     isinstance(sell_res, dict)
                     and sell_res.get("did_sell_or_ratchet")
                 )
 
-                # 3-3) 🛡️ [0주 즉시 1층 산입 & 10분 고정 시드보호 매수 게이트 실행]
-                #      Case 44: 동일 틱에서 매도/래칫이 격발된 경우 추가 물타기 매수를 즉시 건너뜀!
-                if not did_sell_or_ratchet:
+                # 3-3) 🛡️ [1층 공석(0주 또는 2층 단독) 즉시 실물 1층(REENTRY_1FL) 산입 & 10분 고정 시드보호 매수 게이트 실행]
+                #      Case 44: 동일 틱에서 매도가 격발/체결된 경우 자전거래 방지를 위해 매수를 건너뛰고 다음 0.4초 틱에 실행!
+                if not did_sell_in_tick:
                     await _call_plugin_adaptive(
                         execute_seed_protected_buy_gate_plugin,
                         context=context,
@@ -509,7 +519,7 @@ async def async_main() -> None:
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # 1. 제3헌법: 영구 폐기된 데이장(daymarket_sim_plugin.py) 및 1주 휩소(whipsaw_plugin.py) 파일 자동 삭제
+    # 1. 제3헌법: 영구 폐기된 데이장(daymarket_sim_plugin.py), 1주 휩소(whipsaw_plugin.py), SOXS 잔재 자동 삭제
     removed_files = await asyncio.to_thread(
         purge_deprecated_legacy_files, base_dir
     )
@@ -519,25 +529,26 @@ async def async_main() -> None:
             ", ".join(removed_files),
         )
 
-    # 2. Case 11: 기동 직전 9대 필수 코어 모듈 py_compile 무결성 검증
+    # 2. Case 11 & Case 62: 기동 직전 9대 필수 코어 모듈 py_compile 및 AST 심볼 임포트 무결성 검증
     ok, compile_errs = await asyncio.to_thread(
         verify_all_modules_compile, base_dir, True
     )
     if not ok:
         logger.error(
-            "🚨 프리플라이트 컴파일 에러 감지:\n%s", "\n".join(compile_errs)
+            "🚨 프리플라이트 컴파일/임포트 에러 감지:\n%s",
+            "\n".join(compile_errs),
         )
         sys.exit(1)
 
-    # 3. TDD 사전 무결성 검증 (8% 황금정량 산출 · 자투리 시드 귀속 · 2-Tier 병합 · 리앵커링 검증)
+    # 3. TDD 사전 무결성 검증 (8% 황금정량 산출 · 자투리 시드 귀속 · 2-Tier 병합 · 리앵커링 · Case 59/60 검증)
     run_quant_engine_tdd()
 
     context = SniperContext()
 
-    # 4. 10분 시드보호 매수 게이트 고정 및 8% 동적 복리 정량(COMP_08PCT · 08_VREV_PROG) 설정 락온
+    # 4. Case 64: 10분 시드보호 매수 게이트 하드 고정 및 8% 동적 복리 정량(COMP_08PCT · 08_VREV_PROG) 설정 락온
     await context.ledger.update_state(
         TARGET_SYMBOL,
-        buy_interval_min=10,
+        buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
         portion_mode="COMP_08PCT",
         threshold_mode="08_VREV_PROG",
         is_compound=True,
@@ -585,7 +596,7 @@ async def async_main() -> None:
     ]
 
     logger.info(
-        "🚀 [SOXL 지층관리 스나이퍼 가동 완료] 04:07~16:00 EST · 8%% 황금정량 복리 · 10분 시드보호 매수게이트 · 1분 상시 매도 · 무팽창 Always-L1"
+        "🚀 [SOXL 지층관리 스나이퍼 가동 완료] 04:07 ~ 16:00 EST · 8%% 황금정량 복리 · 10분 고정 매수게이트 · 1분 상시 매도 · 실물 무팽창 Always-L1"
     )
     try:
         await asyncio.gather(*tasks)

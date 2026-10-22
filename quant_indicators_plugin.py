@@ -1,33 +1,32 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: quant_indicators_plugin.py
-순수 롱(SOXL) 전용 '04:07 ~ 16:00 EST 10분(bucket_10m) / 30분(bucket_30m) 시드보호 매수 게이트 버킷 산출기',
+순수 롱(SOXL) 전용 '04:07 ~ 16:00 EST 10분 고정(bucket_10m) 시드보호 매수 게이트 버킷 산출기',
 100% 벡터화 시계열 지표(프리장·정규장 고/저가·진폭·VWAP·하이킨 아시) & 0.0ms 실시간 틱 합성,
-일봉 5MA 진폭 및 예상 밴드 산출 코어 플러그인 (Step 02 / 09)
-- NEW: 04:07 ~ 16:00 EST 구간에서 mins_from_0407 = (hour * 60 + minute) - 247 기반
-  10분 버킷(bucket_10m = mins_from_0407 // 10) 및 30분 버킷(bucket_30m = mins_from_0407 // 30) 정밀 산출
-  및 동일 버킷 내 중복 매수 판정 차단 검증기(evaluate_buy_gate_bucket_status, Case 01 & Case 36) 탑재
-- MODIFIED: 제3헌법에 의거하여 폐기된 데이장(19:00 ~ 03:59 EST) 지표, SOXS/SOXL 추세 주도주 선정기
-  (select_vwap_trend_leader), 구버전 VWAP -0.50% 매수 덫 단가 데드코드를 100% 영구 소각
+일봉 5MA 진폭 및 예상 밴드 산출 코어 플러그인 (Step 02 / 04)
+- MODIFIED (Case 01, Case 36, Case 64): 04:07 ~ 16:00 EST 구간에서 mins_from_0407 = (hour * 60 + minute) - 247 기반
+  10분 고정 매수 게이트 버킷(bucket_10m = mins_from_0407 // 10, 16:00 마감봉 72) 정밀 산출,
+  비운용 구간 반환 딕셔너리의 "is_exact_boundary_min" 키 오타 교정 및 동일 버킷 내 중복 매수 판정 차단 검증기 탑재
+- MODIFIED (제3헌법): 폐기된 데이장(19:00 ~ 03:59 EST) 지표, SOXS/SOXL 추세 주도주 선정기,
+  구버전 VWAP -0.50% 매수 덫 단가 데드코드를 100% 영구 소각
 - 제4헌법: 모든 시계열 연산 ZoneInfo('America/New_York') 단일 소스 락온
-- Case 01, 23, 36 ~ 45 완벽 준수
+- Case 01 ~ 64 완벽 준수
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from toss_api import EST_TZ, safe_float, safe_int
+from toss_api import EST_TZ, LOCKED_BUY_INTERVAL_MIN, safe_float, safe_int
 
 logger = logging.getLogger("toss_sniper.quant_indicators_plugin")
 
-# 04:07 EST 기준 분 오프셋 상수 (4시간 * 60분 + 7분 = 247분)
+# 04:07 EST 기준 분 오프셋 상수 (4시간 * 60분 + 7분 = 247분) 및 16:00 EST 마감 분 상수 (960분)
 BASE_OPEN_MINS_0407: int = 4 * 60 + 7  # 247
 FINAL_CLOSE_MINS_1600: int = 16 * 60   # 960
 
@@ -89,25 +88,25 @@ def is_daily_settlement_window(hm: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Case 01 & Case 36 : 04:07 ~ 16:00 EST 10분 / 30분 시드보호 매수 게이트 버킷 산출기
+# Case 01, Case 36, Case 64 : 04:07 ~ 16:00 EST 10분 고정 시드보호 매수 게이트 버킷 산출기
 # ---------------------------------------------------------------------------
 def compute_buy_gate_bucket_info(
     now_est: Optional[datetime] = None,
-    buy_interval_min: int = 10,
+    buy_interval_min: int = LOCKED_BUY_INTERVAL_MIN,
 ) -> Dict[str, Any]:
     """
-    NEW [Case 01 & Case 36 : 10분 / 30분 매수 게이트 버킷 산출 공식]:
+    MODIFIED [Case 01, Case 36, Case 64 : 10분 고정 매수 게이트 버킷 산출 공식]:
+    - 30분 옵션을 완전히 배제하고 buy_interval_min = 10 으로 하드 고정한다.
     - 04:07:00 ~ 16:00:59 EST 구간에서:
       mins_from_0407 = (hour * 60 + minute) - 247
-      * bucket_10m = mins_from_0407 // 10  (04:07->0, 04:17->1, ..., 15:57->71, 16:00->71)
-      * bucket_30m = mins_from_0407 // 30  (04:07->0, 04:37->1, ..., 15:37->23, 16:00->23)
+      * bucket_10m = mins_from_0407 // 10  (04:07->0, 04:17->1, ..., 15:57->71)
     - 단, 16:00 EST 정각 마감봉(hm == 1600)은 백테스트(is_day_last)와 100% 동일하게
-      독립 마감 버킷(10분: 72, 30분: 24)을 부여하여 장 마감 스냅샷 판정을 보장한다.
+      독립 마감 버킷(72)을 부여하여 장 마감 스냅샷 판정을 보장한다.
     """
     dt = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt.hour * 100 + dt.minute
     today_str = dt.strftime("%Y-%m-%d")
-    interval = 30 if safe_int(buy_interval_min, 10) == 30 else 10
+    interval = LOCKED_BUY_INTERVAL_MIN  # Case 64: 10분 하드 고정
 
     if not is_active_trading_window(hm):
         return {
@@ -118,7 +117,8 @@ def compute_buy_gate_bucket_info(
             "bucket_10m": -1,
             "bucket_30m": -1,
             "active_bucket_id": -1,
-            "is_exact_ boundary_min": False,
+            "buy_interval_min": interval,
+            "is_exact_boundary_min": False,  # MODIFIED: 키 공백 오타 완벽 교정
             "next_gate_hm_str": "04:07 EST",
         }
 
@@ -134,9 +134,9 @@ def compute_buy_gate_bucket_info(
         bucket_30m = int(mins_from_0407 // 30)
         is_exact_min = bool((mins_from_0407 % interval) == 0)
 
-    active_bucket_id = bucket_30m if interval == 30 else bucket_10m
+    active_bucket_id = bucket_10m
 
-    # 다음 매수 게이트 예정 시각(HH:MM EST) 산출 (텔레그램 UI 표출용)
+    # 다음 10분 매수 게이트 예정 시각(HH:MM EST) 산출 (텔레그램 UI 표출용)
     if hm >= 1600:
         next_gate_str = "익일 04:07 EST"
     else:
@@ -169,13 +169,13 @@ def evaluate_buy_gate_bucket_status(
     last_evaluated_date: str,
 ) -> Tuple[bool, int, str, Dict[str, Any]]:
     """
-    🚨 Case 36 [동일 10분/30분 버킷 내 중복 매수 판정 원천 차단]:
-    현재 시각(now_est)의 활성 매수 버킷(active_bucket_id)을 산출하여,
+    🚨 Case 36 & Case 64 [동일 10분 버킷 내 중복 매수 판정 원천 차단]:
+    현재 시각(now_est)의 10분 고정 매수 버킷(active_bucket_id = bucket_10m)을 산출하여,
     오늘(today_str) 아직 평가되지 않은 새로운 버킷일 때만 is_buy_gate_open = True 를 반환한다.
     반환값: (is_buy_gate_open, active_bucket_id, today_str, bucket_info)
     """
     b_info = compute_buy_gate_bucket_info(
-        now_est=now_est, buy_interval_min=buy_interval_min
+        now_est=now_est, buy_interval_min=LOCKED_BUY_INTERVAL_MIN
     )
     if not b_info.get("in_trading_window"):
         return False, -1, str(b_info.get("today_str") or ""), b_info
@@ -188,7 +188,7 @@ def evaluate_buy_gate_bucket_status(
     prev_date = str(last_evaluated_date or "").strip()
     prev_bucket_id = safe_int(last_evaluated_bucket_id, -1)
 
-    # 날짜가 바뀌었거나 버킷 인덱스가 이전 평가 버킷과 다르면 게이트 오픈!
+    # 날짜가 바뀌었거나 10분 버킷 인덱스가 이전 평가 버킷과 다르면 게이트 오픈!
     is_open = bool(
         (today_str != prev_date) or (cur_bucket_id != prev_bucket_id)
     )
@@ -379,7 +379,7 @@ def _calc_slice_vwap_and_range(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1] SOXL 04:00 ~ 16:00 EST 프리장·정규장 시계열 지표 및 10m/30m 게이트 산출기
+# [핵심 1] SOXL 04:00 ~ 16:00 EST 프리장·정규장 시계열 지표 및 10m 게이트 산출기
 # ---------------------------------------------------------------------------
 def compute_session_vwap_metrics(
     candles: List[Dict[str, Any]],
@@ -390,13 +390,15 @@ def compute_session_vwap_metrics(
     """
     토스 Open API 1분봉 리스트(candles)와 실시간 현재가(live_price)를 받아
     100% 벡터 연산으로 당일(04:00 ~ 16:00 EST) 프리장/정규장 고·저가, 진폭, 누적 VWAP,
-    10분/30분 매수 게이트 버킷 정보 및 하이킨 아시 기저를 산출한다.
+    10분 고정 매수 게이트 버킷 정보 및 하이킨 아시 기저를 산출한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     anchors = _get_trading_day_anchors_est(dt_now)
     logical_date = anchors["logical_date"]
     lp = safe_float(live_price, 0.0)
-    gate_info = compute_buy_gate_bucket_info(dt_now, buy_interval_min=10)
+    gate_info = compute_buy_gate_bucket_info(
+        dt_now, buy_interval_min=LOCKED_BUY_INTERVAL_MIN
+    )
 
     default_out: Dict[str, Any] = {
         "logical_date": logical_date,
@@ -419,7 +421,7 @@ def compute_session_vwap_metrics(
         "reg_amp_pct": 0.0,
         "reg_sum_tp_v": 0.0,
         "reg_sum_v": 0.0,
-        # 10분 / 30분 매수 게이트 버킷 상태
+        # 10분 매수 게이트 버킷 상태
         "mins_from_0407": gate_info["mins_from_0407"],
         "bucket_10m": gate_info["bucket_10m"],
         "bucket_30m": gate_info["bucket_30m"],
@@ -555,12 +557,14 @@ def refresh_metrics_with_live_tick(
 ) -> Dict[str, Any]:
     """
     캔들 기저 지표(base_metrics)에 실시간 현재가(live_price)를 결합하여
-    당일 고/저가, 프리장/정규장 VWAP, 하이킨 아시 상태 및 10분/30분 버킷 정보를 즉시 갱신한다.
+    당일 고/저가, 프리장/정규장 VWAP, 하이킨 아시 상태 및 10분 버킷 정보를 즉시 갱신한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
     lp = safe_float(live_price, 0.0)
-    gate_info = compute_buy_gate_bucket_info(dt_now, buy_interval_min=10)
+    gate_info = compute_buy_gate_bucket_info(
+        dt_now, buy_interval_min=LOCKED_BUY_INTERVAL_MIN
+    )
 
     if not isinstance(base_metrics, dict) or not base_metrics:
         return {
@@ -753,7 +757,7 @@ def compute_daily_5ma_and_expected_band(
         * 100.0
     ).to_numpy(dtype=float)
 
-    yest_amp = float(amps[-1]) if len(amps) >= 1 else 10.0
+    yest_amp = float(amps[-1]) if len(amps[-1:]) >= 1 else 10.0
     amp_5ma = float(np.mean(amps[-5:])) if len(amps) >= 1 else 10.0
 
     high_chg = (

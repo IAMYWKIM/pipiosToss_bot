@@ -2,16 +2,18 @@
 """
 # MODIFIED: defense_plugin.py
 순수 롱(SOXL) 전용 '오버나이트 지층 원장(soxl_stratum_ledger.json) ↔ 토스 실보유 잔고(/api/v1/holdings)
-무결성 화해(Case 29 유령 잔고 방어 & Case 58 재기동/수동매매 정합성 복원) ·
+무결성 화해(Case 29 유령 잔고 방어 · Case 58 재기동/수동매매 정합성 복원 · Case 60 수동 전량청산 시 기억저가 리셋 ·
+Case 61 15초 인덱싱 시차 그레이스 쉴드 · Case 63 부분 수동매매 시 리앵커링 단가 이점 보존) ·
 04:00 ~ 04:06 EST 프리장 초기 호가 안정화 동기화 ·
-16:00 ~ 16:59 EST 정규장 마감 일일 결산 리포트 및 오버나이트 지층 안전 보존(강제 MOC 없음)' 코어 플러그인 (Step 06 / 09)
-- MODIFIED: 제3헌법에 의거하여 구버전 08:15 EST 거시지표 컷오프, 15:00 EST 정규장 VWAP 덤핑 탈출,
+16:00 ~ 16:59 EST 정규장 마감 일일 결산 리포트 및 오버나이트 지층 안전 보존(강제 MOC 없음)' 코어 플러그인 (Step 03 / 04)
+- MODIFIED (제3헌법): 구버전 08:15 EST 거시지표 컷오프, 15:00 EST 정규장 VWAP 덤핑 탈출,
   15:59 EST 제로-오버나이트 강제 손절 MOC 및 NQ=F/QQQ 매크로 손절 덤핑 데드코드를 100% 영구 소각
-- NEW: 프로세스 재기동 또는 운용자의 토스 앱 수동 매수/매도 발생 시에도 2층 리앵커링 장부단가(book_price)를
-  훼손하지 않고 실보유 수량(holdings_qty) 및 실투입 원금(actual_cost_usd)을 원자적으로 화해(Reconcile)
-- NEW: 16:00 EST 정규장 마감 시 미체결 DAY 주문만 정리하고 보유 지층(1층/2층)은 100% 오버나이트 보존하며
-  당일 세후 실현순익 · 자투리 절약액 · 리앵커링 · 시드보호패스 일일 결산 보고 타전
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 58 완벽 준수
+- MODIFIED (Case 58, 60, 63): 프로세스 재기동 또는 운용자의 토스 앱 수동 매수/매도 발생 시
+  수동 전량 매도(0주)는 cycle_min_buy_price = 0.0 까지 완벽히 리셋하고, 부분 수동 매매 시에는
+  기존 리앵커링 누적 차감 크레딧과 장부단가(book_price)를 훼손하지 않고 실보유 수량(holdings_qty) 및
+  실투입 원금(actual_cost_usd)을 원자적으로 화해(Reconcile)
+- MODIFIED (Case 64): 10분 고정 시드보호 매수 게이트 단일화에 맞춰 알림 및 일일 롤오버 상태 동기화
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 64 완벽 준수
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from quant_engine import (
     StratumBucket,
@@ -38,6 +40,7 @@ from sniper_exit_plugin import update_exit_snapshot_on_hold
 from sniper_plugin import is_within_auto_fill_grace_shield
 from toss_api import (
     EST_TZ,
+    LOCKED_BUY_INTERVAL_MIN,
     TARGET_SYMBOL,
     safe_float,
     safe_int,
@@ -96,7 +99,7 @@ async def relock_stratum_on_bot_resume(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] Case 29 & Case 58 : 로컬 지층 원장(buckets) ↔ 토스 실보유 잔고 무결성 화해
+# [핵심 2] Case 29, 58, 60, 61, 63 : 로컬 지층 원장(buckets) ↔ 토스 실보유 잔고 무결성 화해
 # ---------------------------------------------------------------------------
 async def reconcile_stratum_with_broker_holdings_plugin(
     context: Any,
@@ -106,19 +109,20 @@ async def reconcile_stratum_with_broker_holdings_plugin(
     force_reconcile: bool = False,
 ) -> Dict[str, Any]:
     """
-    🚨 Case 29 (유령 잔고 방어) & Case 58 (재기동/수동매매 지층 복원):
+    🚨 Case 29 (유령 잔고 방어) & Case 58 (재기동/수동매매 지층 복원) & Case 60 ~ 63:
     로컬 원장(soxl_stratum_ledger.json)의 지층 수량 합계(ledger_qty)와
     토스 실제 보유 잔고(/api/v1/holdings 의 h_qty, avg_price)를 대조한다:
     1) 미체결 주문(buy_order_id / sell_order_id)이 진행 중이거나 매수 직후 15.0초 인덱싱 시차
-       그레이스 쉴드 구간이면 화해를 보류하여 정상 체결 프로세스를 보호한다.
+       그레이스 쉴드 구간(Case 61)이면 화해를 보류하여 정상 체결 프로세스를 보호한다.
     2) [케이스 A : 원장 0주인데 실제 토스 잔고 h_qty > 0 존재 (재기동 복원 또는 수동 매수)]
        즉시 실보유 수량(h_qty)과 평단가(avg_price)로 1층(StratumBucket)을 생성하여 지층 관리에 편입한다.
     3) [케이스 B : 원장 > 0주인데 실제 토스 잔고 h_qty == 0 (토스 앱에서 수동 전량 매도)]
-       실시간 가격(또는 직전 스냅샷 가격)으로 수동 청산 손익을 정산하고 지층 큐를 비워
-       유령 잔고 매도 에러를 원천 차단한다.
-    4) [케이스 C : 원장 수량 != 실제 토스 잔고 수량 (부분 수동 매수/매도)]
-       기존 2층의 리앵커링 단가 비율을 유지하면서 총 수량과 실제 원금(actual_cost_usd)을
-       토스 실잔고 팩트에 맞게 정밀 보정한다.
+       실시간 가격(또는 직전 스냅샷 가격)으로 수동 청산 손익을 정산하고 지층 큐를 비우며,
+       기억된 최저 매수가(cycle_min_buy_price = 0.0)까지 완벽히 리셋(Case 60)하여 유령 잔고 에러와
+       차기 사이클 기준가 왜곡을 원천 차단한다.
+    4) [케이스 C : 원장 수량 != 실제 토스 잔고 수량 (부분 수동 매수/매도, Case 63)]
+       기존 지층에 누적된 리앵커링 원금 차감액(reanchor_credit)과 리앵커링 단가(book_price) 이점을
+       증발시키지 않고 보존하면서 총 수량과 실제 원금(actual_cost_usd)을 토스 실잔고 팩트에 맞게 정밀 보정한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     st = context.ledger.get_state(TARGET_SYMBOL)
@@ -151,13 +155,23 @@ async def reconcile_stratum_with_broker_holdings_plugin(
 
     # 수량이 정확히 일치하는 정상 상태
     if ledger_qty == h_qty:
-        if h_qty > 0 and safe_float(st.get("anchor_price"), 0.0) <= 0.0:
-            await context.ledger.update_state(
-                TARGET_SYMBOL,
-                anchor_price=buckets[0].book_price,
-                cycle_min_buy_price=min(b.book_price for b in buckets),
-                ratchet_anchor_price=buckets[0].book_price,
-            )
+        if h_qty > 0:
+            cur_anchor = safe_float(st.get("anchor_price"), 0.0)
+            cur_min_p = safe_float(st.get("cycle_min_buy_price"), 0.0)
+            min_bucket_p = min(b.book_price for b in buckets)
+            if cur_anchor <= 0.0 or cur_min_p <= 0.0:
+                await context.ledger.update_state(
+                    TARGET_SYMBOL,
+                    anchor_price=(
+                        cur_anchor if cur_anchor > 0.0 else buckets[0].book_price
+                    ),
+                    cycle_min_buy_price=(
+                        min(cur_min_p, min_bucket_p)
+                        if cur_min_p > 0.0
+                        else min_bucket_p
+                    ),
+                    ratchet_anchor_price=buckets[0].book_price,
+                )
         return {"status": "STRATUM_HOLDINGS_MATCHED", "qty": h_qty}
 
     # -----------------------------------------------------------------------
@@ -192,7 +206,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                 title=f"🔗 [SOXL 실보유 잔고 지층 자동 편입] {h_qty}주",
                 body=(
                     f"평단가 ${avg_p:.2f} (원금 ${actual_cost:,.2f}) · "
-                    f"1층 목표 +1.50% 스나이퍼 매도 및 10m/30m 매수게이트 결속 완료"
+                    f"1층 목표 +1.50% 스나이퍼 매도 및 10분 고정 시드보호 매수게이트 결속 완료"
                 ),
             )
         return {
@@ -239,10 +253,12 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             safe_float(st.get("daily_realized_net_usd"), 0.0) + net_pnl, 4
         )
 
+        # MODIFIED (Case 60): 수동 전량 매도(0주) 시 cycle_min_buy_price = 0.0 으로 완벽 리셋!
         updated_st = await context.ledger.update_state(
             TARGET_SYMBOL,
             buckets=[],
             anchor_price=round(ref_exit_p, 4) if ref_exit_p > 0.0 else 0.0,
+            cycle_min_buy_price=0.0,
             ratchet_anchor_price=(
                 round(ref_exit_p, 4) if ref_exit_p > 0.0 else 0.0
             ),
@@ -256,7 +272,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             daily_realized_net_usd=day_net,
         )
         logger.info(
-            "🧹 [SOXL 수동 전량매도 감지 ➔ 원장 0주 동기화] %d주 정산 (세후 %+.2f$, 가용현금 $%.2f)",
+            "🧹 [SOXL 수동 전량매도 감지 ➔ 원장 0주 & 기억저가 0점 동기화] %d주 정산 (세후 %+.2f$, 가용현금 $%.2f)",
             ledger_qty,
             net_pnl,
             safe_float(updated_st.get("free_cash_usd"), 0.0),
@@ -268,18 +284,29 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         }
 
     # -----------------------------------------------------------------------
-    # [케이스 C] 원장 수량(ledger_qty)과 토스 실잔고(h_qty)가 부분 불일치하는 경우
+    # [케이스 C] 원장 수량(ledger_qty)과 토스 실잔고(h_qty)가 부분 불일치하는 경우 (Case 63)
     # -----------------------------------------------------------------------
     if h_qty > 0 and avg_p > 0.0:
         total_actual_cost = round(float(h_qty) * avg_p, 4)
         if len(buckets) >= 2 and h_qty > buckets[0].qty:
-            # 1층 수량은 그대로 유지하고 차이를 2층(MERGED_UPPER)에 반영
+            # 1층 수량은 그대로 유지하고 수량 차이와 리앵커링 크레딧을 2층(MERGED_UPPER)에 정밀 반영
             b1 = buckets[0]
             b2_old = buckets[1]
             new_b2_q = h_qty - b1.qty
             b1_cost = min(total_actual_cost - 0.01, b1.actual_cost_usd)
             b2_cost = max(0.01 * float(new_b2_q), total_actual_cost - b1_cost)
-            b2_book_p = min(b2_old.book_price, b2_cost / float(new_b2_q))
+
+            # Case 63: 기존 2층에 누적되어 있던 리앵커링 원금 차감액(credit) 보존
+            old_b2_credit = max(
+                0.0, b2_old.actual_cost_usd - b2_old.book_invested_usd
+            )
+            b2_book_inv_from_credit = max(
+                0.01 * float(new_b2_q), b2_cost - old_b2_credit
+            )
+            b2_book_p = min(
+                b2_old.book_price,
+                b2_book_inv_from_credit / float(new_b2_q),
+            )
             new_b2 = StratumBucket(
                 qty=new_b2_q,
                 book_price=round(b2_book_p, 4),
@@ -290,9 +317,17 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             )
             adj_buckets = [b1, new_b2]
         else:
-            # 단일 지층으로 깔끔하게 수량 및 원금 동기화 (리앵커링된 book_price 가 더 낮으면 보존)
+            # 단일 지층으로 수량 및 원금 동기화 (기존 누적 리앵커링 차감액 및 book_price 이점 100% 보존)
             old_b0 = buckets[0]
-            adj_book_p = min(old_b0.book_price, avg_p)
+            old_total_credit = sum(
+                max(0.0, b.actual_cost_usd - b.book_invested_usd)
+                for b in buckets
+            )
+            book_inv_after_credit = max(
+                0.01 * float(h_qty), total_actual_cost - old_total_credit
+            )
+            credit_book_p = book_inv_after_credit / float(h_qty)
+            adj_book_p = min(old_b0.book_price, credit_book_p, avg_p)
             adj_buckets = [
                 StratumBucket(
                     qty=h_qty,
@@ -304,15 +339,23 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                 )
             ]
 
+        old_cycle_min = safe_float(st.get("cycle_min_buy_price"), 0.0)
+        min_adj_p = min(b.book_price for b in adj_buckets)
+        next_cycle_min = (
+            min(old_cycle_min, min_adj_p) if old_cycle_min > 0.0 else min_adj_p
+        )
+
         await context.ledger.update_state(
             TARGET_SYMBOL,
             buckets=buckets_to_dicts(adj_buckets),
+            cycle_min_buy_price=round(next_cycle_min, 4),
         )
         logger.info(
-            "🔄 [SOXL 지층 수량 정합성 보정] 원장 %d주 -> 실잔고 %d주 (평단 $%.2f)",
+            "🔄 [SOXL 지층 수량 정합성 보정] 원장 %d주 -> 실잔고 %d주 (실평단 $%.2f · 1층장부 $%.2f)",
             ledger_qty,
             h_qty,
             avg_p,
+            adj_buckets[0].book_price,
         )
         return {
             "status": "RECONCILED_PARTIAL_DIFF",
@@ -347,10 +390,43 @@ async def execute_0400_premarket_stabilization_plugin(
     today_str = dt_now.strftime("%Y-%m-%d")
     st = context.ledger.get_state(TARGET_SYMBOL)
 
-    # 새 거래일 진입 시 일일 통계 카운터 초기화
+    # 1) 전일 세션 잔류 미체결 주문 ID 가 있으면 거래소 OPEN 주문과 대조하여 청소
+    buy_oid = str(st.get("buy_order_id") or "").strip()
+    sell_oid = str(st.get("sell_order_id") or "").strip()
+    if buy_oid or sell_oid:
+        open_orders = await context.api.get_orders(
+            status="OPEN", symbol=TARGET_SYMBOL
+        )
+        open_ids = {
+            str(o.get("orderId") or "").strip()
+            for o in open_orders
+            if isinstance(o, dict)
+        }
+        clear_kwargs: Dict[str, Any] = {}
+        if buy_oid and buy_oid not in open_ids:
+            clear_kwargs["buy_order_id"] = ""
+            clear_kwargs["ordered_qty"] = 0
+            clear_kwargs["buy_price"] = 0.0
+            clear_kwargs["pending_portion_budget"] = 0.0
+            clear_kwargs["pending_lot_type"] = ""
+        if sell_oid and sell_oid not in open_ids:
+            clear_kwargs["sell_order_id"] = ""
+            clear_kwargs["ordered_qty"] = 0
+            clear_kwargs["target_sell_price"] = 0.0
+            clear_kwargs["pending_sell_mode"] = ""
+        if clear_kwargs:
+            st = await context.ledger.update_state(
+                TARGET_SYMBOL, **clear_kwargs
+            )
+
+    # 2) 새 거래일 진입 시 일일 통계 카운터 초기화 및 10분 게이트 하드 고정 확인
     if str(st.get("last_evaluated_date") or "") != today_str:
         await context.ledger.update_state(
             TARGET_SYMBOL,
+            buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
+            portion_mode="COMP_08PCT",
+            threshold_mode="08_VREV_PROG",
+            is_compound=True,
             last_evaluated_date=today_str,
             last_evaluated_buy_bucket_id=-1,
             daily_realized_net_usd=0.0,
@@ -361,7 +437,7 @@ async def execute_0400_premarket_stabilization_plugin(
             daily_reanchor_cnt=0,
         )
 
-    # 오버나이트 지층 ↔ 실잔고 무결성 화해
+    # 3) 오버나이트 지층 ↔ 실잔고 무결성 화해
     rec_res = await reconcile_stratum_with_broker_holdings_plugin(
         context=context,
         holdings=holdings,
@@ -407,10 +483,18 @@ async def execute_1600_daily_closing_settlement_plugin(
                 await context.api.cancel_order(oid)
             except Exception:
                 pass
-            await context.ledger.update_state(
+            st = await context.ledger.update_state(
                 TARGET_SYMBOL,
-                buy_order_id="" if oid_key == "buy_order_id" else st.get("buy_order_id", ""),
-                sell_order_id="" if oid_key == "sell_order_id" else st.get("sell_order_id", ""),
+                buy_order_id=(
+                    ""
+                    if oid_key == "buy_order_id"
+                    else st.get("buy_order_id", "")
+                ),
+                sell_order_id=(
+                    ""
+                    if oid_key == "sell_order_id"
+                    else st.get("sell_order_id", "")
+                ),
                 ordered_qty=0,
                 pending_sell_mode="",
             )

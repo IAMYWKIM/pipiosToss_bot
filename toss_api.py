@@ -2,12 +2,13 @@
 """
 # MODIFIED: toss_api.py
 토스증권(Toss) Open API v1.2.14 방탄 클라이언트, GlobalThrottle 중앙 통제기,
-_HybridFileLock 하이브리드 파일 락 및 순수 롱(SOXL) 2-Tier 지층관리 원자적 원장(AssassinLedger) 코어 (Step 01 / 09)
+_HybridFileLock 하이브리드 파일 락 및 순수 롱(SOXL) 2-Tier 지층관리 원자적 원장(AssassinLedger) 코어 (Step 01 / 04)
 - NEW: 인버스 숏(SOXS) 및 데이장/1주 휩소 영구 폐기에 따라 REAL_ALLOWED_SYMBOLS = ("SOXL",) 단일 롱 하드 락온
 - NEW: 04:07 ~ 16:00 EST 운용 시간대 외 자동 매수 주문 물리적 차단 가드 장착
-- MODIFIED: AssassinLedger 를 '8% 황금비율 정액 기반 정량제 + 자투리/수익금 복리 산입 + 10분/30분 시드보호 게이트 +
-  1분 상시 스나이퍼 매도 + 무팽창 True Always-L1 리앵커링' 전용 2-Tier 지층 원장(state_SOXL.json / soxl_stratum_ledger.json)으로 전면 개편
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 58 완벽 준수
+- MODIFIED (Case 64): AssassinLedger 를 '8% 황금비율 정액 기반 정량제(COMP_08PCT 고정) + 자투리/수익금 복리 산입 +
+  10분 고정 시드보호 매수 게이트(buy_interval_min = 10 고정) + 1분 상시 스나이퍼 매도(08_VREV_PROG 고정) +
+  실물 기반 무팽창 True Always-L1 리앵커링' 전용 2-Tier 지층 원장(state_SOXL.json / soxl_stratum_ledger.json)으로 하드 락온
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 64 완벽 준수
 """
 
 from __future__ import annotations
@@ -43,9 +44,12 @@ TOSS_API_BASE_URL: str = "https://openapi.tossinvest.com"
 # 4xx 즉시 탈출 대상 상태 코드 (Case 21: 백오프 재시도 금지)
 NON_RETRYABLE_STATUS_CODES: Tuple[int, ...] = (400, 403, 404, 409, 415, 422)
 
-# 기본 초기 시드머니 ($10,000.00) 및 8%(12.5분할) 황금비율 상수
+# NEW: 기본 초기 시드머니($10,000.00) · 8%(12.5분할) 황금비율 · 리앵커링 버퍼(0.994) · 왕복 수수료(0.14%) · 10분 게이트 고정 상수
 DEFAULT_INITIAL_SEED_USD: float = 10000.0
 PORTION_RATIO_LOCKED: float = 0.08
+REANCHOR_NET_BUFFER_MULT: float = 0.994
+ROUND_TRIP_FEE_RATE_PCT: float = 0.14
+LOCKED_BUY_INTERVAL_MIN: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -321,17 +325,17 @@ def _default_soxl_stratum_state() -> Dict[str, Any]:
         "symbol": TARGET_SYMBOL,
         "is_active": True,
         "is_compound": True,
-        "portion_mode": "COMP_08PCT",         # "COMP_08PCT" (총자산 8% 복리) | "FIXED_800" ($800 고정 정량)
-        "threshold_mode": "08_VREV_PROG",     # "08_VREV_PROG" (1층+1.5%/2층+1.0%) | "01_PROG_LOT" (+1%/+1.5%/+2%)
-        "buy_interval_min": 10,               # 10 (10분 시드보호 매수 게이트) | 30 (30분 시드보호 매수 게이트)
+        "portion_mode": "COMP_08PCT",         # MODIFIED (🎯 1 & Case 64): 총자산 8% 동적 복리 고정
+        "threshold_mode": "08_VREV_PROG",     # MODIFIED (🎯 2 & Case 64): 1층 +1.50% / 2층 +1.00% 고정
+        "buy_interval_min": LOCKED_BUY_INTERVAL_MIN,  # MODIFIED (Case 64): 10분 시드보호 매수 게이트 하드 고정
         "initial_seed_usd": DEFAULT_INITIAL_SEED_USD,
         "budget": DEFAULT_INITIAL_SEED_USD,   # 하위 호환 별칭 (initial_seed_usd 와 상시 동기화)
         "free_cash_usd": DEFAULT_INITIAL_SEED_USD,
         "buckets": [],                        # List[Dict]: 최대 2개 지층 ([0]=1층 L1, [1]=2층 MERGED_UPPER)
         "anchor_price": 0.0,                  # 직전 매매 기준가 (8% 정량 주수 산출 기준)
         "cycle_min_buy_price": 0.0,           # 현재 사이클 역대 최저 매수가 (무팽창 ANTI_BLOAT 신저가 판정용)
-        "ratchet_anchor_price": 0.0,          # 2층 단독 보유 시 무팽창 상승 래칫 기준가
-        "last_evaluated_buy_bucket_id": -1,   # 동일 10m/30m 버킷 내 중복 매수 평가 방지 락
+        "ratchet_anchor_price": 0.0,          # 호환용 기준가 필드 (anchor_price 와 동기화)
+        "last_evaluated_buy_bucket_id": -1,   # 동일 10m 버킷 내 중복 매수 평가 방지 락
         "last_evaluated_date": "",
         # 미체결 주문 추적 필드
         "buy_order_id": "",
@@ -373,7 +377,7 @@ def _default_soxl_stratum_state() -> Dict[str, Any]:
 
 class AssassinLedger:
     """
-    🚨 제1헌법 & Case 02, 04 ~ 06, 09, 25 ~ 58:
+    🚨 제1헌법 & Case 02, 04 ~ 06, 09, 25 ~ 64:
     순수 롱(SOXL) 단일 종목 2-Tier 지층관리 원장(state_SOXL.json 및 soxl_stratum_ledger.json)을
     인메모리 캐시와 원자적 파일 덮어쓰기(.tmp 기록 + fsync + os.replace)로 동기화 관리하는 클래스.
     """
@@ -407,10 +411,11 @@ class AssassinLedger:
         self, st: Dict[str, Any]
     ) -> None:
         """
-        🎯 5 [회계 항등식(Accounting Identity) 무결성 강제]:
-        가용 현금(free_cash_usd) + 보유 지층 실투입 원금 합계(sum(actual_cost_usd))
-        == 초기 시드(initial_seed_usd) + 누적 세후 실현순익(cumulative_realized_net_usd)
-        항등식을 상시 동기화한다.
+        🎯 5 & Case 63, Case 64 [회계 항등식(Accounting Identity) 무결성 및 챔피언 파라미터 하드 락온]:
+        1) 가용 현금(free_cash_usd) = max(0.0, (initial_seed_usd + cumulative_realized_net_usd) - sum(actual_cost_usd))
+           항등식을 상시 동기화하며, 수동 매수로 실투입 원금이 초기 시드를 초과하더라도 max(0.0, ...) 로 안전 클램핑한다.
+        2) Case 64: 30분 옵션을 완전히 제거하고 buy_interval_min = 10, portion_mode = "COMP_08PCT",
+           threshold_mode = "08_VREV_PROG", is_compound = True 로 상시 하드 고정한다.
         """
         raw_buckets = st.get("buckets")
         clean_buckets: List[Dict[str, Any]] = []
@@ -438,19 +443,11 @@ class AssassinLedger:
         expected_free_cash = max(0.0, (init_seed + cum_net) - invested_actual)
         st["free_cash_usd"] = round(expected_free_cash, 4)
 
-        p_mode = str(st.get("portion_mode") or "COMP_08PCT").upper().strip()
-        if p_mode not in ("COMP_08PCT", "FIXED_800"):
-            p_mode = "COMP_08PCT" if bool(st.get("is_compound", True)) else "FIXED_800"
-        st["portion_mode"] = p_mode
-        st["is_compound"] = bool(p_mode == "COMP_08PCT")
-
-        t_mode = str(st.get("threshold_mode") or "").upper().strip()
-        if t_mode not in ("08_VREV_PROG", "01_PROG_LOT"):
-            t_mode = "08_VREV_PROG" if p_mode == "COMP_08PCT" else "01_PROG_LOT"
-        st["threshold_mode"] = t_mode
-
-        b_int = safe_int(st.get("buy_interval_min"), 10)
-        st["buy_interval_min"] = 30 if b_int == 30 else 10
+        # MODIFIED (🎯 1, 🎯 2, Case 64): 챔피언 전략 파라미터 하드 락온 (30분 옵션 및 고정 정량 잔재 원천 배제)
+        st["portion_mode"] = "COMP_08PCT"
+        st["is_compound"] = True
+        st["threshold_mode"] = "08_VREV_PROG"
+        st["buy_interval_min"] = LOCKED_BUY_INTERVAL_MIN
 
     def _load_soxl_state_sync(self) -> Dict[str, Any]:
         primary_fp = self._get_primary_filepath()
@@ -474,7 +471,9 @@ class AssassinLedger:
                 if isinstance(loaded, dict):
                     # 구버전 budget 값만 존재하고 initial_seed_usd 가 없을 경우 자연스럽게 승계
                     if "initial_seed_usd" not in loaded and "budget" in loaded:
-                        b_old = safe_float(loaded.get("budget"), DEFAULT_INITIAL_SEED_USD)
+                        b_old = safe_float(
+                            loaded.get("budget"), DEFAULT_INITIAL_SEED_USD
+                        )
                         if b_old >= 100.0:
                             base["initial_seed_usd"] = b_old
                             base["budget"] = b_old
@@ -527,7 +526,9 @@ class AssassinLedger:
         with self._mem_lock:
             snap = dict(self._state)
             snap["buckets"] = [
-                dict(b) for b in self._state.get("buckets", []) if isinstance(b, dict)
+                dict(b)
+                for b in self._state.get("buckets", [])
+                if isinstance(b, dict)
             ]
             return snap
 
@@ -535,8 +536,8 @@ class AssassinLedger:
         self, symbol: str = TARGET_SYMBOL, **kwargs: Any
     ) -> Dict[str, Any]:
         """
-        제1헌법 & Case 04 ~ 06:
-        인메모리 지층 원장 상태를 즉시 갱신(회계 항등식 자동 보정 포함)하고,
+        제1헌법 & Case 04 ~ 06, Case 64:
+        인메모리 지층 원장 상태를 즉시 갱신(회계 항등식 자동 보정 및 10분/8% 복리 하드 락온 포함)하고,
         백그라운드 스레드(asyncio.to_thread)를 통해 state_SOXL.json 및 soxl_stratum_ledger.json 에 원자적으로 덮어쓴다.
         """
         self._validate_symbol(symbol)
@@ -544,13 +545,8 @@ class AssassinLedger:
             cur = self._state
             if "budget" in kwargs and "initial_seed_usd" not in kwargs:
                 kwargs["initial_seed_usd"] = max(
-                    100.0, safe_float(kwargs["budget"], DEFAULT_INITIAL_SEED_USD)
-                )
-            if "is_compound" in kwargs and "portion_mode" not in kwargs:
-                is_c = bool(kwargs["is_compound"])
-                kwargs["portion_mode"] = "COMP_08PCT" if is_c else "FIXED_800"
-                kwargs["threshold_mode"] = (
-                    "08_VREV_PROG" if is_c else "01_PROG_LOT"
+                    100.0,
+                    safe_float(kwargs["budget"], DEFAULT_INITIAL_SEED_USD),
                 )
 
             for k, v in kwargs.items():
@@ -559,7 +555,9 @@ class AssassinLedger:
             self._reconcile_accounting_identity_in_place(cur)
             snapshot = dict(cur)
             snapshot["buckets"] = [
-                dict(b) for b in cur.get("buckets", []) if isinstance(b, dict)
+                dict(b)
+                for b in cur.get("buckets", [])
+                if isinstance(b, dict)
             ]
 
         await asyncio.wait_for(
@@ -572,7 +570,9 @@ class AssassinLedger:
         """
         초기 기준 시드머니(initial_seed_usd)를 변경하고 회계 항등식에 맞춰 가용 현금(free_cash_usd)을 재동기화한다.
         """
-        clean_seed = round(max(100.0, safe_float(new_seed_usd, DEFAULT_INITIAL_SEED_USD)), 2)
+        clean_seed = round(
+            max(100.0, safe_float(new_seed_usd, DEFAULT_INITIAL_SEED_USD)), 2
+        )
         return await self.update_state(
             TARGET_SYMBOL,
             initial_seed_usd=clean_seed,
@@ -583,15 +583,17 @@ class AssassinLedger:
         self, new_seed_usd: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        🚨 Case 02:
+        🚨 Case 02 & Case 64:
         /reset 명령 시 SOXL 지층 큐(buckets), 기준가(anchor_price, cycle_min_buy_price, ratchet_anchor_price),
         미체결 주문 ID를 원자적으로 0점 초기화한다.
-        - new_seed_usd 미지정 시: 기존 총 실현 자산(initial_seed_usd + cumulative_realized_net_usd)과 운용 모드를 보존한다.
+        - new_seed_usd 미지정 시: 기존 총 실현 자산(initial_seed_usd + cumulative_realized_net_usd)과 작동 상태를 보존한다.
         - new_seed_usd 지정 시(/reset_seed): 해당 금액으로 초기 시드를 재설정하고 누적 손익 통계를 0으로 리셋한다.
         """
         st = self.get_state(TARGET_SYMBOL)
         if new_seed_usd is not None and safe_float(new_seed_usd, 0.0) >= 100.0:
-            preserved_seed = round(safe_float(new_seed_usd, DEFAULT_INITIAL_SEED_USD), 2)
+            preserved_seed = round(
+                safe_float(new_seed_usd, DEFAULT_INITIAL_SEED_USD), 2
+            )
             cum_net = 0.0
             cum_gross = 0.0
             cum_fee = 0.0
@@ -607,12 +609,17 @@ class AssassinLedger:
             extra_13 = 0
         else:
             preserved_seed = max(
-                100.0, safe_float(st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD)
+                100.0,
+                safe_float(st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD),
             )
             cum_net = safe_float(st.get("cumulative_realized_net_usd"), 0.0)
-            cum_gross = safe_float(st.get("cumulative_realized_gross_usd"), 0.0)
+            cum_gross = safe_float(
+                st.get("cumulative_realized_gross_usd"), 0.0
+            )
             cum_fee = safe_float(st.get("cumulative_realized_fee_usd"), 0.0)
-            cum_saved = safe_float(st.get("cumulative_leftover_saved_usd"), 0.0)
+            cum_saved = safe_float(
+                st.get("cumulative_leftover_saved_usd"), 0.0
+            )
             cum_reanchor_drop = safe_float(
                 st.get("cumulative_reanchor_drop_usd"), 0.0
             )
@@ -628,9 +635,10 @@ class AssassinLedger:
         return await self.update_state(
             TARGET_SYMBOL,
             is_active=bool(st.get("is_active", True)),
-            portion_mode=str(st.get("portion_mode") or "COMP_08PCT"),
-            threshold_mode=str(st.get("threshold_mode") or "08_VREV_PROG"),
-            buy_interval_min=safe_int(st.get("buy_interval_min"), 10),
+            is_compound=True,
+            portion_mode="COMP_08PCT",
+            threshold_mode="08_VREV_PROG",
+            buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
             initial_seed_usd=preserved_seed,
             budget=preserved_seed,
             buckets=[],
