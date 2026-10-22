@@ -5,7 +5,9 @@
 자투리 절약금 및 세후 실물 수익금 실시간 시드 풀 복리 산입 ·
 보유 회차별 3단 점진 단차(1~6회 -1.0% / 7~11회 -1.5% / 12회+ -2.0% 및 1층 +1.50% / 2층 +1.00%) ·
 프롬프트 2-Tier 가중평균 자동 병합(REENTRY_1FL 독립 1층 배치 vs DIP_1FL 2층 통합 · Case 53 하드 캡핑) ·
-단일 지층 실물 수익금 리앵커링(0.994 버퍼) · 기억된 최저 매수가(cycle_min_buy_price) 잠금 요약 및 TDD 검증' 코어 모듈 (Step 01 / 04)
+단일 지층 실물 수익금 리앵커링(0.994 버퍼) · 기억된 최저 매수가(cycle_min_buy_price) 잠금 요약 및 TDD 검증' 코어 모듈 (Step 01 / 02)
+- MODIFIED: toss_api.py 로부터 REANCHOR_NET_BUFFER_MULT 등 퀀트 상수를 직접 import 하던 구문을 제거하고
+  getattr(toss_api, ...) 폴백 및 자체 상수 선언으로 전환하여 ImportError 크래시를 100% 원천 소각!
 - NEW (Case 59): 2층(MERGED_UPPER) 단독 보유 상태에서 상시 1층 실물 재매수(REENTRY_1FL) 체결 시
   기존 2층과 병합하지 않고 [L1(REENTRY_1FL), L2(MERGED_UPPER)] 독립 2-Tier 로 배치
 - NEW (Case 60): 1층 보유 중 추가 매수(물타기) 판정 기준가(active_buy_anchor)를
@@ -20,16 +22,24 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from toss_api import (
-    DEFAULT_INITIAL_SEED_USD,
-    PORTION_RATIO_LOCKED,
-    REANCHOR_NET_BUFFER_MULT,
-    ROUND_TRIP_FEE_RATE_PCT,
-    safe_float,
-    safe_int,
-)
+import toss_api
+from toss_api import safe_float, safe_int
 
 logger = logging.getLogger("toss_sniper.quant_engine")
+
+# MODIFIED: toss_api.py 내부 상수 존재 여부와 무관하게 100% 안전하게 작동하는 자립형 폴백 상수 정의
+DEFAULT_INITIAL_SEED_USD: float = float(
+    getattr(toss_api, "DEFAULT_INITIAL_SEED_USD", 10000.0)
+)
+PORTION_RATIO_LOCKED: float = float(
+    getattr(toss_api, "PORTION_RATIO_LOCKED", 0.08)
+)
+REANCHOR_NET_BUFFER_MULT: float = float(
+    getattr(toss_api, "REANCHOR_NET_BUFFER_MULT", 0.994)
+)
+ROUND_TRIP_FEE_RATE_PCT: float = float(
+    getattr(toss_api, "ROUND_TRIP_FEE_RATE_PCT", 0.14)
+)
 
 # 8%(12.5분할) 황금비율 기준 기본 분할 회차 상수
 BASE_MAX_LOTS_8PCT: int = 12
@@ -68,7 +78,10 @@ class StratumBucket:
         q_int = max(1, safe_int(self.qty, 1))
         b_price = round(max(0.0001, safe_float(self.book_price, 0.01)), 4)
         b_inv = round(
-            max(0.01, safe_float(self.book_invested_usd, float(q_int) * b_price)),
+            max(
+                0.01,
+                safe_float(self.book_invested_usd, float(q_int) * b_price),
+            ),
             4,
         )
         a_cost = round(
@@ -97,7 +110,9 @@ class StratumBucket:
         )
         if b_price <= 0.0:
             return None
-        b_inv = safe_float(data.get("book_invested_usd"), float(q_int) * b_price)
+        b_inv = safe_float(
+            data.get("book_invested_usd"), float(q_int) * b_price
+        )
         if b_inv <= 0.0:
             b_inv = float(q_int) * b_price
         a_cost = safe_float(data.get("actual_cost_usd"), b_inv)
@@ -115,7 +130,9 @@ class StratumBucket:
         )
 
 
-def buckets_from_dicts(raw_list: Sequence[Dict[str, Any]]) -> List[StratumBucket]:
+def buckets_from_dicts(
+    raw_list: Sequence[Dict[str, Any]],
+) -> List[StratumBucket]:
     out: List[StratumBucket] = []
     if not isinstance(raw_list, (list, tuple)):
         return out
@@ -126,8 +143,14 @@ def buckets_from_dicts(raw_list: Sequence[Dict[str, Any]]) -> List[StratumBucket
     return out
 
 
-def buckets_to_dicts(buckets: Sequence[StratumBucket]) -> List[Dict[str, Any]]:
-    return [b.to_dict() for b in (buckets or []) if isinstance(b, StratumBucket) and b.qty > 0]
+def buckets_to_dicts(
+    buckets: Sequence[StratumBucket],
+) -> List[Dict[str, Any]]:
+    return [
+        b.to_dict()
+        for b in (buckets or [])
+        if isinstance(b, StratumBucket) and b.qty > 0
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +173,9 @@ def compute_golden8_quota_qty(
     - target_qty = max(1, int(math.floor(portion_budget / max(0.01, anchor_price))))
     반환값: (target_qty, portion_budget)
     """
-    init_seed = max(100.0, safe_float(initial_seed_usd, DEFAULT_INITIAL_SEED_USD))
+    init_seed = max(
+        100.0, safe_float(initial_seed_usd, DEFAULT_INITIAL_SEED_USD)
+    )
     tot_eq = max(init_seed, safe_float(current_total_equity, init_seed))
     mode = str(portion_mode or "COMP_08PCT").upper().strip()
 
@@ -197,7 +222,9 @@ def resolve_affordable_buy_qty(
 
     max_affordable = int(math.floor((avail_cash + 1e-9) / unit_cost_with_fee))
     buy_qty = max(0, min(t_qty, max_affordable))
-    actual_spent_usd = round(float(buy_qty) * exec_p, 4) if buy_qty > 0 else 0.0
+    actual_spent_usd = (
+        round(float(buy_qty) * exec_p, 4) if buy_qty > 0 else 0.0
+    )
     return buy_qty, actual_spent_usd
 
 
@@ -265,7 +292,9 @@ def vrev_add_quota_lot_and_merge_2tier(
     q_int = max(1, safe_int(buy_qty, 1))
     p_val = round(max(0.0001, safe_float(buy_price, 0.01)), 4)
     spent = (
-        round(max(0.01, safe_float(actual_spent_usd, float(q_int) * p_val)), 4)
+        round(
+            max(0.01, safe_float(actual_spent_usd, float(q_int) * p_val)), 4
+        )
         if actual_spent_usd is not None
         else round(float(q_int) * p_val, 4)
     )
@@ -280,7 +309,11 @@ def vrev_add_quota_lot_and_merge_2tier(
         lot_type=tag,
     )
 
-    existing = [b for b in (queue or []) if isinstance(b, StratumBucket) and b.qty > 0]
+    existing = [
+        b
+        for b in (queue or [])
+        if isinstance(b, StratumBucket) and b.qty > 0
+    ]
     if not existing:
         return [new_l1]
 
@@ -308,11 +341,14 @@ def vrev_add_quota_lot_and_merge_2tier(
 
     raw_upper_book_p = old_book_inv / float(old_total_qty)
     old_overall_book_avg = (
-        sum(float(b.qty) * b.book_price for b in existing) / float(old_total_qty)
+        sum(float(b.qty) * b.book_price for b in existing)
+        / float(old_total_qty)
     )
     # Case 53: 병합 시 부동소수점 풍선효과 방지 하드 캡핑
     capped_upper_book_p = round(min(raw_upper_book_p, old_overall_book_avg), 4)
-    capped_upper_book_inv = round(capped_upper_book_p * float(old_total_qty), 4)
+    capped_upper_book_inv = round(
+        capped_upper_book_p * float(old_total_qty), 4
+    )
 
     merged_l2 = StratumBucket(
         qty=old_total_qty,
@@ -333,11 +369,15 @@ def vrev_reanchor_single_tier_quota(
     🎯 3 & Case 47, 59:
     1층(하부 공격수)이 실물 익절되어 장부에 상위 통합층(2층) 단 1개 지층(len(queue) == 1)만 남았을 때,
     실제로 회수된 세후 실현 순수익금(net_realized_cash_profit)에 안전 버퍼(0.994)를 곱한 금액만큼
-    2층의 장부 투자원금(book_invested_usd)만 차감하여 목표 탈출 단가(book_price)를 강제 인하한다.
+    2층의 장부 투자원금(book_invested_usd)만 차감해 목표 탈출 단가(book_price)를 강제 인하한다.
     (단, 실제 원금 actual_cost_usd 는 절대 건드리지 않는다!)
     반환값: (updated_queue, per_share_price_drop_usd)
     """
-    existing = [b for b in (queue or []) if isinstance(b, StratumBucket) and b.qty > 0]
+    existing = [
+        b
+        for b in (queue or [])
+        if isinstance(b, StratumBucket) and b.qty > 0
+    ]
     if len(existing) != 1:
         return existing, 0.0
 
@@ -349,7 +389,9 @@ def vrev_reanchor_single_tier_quota(
     credit_usd = max(0.0, net_profit * REANCHOR_NET_BUFFER_MULT)
     old_book_p = rem.book_price
     min_floor_inv = 0.01 * float(rem.qty)
-    new_book_inv = round(max(min_floor_inv, rem.book_invested_usd - credit_usd), 4)
+    new_book_inv = round(
+        max(min_floor_inv, rem.book_invested_usd - credit_usd), 4
+    )
     new_book_p = round(max(0.01, new_book_inv / float(rem.qty)), 4)
     new_book_p = min(old_book_p, new_book_p)
 
@@ -360,7 +402,11 @@ def vrev_reanchor_single_tier_quota(
         book_invested_usd=round(new_book_p * float(rem.qty), 4),
         actual_cost_usd=rem.actual_cost_usd,
         lot_count=rem.lot_count,
-        lot_type="MERGED_UPPER" if rem.lot_count > 1 or rem.lot_type == "MERGED_UPPER" else rem.lot_type,
+        lot_type=(
+            "MERGED_UPPER"
+            if rem.lot_count > 1 or rem.lot_type == "MERGED_UPPER"
+            else rem.lot_type
+        ),
     )
     return [updated_bucket], price_drop
 
@@ -390,9 +436,13 @@ def calc_sell_realized_pnl(
     proceeds = round(float(q_int) * exec_p, 4)
     gross_pnl = round(proceeds - actual_cost, 4)
     # 매수 원금 + 매도 대금 평균에 대해 왕복 수수료율(0.14%) 적용
-    fee_usd = round(((actual_cost + proceeds) * 0.5) * (ROUND_TRIP_FEE_RATE_PCT / 100.0), 4)
+    fee_usd = round(
+        ((actual_cost + proceeds) * 0.5) * (ROUND_TRIP_FEE_RATE_PCT / 100.0), 4
+    )
     net_pnl = round(gross_pnl - fee_usd, 4)
-    net_rate_pct = round((net_pnl / actual_cost) * 100.0, 4) if actual_cost > 0.0 else 0.0
+    net_rate_pct = (
+        round((net_pnl / actual_cost) * 100.0, 4) if actual_cost > 0.0 else 0.0
+    )
     return {
         "proceeds_usd": proceeds,
         "actual_cost_usd": actual_cost,
@@ -449,7 +499,8 @@ def summarize_stratum_portfolio(
     )
 
     is_l2_only = bool(
-        len(buckets) == 1 and str(buckets[0].lot_type).upper() == "MERGED_UPPER"
+        len(buckets) == 1
+        and str(buckets[0].lot_type).upper() == "MERGED_UPPER"
     )
     l1_target_price = 0.0
     l2_target_price = 0.0
@@ -479,7 +530,9 @@ def summarize_stratum_portfolio(
             for p in (buckets[0].book_price, anchor_p, cycle_min_p)
             if p > 0.0
         ]
-        active_buy_anchor = min(candidates) if candidates else buckets[0].book_price
+        active_buy_anchor = (
+            min(candidates) if candidates else buckets[0].book_price
+        )
     else:
         active_buy_anchor = lp if lp > 0.0 else max(anchor_p, 1.0)
 
@@ -502,9 +555,15 @@ def summarize_stratum_portfolio(
         portion_mode=portion_mode,
     )
 
-    market_eval_usd = round(float(held_shares) * lp, 4) if held_shares > 0 and lp > 0.0 else 0.0
+    market_eval_usd = (
+        round(float(held_shares) * lp, 4)
+        if held_shares > 0 and lp > 0.0
+        else 0.0
+    )
     unrealized_pnl_usd = (
-        round(market_eval_usd - actual_invested, 4) if held_shares > 0 and lp > 0.0 else 0.0
+        round(market_eval_usd - actual_invested, 4)
+        if held_shares > 0 and lp > 0.0
+        else 0.0
     )
     unrealized_rate_pct = (
         round((unrealized_pnl_usd / actual_invested) * 100.0, 2)
@@ -537,7 +596,9 @@ def summarize_stratum_portfolio(
         "l1_target_price": l1_target_price,
         "l2_target_price": l2_target_price,
         "active_buy_anchor": round(active_buy_anchor, 4),
-        "cycle_min_buy_price": round(cycle_min_p if cycle_min_p > 0.0 else active_buy_anchor, 4),
+        "cycle_min_buy_price": round(
+            cycle_min_p if cycle_min_p > 0.0 else active_buy_anchor, 4
+        ),
         "ratchet_anchor_price": round(ratchet_p, 4),
         "trigger_buy_price": trigger_buy_price,
         "next_target_qty": next_target_qty,
@@ -554,17 +615,29 @@ def run_quant_engine_tdd() -> bool:
     Case 59/60(실물 1층 REENTRY_1FL 비병합 독립 배치 & 기억된 최저가 cycle_min_buy_price 잠금)을 검증한다.
     """
     # 1) 8% 황금정량 산출 검증 ($10,000 시드 -> $800 예산, 기준가 $100 -> 8주 확정)
-    q1, bud1 = compute_golden8_quota_qty(100.0, 10000.0, 10000.0, "COMP_08PCT")
-    assert q1 == 8 and abs(bud1 - 800.0) < 1e-6, f"TDD 실패: q1={q1}, bud1={bud1}"
+    q1, bud1 = compute_golden8_quota_qty(
+        100.0, 10000.0, 10000.0, "COMP_08PCT"
+    )
+    assert q1 == 8 and abs(bud1 - 800.0) < 1e-6, (
+        f"TDD 실패: q1={q1}, bud1={bud1}"
+    )
 
     # 2) 하락가 매수 시 자투리 시드 보존 및 가용현금 캡핑 검증
     aff_q, spent = resolve_affordable_buy_qty(8, 90.0, 800.0)
-    assert aff_q == 8 and abs(spent - 720.0) < 1e-6, "TDD 실패: 하락가 매수 자투리 계산 오류"
+    assert aff_q == 8 and abs(spent - 720.0) < 1e-6, (
+        "TDD 실패: 하락가 매수 자투리 계산 오류"
+    )
 
     # 3) 2-Tier 병합 및 리앵커링 검증
-    q_list = vrev_add_quota_lot_and_merge_2tier([], 8, 100.0, 800.0, "REENTRY_1FL")
-    q_list = vrev_add_quota_lot_and_merge_2tier(q_list, 8, 96.0, 768.0, "DIP_1FL")
-    q_list = vrev_add_quota_lot_and_merge_2tier(q_list, 8, 90.0, 720.0, "DIP_1FL")
+    q_list = vrev_add_quota_lot_and_merge_2tier(
+        [], 8, 100.0, 800.0, "REENTRY_1FL"
+    )
+    q_list = vrev_add_quota_lot_and_merge_2tier(
+        q_list, 8, 96.0, 768.0, "DIP_1FL"
+    )
+    q_list = vrev_add_quota_lot_and_merge_2tier(
+        q_list, 8, 90.0, 720.0, "DIP_1FL"
+    )
     assert len(q_list) == 2, "TDD 실패: 2-Tier 병합 개수 오류"
     assert q_list[0].qty == 8 and abs(q_list[0].book_price - 90.0) < 1e-4
     assert q_list[1].qty == 16 and abs(q_list[1].book_price - 98.0) < 1e-4
@@ -572,16 +645,26 @@ def run_quant_engine_tdd() -> bool:
     # 4) 1층($90 -> $91.35) 실물 익절 후 2층 리앵커링 검증
     rem_q = [q_list[1]]
     reanchored_q, drop_amt = vrev_reanchor_single_tier_quota(rem_q, 10.0)
-    assert len(reanchored_q) == 1 and drop_amt > 0.0, "TDD 실패: 2층 리앵커링 미작동"
+    assert len(reanchored_q) == 1 and drop_amt > 0.0, (
+        "TDD 실패: 2층 리앵커링 미작동"
+    )
 
     # 5) 🚨 Case 59 & Case 60: 2층 단독 상태에서 실물 1층(REENTRY_1FL @ $91.35) 재매수 시
     #    2층과 병합되지 않고 [L1($91.35), L2(MERGED_UPPER)] 로 독립 배치되는지 검증!
     after_reentry_q = vrev_add_quota_lot_and_merge_2tier(
         reanchored_q, 8, 91.35, 730.80, "REENTRY_1FL"
     )
-    assert len(after_reentry_q) == 2, "TDD 실패(Case 59): REENTRY_1FL 이 2층에 잘못 병합됨!"
-    assert after_reentry_q[0].lot_type == "REENTRY_1FL" and after_reentry_q[0].qty == 8
-    assert after_reentry_q[1].lot_type == "MERGED_UPPER" and after_reentry_q[1].qty == 16
+    assert len(after_reentry_q) == 2, (
+        "TDD 실패(Case 59): REENTRY_1FL 이 2층에 잘못 병합됨!"
+    )
+    assert (
+        after_reentry_q[0].lot_type == "REENTRY_1FL"
+        and after_reentry_q[0].qty == 8
+    )
+    assert (
+        after_reentry_q[1].lot_type == "MERGED_UPPER"
+        and after_reentry_q[1].qty == 16
+    )
 
     # 6) 기억된 최저 매수가(cycle_min_buy_price = $90.00) 잠금 확인 (Case 60)
     mock_state = {
