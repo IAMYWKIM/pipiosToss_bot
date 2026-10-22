@@ -2,7 +2,7 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 01 / 01)
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 05 / 05)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & 자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
@@ -12,8 +12,9 @@
   5) 매수 후 60초 타임쉴드 & 1분 상시 순수 현재가 지정가 스나이퍼 매도(1층 +1.50% 익절 & 2층 리앵커링 / 2층 +1.00% 전량 졸업)
   6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
-  7) 📡 [내장형 텔레그램 getUpdates 롱폴링 & 엄격한 토큰 정규식 스캐너 & TossApiClient.close 폴리필]
-     URL 상수(TOKEN_URL 등) 오매칭을 100% 차단하고 /start, /avwap, /sync, /settlement, /reset, /update 즉각 응답 및 클린 종료 보장!
+  7) 📡 [내장형 텔레그램 getUpdates 오프셋 즉시 확정(Ack) & 부팅 전 잔류 /update 자동 소각]
+     /update 실행 시 os._exit(0) 호출 전 텔레그램 서버 오프셋(offset = last_update_id + 1)을 선행 확정하고 원장에 영속화하여
+     9초 주기 무한 재기동 루프 및 `[]` 빈 리스트 출력 버그를 100% 영구 종결!
 - 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 전수 락온
 """
 
@@ -101,7 +102,7 @@ NORMAL_LOOP_INTERVAL_SEC: float = 1.50
 FAST_SHIELD_LOOP_INTERVAL_SEC: float = 0.40
 KRW_PER_USD_DEFAULT: float = 1380.0
 
-# MODIFIED: URL("https://...") 오매칭을 100% 차단하는 엄격한 텔레그램 봇 토큰 정규식
+# URL("https://...") 오매칭을 100% 차단하는 엄격한 텔레그램 봇 토큰 정규식
 _TG_TOKEN_STRICT_RE = re.compile(r"\b(\d{8,12}:[A-Za-z0-9_-]{25,60})\b")
 
 
@@ -816,7 +817,6 @@ def _install_toss_api_compatibility_patches() -> None:
 
         setattr(TossApiClient, "get_usd_krw_rate", _poly_get_usd_krw_rate)
 
-    # MODIFIED: 종료 시 AttributeError: 'TossApiClient' object has no attribute 'close' 원천 차단
     if not hasattr(TossApiClient, "close"):
 
         async def _poly_close(self: Any) -> None:
@@ -1156,7 +1156,6 @@ def _discover_telegram_credentials(
     base_dir: str, api_obj: Any = None
 ) -> Tuple[str, str]:
     """
-    MODIFIED:
     1) TOKEN_URL("https://...") 등 URL 상수가 봇 토큰으로 오매칭되는 버그를 100% 차단하고
        오직 _TG_TOKEN_STRICT_RE(\\d{8,12}:[A-Za-z0-9_-]{25,60}) 에 일치하는 토큰만 추출한다.
     2) .env, os.environ, api_obj 속성, tg_ui_plugin / toss_api 모듈 변수 및 로컬 파일에서
@@ -1365,6 +1364,8 @@ class _AdaptiveTelegramBridge:
     외부 tg_ui_plugin 의 폴링 루프 구조에 구애받지 않고
     자체 내장 getUpdates 롱폴링 + /start, /avwap, /sync, /settlement, /reset, /update +
     인라인 버튼 콜백 + 시드 숫자 입력을 100% 직접 수행하는 완결형 텔레그램 컨트롤러.
+    - MODIFIED: /update 실행 시 오프셋(offset = _last_update_id + 1) 서버 즉시 확정(Ack) 및
+      부팅 전 잔류 /update 메시지 자동 소각기를 탑재하여 9초 주기 무한 재기동 루프를 100% 영구 차단!
     """
 
     def __init__(self, context: Any) -> None:
@@ -1372,7 +1373,15 @@ class _AdaptiveTelegramBridge:
         self.bot_token, self.chat_id = _discover_telegram_credentials(
             context.base_dir, getattr(context, "api", None)
         )
+        self._boot_epoch: float = time.time()
         self._last_update_id: int = 0
+        try:
+            st_init = self.context.ledger.get_state(TARGET_SYMBOL)
+            self._last_update_id = max(
+                0, safe_int(st_init.get("last_tg_update_id"), 0)
+            )
+        except Exception:
+            self._last_update_id = 0
         self._awaiting_seed_input_chats: Dict[str, float] = {}
 
     def _api_url(self, method: str) -> str:
@@ -1426,6 +1435,85 @@ class _AdaptiveTelegramBridge:
         except Exception as exc:
             logger.debug("텔레그램 API(%s) 호출 예외: %s", method, exc)
             return {"ok": False, "description": str(exc)}
+
+    async def _ack_telegram_offset(self, target_update_id: int) -> None:
+        """
+        NEW: 텔레그램 본사 서버 큐에서 target_update_id 이하의 모든 메시지를 즉시 소비 확정(Ack)하고
+        로컬 원장(last_tg_update_id)에 영속화하여 프로세스 재기동(os._exit(0)) 후 동일 /update 가
+        다시 실행되는 무한 재기동 루프를 원천 차단한다.
+        """
+        uid = max(self._last_update_id, safe_int(target_update_id, 0))
+        if uid <= 0:
+            return
+        self._last_update_id = uid
+        try:
+            await self.context.ledger.update_state(
+                TARGET_SYMBOL, last_tg_update_id=uid
+            )
+        except Exception:
+            pass
+        try:
+            await self._call_tg(
+                "getUpdates",
+                {"offset": uid + 1, "limit": 1, "timeout": 0},
+                timeout_sec=5.0,
+            )
+        except Exception:
+            pass
+
+    async def _flush_stale_updates_on_startup(self) -> None:
+        """
+        NEW: 기동 직후 텔레그램 큐를 점검하여, 부팅 시각(_boot_epoch) 이전에 전송되었거나
+        미확인 상태로 큐에 남아 있던 잔류 `/update` 명령을 선제 소각(Ack)한다.
+        """
+        try:
+            res = await self._call_tg(
+                "getUpdates",
+                {
+                    "offset": (
+                        self._last_update_id + 1
+                        if self._last_update_id > 0
+                        else -1
+                    ),
+                    "timeout": 0,
+                },
+                timeout_sec=6.0,
+            )
+            if not (isinstance(res, dict) and bool(res.get("ok"))):
+                return
+            updates = res.get("result")
+            if not isinstance(updates, list) or not updates:
+                return
+
+            max_stale_uid = 0
+            for upd in updates:
+                if not isinstance(upd, dict):
+                    continue
+                uid = safe_int(upd.get("update_id"), 0)
+                m_obj = (
+                    upd.get("message")
+                    if isinstance(upd.get("message"), dict)
+                    else {}
+                )
+                msg_date = safe_float(m_obj.get("date"), 0.0)
+                raw_txt = str(m_obj.get("text") or "").strip().lower()
+
+                if (
+                    (msg_date > 0.0 and msg_date < (self._boot_epoch - 2.0))
+                    or raw_txt.startswith("/update")
+                    or raw_txt == "🚀 시스템 업데이트"
+                ):
+                    if uid > max_stale_uid:
+                        max_stale_uid = uid
+
+            if max_stale_uid > 0:
+                await self._ack_telegram_offset(max_stale_uid)
+                logger.info(
+                    "🧹 [텔레그램 부팅 전 잔류 업데이트 오프셋 소각 완료] last_update_id=%d",
+                    max_stale_uid,
+                )
+        except Exception as exc:
+            logger.debug("부팅 시 텔레그램 큐 플러시 스킵: %s", exc)
 
     async def send_message(
         self,
@@ -2011,6 +2099,14 @@ class _AdaptiveTelegramBridge:
         )
 
     async def _execute_manual_update_command(self, chat_id: str) -> None:
+        """
+        MODIFIED [무한 재기동 루프 및 `[]` 출력 버그 원천 종결]:
+        1) /update 명령 진입 즉시 _ack_telegram_offset() 을 호출하여 텔레그램 본사 서버 큐에서
+           해당 update_id 를 즉시 소비 확정(Ack)하고 원장(last_tg_update_id)에 영속화한다.
+        2) execute_git_pull_and_preflight 반환 튜플에서 비어 있지 않은 문자열(msg)만 추출한다.
+        3) os._exit(0) 직전 한 번 더 오프셋을 확정하여 재기동 후 동일 /update 가 재실행되지 않게 보장한다.
+        """
+        await self._ack_telegram_offset(self._last_update_id)
         await self.send_message(
             chat_id=chat_id,
             text="⏳ <b>[시스템 업데이트 개시]</b> GitHub 최신 코드 동기화 및 9대 코어 모듈 프리플라이트 검증 중...",
@@ -2019,9 +2115,24 @@ class _AdaptiveTelegramBridge:
             plugin_updater, "execute_git_pull_and_preflight", None
         )
         if callable(fn_upd):
-            ok, msg, _ = await _call_plugin_adaptive(
+            upd_res = await _call_plugin_adaptive(
                 fn_upd, base_dir=self.context.base_dir
             )
+            if isinstance(upd_res, tuple):
+                ok = bool(upd_res[0]) if len(upd_res) >= 1 else False
+                str_parts = [
+                    str(x).strip()
+                    for x in upd_res[1:]
+                    if isinstance(x, str) and str(x).strip()
+                ]
+                msg = (
+                    " · ".join(str_parts)
+                    if str_parts
+                    else "✅ 9대 코어 모듈 py_compile 및 AST 심볼 정합성 100% 통과"
+                )
+            else:
+                ok = bool(upd_res)
+                msg = "✅ 9대 코어 모듈 py_compile 및 AST 심볼 정합성 100% 통과"
         else:
             ok, msg = verify_all_modules_compile(self.context.base_dir)
 
@@ -2032,6 +2143,7 @@ class _AdaptiveTelegramBridge:
             )
             return
 
+        await self._ack_telegram_offset(self._last_update_id)
         await self.send_message(
             chat_id=chat_id,
             text=f"🚀 <b>[업데이트 검증 통과]</b> {_escape_html(msg)}\n잠시 후 스나이퍼 데몬을 재기동합니다...",
@@ -2124,7 +2236,10 @@ class _AdaptiveTelegramBridge:
             await self._render_and_send_avwap(chat_id=chat_id)
             return
 
-        if first_token == "/sync" or text in ("📜 지층 지시서", "🔄 잔고 동기화"):
+        if first_token == "/sync" or text in (
+            "📜 지층 지시서",
+            "🔄 잔고 동기화",
+        ):
             await self._render_and_send_sync(chat_id=chat_id)
             return
 
@@ -2250,7 +2365,8 @@ class _AdaptiveTelegramBridge:
 
     async def run_polling_loop(self) -> None:
         """
-        내장형 텔레그램 getUpdates 비동기 롱폴링 루프 (엄격한 토큰 검증 + deleteWebhook 초기화)
+        내장형 텔레그램 getUpdates 비동기 롱폴링 루프
+        (엄격한 토큰 검증 + deleteWebhook 초기화 + 부팅 전 잔류 /update 자동 소각 탑재)
         """
         if not _extract_valid_tg_token(self.bot_token):
             self.bot_token, discovered_cid = _discover_telegram_credentials(
@@ -2270,6 +2386,7 @@ class _AdaptiveTelegramBridge:
         await self._call_tg(
             "deleteWebhook", {"drop_pending_updates": False}, timeout_sec=8.0
         )
+        await self._flush_stale_updates_on_startup()
         logger.info(
             "📡 [텔레그램 관제탑 폴링 루프 가동 완료] (chat_id=%s)",
             self.chat_id or "auto-detect",
@@ -2294,6 +2411,12 @@ class _AdaptiveTelegramBridge:
                             uid = safe_int(upd.get("update_id"), 0)
                             if uid > self._last_update_id:
                                 self._last_update_id = uid
+                                try:
+                                    await self.context.ledger.update_state(
+                                        TARGET_SYMBOL, last_tg_update_id=uid
+                                    )
+                                except Exception:
+                                    pass
 
                             if isinstance(upd.get("callback_query"), dict):
                                 await self._handle_callback_query(
@@ -2312,6 +2435,18 @@ class _AdaptiveTelegramBridge:
                                 if self.chat_id and cid and cid != self.chat_id:
                                     continue
                                 txt = str(m_obj.get("text") or "").strip()
+                                msg_date = safe_float(m_obj.get("date"), 0.0)
+                                # 부팅 시각 이전에 전송된 과거 /update 메시지는 즉시 소각 후 스킵
+                                if (
+                                    msg_date > 0.0
+                                    and msg_date < (self._boot_epoch - 2.0)
+                                    and (
+                                        txt.lower().startswith("/update")
+                                        or txt == "🚀 시스템 업데이트"
+                                    )
+                                ):
+                                    await self._ack_telegram_offset(uid)
+                                    continue
                                 if txt:
                                     await self._handle_command_or_text(
                                         chat_id=cid, raw_text=txt
@@ -2760,7 +2895,9 @@ async def async_main() -> None:
     loop = asyncio.get_running_loop()
 
     def _on_signal() -> None:
-        logger.info("🛑 종료 시그널(SIGTERM/SIGINT) 수신 -> 고속 안전 종료 개시...")
+        logger.info(
+            "🛑 종료 시그널(SIGTERM/SIGINT) 수신 -> 고속 안전 종료 개시..."
+        )
         context.shutdown_event.set()
         context.wakeup_event.set()
 
@@ -2829,7 +2966,6 @@ async def async_main() -> None:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        # MODIFIED: context.api.close() 안전 가드로 종료 시점 AttributeError 100% 원천 차단
         close_fn = getattr(context.api, "close", None)
         if callable(close_fn):
             try:

@@ -9,10 +9,10 @@
 단일 지층 실물 수익금 리앵커링(0.994 버퍼) · 기억된 최저 매수가(cycle_min_buy_price) 잠금 요약 및 TDD 검증' 코어 모듈 (Step 02 / 05)
 - MODIFIED (🎯 2 & Case 36 ~ 45, 60): 보유 회차별 요구 하락 단차를 4단 와이드 활주로(1~4회 -1.00% / 5~8회 -2.00% /
   9~10회 -3.50% / 11회+ -5.50%)로 전면 개편하여 대폭락장 시드 조기 고갈 및 무리셋 장기 동결을 원천 차단!
-- NEW (🎯 4 & Case 59): 2층(MERGED_UPPER) 단독 보유 시 직전 익절가(anchor_price) 대비 -1.00% 이하 눌림목(PULLBACK_RELOAD)
+- MODIFIED (🎯 4 & Case 59): 2층(MERGED_UPPER) 단독 보유 시 직전 익절가(anchor_price) 대비 -1.00% 이하 눌림목(PULLBACK_RELOAD)
   또는 +1.00% 이상 상승 돌파(BREAKOUT_RELOAD) 시에만 독립 실물 1층(REENTRY_1FL) 재장전을 승인하는
-  evaluate_l2_only_hybrid_reentry_signal() 함수 및 포트폴리오 요약 타점 필드 탑재!
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 64 완벽 준수
+  evaluate_l2_only_hybrid_reentry_signal() 함수 및 관제탑(main.py / tg_ui_plugin.py / defense_plugin.py) 전 필드 100% 매핑!
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 완벽 준수
 """
 
 from __future__ import annotations
@@ -543,12 +543,13 @@ def summarize_stratum_portfolio(
     """
     🎯 2, 🎯 4, 🎯 5 & Case 59, 60:
     원장 상태(state_dict)와 현재가(live_price)를 받아:
-    - 1층(L1) 및 2층(MERGED_UPPER) 보유 현황과 목표 익절가(l1_target_price, l2_target_price)
+    - 1층(L1) 및 2층(MERGED_UPPER) 보유 현황, 목표 익절가(l1_target_price, l2_target_price) 및 실시간 수익률(l1_gain_pct, l2_gain_pct)
     - 2층 단독 보유(is_l2_only_anti_bloat) 시 직전 익절가(reentry_ref_anchor) 대비
       눌림목 재장전 타점(reentry_pullback_price, -1.00%) 및 상승돌파 재장전 타점(reentry_breakout_price, +1.00%)
     - 1층 보유 중 기억된 사이클 최저 매수가(cycle_min_buy_price)를 반영한 4단 와이드 활주로
-      추가 매수 기준가(active_buy_anchor) 및 신저가 매수 트리거 가격(trigger_buy_price)
-    - 회계 항등식 기반 총자산(total_mark_equity_usd), 가용현금(free_cash_usd), 평가손익, 총 ROI 를 반환한다.
+      추가 매수 기준가(active_buy_anchor / ref_buy_anchor) 및 신저가 매수 트리거 가격(trigger_buy_price)
+    - 회계 항등식 기반 총자산(mark_equity_usd / total_mark_equity_usd), 가용현금(free_cash_usd),
+      실현기준 총자산(realized_equity_usd), 평가손익, 실현/총 ROI 및 누적 통계 필드를 100% 반환한다.
     """
     st = state_dict if isinstance(state_dict, dict) else {}
     buckets = buckets_from_dicts(st.get("buckets", []))
@@ -556,7 +557,9 @@ def summarize_stratum_portfolio(
     init_seed = max(
         100.0, safe_float(st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD)
     )
-    cum_realized = safe_float(st.get("cumulative_realized_net_usd"), 0.0)
+    cum_realized = round(
+        safe_float(st.get("cumulative_realized_net_usd"), 0.0), 4
+    )
     actual_invested = round(sum(b.actual_cost_usd for b in buckets), 4)
     book_invested = round(sum(b.book_invested_usd for b in buckets), 4)
 
@@ -574,6 +577,17 @@ def summarize_stratum_portfolio(
     if lp <= 0.0 and buckets:
         lp = buckets[0].actual_avg_price
 
+    actual_avg_p = (
+        round(actual_invested / float(held_shares), 4)
+        if held_shares > 0
+        else 0.0
+    )
+    book_avg_p = (
+        round(book_invested / float(held_shares), 4)
+        if held_shares > 0
+        else 0.0
+    )
+
     threshold_mode = str(st.get("threshold_mode") or "08_VREV_PROG").upper()
     portion_mode = str(st.get("portion_mode") or "COMP_08PCT").upper()
     drop_buy_pct, rise_l1_pct, rise_l2_pct = get_golden8_prog_thresholds(
@@ -586,26 +600,43 @@ def summarize_stratum_portfolio(
     )
     l1_target_price = 0.0
     l2_target_price = 0.0
+    l1_gain_pct = 0.0
+    l2_gain_pct = 0.0
 
     if buckets:
         if is_l2_only:
+            b2 = buckets[0]
             l2_target_price = round(
-                buckets[0].book_price * (1.0 + rise_l2_pct / 100.0), 2
+                b2.book_price * (1.0 + rise_l2_pct / 100.0), 2
             )
-        else:
-            l1_target_price = round(
-                buckets[0].book_price * (1.0 + rise_l1_pct / 100.0), 2
-            )
-            if len(buckets) >= 2:
-                l2_target_price = round(
-                    buckets[1].book_price * (1.0 + rise_l2_pct / 100.0), 2
+            if lp > 0.0 and b2.book_price > 0.0:
+                l2_gain_pct = round(
+                    ((lp - b2.book_price) / b2.book_price) * 100.0, 2
                 )
+        else:
+            b1 = buckets[0]
+            l1_target_price = round(
+                b1.book_price * (1.0 + rise_l1_pct / 100.0), 2
+            )
+            if lp > 0.0 and b1.book_price > 0.0:
+                l1_gain_pct = round(
+                    ((lp - b1.book_price) / b1.book_price) * 100.0, 2
+                )
+            if len(buckets) >= 2:
+                b2 = buckets[1]
+                l2_target_price = round(
+                    b2.book_price * (1.0 + rise_l2_pct / 100.0), 2
+                )
+                if lp > 0.0 and b2.book_price > 0.0:
+                    l2_gain_pct = round(
+                        ((lp - b2.book_price) / b2.book_price) * 100.0, 2
+                    )
 
     anchor_p = safe_float(st.get("anchor_price"), 0.0)
     cycle_min_p = safe_float(st.get("cycle_min_buy_price"), 0.0)
     ratchet_p = safe_float(st.get("ratchet_anchor_price"), anchor_p)
 
-    # NEW: 2층 단독 보유 시 눌림목(-1.00%) / 상승돌파(+1.00%) 독립 1층 재장전 타점 산출
+    # 2층 단독 보유 시 눌림목(-1.00%) / 상승돌파(+1.00%) 독립 1층 재장전 타점 산출
     l2_book_p = buckets[0].book_price if is_l2_only and buckets else 0.0
     reentry_sig = evaluate_l2_only_hybrid_reentry_signal(
         live_price=lp,
@@ -642,6 +673,22 @@ def summarize_stratum_portfolio(
         else 0.0
     )
 
+    # MODIFIED: 관제 보드(/avwap)용 ref_buy_anchor 및 chg_from_buy_anchor_pct 정밀 산출
+    if is_l2_only:
+        ref_buy_anchor = (
+            reentry_ref_anchor
+            if reentry_ref_anchor > 0.0
+            else active_buy_anchor
+        )
+        chg_from_buy_anchor_pct = chg_from_reentry_anchor_pct
+    else:
+        ref_buy_anchor = active_buy_anchor
+        chg_from_buy_anchor_pct = (
+            round(((lp - active_buy_anchor) / active_buy_anchor) * 100.0, 2)
+            if (lp > 0.0 and active_buy_anchor > 0.0)
+            else 0.0
+        )
+
     cost_equity = free_cash + actual_invested
     if len(buckets) == 0:
         ref_for_quota = lp if lp > 0.0 else max(anchor_p, 1.0)
@@ -675,9 +722,22 @@ def summarize_stratum_portfolio(
         if actual_invested > 0.0
         else 0.0
     )
+
+    realized_equity_usd = round(max(0.0, init_seed + cum_realized), 4)
+    realized_roi_pct = round((cum_realized / init_seed) * 100.0, 2)
     total_mark_equity_usd = round(free_cash + market_eval_usd, 4)
     total_net_pnl_usd = round(cum_realized + unrealized_pnl_usd, 4)
     total_roi_pct = round((total_net_pnl_usd / init_seed) * 100.0, 2)
+
+    reanchor_cnt = safe_int(st.get("reanchor_cnt"), 0)
+    cum_reanchor_drop = round(
+        safe_float(st.get("cumulative_reanchor_drop_usd"), 0.0), 4
+    )
+    seed_protect_pass_cnt = safe_int(st.get("seed_protect_pass_cnt"), 0)
+    extra_13plus_buy_events = safe_int(st.get("extra_13plus_buy_events"), 0)
+    cum_leftover_saved = round(
+        safe_float(st.get("cumulative_leftover_saved_usd"), 0.0), 4
+    )
 
     return {
         "buckets": buckets,
@@ -688,19 +748,29 @@ def summarize_stratum_portfolio(
         "free_cash_usd": free_cash,
         "actual_invested_usd": actual_invested,
         "book_invested_usd": book_invested,
+        "actual_avg_price": actual_avg_p,
+        "book_avg_price": book_avg_p,
         "market_eval_usd": market_eval_usd,
         "unrealized_pnl_usd": unrealized_pnl_usd,
         "unrealized_rate_pct": unrealized_rate_pct,
         "cumulative_realized_net_usd": cum_realized,
+        "realized_equity_usd": realized_equity_usd,
+        "realized_roi_pct": realized_roi_pct,
         "total_mark_equity_usd": total_mark_equity_usd,
+        "mark_equity_usd": total_mark_equity_usd,
         "total_net_pnl_usd": total_net_pnl_usd,
         "total_roi_pct": total_roi_pct,
+        "mark_roi_pct": total_roi_pct,
         "drop_buy_pct": drop_buy_pct,
         "rise_sell_l1_pct": rise_l1_pct,
         "rise_sell_l2_pct": rise_l2_pct,
         "l1_target_price": l1_target_price,
         "l2_target_price": l2_target_price,
+        "l1_gain_pct": l1_gain_pct,
+        "l2_gain_pct": l2_gain_pct,
         "active_buy_anchor": round(active_buy_anchor, 4),
+        "ref_buy_anchor": round(ref_buy_anchor, 4),
+        "chg_from_buy_anchor_pct": chg_from_buy_anchor_pct,
         "cycle_min_buy_price": round(
             cycle_min_p if cycle_min_p > 0.0 else active_buy_anchor, 4
         ),
@@ -712,16 +782,22 @@ def summarize_stratum_portfolio(
         "chg_from_reentry_anchor_pct": chg_from_reentry_anchor_pct,
         "next_target_qty": next_target_qty,
         "next_portion_budget": next_portion_budget,
+        "reanchor_cnt": reanchor_cnt,
+        "cumulative_reanchor_drop_usd": cum_reanchor_drop,
+        "seed_protect_pass_cnt": seed_protect_pass_cnt,
+        "extra_13plus_buy_events": extra_13plus_buy_events,
+        "cumulative_leftover_saved_usd": cum_leftover_saved,
     }
 
 
 # ---------------------------------------------------------------------------
-# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 64 & 전술 A 4단 와이드 활주로 전수 검증)
+# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 66 & 전술 A 4단 와이드 활주로 전수 검증)
 # ---------------------------------------------------------------------------
 def run_quant_engine_tdd() -> bool:
     """
     기동 직전 8% 황금정량 산출, 4단 와이드 활주로(-1.0% / -2.0% / -3.5% / -5.5%),
-    2층 단독 시 눌림/돌파 하이브리드 독립 1층 재장전(Case 59) 및 기억된 최저가 잠금(Case 60)을 검증한다.
+    2층 단독 시 눌림/돌파 하이브리드 독립 1층 재장전(Case 59), 기억된 최저가 잠금(Case 60) 및
+    관제 UI 필수 요약 필드를 전수 검증한다.
     """
     # 1) 8% 황금정량 산출 검증 ($10,000 시드 -> $800 예산, 기준가 $100 -> 8주 확정)
     q1, bud1 = compute_golden8_quota_qty(
@@ -821,6 +897,9 @@ def run_quant_engine_tdd() -> bool:
     sum_info = summarize_stratum_portfolio(mock_state, live_price=90.20)
     assert abs(sum_info["active_buy_anchor"] - 90.00) < 1e-4, (
         f"TDD 실패(Case 60): 기억된 최저가($90.00) 잠금 풀림 -> {sum_info['active_buy_anchor']}"
+    )
+    assert "mark_equity_usd" in sum_info and "ref_buy_anchor" in sum_info, (
+        "TDD 실패: 관제 보드 필수 요약 키 누락"
     )
     logger.info(
         "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60) 검증 완료"
