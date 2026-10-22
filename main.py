@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: main.py
-인피니트 스노우볼 (Infinite Snowball) — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 및 비동기 이벤트 루프 컨트롤러 (TossApiClient 폴리필 & AST 심볼 100% 호환 완비판)
+인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 01 / 01)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & 자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
@@ -12,27 +12,39 @@
   5) 매수 후 60초 타임쉴드 & 1분 상시 순수 현재가 지정가 스나이퍼 매도(1층 +1.50% 익절 & 2층 리앵커링 / 2층 +1.00% 전량 졸업)
   6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
-  7) 🔗 [TossApiClient 런타임 폴리필] get_holdings_map_with_status, get_candles_1m, get_candles_1d 등 메서드 명칭 차이를
-     자동 흡수하는 어댑터를 장착하여 AttributeError 를 원천 차단!
+  7) 📡 [내장형 텔레그램 getUpdates 롱폴링 & 엄격한 토큰 정규식 스캐너 & TossApiClient.close 폴리필]
+     URL 상수(TOKEN_URL 등) 오매칭을 100% 차단하고 /start, /avwap, /sync, /settlement, /reset, /update 즉각 응답 및 클린 종료 보장!
 - 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 전수 락온
 """
 
 from __future__ import annotations
 
 import asyncio
+import html
 import inspect
+import json
 import logging
 import math
 import os
+import re
 import signal
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
+import pandas as pd
+
+import defense_plugin
 import plugin_updater
 import quant_engine
 import quant_indicators_plugin
+import sniper_exit_plugin
+import sniper_plugin
 import tg_ui_plugin
 import toss_api
 from defense_plugin import (
@@ -40,7 +52,6 @@ from defense_plugin import (
     execute_1600_daily_closing_settlement_plugin,
     execute_daily_1700_gc_and_backup_plugin,
     reconcile_stratum_with_broker_holdings_plugin,
-    relock_stratum_on_bot_resume,
 )
 from plugin_updater import (
     purge_deprecated_legacy_files,
@@ -66,6 +77,7 @@ from sniper_plugin import (
     sync_pending_buy_order_plugin,
 )
 from toss_api import (
+    DEFAULT_INITIAL_SEED_USD,
     EST_TZ,
     LOCKED_BUY_INTERVAL_MIN,
     TARGET_SYMBOL,
@@ -88,6 +100,9 @@ logger = logging.getLogger("toss_sniper.main")
 NORMAL_LOOP_INTERVAL_SEC: float = 1.50
 FAST_SHIELD_LOOP_INTERVAL_SEC: float = 0.40
 KRW_PER_USD_DEFAULT: float = 1380.0
+
+# MODIFIED: URL("https://...") 오매칭을 100% 차단하는 엄격한 텔레그램 봇 토큰 정규식
+_TG_TOKEN_STRICT_RE = re.compile(r"\b(\d{8,12}:[A-Za-z0-9_-]{25,60})\b")
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +163,7 @@ def _resolve_module_attr(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1-B] TossApiClient 런타임 메서드 호환성 폴리필 어댑터 (AttributeError 원천 소각)
+# [핵심 1-B] TossApiClient 런타임 메서드 호환성 폴리필 어댑터 (close 포함 AttributeError 원천 소각)
 # ---------------------------------------------------------------------------
 def _empty_soxl_holding_entry() -> Dict[str, Any]:
     return {
@@ -247,7 +262,6 @@ def _normalize_single_holding_item(
         ),
         0.0,
     )
-    # 토스 API의 rate는 소수비율(예: 0.1333 = 13.33%)로 내려오므로 절대값이 5.0 이하이고 실제 손익률과 차이가 나면 보정
     if pur_amt > 0.0 and abs(raw_rate) < 2.0 and abs(pnl_amt / pur_amt) > 0.005:
         profit_rate = round((pnl_amt / pur_amt) * 100.0, 2)
     else:
@@ -271,10 +285,6 @@ def _normalize_single_holding_item(
 def _normalize_holdings_payload(
     raw_res: Any,
 ) -> Tuple[Dict[str, Dict[str, Any]], bool]:
-    """
-    TossApiClient 의 기존 잔고 조회 함수 반환값(튜플, 맵 딕셔너리, 원본 BFF JSON, 리스트)을
-    표준 (holdings_map, fetch_ok) 튜플로 변환한다.
-    """
     if raw_res is None:
         return {}, False
 
@@ -292,7 +302,6 @@ def _normalize_holdings_payload(
     }
 
     if isinstance(raw_res, dict):
-        # 1) 이미 {"SOXL": {...}} 형태인 경우
         if TARGET_SYMBOL in raw_res and isinstance(
             raw_res[TARGET_SYMBOL], dict
         ):
@@ -301,7 +310,6 @@ def _normalize_holdings_payload(
             )
             return out_map, True
 
-        # 2) 단일 종목 딕셔너리 형태인 경우
         if (
             str(raw_res.get("symbol") or "").upper().strip() == TARGET_SYMBOL
             and ("quantity" in raw_res or "qty" in raw_res)
@@ -311,7 +319,6 @@ def _normalize_holdings_payload(
             )
             return out_map, True
 
-        # 3) 토스 Open API 원본 BFF 응답 {"result": {"items": [...]}} 또는 {"items": [...]}
         res_obj = (
             raw_res.get("result")
             if isinstance(raw_res.get("result"), dict)
@@ -328,7 +335,6 @@ def _normalize_holdings_payload(
                         )
             return out_map, True
 
-        # 4) 빈 딕셔너리({})인 경우 (미보유 0주 정상 응답)
         if len(raw_res) == 0:
             return out_map, True
 
@@ -353,18 +359,14 @@ async def _invoke_raw_toss_api(
     json_data: Optional[Dict[str, Any]] = None,
     require_account: bool = False,
 ) -> Any:
-    """
-    TossApiClient 내부의 HTTP 호출 메서드(_request / request / _api_request / _get 등)를
-    시그니처 적응형으로 호출한다.
-    """
     for req_name in (
         "_request",
         "request",
         "_api_request",
         "_call_api",
-        "_ fetch_json",
+        "_fetch_json",
     ):
-        req_fn = getattr(api, req_name.replace(" ", ""), None)
+        req_fn = getattr(api, req_name, None)
         if callable(req_fn):
             sig = inspect.signature(req_fn)
             kw: Dict[str, Any] = {}
@@ -413,7 +415,9 @@ async def _invoke_raw_toss_api(
     return None
 
 
-def _extract_candles_list(raw_res: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _extract_candles_list(
+    raw_res: Any,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     if isinstance(raw_res, list):
         return [c for c in raw_res if isinstance(c, dict)], None
     if isinstance(raw_res, dict):
@@ -435,10 +439,9 @@ def _extract_candles_list(raw_res: Any) -> Tuple[List[Dict[str, Any]], Optional[
 
 def _install_toss_api_compatibility_patches() -> None:
     """
-    NEW: 서버의 TossApiClient 에 get_holdings_map_with_status, get_candles_1m, get_candles_1d 등의
-    별칭 메서드가 없을 경우 기존 메서드를 감싸거나 토스 Open API v1.2.14 규격으로 호출하는 폴리필을 자동 장착한다.
+    서버의 TossApiClient 에 get_holdings_map_with_status, get_candles_1m, get_candles_1d, close 등의
+    메서드가 없을 경우 자동으로 폴리필을 장착하여 런타임 및 종료 시점의 AttributeError 를 0건으로 차단한다.
     """
-    # 1) get_holdings_map_with_status 폴리필
     if not hasattr(TossApiClient, "get_holdings_map_with_status"):
 
         async def _poly_get_holdings_map_with_status(
@@ -483,7 +486,6 @@ def _install_toss_api_compatibility_patches() -> None:
             _poly_get_holdings_map_with_status,
         )
 
-    # 2) get_candles_1m 폴리필
     if not hasattr(TossApiClient, "get_candles_1m"):
 
         async def _poly_get_candles_1m(
@@ -517,12 +519,9 @@ def _install_toss_api_compatibility_patches() -> None:
                         c_list, _ = _extract_candles_list(res)
                         if c_list:
                             return c_list
-                    except Exception as exc:
-                        logger.debug(
-                            "TossApiClient.%s(1m) 폴백 전환: %s", cand_name, exc
-                        )
+                    except Exception:
+                        pass
 
-            # 직접 GET /api/v1/candles 호출 (최대 2페이지 페이지네이션 지원)
             collected: List[Dict[str, Any]] = []
             before_cursor: Optional[str] = None
             pages = 2 if req_total > 200 else 1
@@ -554,7 +553,6 @@ def _install_toss_api_compatibility_patches() -> None:
 
         setattr(TossApiClient, "get_candles_1m", _poly_get_candles_1m)
 
-    # 3) get_candles_1d 폴리필
     if not hasattr(TossApiClient, "get_candles_1d"):
 
         async def _poly_get_candles_1d(
@@ -586,10 +584,8 @@ def _install_toss_api_compatibility_patches() -> None:
                         c_list, _ = _extract_candles_list(res)
                         if c_list:
                             return c_list
-                    except Exception as exc:
-                        logger.debug(
-                            "TossApiClient.%s(1d) 폴백 전환: %s", cand_name, exc
-                        )
+                    except Exception:
+                        pass
 
             raw = await _invoke_raw_toss_api(
                 self,
@@ -608,7 +604,6 @@ def _install_toss_api_compatibility_patches() -> None:
 
         setattr(TossApiClient, "get_candles_1d", _poly_get_candles_1d)
 
-    # 4) get_open_orders 폴리필
     if not hasattr(TossApiClient, "get_open_orders"):
 
         async def _poly_get_open_orders(
@@ -660,7 +655,6 @@ def _install_toss_api_compatibility_patches() -> None:
 
         setattr(TossApiClient, "get_open_orders", _poly_get_open_orders)
 
-    # 5) cancel_all_open_orders 폴리필
     if not hasattr(TossApiClient, "cancel_all_open_orders"):
 
         async def _poly_cancel_all_open_orders(
@@ -685,7 +679,6 @@ def _install_toss_api_compatibility_patches() -> None:
             _poly_cancel_all_open_orders,
         )
 
-    # 6) find_latest_open_order_id 폴리필
     if not hasattr(TossApiClient, "find_latest_open_order_id"):
 
         async def _poly_find_latest_open_order_id(
@@ -708,7 +701,71 @@ def _install_toss_api_compatibility_patches() -> None:
             _poly_find_latest_open_order_id,
         )
 
-    # 7) get_usd_krw_rate 폴리필
+    if not hasattr(TossApiClient, "get_buying_power_usd"):
+
+        async def _poly_get_buying_power_usd(
+            self: Any, safety_buffer_pct: float = 0.2
+        ) -> float:
+            for cand_name in (
+                "get_buying_power",
+                "fetch_buying_power_usd",
+                "fetch_buying_power",
+            ):
+                fn = getattr(self, cand_name, None)
+                if callable(fn):
+                    try:
+                        res = await _call_plugin_adaptive(
+                            fn,
+                            currency="USD",
+                            safety_buffer_pct=safety_buffer_pct,
+                        )
+                        if isinstance(res, (int, float)):
+                            return max(0.0, float(res))
+                        if isinstance(res, dict):
+                            r_obj = (
+                                res.get("result")
+                                if isinstance(res.get("result"), dict)
+                                else res
+                            )
+                            return max(
+                                0.0,
+                                safe_float(r_obj.get("cashBuyingPower"), 0.0),
+                            )
+                    except Exception:
+                        pass
+            try:
+                raw = await _invoke_raw_toss_api(
+                    self,
+                    method="GET",
+                    path="/api/v1/buying-power",
+                    params={"currency": "USD"},
+                    require_account=True,
+                )
+                if isinstance(raw, dict):
+                    r_obj = (
+                        raw.get("result")
+                        if isinstance(raw.get("result"), dict)
+                        else raw
+                    )
+                    raw_bp = max(
+                        0.0, safe_float(r_obj.get("cashBuyingPower"), 0.0)
+                    )
+                    mult = max(
+                        0.90,
+                        min(
+                            1.0,
+                            1.0 - safe_float(safety_buffer_pct, 0.0) / 100.0,
+                        ),
+                    )
+                    return round(raw_bp * mult, 4)
+            except Exception:
+                pass
+            return 0.0
+
+        setattr(
+            TossApiClient, "get_buying_power_usd", _poly_get_buying_power_usd
+        )
+
     if not hasattr(TossApiClient, "get_usd_krw_rate"):
 
         async def _poly_get_usd_krw_rate(self: Any) -> float:
@@ -759,15 +816,28 @@ def _install_toss_api_compatibility_patches() -> None:
 
         setattr(TossApiClient, "get_usd_krw_rate", _poly_get_usd_krw_rate)
 
+    # MODIFIED: 종료 시 AttributeError: 'TossApiClient' object has no attribute 'close' 원천 차단
+    if not hasattr(TossApiClient, "close"):
 
-# 모듈 임포트 즉시 TossApiClient 호환성 폴리필 장착
+        async def _poly_close(self: Any) -> None:
+            for sess_attr in ("_session", "session", "_client", "client"):
+                s_obj = getattr(self, sess_attr, None)
+                if s_obj is not None and hasattr(s_obj, "close"):
+                    try:
+                        c_res = s_obj.close()
+                        if inspect.isawaitable(c_res):
+                            await c_res
+                    except Exception:
+                        pass
+            return None
+
+        setattr(TossApiClient, "close", _poly_close)
+
+
 _install_toss_api_compatibility_patches()
 
 
 def _instantiate_stratum_ledger(filepath: str) -> Any:
-    """
-    toss_api 또는 quant_engine 내에 정의된 원장 클래스를 동적으로 찾아 인스턴스화한다.
-    """
     ledger_cls = _resolve_module_attr(
         modules=(toss_api, quant_engine),
         candidate_names=(
@@ -800,9 +870,6 @@ def _instantiate_stratum_ledger(filepath: str) -> Any:
 
 
 def _check_weekend_nyse_closed_dynamic(now_est: datetime) -> bool:
-    """
-    quant_indicators_plugin 내 주말 휴장 판별 함수를 동적 호출하거나 표준 EST 주말 규칙(금 17:00 ~ 일 17:59 EST)을 적용한다.
-    """
     fn = _resolve_module_attr(
         modules=(quant_indicators_plugin, toss_api),
         candidate_names=(
@@ -829,6 +896,183 @@ def _check_weekend_nyse_closed_dynamic(now_est: datetime) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# [핵심 1-C] 자체 벡터화 1분봉/일봉 지표 산출 폴백 (VWAP · 5MA · HA양봉/음봉)
+# ---------------------------------------------------------------------------
+def _compute_vectorized_metrics_fallback(
+    candles_1m: List[Dict[str, Any]],
+    live_price: float,
+    now_est: datetime,
+    candles_1d: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    dt_now = now_est.astimezone(EST_TZ)
+    today_str = dt_now.strftime("%Y-%m-%d")
+    lp = safe_float(live_price, 0.0)
+
+    out: Dict[str, Any] = {
+        "symbol": TARGET_SYMBOL,
+        "live_price": round(lp, 4),
+        "ma5_amp_pct": 6.50,
+        "rsi_14": 50.0,
+        "ha_bull": True,
+        "ha_badge": "🕯️HA양봉",
+        "premarket_vwap": 0.0,
+        "premarket_high": 0.0,
+        "premarket_low": 0.0,
+        "premarket_amp_pct": 0.0,
+        "premarket_est_low": 0.0,
+        "premarket_est_high": 0.0,
+        "regular_vwap": 0.0,
+        "regular_high": 0.0,
+        "regular_low": 0.0,
+        "regular_amp_pct": 0.0,
+        "regular_est_low": 0.0,
+        "regular_est_high": 0.0,
+    }
+
+    if isinstance(candles_1d, list) and len(candles_1d) >= 2:
+        try:
+            df_d = pd.DataFrame(candles_1d)
+            if "highPrice" in df_d.columns and "lowPrice" in df_d.columns:
+                hs = pd.to_numeric(df_d["highPrice"], errors="coerce")
+                ls = pd.to_numeric(df_d["lowPrice"], errors="coerce")
+                valid = (hs > 0) & (ls > 0) & (hs >= ls)
+                hv = (
+                    hs[valid].to_numpy(dtype=float)[-6:-1]
+                    if valid.sum() > 5
+                    else hs[valid].to_numpy(dtype=float)[-5:]
+                )
+                lv = (
+                    ls[valid].to_numpy(dtype=float)[-6:-1]
+                    if valid.sum() > 5
+                    else ls[valid].to_numpy(dtype=float)[-5:]
+                )
+                if len(lv) >= 1:
+                    out["ma5_amp_pct"] = round(
+                        float(
+                            np.mean(((hv - lv) / np.maximum(0.01, lv)) * 100.0)
+                        ),
+                        2,
+                    )
+        except Exception:
+            pass
+
+    if not isinstance(candles_1m, list) or not candles_1m:
+        return refresh_metrics_with_live_tick(out, lp, now_est=dt_now)
+
+    try:
+        df = pd.DataFrame(candles_1m)
+        if df.empty or "timestamp" not in df.columns:
+            return refresh_metrics_with_live_tick(out, lp, now_est=dt_now)
+
+        ts_utc = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.loc[ts_utc.notna()].copy()
+        df["dt_est"] = ts_utc[ts_utc.notna()].dt.tz_convert(EST_TZ)
+        df.sort_values("dt_est", ascending=True, inplace=True)
+        df.drop_duplicates(subset=["dt_est"], keep="last", inplace=True)
+
+        df["O"] = pd.to_numeric(
+            df.get("openPrice", df.get("open")), errors="coerce"
+        )
+        df["H"] = pd.to_numeric(
+            df.get("highPrice", df.get("high")), errors="coerce"
+        )
+        df["L"] = pd.to_numeric(
+            df.get("lowPrice", df.get("low")), errors="coerce"
+        )
+        df["C"] = pd.to_numeric(
+            df.get("closePrice", df.get("close")), errors="coerce"
+        )
+        df["V"] = pd.to_numeric(
+            df.get("volume", 0.0), errors="coerce"
+        ).fillna(0.0)
+        df.dropna(subset=["O", "H", "L", "C"], inplace=True)
+        if df.empty:
+            return refresh_metrics_with_live_tick(out, lp, now_est=dt_now)
+
+        if lp <= 0.0:
+            lp = float(df["C"].iloc[-1])
+            out["live_price"] = round(lp, 4)
+
+        opens = df["O"].to_numpy(dtype=float)
+        highs = df["H"].to_numpy(dtype=float)
+        lows = df["L"].to_numpy(dtype=float)
+        closes = df["C"].to_numpy(dtype=float)
+        if lp > 0.0 and len(closes) > 0:
+            closes[-1] = lp
+            highs[-1] = max(highs[-1], lp)
+            lows[-1] = min(lows[-1], lp)
+
+        ha_c = (opens + highs + lows + closes) * 0.25
+        shifted = np.empty(len(ha_c), dtype=float)
+        shifted[0] = (opens[0] + closes[0]) * 0.5
+        if len(ha_c) > 1:
+            shifted[1:] = ha_c[:-1]
+        ha_o = (
+            pd.Series(shifted)
+            .ewm(alpha=0.5, adjust=False)
+            .mean()
+            .to_numpy(dtype=float)
+        )
+        is_bull = bool(ha_c[-1] >= ha_o[-1])
+        out["ha_bull"] = is_bull
+        out["ha_badge"] = "🕯️HA양봉" if is_bull else "🌑HA음봉"
+        out["prev_ha_open"] = round(
+            float(ha_o[-2] if len(ha_o) >= 2 else ha_o[-1]), 4
+        )
+        out["prev_ha_close"] = round(
+            float(ha_c[-2] if len(ha_c) >= 2 else ha_c[-1]), 4
+        )
+        out["cur_bar_open"] = round(float(opens[-1]), 4)
+        out["cur_bar_high"] = round(float(highs[-1]), 4)
+        out["cur_bar_low"] = round(float(lows[-1]), 4)
+
+        df["Date"] = df["dt_est"].dt.strftime("%Y-%m-%d")
+        df["hm"] = df["dt_est"].dt.hour * 100 + df["dt_est"].dt.minute
+        t_date = (
+            today_str
+            if (df["Date"] == today_str).any()
+            else str(df["Date"].iloc[-1])
+        )
+        df_t = df[df["Date"] == t_date]
+
+        amp_ratio = max(0.01, float(out["ma5_amp_pct"]) / 100.0)
+        for prefix, sub in (
+            ("premarket", df_t[(df_t["hm"] >= 400) & (df_t["hm"] <= 929)]),
+            ("regular", df_t[(df_t["hm"] >= 930) & (df_t["hm"] <= 1600)]),
+        ):
+            if not sub.empty:
+                h_a = sub["H"].to_numpy(dtype=float)
+                l_a = sub["L"].to_numpy(dtype=float)
+                c_a = sub["C"].to_numpy(dtype=float)
+                v_a = np.maximum(0.0, sub["V"].to_numpy(dtype=float))
+                tp = (h_a + l_a + c_a) / 3.0
+                tv = float(np.sum(v_a))
+                vwap_v = (
+                    float(np.sum(tp * v_a) / tv)
+                    if tv > 0
+                    else float(np.mean(tp))
+                )
+                sh = float(np.max(h_a))
+                sl = float(np.min(l_a))
+                out[f"{prefix}_vwap"] = round(vwap_v, 4)
+                out[f"{prefix}_high"] = round(sh, 4)
+                out[f"{prefix}_low"] = round(sl, 4)
+                out[f"{prefix}_amp_pct"] = round(
+                    ((sh - sl) / sl) * 100.0 if sl > 0 else 0.0, 2
+                )
+                out[f"{prefix}_est_high"] = round(
+                    max(sh, sl * (1.0 + amp_ratio)), 2
+                )
+                out[f"{prefix}_est_low"] = round(
+                    min(sl, sh / (1.0 + amp_ratio)), 2
+                )
+    except Exception:
+        pass
+
+    return refresh_metrics_with_live_tick(out, lp, now_est=dt_now)
+
+
 async def _compute_candle_metrics_dynamic(
     context: Any,
     candles_1m: List[Dict[str, Any]],
@@ -836,9 +1080,6 @@ async def _compute_candle_metrics_dynamic(
     now_est: datetime,
     candles_1d: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    quant_indicators_plugin 내 1분봉 지표 산출 함수를 시그니처 적응형으로 호출한다.
-    """
     excluded = {
         "evaluate_buy_gate_bucket_status",
         "is_active_trading_window",
@@ -855,8 +1096,6 @@ async def _compute_candle_metrics_dynamic(
             "compute_candle_metrics_1m",
             "build_soxl_candle_metrics",
             "calculate_vwap_metrics_1m",
-            "compute_soxl_indicators",
-            "calculate_intraday_vwap_metrics",
         ),
         predicate=lambda f: (
             inspect.isfunction(f)
@@ -885,71 +1124,401 @@ async def _compute_candle_metrics_dynamic(
                 now_est=now_est,
                 dt_now=now_est,
             )
-            if isinstance(res, dict) and res:
+            if isinstance(res, dict) and (
+                safe_float(res.get("premarket_vwap"), 0.0) > 0.0
+                or safe_float(res.get("regular_vwap"), 0.0) > 0.0
+            ):
                 return refresh_metrics_with_live_tick(
                     res, live_price, now_est=now_est
                 )
-        except Exception as exc:
-            logger.debug("캔들 지표 함수 동적 호출 폴백: %s", exc)
+        except Exception:
+            pass
 
-    return refresh_metrics_with_live_tick(
-        {"symbol": TARGET_SYMBOL, "live_price": live_price},
-        live_price,
+    return _compute_vectorized_metrics_fallback(
+        candles_1m=candles_1m,
+        live_price=live_price,
         now_est=now_est,
+        candles_1d=candles_1d,
     )
+
+
+# ---------------------------------------------------------------------------
+# [핵심 1-D] 정밀 텔레그램 토큰·채팅방 ID 자동 탐색기 (URL 오매칭 100% 차단)
+# ---------------------------------------------------------------------------
+def _extract_valid_tg_token(text: str) -> str:
+    if not text or "://" in text:
+        return ""
+    m = _TG_TOKEN_STRICT_RE.search(str(text).strip())
+    return m.group(1) if m else ""
+
+
+def _discover_telegram_credentials(
+    base_dir: str, api_obj: Any = None
+) -> Tuple[str, str]:
+    """
+    MODIFIED:
+    1) TOKEN_URL("https://...") 등 URL 상수가 봇 토큰으로 오매칭되는 버그를 100% 차단하고
+       오직 _TG_TOKEN_STRICT_RE(\\d{8,12}:[A-Za-z0-9_-]{25,60}) 에 일치하는 토큰만 추출한다.
+    2) .env, os.environ, api_obj 속성, tg_ui_plugin / toss_api 모듈 변수 및 로컬 파일에서
+       (bot_token, chat_id) 를 탐색한다.
+    """
+    candidate_dirs = [base_dir, "/home/pipiosToss", os.getcwd()]
+    for d in candidate_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        env_fp = os.path.join(d, ".env")
+        if os.path.isfile(env_fp):
+            try:
+                with open(env_fp, "r", encoding="utf-8") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        if line.startswith("export "):
+                            line = line[len("export ") :].strip()
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'").strip('"')
+                        if k and v and k not in os.environ:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
+    token_keys = (
+        "TELEGRAM_BOT_TOKEN",
+        "TG_BOT_TOKEN",
+        "BOT_TOKEN",
+        "TELEGRAM_TOKEN",
+        "TG_TOKEN",
+    )
+    chat_keys = (
+        "TELEGRAM_CHAT_ID",
+        "TG_CHAT_ID",
+        "CHAT_ID",
+        "TELEGRAM_ADMIN_ID",
+        "ADMIN_CHAT_ID",
+        "ALLOWED_CHAT_ID",
+    )
+
+    bot_token = ""
+    chat_id = ""
+
+    # 1) 환경변수 우선 탐색
+    for k in token_keys:
+        cand = _extract_valid_tg_token(str(os.environ.get(k) or ""))
+        if cand:
+            bot_token = cand
+            break
+
+    if not bot_token:
+        for _, v in os.environ.items():
+            cand = _extract_valid_tg_token(str(v or ""))
+            if cand:
+                bot_token = cand
+                break
+
+    for k in chat_keys:
+        v = str(os.environ.get(k) or "").strip()
+        if v.lstrip("-").isdigit() and len(v.lstrip("-")) >= 5:
+            chat_id = v
+            break
+
+    # 2) api_obj 인스턴스 및 tg_ui_plugin / toss_api 모듈 전역 변수 탐색
+    scan_targets: List[Any] = [tg_ui_plugin, toss_api]
+    if api_obj is not None:
+        scan_targets.insert(0, api_obj)
+
+    for target in scan_targets:
+        try:
+            obj_dict = vars(target)
+        except Exception:
+            continue
+        for attr_name, attr_val in obj_dict.items():
+            if isinstance(attr_val, (str, int)):
+                s_val = str(attr_val).strip()
+                u_name = attr_name.upper()
+                if not bot_token:
+                    cand = _extract_valid_tg_token(s_val)
+                    if cand:
+                        bot_token = cand
+                if not chat_id and (
+                    "CHAT_ID" in u_name or "ADMIN_ID" in u_name
+                ):
+                    if (
+                        s_val.lstrip("-").isdigit()
+                        and len(s_val.lstrip("-")) >= 5
+                    ):
+                        chat_id = s_val
+
+    # 3) 모듈 소스 파일(.py / .json / .env) 텍스트 정규식 스캔 폴백
+    if not bot_token or not chat_id:
+        chat_re = re.compile(
+            r"(?:CHAT_ID|chat_id)\s*[:=]\s*['\"]?(-?\d{6,15})['\"]?"
+        )
+        for d in candidate_dirs:
+            if not d or not os.path.isdir(d):
+                continue
+            for fn in (
+                ".env",
+                "config.json",
+                "secrets.json",
+                "toss_api.py",
+                "tg_ui_plugin.py",
+            ):
+                fp = os.path.join(d, fn)
+                if not os.path.isfile(fp):
+                    continue
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    if not bot_token:
+                        m_tok = _TG_TOKEN_STRICT_RE.search(content)
+                        if m_tok:
+                            bot_token = m_tok.group(1)
+                    if not chat_id:
+                        m_cid = chat_re.search(content)
+                        if m_cid:
+                            chat_id = m_cid.group(1)
+                except Exception:
+                    pass
+
+    return bot_token, chat_id
+
+
+def _escape_html(val: Any) -> str:
+    return html.escape(str(val if val is not None else ""), quote=False)
+
+
+def _get_dst_badge(now_est: Optional[datetime] = None) -> str:
+    dt = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+    tz_name = dt.tzname() or "EST"
+    if "EDT" in tz_name.upper():
+        return "☀️서머타임 ON (EDT)"
+    return "❄️서머타임 OFF (EST)"
+
+
+def _build_main_reply_keyboard() -> Dict[str, Any]:
+    return {
+        "keyboard": [
+            [
+                {"text": "🔫 스나이퍼 레이더"},
+                {"text": "📜 지층 지시서"},
+                {"text": "⬅️ 메인 메뉴"},
+            ],
+            [
+                {"text": "⚙️ 전술 제어반"},
+                {"text": "🔄 잔고 동기화"},
+                {"text": "🚀 시스템 업데이트"},
+            ],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def _build_radar_inline_keyboard() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 레이더 갱신", "callback_data": "cmd_avwap"},
+                {"text": "📜 지층 지시서", "callback_data": "cmd_sync"},
+            ],
+            [
+                {"text": "⚙️ 전술 제어반", "callback_data": "cmd_settlement"},
+                {"text": "⬅️ 메인 메뉴", "callback_data": "cmd_start"},
+            ],
+        ]
+    }
+
+
+def _build_settlement_inline_keyboard(is_active: bool) -> Dict[str, Any]:
+    """
+    🚨 Case 64:
+    전술 제어반(/settlement)에는 오직 [작동 ON/OFF] 와 [시드머니 설정] 2가지 핵심 조작 버튼만 둔다.
+    """
+    power_label = (
+        "🔴 스나이퍼 작동 OFF 로 전환"
+        if is_active
+        else "🟢 스나이퍼 작동 ON 으로 전환"
+    )
+    return {
+        "inline_keyboard": [
+            [
+                {"text": power_label, "callback_data": "toggle_bot_active"},
+            ],
+            [
+                {
+                    "text": "💵 기준 시드머니($) 설정",
+                    "callback_data": "prompt_seed_input",
+                },
+            ],
+            [
+                {"text": "🔫 스나이퍼 레이더", "callback_data": "cmd_avwap"},
+                {"text": "📜 지층 지시서", "callback_data": "cmd_sync"},
+            ],
+        ]
+    }
 
 
 class _AdaptiveTelegramBridge:
     """
-    tg_ui_plugin 내의 컨트롤러 클래스 또는 모듈 레벨 텔레그램 함수들을 동적으로 감싸서
-    SniperAppContext 와 100% 호환시키는 어댑터.
+    외부 tg_ui_plugin 의 폴링 루프 구조에 구애받지 않고
+    자체 내장 getUpdates 롱폴링 + /start, /avwap, /sync, /settlement, /reset, /update +
+    인라인 버튼 콜백 + 시드 숫자 입력을 100% 직접 수행하는 완결형 텔레그램 컨트롤러.
     """
 
     def __init__(self, context: Any) -> None:
-        self.context = context
-        self._impl: Any = None
+        self.context: Any = context
+        self.bot_token, self.chat_id = _discover_telegram_credentials(
+            context.base_dir, getattr(context, "api", None)
+        )
+        self._last_update_id: int = 0
+        self._awaiting_seed_input_chats: Dict[str, float] = {}
 
-        ctrl_cls = _resolve_module_attr(
+    def _api_url(self, method: str) -> str:
+        return f"https://api.telegram.org/bot{self.bot_token}/{method}"
+
+    def _post_tg_sync(
+        self,
+        method: str,
+        payload: Dict[str, Any],
+        timeout_sec: float = 15.0,
+    ) -> Dict[str, Any]:
+        if not self.bot_token:
+            return {"ok": False, "description": "missing-bot-token"}
+        url = self._api_url(method)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url=url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw else {"ok": True}
+        except urllib.error.HTTPError as he:
+            try:
+                err_raw = he.read().decode("utf-8", errors="replace")
+                return json.loads(err_raw)
+            except Exception:
+                return {"ok": False, "error_code": he.code}
+        except Exception as exc:
+            return {"ok": False, "description": str(exc)}
+
+    async def _call_tg(
+        self,
+        method: str,
+        payload: Dict[str, Any],
+        timeout_sec: float = 15.0,
+    ) -> Dict[str, Any]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._post_tg_sync, method, payload, timeout_sec
+                ),
+                timeout=timeout_sec + 3.0,
+            )
+        except Exception as exc:
+            logger.debug("텔레그램 API(%s) 호출 예외: %s", method, exc)
+            return {"ok": False, "description": str(exc)}
+
+    async def send_message(
+        self,
+        text: str,
+        chat_id: Optional[str] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
+        parse_mode: str = "HTML",
+    ) -> bool:
+        target_chat = str(chat_id or self.chat_id or "").strip()
+        if self.bot_token and target_chat:
+            payload: Dict[str, Any] = {
+                "chat_id": target_chat,
+                "text": text,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
+            }
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
+            res = await self._call_tg("sendMessage", payload, timeout_sec=10.0)
+            if not bool(res.get("ok")):
+                payload.pop("parse_mode", None)
+                res = await self._call_tg(
+                    "sendMessage", payload, timeout_sec=10.0
+                )
+            if bool(res.get("ok")):
+                return True
+
+        fn = _resolve_module_attr(
             modules=(tg_ui_plugin,),
             candidate_names=(
-                "TelegramCommandController",
-                "TelegramBotController",
-                "TelegramUiController",
-                "SniperTelegramController",
-                "TelegramController",
-                "TelegramRouter",
-            ),
-            predicate=lambda c: (
-                inspect.isclass(c)
-                and (
-                    hasattr(c, "run_polling_loop")
-                    or hasattr(c, "poll_updates_loop")
-                    or hasattr(c, "send_slim_alert")
-                )
+                "send_telegram_message",
+                "send_slim_alert",
+                "send_telegram_alert",
             ),
         )
-        if ctrl_cls is not None:
-            try:
-                sig = inspect.signature(ctrl_cls.__init__)
-                if "context" in sig.parameters:
-                    self._impl = ctrl_cls(context=context)
-                elif len(sig.parameters) >= 2:
-                    self._impl = ctrl_cls(context)
-                else:
-                    self._impl = ctrl_cls()
-            except Exception as exc:
-                logger.warning("텔레그램 컨트롤러 클래스 초기화 폴백: %s", exc)
-
-    async def send_slim_alert(self, title: str, body: str = "") -> bool:
-        if self._impl is not None and hasattr(self._impl, "send_slim_alert"):
-            res = await _call_plugin_adaptive(
-                self._impl.send_slim_alert,
+        if callable(fn):
+            res_f = await _call_plugin_adaptive(
+                fn,
                 context=self.context,
-                title=title,
-                body=body,
-                message=f"{title}\n{body}" if body else title,
+                title=text,
+                body="",
+                text=text,
+                message=text,
+                reply_markup=reply_markup,
             )
-            return bool(res)
+            return bool(res_f)
+        return False
+
+    async def edit_or_send_message(
+        self,
+        chat_id: str,
+        message_id: Optional[int],
+        text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if self.bot_token and chat_id and message_id and message_id > 0:
+            payload: Dict[str, Any] = {
+                "chat_id": str(chat_id),
+                "message_id": int(message_id),
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
+            res = await self._call_tg(
+                "editMessageText", payload, timeout_sec=10.0
+            )
+            if bool(res.get("ok")) or "message is not modified" in str(
+                res.get("description") or ""
+            ):
+                return True
+        return await self.send_message(
+            text=text, chat_id=chat_id, reply_markup=reply_markup
+        )
+
+    async def send_slim_alert(
+        self,
+        title: str,
+        body: str = "",
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        safe_title = _escape_html(title)
+        safe_body = _escape_html(body)
+        msg = (
+            f"<b>{safe_title}</b>\n🔸 {safe_body}"
+            if safe_body
+            else f"<b>{safe_title}</b>"
+        )
+        if self.bot_token and self.chat_id:
+            return await self.send_message(
+                text=msg, chat_id=self.chat_id, reply_markup=reply_markup
+            )
 
         fn = _resolve_module_attr(
             modules=(tg_ui_plugin,),
@@ -966,79 +1535,799 @@ class _AdaptiveTelegramBridge:
                 context=self.context,
                 title=title,
                 body=body,
-                text=f"{title}\n{body}" if body else title,
-                message=f"{title}\n{body}" if body else title,
+                text=msg,
+                message=msg,
             )
             return bool(res)
         return False
 
     async def send_startup_alive_banner(self) -> None:
-        if self._impl is not None and hasattr(
-            self._impl, "send_startup_alive_banner"
-        ):
+        st = self.context.ledger.get_state(TARGET_SYMBOL)
+        init_seed = safe_float(
+            st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD
+        )
+        free_cash = safe_float(st.get("free_cash_usd"), init_seed)
+        text = (
+            "<b>✅ 서버가 정상 작동 중입니다.</b>\n"
+            "🔸 🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 &amp; 선행 체결정산(Case 65/66) 가동 완료\n"
+            f"🔸 기준시드: <b>${init_seed:,.2f}</b> · 가용현금: <b>${free_cash:,.2f}</b> (📡 텔레그램 명령어 폴링 ON)"
+        )
+        sent = await self.send_message(
+            text=text, reply_markup=_build_main_reply_keyboard()
+        )
+        if not sent:
+            await self.send_slim_alert(
+                title="✅ 서버가 정상 작동 중입니다.",
+                body="🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 & 선행 체결정산(Case 65/66) 가동 완료",
+            )
+
+    # -----------------------------------------------------------------------
+    # 4대 관제 보드 메시지 빌더 (/start · /avwap · /sync · /settlement)
+    # -----------------------------------------------------------------------
+    def _build_start_schedule_message(
+        self, st: Dict[str, Any], now_est: datetime
+    ) -> str:
+        dst_str = _get_dst_badge(now_est)
+        init_seed = max(
+            100.0,
+            safe_float(st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD),
+        )
+        lines = [
+            f"🐂 <b>[ SOXL 지층관리 스나이퍼 ({_escape_html(dst_str)}) ]</b>",
+            "▫️ 전략: 🛡️ 05_AF_WIDE_10_01 (8% 황금정량 · 눌림/돌파 독립 1층 재장전 · 기억저가 와이드 활주로)",
+            "▫️ 매수: 🛡️ 10분 고정 4단 와이드 게이트 (기억저가 대비 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%)",
+            "▫️ 재장전: 🔥 0주 즉시 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
+            "▫️ 매도: ⚡ 1분 상시 실물 스나이퍼 매도 (1층 +1.50% 익절&amp;리앵커링 / 2층 +1.00% 졸업)",
+            "▫️ 방어: ⏱️ 양방향 60초 타임쉴드 &amp; 순수 현재가 지정가(LIMIT) 락온 (Case 65/66)",
+            f"▫️ 기준 시드머니: <b>${init_seed:,.2f}</b> (1회 8% 정량 자동 산출)",
+            "──────────────",
+            "🔹 04:00 ~ 04:06: 🌅 프리장 호가 안정화 &amp; 오버나이트 지층 동기화",
+            "🔹 04:07 ~ 09:29: 🔫 프리장 지층관리 가동 (10분 와이드매수게이트 · 1분 상시매도)",
+            "🔹 09:30 ~ 16:00: 🔥 정규장 지층관리 가동 (10분 와이드매수게이트 · 1분 상시매도)",
+            "🔹 16:00 ~ 16:59: 🌙 정규장 마감 일일 결산 &amp; 보유 지층 오버나이트 보존",
+            "🔹 17:00 ~ 03:59: 🧹 일일 GC 및 장외 대기 (강제 손절 MOC 없음)",
+            "──────────────",
+            "📡 /avwap : 실시간 지층 스나이퍼 레이더 관제탑",
+            "📜 /sync : 토스 실잔고 동기화 &amp; 지층 지시서",
+            "⚙️ /settlement : 초슬림 전술 제어반 (작동 ON/OFF · 시드머니 설정)",
+            "🧹 /reset : 지층 원장 0점 초기화 (/reset_seed 금액)",
+            "🚀 /update : 최신 깃허브 코드 검증 업데이트",
+        ]
+        return "\n".join(lines)
+
+    def _build_avwap_radar_message(
+        self,
+        st: Dict[str, Any],
+        metrics: Dict[str, Any],
+        live_price: float,
+        now_est: datetime,
+    ) -> str:
+        met = refresh_metrics_with_live_tick(
+            metrics, live_price, now_est=now_est
+        )
+        lp = safe_float(
+            live_price,
+            safe_float(
+                met.get("live_price"), safe_float(st.get("anchor_price"), 0.0)
+            ),
+        )
+        summary = summarize_stratum_portfolio(st, live_price=lp)
+        is_active = bool(st.get("is_active", True))
+        active_badge = "🟢 ON" if is_active else "🔴 OFF"
+        fast_badge = (
+            "⚡0.4s 부스터"
+            if getattr(self.context, "fast_shield_mode", False)
+            else "⏱️1.5s 표준"
+        )
+
+        ma5_amp = safe_float(met.get("ma5_amp_pct"), 6.50)
+        ha_badge = str(met.get("ha_badge") or "🕯️HA양봉")
+
+        pre_vwap = safe_float(met.get("premarket_vwap"), 0.0)
+        pre_l = safe_float(met.get("premarket_low"), 0.0)
+        pre_h = safe_float(met.get("premarket_high"), 0.0)
+        pre_amp = safe_float(met.get("premarket_amp_pct"), 0.0)
+        pre_el = safe_float(met.get("premarket_est_low"), 0.0)
+        pre_eh = safe_float(met.get("premarket_est_high"), 0.0)
+
+        reg_vwap = safe_float(met.get("regular_vwap"), 0.0)
+        reg_l = safe_float(met.get("regular_low"), 0.0)
+        reg_h = safe_float(met.get("regular_high"), 0.0)
+        reg_amp = safe_float(met.get("regular_amp_pct"), 0.0)
+        reg_el = safe_float(met.get("regular_est_low"), 0.0)
+        reg_eh = safe_float(met.get("regular_est_high"), 0.0)
+
+        held_sh = safe_int(summary.get("held_shares"), 0)
+        held_lots = safe_int(summary.get("held_lots"), 0)
+        buckets = summary.get("buckets", [])
+
+        shield_line = ""
+        fn_buy_sh = getattr(
+            sniper_exit_plugin, "is_within_post_buy_time_shield", None
+        )
+        fn_sell_sh = getattr(
+            sniper_exit_plugin, "is_within_post_sell_time_shield", None
+        )
+        if callable(fn_buy_sh):
+            in_b, rem_b = fn_buy_sh(self.context, st, TARGET_SYMBOL)
+            if in_b:
+                shield_line = f"🛡️ <b>[매수 후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_b:.1f}초</b> 후 현재가 조회 &amp; 매도 감시 개시"
+        if not shield_line and callable(fn_sell_sh):
+            in_s, rem_s = fn_sell_sh(self.context, st, TARGET_SYMBOL)
+            if in_s:
+                shield_line = f"🛡️ <b>[매도 후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_s:.1f}초</b> 후 현재가 조회 &amp; 매수 감시 개시"
+
+        stratum_lines: List[str] = []
+        if held_sh <= 0 or not buckets:
+            stratum_lines.append(
+                "⚪ <b>[보유 지층 없음 · 0주]</b> 60초 타임쉴드 확인 후 현재가 지정가 1층(REENTRY_1FL) 즉시 산입 대기"
+            )
+        elif bool(summary.get("is_l2_only_anti_bloat")):
+            b2 = buckets[0]
+            l2_t = safe_float(summary.get("l2_target_price"), 0.0)
+            l2_g = safe_float(summary.get("l2_gain_pct"), 0.0)
+            g_sign = "+" if l2_g >= 0.0 else ""
+            stratum_lines.append(
+                "⚡ <b>[1층: 공석 · 10분 게이트 눌림(-1%)/돌파(+1%) 대기]</b>"
+            )
+            stratum_lines.append(
+                f"📦 <b>[2층: 통합층 {b2.qty}주({b2.lot_count}회차)]</b> 장부 <b>${b2.book_price:.2f}</b>"
+                f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0%) [{g_sign}{l2_g:.2f}%]"
+            )
+        else:
+            b1 = buckets[0]
+            l1_t = safe_float(summary.get("l1_target_price"), 0.0)
+            l1_g = safe_float(summary.get("l1_gain_pct"), 0.0)
+            g1_sign = "+" if l1_g >= 0.0 else ""
+            stratum_lines.append(
+                f"⚡ <b>[1층: 공격수 {b1.qty}주]</b> 단가 <b>${b1.book_price:.2f}</b> · "
+                f"익절목표 <b>${l1_t:.2f}</b>(+1.5%) [{g1_sign}{l1_g:.2f}%]"
+            )
+            if len(buckets) >= 2:
+                b2 = buckets[1]
+                l2_t = safe_float(summary.get("l2_target_price"), 0.0)
+                l2_g = safe_float(summary.get("l2_gain_pct"), 0.0)
+                g2_sign = "+" if l2_g >= 0.0 else ""
+                stratum_lines.append(
+                    f"📦 <b>[2층: 통합층 {b2.qty}주({b2.lot_count}회차)]</b> 장부 <b>${b2.book_price:.2f}</b>"
+                    f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0%) [{g2_sign}{l2_g:.2f}%]"
+                )
+
+        _, _, _, gate_info = evaluate_buy_gate_bucket_status(
+            now_est=now_est,
+            buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
+            last_evaluated_bucket_id=safe_int(
+                st.get("last_evaluated_buy_bucket_id"), -1
+            ),
+            last_evaluated_date=str(st.get("last_evaluated_date") or ""),
+        )
+        next_gate_str = str(gate_info.get("next_gate_hm_str") or "04:07 EST")
+        next_bud = safe_float(summary.get("next_portion_budget"), 800.0)
+        next_qty = safe_int(summary.get("next_target_qty"), 1)
+        ref_anchor = safe_float(summary.get("ref_buy_anchor"), lp)
+        chg_anchor = safe_float(summary.get("chg_from_buy_anchor_pct"), 0.0)
+        c_sign = "+" if chg_anchor >= 0.0 else ""
+
+        if bool(summary.get("is_l2_only_anti_bloat")):
+            pull_p = safe_float(summary.get("reentry_pullback_price"), 0.0)
+            brk_p = safe_float(summary.get("reentry_breakout_price"), 0.0)
+            locked_min_p = safe_float(summary.get("cycle_min_buy_price"), 0.0)
+            gate_cond_line = (
+                f"▫️ 직전익절 ${ref_anchor:.2f} 대비 {c_sign}{chg_anchor:.2f}% "
+                f"(눌림목 <b>${pull_p:.2f}</b> 이하 OR 돌파 <b>${brk_p:.2f}</b> 이상 · 기억저가 ${locked_min_p:.2f})"
+            )
+        else:
+            drop_req = safe_float(summary.get("drop_buy_pct"), -1.0)
+            trig_p = safe_float(summary.get("trigger_buy_price"), 0.0)
+            gate_cond_line = (
+                f"▫️ 기억저가 ${ref_anchor:.2f} 대비 현재 {c_sign}{chg_anchor:.2f}% "
+                f"(와이드단차 {drop_req:.2f}% · 신저가 <b>${trig_p:.2f}</b> 이하)"
+            )
+
+        reanchor_cnt = safe_int(summary.get("reanchor_cnt"), 0)
+        reanchor_drop = safe_float(
+            summary.get("cumulative_reanchor_drop_usd"), 0.0
+        )
+        pass_cnt = safe_int(summary.get("seed_protect_pass_cnt"), 0)
+        extra_13 = safe_int(summary.get("extra_13plus_buy_events"), 0)
+        saved_u = safe_float(summary.get("cumulative_leftover_saved_usd"), 0.0)
+        cum_net = safe_float(summary.get("cumulative_realized_net_usd"), 0.0)
+        free_cash = safe_float(summary.get("free_cash_usd"), 0.0)
+        mark_eq = safe_float(summary.get("mark_equity_usd"), 0.0)
+        mark_roi = safe_float(summary.get("mark_roi_pct"), 0.0)
+        n_sign = "+" if cum_net >= 0.0 else "-"
+        m_sign = "+" if mark_roi >= 0.0 else ""
+
+        lines = [
+            f"📡 <b>[SOXL 지층 스나이퍼 레이더]</b> ({active_badge} · {fast_badge})",
+            f"🐂 <b>SOXL</b> [{active_badge}] 현재가 <b>${lp:.2f}</b> · 5MA {ma5_amp:.2f}% · {_escape_html(ha_badge)}",
+            f"🌅 프리장 VWAP ${pre_vwap:.2f} · 밴드 ${pre_l:.2f} ~ ${pre_h:.2f} ({pre_amp:.1f}%) · 예상 ${pre_el:.2f} ~ ${pre_eh:.2f}",
+            f"🔥 정규장 VWAP ${reg_vwap:.2f} · 밴드 ${reg_l:.2f} ~ ${reg_h:.2f} ({reg_amp:.1f}%) · 예상 ${reg_el:.2f} ~ ${reg_eh:.2f}",
+        ]
+        if shield_line:
+            lines.append(shield_line)
+
+        lines.extend(
+            [
+                "──────────────",
+                f"🏛️ <b>[2-Tier 실물 지층 &amp; 와이드 활주로]</b> (총 {held_sh}주 · {held_lots}회차)",
+                *stratum_lines,
+                "──────────────",
+                f"🛡️ <b>[10분 고정 와이드 시드보호 매수 게이트]</b> (차기검문: {_escape_html(next_gate_str)})",
+                gate_cond_line,
+                f"▫️ 차기 8% 정량: 예산 ${next_bud:,.2f} ➔ <b>{next_qty}주</b> 고정 대기",
+                "──────────────",
+                f"♻️ 평단 리앵커링: {reanchor_cnt}회 (누적 -${reanchor_drop:.2f} 단가인하)",
+                f"🛡️ 시드보호 패스: {pass_cnt:,}회 · 🔥 13회차+ 확장매수: {extra_13}회",
+                f"💰 자투리절약 누적: +${saved_u:,.2f} · 세후실현익: {n_sign}${abs(cum_net):,.2f}",
+                f"💵 가용현금: <b>${free_cash:,.2f}</b> · 총자산: <b>${mark_eq:,.2f}</b> ({m_sign}{mark_roi:.2f}%)",
+                f"🕒 갱신: {now_est.strftime('%m-%d %H:%M:%S EST')}",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _build_sync_instruction_message(
+        self,
+        st: Dict[str, Any],
+        holdings: Dict[str, Dict[str, Any]],
+        live_price: float,
+        broker_bp_usd: float,
+        fx_rate: float,
+        now_est: datetime,
+    ) -> str:
+        h_info = (holdings or {}).get(TARGET_SYMBOL, {})
+        lp = safe_float(
+            live_price,
+            safe_float(
+                h_info.get("last_price"),
+                safe_float(st.get("anchor_price"), 0.0),
+            ),
+        )
+        summary = summarize_stratum_portfolio(st, live_price=lp)
+        eff_fx = fx_rate if fx_rate > 100.0 else KRW_PER_USD_DEFAULT
+
+        init_seed = safe_float(summary.get("initial_seed_usd"), 10000.0)
+        free_cash = safe_float(summary.get("free_cash_usd"), 0.0)
+        actual_inv = safe_float(summary.get("actual_invested_usd"), 0.0)
+        cum_net = safe_float(summary.get("cumulative_realized_net_usd"), 0.0)
+        cum_roi = safe_float(summary.get("realized_roi_pct"), 0.0)
+        unreal_pnl = safe_float(summary.get("unrealized_pnl_usd"), 0.0)
+        mark_eq = safe_float(summary.get("mark_equity_usd"), 0.0)
+        mark_roi = safe_float(summary.get("mark_roi_pct"), 0.0)
+
+        total_net_usd = cum_net + unreal_pnl
+        total_net_krw = total_net_usd * eff_fx
+        cum_net_krw = cum_net * eff_fx
+
+        held_sh = safe_int(summary.get("held_shares"), 0)
+        held_lots = safe_int(summary.get("held_lots"), 0)
+        actual_avg = safe_float(summary.get("actual_avg_price"), 0.0)
+        book_avg = safe_float(summary.get("book_avg_price"), 0.0)
+        locked_min_p = safe_float(summary.get("cycle_min_buy_price"), 0.0)
+
+        c_sign = "+" if cum_net >= 0.0 else "-"
+        u_sign = "+" if unreal_pnl >= 0.0 else "-"
+        t_sign = "+" if total_net_usd >= 0.0 else "-"
+
+        lines = [
+            "📜 <b>[SOXL 지층관리 스나이퍼 지시서 (실잔고 동기화)]</b>",
+            f"💵 설정 기준시드: <b>${init_seed:,.2f}</b> (환율 {eff_fx:,.1f}원/$)",
+            f"🏦 스나이퍼 가용현금: <b>${free_cash:,.2f}</b> (토스 실주문가능: ${broker_bp_usd:,.2f})",
+            f"📦 보유 지층 합계: <b>{held_sh}주</b> ({held_lots}회차 · 실매수원금 ${actual_inv:,.2f})",
+            f"📐 전체 실평단: <b>${actual_avg:.2f}</b> · 리앵커링 장부평단: <b>${book_avg:.2f}</b> (기억저가 ${locked_min_p:.2f})",
+            "──────────────",
+            f"💰 누적 세후실현익(보유원금 미차감): <b>{c_sign}${abs(cum_net):,.2f}</b> ({c_sign}{abs(cum_roi):.2f}% · {c_sign}{abs(cum_net_krw):,.0f}원)",
+            f"📊 현재 지층 평가손익: <b>{u_sign}${abs(unreal_pnl):,.2f}</b> (현재가 ${lp:.2f})",
+            f"👑 시가평가 총자산: <b>${mark_eq:,.2f}</b> ({t_sign}{abs(mark_roi):.2f}% · 총순익 {t_sign}{abs(total_net_krw):,.0f}원)",
+            f"🕒 동기화 시각: {now_est.strftime('%Y-%m-%d %H:%M:%S EST')}",
+        ]
+        return "\n".join(lines)
+
+    def _build_settlement_control_message(
+        self, st: Dict[str, Any], live_price: float, now_est: datetime
+    ) -> str:
+        lp = safe_float(live_price, safe_float(st.get("anchor_price"), 100.0))
+        summary = summarize_stratum_portfolio(st, live_price=lp)
+
+        is_active = bool(st.get("is_active", True))
+        power_str = "🟢 가동 중 (ON)" if is_active else "🔴 일시정지 (OFF)"
+        init_seed = safe_float(summary.get("initial_seed_usd"), 10000.0)
+        free_cash = safe_float(summary.get("free_cash_usd"), 0.0)
+        real_eq = safe_float(summary.get("realized_equity_usd"), init_seed)
+        next_bud = safe_float(
+            summary.get("next_portion_budget"), init_seed * 0.08
+        )
+        next_qty = safe_int(summary.get("next_target_qty"), 1)
+        held_sh = safe_int(summary.get("held_shares"), 0)
+        held_lots = safe_int(summary.get("held_lots"), 0)
+
+        lines = [
+            "⚙️ <b>[SOXL 인피니트 스노우볼 v3.0 전술 제어반]</b>",
+            f"1️⃣ 마스터 전원: <b>{power_str}</b>",
+            f"2️⃣ 기준 시드머니: <b>${init_seed:,.2f}</b> (실현기준 총자산 ${real_eq:,.2f})",
+            "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · 10분 4단 와이드 · 1분 현재가 지정가 매도 · 60초 타임쉴드</b> (고정)",
+            f"4️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ <b>{next_qty}주</b> (가용현금 ${free_cash:,.2f})",
+            f"5️⃣ 현재 보유 지층: <b>{held_sh}주</b> ({held_lots}회차)",
+            "──────────────",
+            "💡 시드머니를 변경하시려면 아래 <b>[💵 기준 시드머니($) 설정]</b> 버튼을 누르거나 채팅창에 숫자(예: <code>19000</code>)를 바로 입력하세요.",
+            f"🕒 기준 시각: {now_est.strftime('%m-%d %H:%M:%S EST')}",
+        ]
+        return "\n".join(lines)
+
+    # -----------------------------------------------------------------------
+    # 실시간 시세/잔고 갱신 및 명령어/콜백 핸들러
+    # -----------------------------------------------------------------------
+    async def _refresh_live_price_and_metrics(
+        self,
+    ) -> Tuple[float, Dict[str, Any]]:
+        now_est = datetime.now(EST_TZ)
+        live_p = safe_float(
+            self.context.latest_prices.get(TARGET_SYMBOL), 0.0
+        )
+        try:
+            p_map = await self.context.api.get_current_prices_batch(
+                (TARGET_SYMBOL,)
+            )
+            fetched_p = safe_float(p_map.get(TARGET_SYMBOL), 0.0)
+            if fetched_p > 0.0:
+                live_p = fetched_p
+                self.context.latest_prices[TARGET_SYMBOL] = live_p
+        except Exception:
+            pass
+
+        base_met = self.context.candle_metrics_cache.get(TARGET_SYMBOL, {})
+        met = refresh_metrics_with_live_tick(
+            base_met, live_p, now_est=now_est
+        )
+        self.context.candle_metrics_cache[TARGET_SYMBOL] = met
+        if live_p <= 0.0:
+            live_p = safe_float(met.get("live_price"), 0.0)
+        return live_p, met
+
+    async def _render_and_send_avwap(
+        self, chat_id: str, edit_msg_id: Optional[int] = None
+    ) -> None:
+        live_p, met = await self._refresh_live_price_and_metrics()
+        st = self.context.ledger.get_state(TARGET_SYMBOL)
+        msg = self._build_avwap_radar_message(
+            st=st,
+            metrics=met,
+            live_price=live_p,
+            now_est=datetime.now(EST_TZ),
+        )
+        await self.edit_or_send_message(
+            chat_id=chat_id,
+            message_id=edit_msg_id,
+            text=msg,
+            reply_markup=_build_radar_inline_keyboard(),
+        )
+
+    async def _render_and_send_sync(
+        self, chat_id: str, edit_msg_id: Optional[int] = None
+    ) -> None:
+        now_est = datetime.now(EST_TZ)
+        live_p, _ = await self._refresh_live_price_and_metrics()
+        holdings_map, fetch_ok = (
+            await self.context.api.get_holdings_map_with_status()
+        )
+        if fetch_ok and isinstance(holdings_map, dict):
+            self.context.latest_holdings = holdings_map
+            self.context.holdings_fetch_ok = True
             await _call_plugin_adaptive(
-                self._impl.send_startup_alive_banner, context=self.context
+                reconcile_stratum_with_broker_holdings_plugin,
+                context=self.context,
+                holdings=holdings_map,
+                prices={TARGET_SYMBOL: live_p},
+                now_est=now_est,
+                force_sync=False,
+            )
+        else:
+            holdings_map = self.context.latest_holdings
+
+        bp_usd = await self.context.api.get_buying_power_usd(
+            safety_buffer_pct=0.0
+        )
+        fx_rate = await self.context.api.get_usd_krw_rate()
+        st = self.context.ledger.get_state(TARGET_SYMBOL)
+
+        msg = self._build_sync_instruction_message(
+            st=st,
+            holdings=holdings_map,
+            live_price=live_p,
+            broker_bp_usd=bp_usd,
+            fx_rate=fx_rate,
+            now_est=now_est,
+        )
+        await self.edit_or_send_message(
+            chat_id=chat_id,
+            message_id=edit_msg_id,
+            text=msg,
+            reply_markup=_build_radar_inline_keyboard(),
+        )
+
+    async def _render_and_send_settlement(
+        self, chat_id: str, edit_msg_id: Optional[int] = None
+    ) -> None:
+        live_p, _ = await self._refresh_live_price_and_metrics()
+        st = self.context.ledger.get_state(TARGET_SYMBOL)
+        msg = self._build_settlement_control_message(
+            st=st, live_price=live_p, now_est=datetime.now(EST_TZ)
+        )
+        await self.edit_or_send_message(
+            chat_id=chat_id,
+            message_id=edit_msg_id,
+            text=msg,
+            reply_markup=_build_settlement_inline_keyboard(
+                bool(st.get("is_active", True))
+            ),
+        )
+
+    async def _apply_new_seed_value(
+        self, chat_id: str, raw_num_str: str
+    ) -> None:
+        cleaned = (
+            str(raw_num_str)
+            .replace(",", "")
+            .replace("$", "")
+            .replace("불", "")
+            .replace("달러", "")
+            .strip()
+        )
+        try:
+            val = float(cleaned)
+        except Exception:
+            return
+        if val < 100.0 or val > 10000000.0:
+            await self.send_message(
+                chat_id=chat_id,
+                text="⚠️ 시드머니는 <b>$100 ~ $10,000,000</b> 사이의 숫자로 입력해 주세요. (예: <code>19000</code>)",
             )
             return
 
-        fn = _resolve_module_attr(
-            modules=(tg_ui_plugin,),
-            candidate_names=(
-                "send_startup_alive_banner",
-                "send_startup_banner",
-                "notify_server_startup",
+        if hasattr(self.context.ledger, "set_initial_seed_usd"):
+            updated_st = await _call_plugin_adaptive(
+                self.context.ledger.set_initial_seed_usd,
+                new_seed_usd=val,
+            )
+        else:
+            updated_st = await self.context.ledger.update_state(
+                TARGET_SYMBOL, initial_seed_usd=round(val, 4)
+            )
+        self.context.wakeup_event.set()
+        live_p, _ = await self._refresh_live_price_and_metrics()
+        summary = summarize_stratum_portfolio(updated_st, live_price=live_p)
+        await self.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ <b>[기준 시드머니 설정 완료]</b>\n"
+                f"🔸 새 기준 시드머니: <b>${val:,.2f}</b>\n"
+                f"🔸 가용 현금시드: <b>${safe_float(summary.get('free_cash_usd'), 0.0):,.2f}</b>\n"
+                f"🔸 차기 1회(8%) 예산: <b>${safe_float(summary.get('next_portion_budget'), 0.0):,.2f}</b> "
+                f"(현재가 기준 <b>{safe_int(summary.get('next_target_qty'), 1)}주</b>)"
+            ),
+            reply_markup=_build_settlement_inline_keyboard(
+                bool(updated_st.get("is_active", True))
             ),
         )
-        if callable(fn):
-            await _call_plugin_adaptive(fn, context=self.context)
+
+    async def _execute_manual_update_command(self, chat_id: str) -> None:
+        await self.send_message(
+            chat_id=chat_id,
+            text="⏳ <b>[시스템 업데이트 개시]</b> GitHub 최신 코드 동기화 및 9대 코어 모듈 프리플라이트 검증 중...",
+        )
+        fn_upd = getattr(
+            plugin_updater, "execute_git_pull_and_preflight", None
+        )
+        if callable(fn_upd):
+            ok, msg, _ = await _call_plugin_adaptive(
+                fn_upd, base_dir=self.context.base_dir
+            )
+        else:
+            ok, msg = verify_all_modules_compile(self.context.base_dir)
+
+        if not ok:
+            await self.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ <b>[업데이트 중단]</b>\n{_escape_html(msg)}",
+            )
             return
 
-        await self.send_slim_alert(
-            title="✅ 서버가 정상 작동 중입니다.",
-            body="🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 & 선행 체결정산(Case 65/66) 가동 완료",
+        await self.send_message(
+            chat_id=chat_id,
+            text=f"🚀 <b>[업데이트 검증 통과]</b> {_escape_html(msg)}\n잠시 후 스나이퍼 데몬을 재기동합니다...",
         )
+        await asyncio.sleep(0.5)
+        os._exit(0)
+
+    async def _reset_ledger_state(
+        self, chat_id: str, new_seed_usd: Optional[float] = None
+    ) -> None:
+        await self.context.api.cancel_all_open_orders(symbol=TARGET_SYMBOL)
+        if hasattr(self.context.ledger, "reset_stratum_only"):
+            st_reset = await _call_plugin_adaptive(
+                self.context.ledger.reset_stratum_only,
+                symbol=TARGET_SYMBOL,
+                new_seed_usd=new_seed_usd,
+                preserve_realized_profit=(new_seed_usd is None),
+            )
+        else:
+            kw: Dict[str, Any] = {
+                "buckets": [],
+                "anchor_price": 0.0,
+                "cycle_min_buy_price": 0.0,
+                "ratchet_anchor_price": 0.0,
+                "buy_order_id": "",
+                "sell_order_id": "",
+                "ordered_qty": 0,
+                "target_sell_price": 0.0,
+                "pending_sell_mode": "",
+                "pending_lot_type": "",
+            }
+            if new_seed_usd is not None and new_seed_usd >= 100.0:
+                kw["initial_seed_usd"] = round(new_seed_usd, 4)
+                kw["cumulative_realized_net_usd"] = 0.0
+            st_reset = await self.context.ledger.update_state(
+                TARGET_SYMBOL, **kw
+            )
+
+        self.context.indexing_grace_cache.pop(TARGET_SYMBOL, None)
+        self.context.exit_snapshot_cache.pop(TARGET_SYMBOL, None)
+        self.context.wakeup_event.set()
+        await self.send_message(
+            chat_id=chat_id,
+            text=(
+                "🧹 <b>[SOXL 지층 원장 0점 소각 완료]</b>\n"
+                f"🔸 기준 시드머니: <b>${safe_float(st_reset.get('initial_seed_usd'), 10000.0):,.2f}</b>\n"
+                f"🔸 가용 현금시드: <b>${safe_float(st_reset.get('free_cash_usd'), 10000.0):,.2f}</b>\n"
+                "🔸 미체결 주문 취소 및 지층 큐·기억저가(cycle_min_buy_price) 초기화 완료"
+            ),
+        )
+
+    async def _handle_command_or_text(
+        self, chat_id: str, raw_text: str
+    ) -> None:
+        text = str(raw_text or "").strip()
+        if not text:
+            return
+
+        if not self.chat_id and chat_id:
+            self.chat_id = str(chat_id)
+
+        clean_num_check = (
+            text.replace(",", "").replace("$", "").replace(".", "").strip()
+        )
+        if clean_num_check.isdigit():
+            self._awaiting_seed_input_chats.pop(chat_id, None)
+            await self._apply_new_seed_value(chat_id, text)
+            return
+
+        first_token = text.split()[0].lower()
+        if "@" in first_token:
+            first_token = first_token.split("@", 1)[0]
+
+        if first_token in ("/start", "/menu", "/help") or text == "⬅️ 메인 메뉴":
+            st = self.context.ledger.get_state(TARGET_SYMBOL)
+            msg = self._build_start_schedule_message(
+                st, now_est=datetime.now(EST_TZ)
+            )
+            await self.send_message(
+                chat_id=chat_id,
+                text=msg,
+                reply_markup=_build_main_reply_keyboard(),
+            )
+            return
+
+        if (
+            first_token in ("/avwap", "/status", "/radar")
+            or text == "🔫 스나이퍼 레이더"
+        ):
+            await self._render_and_send_avwap(chat_id=chat_id)
+            return
+
+        if first_token == "/sync" or text in ("📜 지층 지시서", "🔄 잔고 동기화"):
+            await self._render_and_send_sync(chat_id=chat_id)
+            return
+
+        if (
+            first_token in ("/settlement", "/config")
+            or text == "⚙️ 전술 제어반"
+        ):
+            await self._render_and_send_settlement(chat_id=chat_id)
+            return
+
+        if first_token == "/seed":
+            parts = text.split(maxsplit=1)
+            if len(parts) >= 2:
+                await self._apply_new_seed_value(chat_id, parts[1])
+            else:
+                await self._render_and_send_settlement(chat_id=chat_id)
+            return
+
+        if first_token == "/reset_seed":
+            parts = text.split(maxsplit=1)
+            new_seed: Optional[float] = None
+            if len(parts) >= 2:
+                sv = safe_float(parts[1], 0.0)
+                if sv >= 100.0:
+                    new_seed = sv
+            await self._reset_ledger_state(
+                chat_id=chat_id, new_seed_usd=new_seed
+            )
+            return
+
+        if first_token == "/reset":
+            await self._reset_ledger_state(chat_id=chat_id, new_seed_usd=None)
+            return
+
+        if first_token == "/update" or text == "🚀 시스템 업데이트":
+            await self._execute_manual_update_command(chat_id=chat_id)
+            return
+
+    async def _handle_callback_query(self, cb: Dict[str, Any]) -> None:
+        cb_id = str(cb.get("id") or "").strip()
+        data = str(cb.get("data") or "").strip()
+        msg_obj = (
+            cb.get("message") if isinstance(cb.get("message"), dict) else {}
+        )
+        chat_obj = (
+            msg_obj.get("chat") if isinstance(msg_obj.get("chat"), dict) else {}
+        )
+        chat_id = str(chat_obj.get("id") or self.chat_id or "").strip()
+        msg_id = safe_int(msg_obj.get("message_id"), 0)
+
+        if cb_id:
+            await self._call_tg(
+                "answerCallbackQuery",
+                {"callback_query_id": cb_id},
+                timeout_sec=5.0,
+            )
+
+        if not chat_id:
+            return
+
+        if data == "cmd_avwap":
+            await self._render_and_send_avwap(
+                chat_id=chat_id, edit_msg_id=msg_id
+            )
+        elif data == "cmd_sync":
+            await self._render_and_send_sync(
+                chat_id=chat_id, edit_msg_id=msg_id
+            )
+        elif data == "cmd_settlement":
+            await self._render_and_send_settlement(
+                chat_id=chat_id, edit_msg_id=msg_id
+            )
+        elif data == "cmd_start":
+            st = self.context.ledger.get_state(TARGET_SYMBOL)
+            msg = self._build_start_schedule_message(
+                st, now_est=datetime.now(EST_TZ)
+            )
+            await self.edit_or_send_message(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=msg,
+                reply_markup=_build_radar_inline_keyboard(),
+            )
+        elif data == "toggle_bot_active":
+            st_cur = self.context.ledger.get_state(TARGET_SYMBOL)
+            next_act = not bool(st_cur.get("is_active", True))
+            await self.context.ledger.update_state(
+                TARGET_SYMBOL, is_active=next_act
+            )
+            if next_act:
+                fn_relock = getattr(
+                    defense_plugin, "relock_stratum_on_bot_resume", None
+                )
+                if callable(fn_relock):
+                    await _call_plugin_adaptive(
+                        fn_relock,
+                        context=self.context,
+                        now_est=datetime.now(EST_TZ),
+                    )
+                else:
+                    await _call_plugin_adaptive(
+                        reconcile_stratum_with_broker_holdings_plugin,
+                        context=self.context,
+                        holdings=self.context.latest_holdings,
+                        prices=self.context.latest_prices,
+                        now_est=datetime.now(EST_TZ),
+                        force_sync=True,
+                    )
+            self.context.wakeup_event.set()
+            await self._render_and_send_settlement(
+                chat_id=chat_id, edit_msg_id=msg_id
+            )
+        elif data == "prompt_seed_input":
+            self._awaiting_seed_input_chats[chat_id] = time.monotonic()
+            await self.send_message(
+                chat_id=chat_id,
+                text=(
+                    "💵 <b>[기준 시드머니($) 입력 안내]</b>\n"
+                    "운용할 기준 달러 시드머니 금액을 숫자만 채팅창에 입력해 주세요.\n"
+                    "예시: <code>10000</code> 또는 <code>19000</code>"
+                ),
+            )
 
     async def run_polling_loop(self) -> None:
-        if self._impl is not None:
-            for m_name in (
-                "run_polling_loop",
-                "poll_updates_loop",
-                "telegram_polling_loop",
-                "start_polling",
-                "run",
-            ):
-                m_fn = getattr(self._impl, m_name, None)
-                if callable(m_fn):
-                    await _call_plugin_adaptive(m_fn, context=self.context)
-                    return
+        """
+        내장형 텔레그램 getUpdates 비동기 롱폴링 루프 (엄격한 토큰 검증 + deleteWebhook 초기화)
+        """
+        if not _extract_valid_tg_token(self.bot_token):
+            self.bot_token, discovered_cid = _discover_telegram_credentials(
+                self.context.base_dir, getattr(self.context, "api", None)
+            )
+            if not self.chat_id and discovered_cid:
+                self.chat_id = discovered_cid
 
-        fn = _resolve_module_attr(
-            modules=(tg_ui_plugin,),
-            candidate_names=(
-                "run_telegram_polling_loop",
-                "telegram_polling_loop",
-                "run_polling_loop",
-                "poll_telegram_updates_loop",
-                "start_telegram_polling_loop",
-            ),
-            predicate=lambda f: (
-                inspect.iscoroutinefunction(f) and "poll" in f.__name__.lower()
-            ),
-        )
-        if callable(fn):
-            await _call_plugin_adaptive(fn, context=self.context)
+        if not _extract_valid_tg_token(self.bot_token):
+            logger.error(
+                "🚨 유효한 텔레그램 봇 토큰(숫자:영숫자)을 찾을 수 없습니다! .env 의 TELEGRAM_BOT_TOKEN 을 확인하세요."
+            )
+            while not self.context.shutdown_event.is_set():
+                await asyncio.sleep(10.0)
             return
 
+        await self._call_tg(
+            "deleteWebhook", {"drop_pending_updates": False}, timeout_sec=8.0
+        )
+        logger.info(
+            "📡 [텔레그램 관제탑 폴링 루프 가동 완료] (chat_id=%s)",
+            self.chat_id or "auto-detect",
+        )
+
         while not self.context.shutdown_event.is_set():
-            await asyncio.sleep(5.0)
+            try:
+                payload: Dict[str, Any] = {
+                    "offset": self._last_update_id + 1,
+                    "timeout": 15,
+                    "allowed_updates": ["message", "callback_query"],
+                }
+                res = await self._call_tg(
+                    "getUpdates", payload, timeout_sec=20.0
+                )
+                if isinstance(res, dict) and bool(res.get("ok")):
+                    updates = res.get("result")
+                    if isinstance(updates, list):
+                        for upd in updates:
+                            if not isinstance(upd, dict):
+                                continue
+                            uid = safe_int(upd.get("update_id"), 0)
+                            if uid > self._last_update_id:
+                                self._last_update_id = uid
+
+                            if isinstance(upd.get("callback_query"), dict):
+                                await self._handle_callback_query(
+                                    upd["callback_query"]
+                                )
+                            elif isinstance(upd.get("message"), dict):
+                                m_obj = upd["message"]
+                                c_obj = (
+                                    m_obj.get("chat")
+                                    if isinstance(m_obj.get("chat"), dict)
+                                    else {}
+                                )
+                                cid = str(
+                                    c_obj.get("id") or self.chat_id or ""
+                                ).strip()
+                                if self.chat_id and cid and cid != self.chat_id:
+                                    continue
+                                txt = str(m_obj.get("text") or "").strip()
+                                if txt:
+                                    await self._handle_command_or_text(
+                                        chat_id=cid, raw_text=txt
+                                    )
+                else:
+                    await asyncio.sleep(1.5)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("텔레그램 폴링 루프 일시 예외: %s", exc)
+                await asyncio.sleep(2.0)
 
 
 async def _run_auto_update_loop_dynamic(
     context: Any, interval_sec: float = 3600.0
 ) -> None:
-    """
-    plugin_updater 모듈 내의 자동 업데이트 루프 함수를 동적으로 찾아 실행하거나 안전한 주기 점검 루프를 가동한다.
-    """
     fn = _resolve_module_attr(
         modules=(plugin_updater,),
         candidate_names=(
@@ -1072,9 +2361,6 @@ async def _run_auto_update_loop_dynamic(
 class SniperAppContext:
     """
     9대 코어 모듈이 공유하는 단일 런타임 상태 컨텍스트.
-    - api: TossApiClient (제1헌법 GlobalThrottle & 제2헌법 AccountSeq 락온 & 런타임 폴리필 완료)
-    - ledger: SOXL 단일 롱 지층 원장 (buy_interval_min = 10 & COMP_08PCT 하드 고정)
-    - tg: _AdaptiveTelegramBridge (텔레그램 관제 UI & 2대 옵션 전술 제어반)
     """
 
     def __init__(self, base_dir: Optional[str] = None) -> None:
@@ -1091,13 +2377,11 @@ class SniperAppContext:
             filepath=self.ledger_path
         )
 
-        # 비동기 동시성 제어 뮤텍스 및 웨이크업 이벤트
         self.in_memory_ordering_lock: asyncio.Lock = asyncio.Lock()
         self.dual_strike_mutex: asyncio.Lock = asyncio.Lock()
         self.wakeup_event: asyncio.Event = asyncio.Event()
         self.shutdown_event: asyncio.Event = asyncio.Event()
 
-        # 실시간 시세 · 잔고 · 1분봉 지표 · 체결 스냅샷 · 인덱싱 그레이스 쉴드 & 60초 타임쉴드 캐시
         self.latest_prices: Dict[str, float] = {TARGET_SYMBOL: 0.0}
         self.latest_holdings: Dict[str, Dict[str, Any]] = {
             TARGET_SYMBOL: _empty_soxl_holding_entry()
@@ -1107,7 +2391,6 @@ class SniperAppContext:
         self.exit_snapshot_cache: Dict[str, Dict[str, Any]] = {}
         self.indexing_grace_cache: Dict[str, Dict[str, Any]] = {}
 
-        # 중복 보류 알림 방지 스로틀 맵
         self._strike_hold_alert_ts: Dict[str, float] = {}
         self.last_0400_sync_date: str = ""
         self.fast_shield_mode: bool = False
@@ -1142,11 +2425,6 @@ class SniperAppContext:
 # [핵심 3] 백그라운드 태스크 1 : 1분봉 시계열 및 10분 게이트 지표 레이더 (candle_radar_loop)
 # ---------------------------------------------------------------------------
 async def candle_radar_loop(context: SniperAppContext) -> None:
-    """
-    04:00 ~ 16:05 EST 운용 시간대에는 5.0초 주기로, 장외 시간대에는 20.0초 주기로
-    SOXL 1분봉(300개) 및 최근 일봉(10개)을 조회하여 VWAP · 5MA 진폭 · 하이킨 아시 추세 ·
-    10분 고정 매수 게이트 버킷 상태를 갱신한다.
-    """
     while not context.shutdown_event.is_set():
         now_est = datetime.now(EST_TZ)
         hm = now_est.hour * 100 + now_est.minute
@@ -1208,14 +2486,6 @@ def _evaluate_fast_shield_mode(
     now_est: datetime,
     live_p: float,
 ) -> bool:
-    """
-    평시 1.5초 폴링을 0.4초 고주파 스나이퍼 부스터로 전환할지 판정한다:
-    1) 미체결 매수 주문(buy_order_id) 또는 미체결 매도 주문(sell_order_id) 진행 중일 때
-    2) 보유 수량 0주(held_shares == 0)여서 0주 현재가 지정가 1층 진입을 대기 중일 때
-    3) 04:07 EST 기점 10분 고정 매수 게이트 정각 분봉이거나 현재 버킷 미평가 상태일 때
-    4) 1층 익절 목표가(+1.50%) 또는 2층 졸업 목표가(+1.00%)에 0.30% 이내로 근접했을 때
-    5) 2층 단독 보유 중 눌림목(-1.00%) 또는 상승돌파(+1.00%) 재장전 타점에 근접했을 때
-    """
     hm = now_est.hour * 100 + now_est.minute
     if not is_active_trading_window(hm):
         return False
@@ -1266,16 +2536,6 @@ def _evaluate_fast_shield_mode(
 
 
 async def main_sniper_loop(context: SniperAppContext) -> None:
-    """
-    04:00 ~ 16:59 EST 일일 스케줄러 및 메인 지층관리 스나이퍼 루프:
-    - 04:00 ~ 04:06 EST: 프리장 개장 초기 호가 안정화 및 오버나이트 지층 동기화
-    - 04:07 ~ 16:00 EST:
-      Step 3-0) 🚨 [Case 66] 미결 매수 주문(buy_order_id) 최우선 체결 확인 및 커밋
-      Step 3-1) 로컬 지층 원장 ↔ 토스 실잔고 화해 (미결 봇 주문 진행 중 가로채기 차단 가드 내장)
-      Step 3-2) 매수 후 60초 타임쉴드 검문 & 1분 상시 순수 현재가 지정가 스나이퍼 매도 (체결 시 자전거래 방지 스킵)
-      Step 3-3) 매도 후 60초 타임쉴드 검문 & 0주 진입 / 2층 단독 눌림·돌파 재장전 / 10분 4단 와이드 신저가 추매
-    - 16:00 ~ 16:59 EST: 정규장 마감 일일 결산 보고 및 보유 지층 오버나이트 보존
-    """
     while not context.shutdown_event.is_set():
         now_est = datetime.now(EST_TZ)
         hm = now_est.hour * 100 + now_est.minute
@@ -1291,7 +2551,6 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     pass
                 continue
 
-            # 1) SOXL 실시간 현재가 및 보유 잔고 조회 (폴리필 장착으로 AttributeError 0건 보장)
             price_map = await context.api.get_current_prices_batch(
                 (TARGET_SYMBOL,)
             )
@@ -1313,7 +2572,6 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     if live_p > 0.0:
                         context.latest_prices[TARGET_SYMBOL] = live_p
 
-            # 캔들 캐시에 실시간 틱 합성
             if (
                 live_p > 0.0
                 and TARGET_SYMBOL in context.candle_metrics_cache
@@ -1332,7 +2590,6 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
             prices = dict(context.latest_prices)
             holdings = dict(context.latest_holdings)
 
-            # 2) 04:00 ~ 04:06 EST 프리장 오프닝 안정화 및 전일 미체결 청소
             if 400 <= hm <= 406:
                 await _call_plugin_adaptive(
                     execute_0400_premarket_stabilization_plugin,
@@ -1342,12 +2599,8 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     now_est=now_est,
                 )
 
-            # 3) 04:07 ~ 16:00 EST (프리장 + 정규장 전 구간 연속 가동)
             elif is_active_trading_window(hm):
                 # 🚨 3-0) [Case 66 핵심 방어 : 미결 매수 주문 최우선 선행 정산]
-                # 직전 루프에서 발주한 매수 주문(buy_order_id)이 존재하면 reconcile 보다 먼저
-                # sync_pending_buy_order_plugin 을 실행하여 정식 매수 체결 알림, 자투리 절약금 누적,
-                # 매수 후 60초 타임쉴드 각인이 가로채기 없이 100% 완수되도록 보장한다!
                 st_pre = context.ledger.get_state(TARGET_SYMBOL)
                 if str(st_pre.get("buy_order_id") or "").strip():
                     await _call_plugin_adaptive(
@@ -1382,7 +2635,6 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
 
                 # 🚨 Case 44: 동일 틱에서 매도가 발생(또는 진행 중)한 경우 추가 매수를 즉시 스킵하여 자전거래 차단!
                 if not did_sell:
-                    # 3-3) 매도 후 60초 타임쉴드 검문 & 0주 진입 / 2층 단독 눌림·돌파 재장전 / 10분 4단 와이드 신저가 추매
                     await _call_plugin_adaptive(
                         execute_seed_protected_buy_gate_plugin,
                         context=context,
@@ -1391,7 +2643,6 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                         now_est=now_est,
                     )
 
-            # 4) 16:00 ~ 16:59 EST 정규장 마감 일일 결산 보고 (보유 지층 오버나이트 보존)
             elif 1600 <= hm <= 1659:
                 await _call_plugin_adaptive(
                     execute_1600_daily_closing_settlement_plugin,
@@ -1401,7 +2652,6 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     now_est=now_est,
                 )
 
-            # 5) 장외 대기 시간에도 미체결 주문이 남아 있으면 상태 동기화 수행
             else:
                 st_idle = context.ledger.get_state(TARGET_SYMBOL)
                 if str(st_idle.get("sell_order_id") or "").strip():
@@ -1452,9 +2702,6 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
 # [핵심 5] 백그라운드 태스크 3 : 17:00 EST 일일 GC 및 논리 거래일 롤오버 루프
 # ---------------------------------------------------------------------------
 async def daily_gc_and_rollover_loop(context: SniperAppContext) -> None:
-    """
-    매일 17:00 EST 에 가비지 컬렉션(GC)을 수행하고 새 거래일 진입 시 일일 카운터를 롤오버한다.
-    """
     last_gc_date = ""
     while not context.shutdown_event.is_set():
         now_est = datetime.now(EST_TZ)
@@ -1492,12 +2739,10 @@ async def daily_gc_and_rollover_loop(context: SniperAppContext) -> None:
 async def async_main() -> None:
     base_dir = os.path.dirname(os.path.abspath(__file__)) or "."
 
-    # 1) 구버전 폐기 파일(daymarket_sim_plugin.py, whipsaw_plugin.py, state_SOXS.json) 자동 청소
     purged = purge_deprecated_legacy_files(base_dir)
     if purged:
         logger.info("🧹 [구버전 폐기 파일 청소 완료] 삭제 목록: %s", purged)
 
-    # 2) 9대 코어 모듈 py_compile + AST 심볼 임포트 정적 검증 & QuantEngine TDD 실행
     ok_compile, err_msg = verify_all_modules_compile(base_dir)
     if not ok_compile:
         logger.critical(
@@ -1512,7 +2757,6 @@ async def async_main() -> None:
 
     context = SniperAppContext(base_dir=base_dir)
 
-    # 3) SIGTERM / SIGINT 0.1초 고속 종료 시그널 결속 (Case 11)
     loop = asyncio.get_running_loop()
 
     def _on_signal() -> None:
@@ -1526,7 +2770,6 @@ async def async_main() -> None:
         except NotImplementedError:
             pass
 
-    # 4) 제2헌법: 토스증권 AccountSeq 락온 및 초기 실잔고 동기화
     try:
         acc_seq = await context.api.ensure_account_seq()
         logger.info("🏛️ [제2헌법 AccountSeq 락온 완료] accountSeq=%d", acc_seq)
@@ -1559,10 +2802,8 @@ async def async_main() -> None:
     except Exception as exc:
         logger.warning("초기 잔고/시세 동기화 폴백: %s", exc)
 
-    # 5) Case 16: 기동 완료 후 텔레그램 생존 신호 타전 ("✅ 서버가 정상 작동 중입니다.")
     await context.tg.send_startup_alive_banner()
 
-    # 6) 5대 백그라운드 비동기 워커 가동
     tasks = [
         asyncio.create_task(candle_radar_loop(context), name="candle_radar"),
         asyncio.create_task(main_sniper_loop(context), name="main_sniper"),
@@ -1588,7 +2829,15 @@ async def async_main() -> None:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await context.api.close()
+        # MODIFIED: context.api.close() 안전 가드로 종료 시점 AttributeError 100% 원천 차단
+        close_fn = getattr(context.api, "close", None)
+        if callable(close_fn):
+            try:
+                c_res = close_fn()
+                if inspect.isawaitable(c_res):
+                    await c_res
+            except Exception:
+                pass
         logger.info("✅ [SOXL 지층관리 스나이퍼 안전 종료 완료]")
 
 
