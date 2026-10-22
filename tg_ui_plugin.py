@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: tg_ui_plugin.py
-순수 롱(SOXL) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼 전용 텔레그램 비동기 롱폴링 라우터,
-/update 무한 재기동 원천 차단 4중 방어벽 & 독립 서브프로세스 컴파일 검증(Case 62),
+순수 롱(SOXL) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼(전술 A 챔피언 : 🛡️ 05_AF_WIDE_10_01) 전용
+텔레그램 비동기 롱폴링 라우터, /update 무한 재기동 원천 차단 4중 방어벽 & 독립 서브프로세스 컴파일 검증(Case 62),
 2대 핵심 제어 옵션(작동 ON/OFF 버튼 & 시드머니 설정 옵션) 전용 전술 제어반(/settlement, Case 64),
-실물 1층(REENTRY_1FL / DIP_1FL) 및 기억된 최저 매수가(cycle_min_buy_price) 실시간 관제 보드(/avwap, /sync, Case 59 & 60) 및
-/reset 원자적 지층 소각 플러그인 (Step 04 / 04)
-- MODIFIED (Case 59 & 60): 가상 래칫 문구를 완전 제거하고 실물 1층 상시 재매수(REENTRY_1FL) 상태와
-  기억된 사이클 최저 매수가(cycle_min_buy_price) 기반 신저가 매수 트리거 가격을 투명하게 렌더링!
+0주 즉시 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%)/돌파(+1.0%) 독립 1층 재장전(Case 59) ·
+기억된 최저 매수가(cycle_min_buy_price) 기준 4단 와이드 활주로(1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%, Case 60)
+실시간 관제 보드(/avwap, /sync) 및 /reset 원자적 지층 소각 플러그인 (Step 04 / 05)
+- MODIFIED (🎯 2, 🎯 4 & Case 59, 60): 2층(MERGED_UPPER) 단독 보유 시 직전 익절가 대비 눌림목(-1.00%) 및
+  상승돌파(+1.00%) 독립 1층 재장전 타점과 기억된 사이클 최저 매수가(cycle_min_buy_price) 기반 4단 와이드 활주로
+  신저가 매수 트리거 가격을 투명하게 렌더링!
 - MODIFIED (Case 62): /update 실행 시 git reset 직후 구버전 RAM 캐시(sys.modules) 참조로 인한 롤백 도돌이표를
   원천 차단하기 위해 python3 plugin_updater.py --verify-only 를 독립 서브프로세스로 호출하여 검증!
 - MODIFIED (Case 64): 30분 옵션을 완전히 배제(10분 매수 게이트 고정)하고,
@@ -47,6 +49,7 @@ from quant_indicators_plugin import (
 from toss_api import (
     DEFAULT_INITIAL_SEED_USD,
     EST_TZ,
+    LOCKED_BUY_INTERVAL_MIN,
     TARGET_SYMBOL,
     GlobalThrottle,
     _autoload_dotenv_files,
@@ -58,8 +61,8 @@ logger = logging.getLogger("toss_sniper.tg_ui_plugin")
 
 _autoload_dotenv_files(override=False)
 
-# 전략 공식 코드명 (10분 시드보호 매수 게이트 · 1분 상시 스나이퍼 매도 · 8% 황금정량 복리 · 실물 무팽창 Always-L1)
-STRATEGY_CODE_LABEL: str = "👑CMP08_10M_1M"
+# MODIFIED: 전술 A 공식 코드명 (8% 황금정량 복리 · 10분 4단 와이드 매수게이트 · 1분 상시 매도 · 눌림/돌파 독립 1층 재장전)
+STRATEGY_CODE_LABEL: str = "🛡️05_AF_WIDE_10_01"
 DIVIDER_LINE: str = "➖➖➖➖➖➖➖➖➖➖➖➖➖➖"
 
 # /update 명령 중복 실행 방지용 마지막 처리 update_id 기록 파일 경로
@@ -154,13 +157,13 @@ def get_market_session_banners(now_est: Optional[datetime] = None) -> Dict[str, 
         return {
             "sync_banner": f"🌅 프리장 지층관리 가동 ({STRATEGY_CODE_LABEL})",
             "radar_banner": f"🌅 프리장 가동 · {STRATEGY_CODE_LABEL}",
-            "dispatch_status": "🔫 프리장 (10분 매수게이트 · 1분 상시매도)",
+            "dispatch_status": "🔫 프리장 (10분 와이드매수게이트 · 1분 상시매도)",
         }
     if 930 <= hm <= 1600:
         return {
             "sync_banner": f"🔥 정규장 지층관리 가동 ({STRATEGY_CODE_LABEL})",
             "radar_banner": f"🔥 정규장 가동 · {STRATEGY_CODE_LABEL}",
-            "dispatch_status": "🔥 정규장 (10분 매수게이트 · 1분 상시매도)",
+            "dispatch_status": "🔥 정규장 (10분 와이드매수게이트 · 1분 상시매도)",
         }
     if 1601 <= hm <= 1659:
         return {
@@ -208,9 +211,9 @@ async def _fetch_usd_krw_rate(context: Any) -> float:
 
 def _format_stratum_lines(summary: Dict[str, Any], live_p: float) -> List[str]:
     """
-    Case 59 & Case 60:
-    1층(실물 공격수 REENTRY_1FL / DIP_1FL / QUOTA_L1) 및 2층(MERGED_UPPER) 지층 상태를
-    직관적인 모바일 라인으로 포맷팅한다.
+    MODIFIED (Case 59 & Case 60 — 전술 A 하이브리드 재장전 & 4단 와이드 활주로):
+    1층(실물 공격수 REENTRY_1FL / DIP_1FL / QUOTA_L1) 및 2층(MERGED_UPPER) 지층 상태와
+    2층 단독 보유 시 눌림목(-1.00%)/상승돌파(+1.00%) 재장전 타점을 직관적인 모바일 라인으로 포맷팅한다.
     """
     buckets = summary.get("buckets", [])
     if not buckets:
@@ -229,8 +232,14 @@ def _format_stratum_lines(summary: Dict[str, Any], live_p: float) -> List[str]:
             if (b2.book_price > 0.0 and live_p > 0.0)
             else 0.0
         )
+        re_anc = safe_float(summary.get("reentry_ref_anchor"), b2.book_price)
+        pull_p = safe_float(summary.get("reentry_pullback_price"), 0.0)
+        brk_p = safe_float(summary.get("reentry_breakout_price"), 0.0)
+        chg_re = safe_float(summary.get("chg_from_reentry_anchor_pct"), 0.0)
+
         out_lines.append(
-            "🔥 <b>[1층: 실물 공격수 재매수 대기]</b> (운용시간/가용현금 확인 즉시 1층 실물 산입)"
+            f"🔥 <b>[1층: 하이브리드 재장전 대기]</b> 직전익절 ${re_anc:.2f}[{chg_re:+.2f}%] · "
+            f"눌림 ${pull_p:.2f}(-1%) 이하 OR 돌파 ${brk_p:.2f}(+1%) 이상 시 독립 1층 산입"
         )
         out_lines.append(
             f"📦 <b>[2층: 통합층 {b2.qty}주({b2.lot_count}회차)]</b> "
@@ -247,7 +256,7 @@ def _format_stratum_lines(summary: Dict[str, Any], live_p: float) -> List[str]:
         else 0.0
     )
     l1_role = (
-        "상시1층"
+        "독립1층"
         if str(b1.lot_type).upper() == "REENTRY_1FL" and len(buckets) >= 2
         else "공격수"
     )
@@ -281,7 +290,7 @@ async def render_main_menu_board(
     now_est: Optional[datetime] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
-    🐂 [ SOXL 지층관리 스나이퍼 ] 메인 메뉴 및 일일 스케줄러 보드 렌더링.
+    🐂 [ SOXL 지층관리 스나이퍼 ] 메인 메뉴 및 일일 스케줄러 보드 렌더링 (전술 A 동기화).
     """
     dt_est = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     dst_info = get_dst_status_badges(dt_est)
@@ -292,14 +301,15 @@ async def render_main_menu_board(
 
     lines: List[str] = [
         f"🐂 <b>[ SOXL 지층관리 스나이퍼 ({dst_info['menu_header']}) ]</b>",
-        f"▫️ 전략: {STRATEGY_CODE_LABEL} (8% 황금정량 · 실물 1층 상시보유 · 기억저가 잠금 무팽창)",
-        "▫️ 매수: 🛡️ 10분 고정 시드보호 게이트 (기억저가 대비 1~6회 -1.0% / 7~11회 -1.5% / 12회+ -2.0%)",
+        f"▫️ 전략: {STRATEGY_CODE_LABEL} (8% 황금정량 · 눌림/돌파 독립 1층 재장전 · 기억저가 와이드 활주로)",
+        "▫️ 매수: 🛡️ 10분 고정 4단 와이드 게이트 (기억저가 대비 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%)",
+        "▫️ 재장전: 🔥 0주 즉시 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
         "▫️ 매도: ⚡ 1분 상시 실물 스나이퍼 매도 (1층 +1.50% 익절&amp;리앵커링 / 2층 +1.00% 졸업)",
         f"▫️ 기준 시드머니: ${init_seed:,.2f} (1회 8% 정량 자동 산출)",
         DIVIDER_LINE,
         "🔹 04:00 ~ 04:06: 🌅 프리장 호가 안정화 &amp; 오버나이트 지층 동기화",
-        "🔹 04:07 ~ 09:29: 🔫 프리장 지층관리 가동 (10분 매수게이트 · 1분 상시매도)",
-        "🔹 09:30 ~ 16:00: 🔥 정규장 지층관리 가동 (10분 매수게이트 · 1분 상시매도)",
+        "🔹 04:07 ~ 09:29: 🔫 프리장 지층관리 가동 (10분 와이드매수게이트 · 1분 상시매도)",
+        "🔹 09:30 ~ 16:00: 🔥 정규장 지층관리 가동 (10분 와이드매수게이트 · 1분 상시매도)",
         "🔹 16:00 ~ 16:59: 🌙 일일 결산 보고 &amp; 지층 오버나이트 보존 (강제 MOC 없음)",
         "🔹 17:00: 🧹 일일 가비지 컬렉션(GC) 및 원장 백업",
         "",
@@ -376,9 +386,9 @@ async def render_settlement_control_board(
         DIVIDER_LINE,
         f"▫️ 작동 상태: {power_str}",
         f"▫️ 운용 현황: {sanitize_tg_text(dispatch_str)}",
-        "▫️ 매수 게이트: 🛡️ 10분 고정 시드보호 게이트 (기억저가 대비 -1.0% / -1.5% / -2.0%)",
+        "▫️ 매수 게이트: 🛡️ 10분 고정 4단 와이드 게이트 (-1.0% / -2.0% / -3.5% / -5.5%)",
+        "▫️ 1층 재장전: 🔥 0주 즉시 진입 · 2층 보유 시 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
         "▫️ 매도 게이트: ⚡ 1분 상시 실물 스나이퍼 매도 (1층 +1.50% / 2층 +1.00%)",
-        "▫️ 정량 엔진: 👑 8%(12.5분할) 정액기반 정량 + 실물 1층 상시보유 무팽창",
         DIVIDER_LINE,
         f"💵 <b>설정 시드머니: ${init_seed:,.2f}</b>",
         f"💰 가용 현금시드: ${free_cash:,.2f} · 총자산: ${tot_mark_eq:,.2f}",
@@ -483,6 +493,19 @@ async def render_sync_session_board(
     ref_anchor = safe_float(summary.get("active_buy_anchor"), live_p)
     trig_buy_p = safe_float(summary.get("trigger_buy_price"), 0.0)
 
+    if bool(summary.get("is_l2_only_anti_bloat")):
+        pull_p = safe_float(summary.get("reentry_pullback_price"), 0.0)
+        brk_p = safe_float(summary.get("reentry_breakout_price"), 0.0)
+        gate_guide_line = (
+            f"🛡️ 10분게이트 독립1층 재장전: 눌림 ${pull_p:.2f}(-1%) OR 돌파 ${brk_p:.2f}(+1%) 시 "
+            f"<b>{next_q}주</b> (기억저가 ${ref_anchor:.2f} 잠금)"
+        )
+    else:
+        gate_guide_line = (
+            f"🛡️ 기억저가 ${ref_anchor:.2f} 기준 10분 와이드게이트({drop_p:.1f}%): "
+            f"${trig_buy_p:.2f} 이하 시 <b>{next_q}주</b>(예산 ${next_b:,.0f}) 추매"
+        )
+
     u_sign = "+" if unreal_usd >= 0.0 else "-"
     r_sign = "+" if cum_realized >= 0.0 else "-"
     t_sign = "+" if tot_net_usd >= 0.0 else "-"
@@ -497,7 +520,7 @@ async def render_sync_session_board(
         f"🐂 <b>[SOXL] 현재가 ${live_p:.2f} / 실평단 ${avg_p:.2f} (총 {summary['held_shares']}주 · {summary['held_lots']}회차)</b>",
         f"📈 금일 고가: ${sess_h:.2f} ({h_chg_pct:+.2f}%) · 저가: ${sess_l:.2f} ({l_chg_pct:+.2f}%)",
         *stratum_lines,
-        f"🛡️ 기억저가 ${ref_anchor:.2f} 기준 10분게이트({drop_p:.1f}%): ${trig_buy_p:.2f} 이하 시 <b>{next_q}주</b>(예산 ${next_b:,.0f}) 추매",
+        gate_guide_line,
         DIVIDER_LINE,
         f"💰 누적 세후실현익: {r_sign}${abs(cum_realized):,.2f}",
         f"📊 현재 평가손익: {u_sign}${abs(unreal_usd):,.2f} ({unreal_pct:+.2f}%)",
@@ -520,19 +543,21 @@ async def render_sync_session_board(
 
 
 # ---------------------------------------------------------------------------
-# [보드 4] /avwap SOXL 지층관리 스나이퍼 레이더 관제탑 (Case 59, 60 반영)
+# [보드 4] /avwap SOXL 지층관리 스나이퍼 레이더 관제탑 (전술 A Case 59, 60 반영)
 # ---------------------------------------------------------------------------
 async def render_avwap_radar_board(
     context: Any,
     now_est: Optional[datetime] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
-    📡 [SOXL 지층관리 스나이퍼 레이더] — 실물 1층/2층 지층 상태, 기억된 최저 매수가 기반
-    10분 시드보호 매수 게이트, 1분 상시 스나이퍼 매도 목표가, 리앵커링 및 자투리 절약 통계를 표출한다.
+    📡 [SOXL 지층관리 스나이퍼 레이더] — 실물 1층/2층 지층 상태, 2층 단독 시 눌림/돌파 재장전 타점,
+    기억된 최저 매수가 기반 10분 4단 와이드 시드보호 매수 게이트, 1분 상시 매도 목표가 및 통계를 표출한다.
     """
     dt_est = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     banners = get_market_session_banners(dt_est)
-    gate_info = compute_buy_gate_bucket_info(dt_est, buy_interval_min=10)
+    gate_info = compute_buy_gate_bucket_info(
+        dt_est, buy_interval_min=LOCKED_BUY_INTERVAL_MIN
+    )
 
     prices = await context.api.get_current_prices_batch((TARGET_SYMBOL,))
     holdings = await context.api.get_holdings_all()
@@ -595,6 +620,21 @@ async def render_avwap_radar_board(
         else 0.0
     )
 
+    if bool(summary.get("is_l2_only_anti_bloat")):
+        re_anc = safe_float(summary.get("reentry_ref_anchor"), ref_anchor)
+        pull_p = safe_float(summary.get("reentry_pullback_price"), 0.0)
+        brk_p = safe_float(summary.get("reentry_breakout_price"), 0.0)
+        chg_re = safe_float(summary.get("chg_from_reentry_anchor_pct"), 0.0)
+        gate_target_line = (
+            f"▫️ 직전익절 ${re_anc:.2f} 대비 {chg_re:+.2f}% "
+            f"(눌림 ${pull_p:.2f}[-1%] OR 돌파 ${brk_p:.2f}[+1%] · 기억저가 ${ref_anchor:.2f})"
+        )
+    else:
+        gate_target_line = (
+            f"▫️ 기억저가 ${ref_anchor:.2f} 대비 현재 {cur_chg_from_anchor:+.2f}% "
+            f"(와이드단차 {drop_p:.2f}% · 신저가 ${trig_buy_p:.2f} 이하)"
+        )
+
     reanchor_cnt = safe_int(st.get("reanchor_cnt"), 0)
     reanchor_drop = safe_float(st.get("cumulative_reanchor_drop_usd"), 0.0)
     pass_cnt = safe_int(st.get("seed_protect_pass_cnt"), 0)
@@ -614,11 +654,11 @@ async def render_avwap_radar_board(
         f"🌅 프리장 VWAP ${pre_vwap:.2f} · 팩트 ${pl:.2f} ~ ${ph:.2f} ({p_amp:.1f}%) · 예상 ${p_exp_l:.2f} ~ ${p_exp_h:.2f}",
         f"🔥 정규장 VWAP ${reg_vwap:.2f} · 팩트 ${rl:.2f} ~ ${rh:.2f} ({r_amp:.1f}%) · 예상 ${r_exp_l:.2f} ~ ${r_exp_h:.2f}",
         DIVIDER_LINE,
-        f"🏛️ <b>[2-Tier 실물 지층 &amp; 무팽창 Always-L1]</b> (총 {summary['held_shares']}주 · {summary['held_lots']}회차)",
+        f"🏛️ <b>[2-Tier 실물 지층 &amp; 와이드 활주로]</b> (총 {summary['held_shares']}주 · {summary['held_lots']}회차)",
         *stratum_lines,
         DIVIDER_LINE,
-        f"🛡️ <b>[10분 고정 시드보호 매수 게이트]</b> (차기검문: {gate_info['next_gate_hm_str']})",
-        f"▫️ 기억저가 ${ref_anchor:.2f} 대비 현재 {cur_chg_from_anchor:+.2f}% (요구단차 {drop_p:.2f}% · 신저가 ${trig_buy_p:.2f} 이하)",
+        f"🛡️ <b>[10분 고정 와이드 시드보호 매수 게이트]</b> (차기검문: {gate_info['next_gate_hm_str']})",
+        gate_target_line,
         f"▫️ 차기 8% 정량: 예산 ${next_b:,.2f} ➔ <b>{next_q}주</b> 고정 대기",
         DIVIDER_LINE,
         f"♻️ 평단 리앵커링: {reanchor_cnt}회 (누적 -${reanchor_drop:,.2f} 단가인하)",
@@ -673,7 +713,7 @@ async def handle_reset_command(
     # 10분 고정 및 8% 복리 정량 설정 유지 보장
     await context.ledger.update_state(
         TARGET_SYMBOL,
-        buy_interval_min=10,
+        buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
         portion_mode="COMP_08PCT",
         threshold_mode="08_VREV_PROG",
         is_compound=True,
@@ -989,7 +1029,7 @@ class TelegramBotRouter:
         await self.context.ledger.set_initial_seed_usd(clean_seed)
         await self.context.ledger.update_state(
             TARGET_SYMBOL,
-            buy_interval_min=10,
+            buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
             portion_mode="COMP_08PCT",
             threshold_mode="08_VREV_PROG",
             is_compound=True,
@@ -1155,7 +1195,7 @@ class TelegramBotRouter:
                 await self.context.ledger.update_state(
                     TARGET_SYMBOL,
                     is_active=next_active,
-                    buy_interval_min=10,
+                    buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
                     portion_mode="COMP_08PCT",
                     threshold_mode="08_VREV_PROG",
                     is_compound=True,
