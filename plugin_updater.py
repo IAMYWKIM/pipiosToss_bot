@@ -2,7 +2,7 @@
 """
 # MODIFIED: plugin_updater.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-9대 코어 모듈 프리플라이트 컴파일 · AST 심볼 교차 검증 · 홀수 들여쓰기 자동 치유 및 무인 Git 업데이트 코어 모듈 (Step 03 / 05)
+9대 코어 모듈 프리플라이트 컴파일 · AST 심볼 교차 검증 · 텔레그램 잔류 큐 선제 소각 및 무인 Git 업데이트 코어 모듈 (Step 01 / 03)
 - 제1헌법: 모든 파일 I/O 및 git/python 서브프로세스 실행을 asyncio.to_thread 로 비동기 격리 및 타임아웃 적용
 - 제3헌법: 구버전 폐기 파일(daymarket_sim_plugin.py, whipsaw_plugin.py, state_SOXS.json 등) 디스크 영구 소각
 - Case 07: 평일 04:00 ~ 16:05 EST 장중 백그라운드 무인 업데이트 재기동 전면 차단 및 systemd ExecStartPre 장중 락다운 지원
@@ -11,7 +11,9 @@
   2) 모바일 복사·붙여넣기 과정에서 발생한 홀수 공백(1칸/9칸 등) IndentationError 자동 치유기(_auto_heal_indentation_glitches) 내장
   3) /update 실행 시 구버전 RAM 캐시(sys.modules) 간섭을 막기 위해 `python3 plugin_updater.py --verify-only` 를
      독립 서브프로세스로 호출하고 실패 시 직전 정상 커밋 해시로 즉시 원자적 롤백 수행
-  4) MODIFIED: 반환 튜플(ok, msg, changed)의 msg 문자열 정규화로 `[]` 빈 리스트 표출 버그 100% 소각
+  4) NEW: 프리플라이트 및 업데이트 시점에 텔레그램 서버의 미확인 적체 큐(getUpdates offset = max_uid + 1)를
+     즉시 강제 소각(_flush_telegram_pending_updates_sync)하고, 원격 저장소에 신규 커밋이 없을 때 로컬 SFTP 수정본이
+     git reset --hard 로 유실되는 현상을 원천 차단!
 """
 
 from __future__ import annotations
@@ -19,15 +21,19 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import json
 import logging
 import os
 import py_compile
+import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from toss_api import EST_TZ, GlobalThrottle
+from toss_api import EST_TZ, GlobalThrottle, safe_int
 
 logger = logging.getLogger("toss_sniper.plugin_updater")
 
@@ -54,6 +60,128 @@ DEPRECATED_LEGACY_FILES: Tuple[str, ...] = (
     "state_SOXS.json",
     "soxs_stratum_ledger.json",
 )
+
+_TG_TOKEN_STRICT_RE = re.compile(r"\b(\d{8,12}:[A-Za-z0-9_-]{25,60})\b")
+
+
+# ---------------------------------------------------------------------------
+# [핵심 0] 텔레그램 미확인 적체 큐(/update 무한루프 주범) 선제 강제 소각기
+# ---------------------------------------------------------------------------
+def _discover_bot_token_sync(base_dir: str) -> str:
+    candidate_dirs = [base_dir, "/home/pipiosToss", os.getcwd()]
+    for d in candidate_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        env_fp = os.path.join(d, ".env")
+        if os.path.isfile(env_fp):
+            try:
+                with open(env_fp, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                m = _TG_TOKEN_STRICT_RE.search(content)
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+
+    for k in (
+        "TELEGRAM_BOT_TOKEN",
+        "TG_BOT_TOKEN",
+        "BOT_TOKEN",
+        "TELEGRAM_TOKEN",
+        "TG_TOKEN",
+    ):
+        val = str(os.environ.get(k) or "").strip()
+        if "://" not in val:
+            m = _TG_TOKEN_STRICT_RE.search(val)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def _flush_telegram_pending_updates_sync(
+    base_dir: Optional[str] = None,
+) -> int:
+    """
+    NEW:
+    데몬 기동 전(ExecStartPre / --verify-only) 또는 /update 실행 직후에
+    텔레그램 서버 큐에 남아 있는 모든 미확인 메시지(/start, /update, callback_query 등)의
+    최대 update_id 를 조회하여 즉시 `offset = max_update_id + 1` 로 소비 확정(Ack)하고
+    로컬 원장(soxl_stratum_ledger.json)의 `last_tg_update_id` 에 기록한다.
+    이를 통해 재기동 시 과거 `/update` 명령이 재실행되는 9초 무한 루프를 물리적으로 100% 차단한다!
+    """
+    target_dir = os.path.abspath(
+        base_dir or os.path.dirname(os.path.abspath(__file__)) or "."
+    )
+    bot_token = _discover_bot_token_sync(target_dir)
+    if not bot_token:
+        return 0
+
+    def _call_tg_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"https://api.telegram.org/bot{bot_token}/{method}"
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url=url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {"ok": True}
+
+    max_uid = 0
+    try:
+        _call_tg_api("deleteWebhook", {"drop_pending_updates": False})
+    except Exception:
+        pass
+
+    try:
+        res = _call_tg_api("getUpdates", {"offset": -1, "timeout": 0})
+        if isinstance(res, dict) and bool(res.get("ok")):
+            updates = res.get("result")
+            if isinstance(updates, list) and updates:
+                for u in updates:
+                    if isinstance(u, dict):
+                        uid = safe_int(u.get("update_id"), 0)
+                        if uid > max_uid:
+                            max_uid = uid
+                if max_uid > 0:
+                    _call_tg_api(
+                        "getUpdates",
+                        {"offset": max_uid + 1, "limit": 1, "timeout": 0},
+                    )
+    except Exception as exc:
+        logger.debug("텔레그램 큐 선제 소각 예외(무시): %s", exc)
+
+    if max_uid > 0:
+        ledger_fp = os.path.join(target_dir, "soxl_stratum_ledger.json")
+        if os.path.isfile(ledger_fp):
+            try:
+                with GlobalThrottle.get_file_lock(ledger_fp):
+                    with open(ledger_fp, "r", encoding="utf-8") as rf:
+                        ldata = json.load(rf)
+                    if isinstance(ldata, dict):
+                        if "SOXL" in ldata and isinstance(ldata["SOXL"], dict):
+                            cur_saved = safe_int(
+                                ldata["SOXL"].get("last_tg_update_id"), 0
+                            )
+                            if max_uid > cur_saved:
+                                ldata["SOXL"]["last_tg_update_id"] = max_uid
+                                tmp_p = f"{ledger_fp}.ack.tmp"
+                                with open(tmp_p, "w", encoding="utf-8") as wf:
+                                    json.dump(
+                                        ldata, wf, ensure_ascii=False, indent=2
+                                    )
+                                    wf.flush()
+                                    os.fsync(wf.fileno())
+                                os.replace(tmp_p, ledger_fp)
+            except Exception:
+                pass
+
+    return max_uid
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +251,6 @@ def _auto_heal_indentation_glitches(
                         break
                     lead_len = len(raw_line) - len(stripped)
 
-                    # 인접한 이전 유효 코드 라인의 들여쓰기 탐색
                     prev_indent = 0
                     for p_i in range(idx - 1, -1, -1):
                         p_str = lines[p_i].strip()
@@ -286,7 +413,7 @@ def verify_all_modules_compile(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 4] Git 동기화 및 Case 62 독립 서브프로세스 검증·롤백 엔진
+# [핵심 4] 스마트 Git 동기화 및 Case 62 독립 서브프로세스 검증·롤백 엔진
 # ---------------------------------------------------------------------------
 def _run_cmd_sync(
     cmd: List[str], cwd: str, timeout_sec: float = 30.0
@@ -309,17 +436,21 @@ def _execute_git_pull_and_preflight_sync(
     base_dir: Optional[str] = None,
 ) -> Tuple[bool, str, bool]:
     """
-    🚨 Case 62:
-    1) 현재 HEAD 해시(prev_hash)를 기록한다.
-    2) git fetch --all 및 git reset --hard origin/<branch> 로 최신 코드를 반영한다.
+    🚨 Case 62 & 로컬 SFTP 핫픽스 보호 가드:
+    1) 실행 즉시 `_flush_telegram_pending_updates_sync()` 로 텔레그램 서버의 미확인 `/update` 큐를 선제 소각한다.
+    2) `git fetch --all --prune` 후 `git rev-list --count HEAD..origin/<branch>` 를 확인하여,
+       원격 저장소에 신규 커밋이 실제로 존재할 때(`remote_ahead > 0`)만 `git reset --hard origin/<branch>` 를 수행한다.
+       원격에 신규 커밋이 없을 때(`remote_ahead == 0`)는 로컬 디스크(SFTP 수정본)를 덮어쓰지 않고 그대로 보존·검증한다!
     3) 구버전 RAM 캐시(sys.modules) 간섭을 차단하기 위해
        반드시 `[sys.executable, "plugin_updater.py", "--verify-only"]` 를 독립 서브프로세스로 실행한다!
-    4) 서브프로세스 검증 실패 시 즉시 `git reset --hard <prev_hash>` 로 자동 롤백한다.
-    5) MODIFIED: 항상 비어 있지 않은 명확한 결과 문자열(summary_msg)을 반환하여 `[]` 출력 버그를 차단한다.
+    4) 서브프로세스 검증 실패 시 즉시 이전 정상 커밋 해시로 자동 롤백한다.
     """
     target_dir = os.path.abspath(
         base_dir or os.path.dirname(os.path.abspath(__file__)) or "."
     )
+
+    # 1) 텔레그램 미확인 업데이트 큐 선제 소각 (무한 /update 루프 즉시 차단)
+    _flush_telegram_pending_updates_sync(target_dir)
 
     try:
         rc_h, prev_hash, _ = _run_cmd_sync(
@@ -342,9 +473,9 @@ def _execute_git_pull_and_preflight_sync(
             timeout_sec=25.0,
         )
         if rc_f != 0:
-            return False, f"git fetch 실패: {err_f}", False
+            ok_local, msg_local = verify_all_modules_compile(target_dir)
+            return ok_local, f"로컬 검증 완료 (git fetch 스킵): {msg_local}", False
 
-        # origin/<branch> 또는 origin/main 결정
         target_ref = f"origin/{branch_name}"
         rc_ref, _, _ = _run_cmd_sync(
             ["git", "rev-parse", "--verify", target_ref],
@@ -354,20 +485,29 @@ def _execute_git_pull_and_preflight_sync(
         if rc_ref != 0:
             target_ref = "origin/main"
 
-        rc_r, _, err_r = _run_cmd_sync(
-            ["git", "reset", "--hard", target_ref],
+        # 원격 브랜치에 로컬 HEAD 보다 새로운 커밋이 있는지 확인
+        rc_cnt, cnt_str, _ = _run_cmd_sync(
+            ["git", "rev-list", "--count", f"HEAD..{target_ref}"],
             cwd=target_dir,
-            timeout_sec=15.0,
+            timeout_sec=8.0,
         )
-        if rc_r != 0:
-            return False, f"git reset 실패: {err_r}", False
+        remote_ahead = safe_int(cnt_str, 0) if rc_cnt == 0 else 0
 
-        _, new_hash, _ = _run_cmd_sync(
-            ["git", "rev-parse", "HEAD"], cwd=target_dir, timeout_sec=10.0
-        )
-        changed = bool(prev_hash and new_hash and prev_hash != new_hash)
+        changed = False
+        new_hash = prev_hash
+        if remote_ahead > 0:
+            rc_r, _, err_r = _run_cmd_sync(
+                ["git", "reset", "--hard", target_ref],
+                cwd=target_dir,
+                timeout_sec=15.0,
+            )
+            if rc_r != 0:
+                return False, f"git reset 실패: {err_r}", False
+            _, new_hash, _ = _run_cmd_sync(
+                ["git", "rev-parse", "HEAD"], cwd=target_dir, timeout_sec=10.0
+            )
+            changed = bool(prev_hash and new_hash and prev_hash != new_hash)
 
-        # 구버전 폐기 파일 청소
         purged_list = purge_deprecated_legacy_files(target_dir)
 
         # 🚨 Case 62: 디스크의 최신 plugin_updater.py 를 독립 서브프로세스로 호출하여 검증!
@@ -379,7 +519,7 @@ def _execute_git_pull_and_preflight_sync(
         )
         if rc_v != 0:
             detail_err = out_v or err_v or "알 수 없는 컴파일/심볼 검증 오류"
-            if prev_hash:
+            if changed and prev_hash:
                 _run_cmd_sync(
                     ["git", "reset", "--hard", prev_hash],
                     cwd=target_dir,
@@ -387,15 +527,15 @@ def _execute_git_pull_and_preflight_sync(
                 )
             return (
                 False,
-                f"🚨 프리플라이트 컴파일 에러 감지 (이전 정상 해시로 즉시 롤백 완료):\n{detail_err}",
+                f"🚨 프리플라이트 컴파일 에러 감지:\n{detail_err}",
                 False,
             )
 
-        short_hash = new_hash[:7] if new_hash else "latest"
+        short_hash = new_hash[:7] if new_hash else "local"
         status_note = (
             f"신규 커밋({short_hash}) 적용"
             if changed
-            else f"최신 커밋({short_hash}) 유지"
+            else f"현재 버전({short_hash}) 유지"
         )
         verify_note = (
             out_v
@@ -469,7 +609,6 @@ async def run_auto_update_loop(
         if _is_weekday_market_busy_est(now_est):
             continue
 
-        # 미체결 주문이 진행 중이면 무인 업데이트 스킵
         try:
             st = context.ledger.get_state("SOXL")
             if str(st.get("buy_order_id") or "").strip() or str(
@@ -521,8 +660,9 @@ def _cli_main() -> int:
 
     purge_deprecated_legacy_files(args.base_dir)
 
-    # 1) --verify-only 플래그가 지정된 경우: 순수 컴파일 및 AST 심볼 정합성 검증만 즉시 수행
+    # 1) --verify-only 플래그가 지정된 경우: 텔레그램 잔류 큐 선제 소각 + 컴파일 및 AST 심볼 정합성 검증
     if args.verify_only:
+        _flush_telegram_pending_updates_sync(args.base_dir)
         ok, msg = verify_all_modules_compile(args.base_dir)
         if ok:
             print(msg)
@@ -530,7 +670,10 @@ def _cli_main() -> int:
         print(msg, file=sys.stderr)
         return 1
 
-    # 2) 인자 없이 호출된 경우 (systemd ExecStartPre 등): Case 07 장중 락다운 판별
+    # 2) 인자 없이 호출된 경우 (systemd ExecStartPre 등):
+    # 기동 직전 텔레그램 적체 큐를 무조건 선제 소각하여 /update 재기동 루프를 원천 봉쇄!
+    _flush_telegram_pending_updates_sync(args.base_dir)
+
     now_est = datetime.now(EST_TZ)
     if _is_weekday_market_busy_est(now_est):
         print(
@@ -548,7 +691,7 @@ def _cli_main() -> int:
         print(msg_git)
         return 0
     print(msg_git, file=sys.stderr)
-    ok_local, msg_local = verify_all_modules_compile(args.base_dir)
+    ok_local, _ = verify_all_modules_compile(args.base_dir)
     return 0 if ok_local else 1
 
 

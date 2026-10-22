@@ -2,7 +2,7 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 05 / 05)
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 03 / 03)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & 자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
@@ -12,8 +12,9 @@
   5) 매수 후 60초 타임쉴드 & 1분 상시 순수 현재가 지정가 스나이퍼 매도(1층 +1.50% 익절 & 2층 리앵커링 / 2층 +1.00% 전량 졸업)
   6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
-  7) 📡 [내장형 텔레그램 getUpdates 오프셋 즉시 확정(Ack) & 부팅 전 잔류 /update 자동 소각]
-     /update 실행 시 os._exit(0) 호출 전 텔레그램 서버 오프셋(offset = last_update_id + 1)을 선행 확정하고 원장에 영속화하여
+  7) 📡 [내장형 텔레그램 적체 큐 무조건부 일괄 소각 & 무변경 시 무중단 가동 유지]
+     기동 직후 _flush_stale_updates_on_startup() 에서 큐의 마지막 update_id 까지 조건 없이 즉시 소비 확정(Ack)하고,
+     /update 실행 시 신규 커밋이 없을 때(changed == False)는 os._exit(0) 를 호출하지 않고 무중단 가동을 유지하여
      9초 주기 무한 재기동 루프 및 `[]` 빈 리스트 출력 버그를 100% 영구 종결!
 - 제1헌법 ~ 제6헌법 및 Case 01 ~ 66 전수 락온
 """
@@ -1364,8 +1365,11 @@ class _AdaptiveTelegramBridge:
     외부 tg_ui_plugin 의 폴링 루프 구조에 구애받지 않고
     자체 내장 getUpdates 롱폴링 + /start, /avwap, /sync, /settlement, /reset, /update +
     인라인 버튼 콜백 + 시드 숫자 입력을 100% 직접 수행하는 완결형 텔레그램 컨트롤러.
-    - MODIFIED: /update 실행 시 오프셋(offset = _last_update_id + 1) 서버 즉시 확정(Ack) 및
-      부팅 전 잔류 /update 메시지 자동 소각기를 탑재하여 9초 주기 무한 재기동 루프를 100% 영구 차단!
+    - MODIFIED:
+      1) 기동 직후 _flush_stale_updates_on_startup() 에서 조건 없이 큐의 마지막 update_id 를
+         즉시 소비 확정(Ack)하여 과거 적체된 /start, /update 를 100% 소멸시킨다.
+      2) /update 실행 시 오프셋 선행 확정 후, 신규 커밋(changed == True)이 있을 때만 재기동(os._exit(0))하고
+         변경 사항이 없을 때(changed == False)는 무중단 가동을 유지하여 9초 주기 무한 재기동 루프를 영구 차단한다.
     """
 
     def __init__(self, context: Any) -> None:
@@ -1439,8 +1443,7 @@ class _AdaptiveTelegramBridge:
     async def _ack_telegram_offset(self, target_update_id: int) -> None:
         """
         NEW: 텔레그램 본사 서버 큐에서 target_update_id 이하의 모든 메시지를 즉시 소비 확정(Ack)하고
-        로컬 원장(last_tg_update_id)에 영속화하여 프로세스 재기동(os._exit(0)) 후 동일 /update 가
-        다시 실행되는 무한 재기동 루프를 원천 차단한다.
+        로컬 원장(last_tg_update_id)에 영속화하여 프로세스 재기동 후 동일 명령이 재실행되지 않게 한다.
         """
         uid = max(self._last_update_id, safe_int(target_update_id, 0))
         if uid <= 0:
@@ -1463,20 +1466,14 @@ class _AdaptiveTelegramBridge:
 
     async def _flush_stale_updates_on_startup(self) -> None:
         """
-        NEW: 기동 직후 텔레그램 큐를 점검하여, 부팅 시각(_boot_epoch) 이전에 전송되었거나
-        미확인 상태로 큐에 남아 있던 잔류 `/update` 명령을 선제 소각(Ack)한다.
+        MODIFIED: 기동 직후 텔레그램 큐의 가장 마지막 항목(offset=-1)을 조회하여,
+        메시지 종류나 발송 시각과 무관하게 부팅 전에 쌓여 있던 모든 적체 이벤트를 조건 없이
+        즉시 소각(Ack)한다.
         """
         try:
             res = await self._call_tg(
                 "getUpdates",
-                {
-                    "offset": (
-                        self._last_update_id + 1
-                        if self._last_update_id > 0
-                        else -1
-                    ),
-                    "timeout": 0,
-                },
+                {"offset": -1, "timeout": 0},
                 timeout_sec=6.0,
             )
             if not (isinstance(res, dict) and bool(res.get("ok"))):
@@ -1487,29 +1484,15 @@ class _AdaptiveTelegramBridge:
 
             max_stale_uid = 0
             for upd in updates:
-                if not isinstance(upd, dict):
-                    continue
-                uid = safe_int(upd.get("update_id"), 0)
-                m_obj = (
-                    upd.get("message")
-                    if isinstance(upd.get("message"), dict)
-                    else {}
-                )
-                msg_date = safe_float(m_obj.get("date"), 0.0)
-                raw_txt = str(m_obj.get("text") or "").strip().lower()
-
-                if (
-                    (msg_date > 0.0 and msg_date < (self._boot_epoch - 2.0))
-                    or raw_txt.startswith("/update")
-                    or raw_txt == "🚀 시스템 업데이트"
-                ):
+                if isinstance(upd, dict):
+                    uid = safe_int(upd.get("update_id"), 0)
                     if uid > max_stale_uid:
                         max_stale_uid = uid
 
             if max_stale_uid > 0:
                 await self._ack_telegram_offset(max_stale_uid)
                 logger.info(
-                    "🧹 [텔레그램 부팅 전 잔류 업데이트 오프셋 소각 완료] last_update_id=%d",
+                    "🧹 [텔레그램 부팅 전 적체 큐 전량 소각 완료] last_update_id=%d",
                     max_stale_uid,
                 )
         except Exception as exc:
@@ -2103,8 +2086,9 @@ class _AdaptiveTelegramBridge:
         MODIFIED [무한 재기동 루프 및 `[]` 출력 버그 원천 종결]:
         1) /update 명령 진입 즉시 _ack_telegram_offset() 을 호출하여 텔레그램 본사 서버 큐에서
            해당 update_id 를 즉시 소비 확정(Ack)하고 원장(last_tg_update_id)에 영속화한다.
-        2) execute_git_pull_and_preflight 반환 튜플에서 비어 있지 않은 문자열(msg)만 추출한다.
-        3) os._exit(0) 직전 한 번 더 오프셋을 확정하여 재기동 후 동일 /update 가 재실행되지 않게 보장한다.
+        2) execute_git_pull_and_preflight 반환 튜플에서 비어 있지 않은 문자열(msg)과 변경 여부(changed)를 추출한다.
+        3) 원격 저장소에 새로운 커밋이 없어 변경 사항이 없을 때(changed == False)는 os._exit(0) 를 호출하지 않고
+           현재 프로세스를 무중단 유지한다!
         """
         await self._ack_telegram_offset(self._last_update_id)
         await self.send_message(
@@ -2114,12 +2098,15 @@ class _AdaptiveTelegramBridge:
         fn_upd = getattr(
             plugin_updater, "execute_git_pull_and_preflight", None
         )
+        changed = False
         if callable(fn_upd):
             upd_res = await _call_plugin_adaptive(
                 fn_upd, base_dir=self.context.base_dir
             )
             if isinstance(upd_res, tuple):
                 ok = bool(upd_res[0]) if len(upd_res) >= 1 else False
+                if len(upd_res) >= 3 and isinstance(upd_res[2], bool):
+                    changed = bool(upd_res[2])
                 str_parts = [
                     str(x).strip()
                     for x in upd_res[1:]
@@ -2136,6 +2123,8 @@ class _AdaptiveTelegramBridge:
         else:
             ok, msg = verify_all_modules_compile(self.context.base_dir)
 
+        await self._ack_telegram_offset(self._last_update_id)
+
         if not ok:
             await self.send_message(
                 chat_id=chat_id,
@@ -2143,10 +2132,20 @@ class _AdaptiveTelegramBridge:
             )
             return
 
-        await self._ack_telegram_offset(self._last_update_id)
+        if not changed:
+            await self.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✅ <b>[최신 버전 검증 완료 · 무중단 가동 유지]</b>\n"
+                    f"🔸 {_escape_html(msg)}\n"
+                    "🔸 원격 변경사항이 없으므로 재기동 없이 현재 스나이퍼 엔진을 계속 가동합니다."
+                ),
+            )
+            return
+
         await self.send_message(
             chat_id=chat_id,
-            text=f"🚀 <b>[업데이트 검증 통과]</b> {_escape_html(msg)}\n잠시 후 스나이퍼 데몬을 재기동합니다...",
+            text=f"🚀 <b>[신규 업데이트 검증 통과]</b> {_escape_html(msg)}\n잠시 후 스나이퍼 데몬을 재기동합니다...",
         )
         await asyncio.sleep(0.5)
         os._exit(0)
@@ -2366,7 +2365,7 @@ class _AdaptiveTelegramBridge:
     async def run_polling_loop(self) -> None:
         """
         내장형 텔레그램 getUpdates 비동기 롱폴링 루프
-        (엄격한 토큰 검증 + deleteWebhook 초기화 + 부팅 전 잔류 /update 자동 소각 탑재)
+        (엄격한 토큰 검증 + deleteWebhook 초기화 + 기동 시 적체 큐 무조건부 일괄 소각 탑재)
         """
         if not _extract_valid_tg_token(self.bot_token):
             self.bot_token, discovered_cid = _discover_telegram_credentials(
@@ -2436,10 +2435,9 @@ class _AdaptiveTelegramBridge:
                                     continue
                                 txt = str(m_obj.get("text") or "").strip()
                                 msg_date = safe_float(m_obj.get("date"), 0.0)
-                                # 부팅 시각 이전에 전송된 과거 /update 메시지는 즉시 소각 후 스킵
                                 if (
                                     msg_date > 0.0
-                                    and msg_date < (self._boot_epoch - 2.0)
+                                    and msg_date < (self._boot_epoch - 1.0)
                                     and (
                                         txt.lower().startswith("/update")
                                         or txt == "🚀 시스템 업데이트"
@@ -2939,6 +2937,8 @@ async def async_main() -> None:
     except Exception as exc:
         logger.warning("초기 잔고/시세 동기화 폴백: %s", exc)
 
+    # 기동 배너 발송 전에 텔레그램 적체 큐를 먼저 소각하여 과거 /update 재발동을 100% 차단
+    await context.tg._flush_stale_updates_on_startup()
     await context.tg.send_startup_alive_banner()
 
     tasks = [

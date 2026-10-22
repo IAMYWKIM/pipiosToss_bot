@@ -2,13 +2,15 @@
 """
 # MODIFIED: tg_ui_plugin.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-텔레그램 관제탑 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 04 / 05)
+텔레그램 관제탑 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 02 / 03)
 - 제1헌법: 모든 텔레그램 HTTP API 호출을 asyncio.to_thread 로 비동기 격리 및 타임아웃 적용
 - 제4헌법: 모든 논리 시계열은 미국 동부 시간(EST/EDT) 100% 락온
 - Case 15 & Case 16: 모바일 가독성 최적화, html.escape 전역 적용, 세로바 대신 가운뎃점(·) 사용,
   기동 완료 시 "✅ 서버가 정상 작동 중입니다." 생존 신호 자동 타전
-- Case 62: /update 실행 시 텔레그램 서버 오프셋(offset = last_update_id + 1) 선행 확정(Ack) 및 원장 영속화 후
-  plugin_updater.execute_git_pull_and_preflight() 독립 서브프로세스 검증을 거쳐 안전 재기동 (무한 재기동 루프 100% 원천 차단!)
+- Case 62 & 무한 재기동 원천 봉쇄:
+  1) 기동 직후 _flush_stale_updates_on_startup() 에서 조건 없이 큐의 마지막 update_id 까지 일괄 소각(Ack)
+  2) /update 실행 시 오프셋 선행 확정 후 신규 커밋(changed == True)이 있을 때만 재기동(os._exit(0))하고,
+     이미 최신 코드(changed == False)일 때는 재기동 없이 무중단 가동 유지!
 - Case 64: 전술 제어반(/settlement) 내 30분 옵션 완전 제거 -> 오직 [작동 ON/OFF 버튼]과 [시드머니 설정 버튼] 2가지 옵션만 유지
 - Case 65 & Case 66: /avwap 레이더 내 양방향 60초 타임쉴드(매수 후 60초 / 매도 후 60초) 상태 및 4단 와이드 활주로 실시간 표출
 """
@@ -457,8 +459,9 @@ class TelegramCommandController:
     """
     🚨 제1헌법 & Case 02, 15, 16, 62, 64, 65, 66:
     main.py 의 SniperAppContext 와 정식 결속되는 텔레그램 봇 컨트롤러.
-    - MODIFIED: /update 실행 시 오프셋(offset = _last_update_id + 1) 서버 즉시 확정(Ack) 및
-      부팅 이전 잔류 /update 메시지 자동 소각기를 탑재하여 무한 재가동 루프를 100% 원천 봉쇄!
+    - MODIFIED: 기동 직후 _flush_stale_updates_on_startup() 에서 조건 없이 큐의 마지막 update_id 를
+      즉시 소비 확정(Ack)하고, /update 실행 시 변경 사항이 없으면(changed == False) 재기동하지 않고
+      무중단 가동을 유지하여 9초 주기 무한 재기동 루프를 100% 영구 봉쇄!
     """
 
     def __init__(self, context: Any) -> None:
@@ -566,20 +569,14 @@ class TelegramCommandController:
 
     async def _flush_stale_updates_on_startup(self) -> None:
         """
-        NEW: 데몬 기동 직후 텔레그램 큐를 스캔하여, 부팅 이전에 전송되었거나
-        미확인 상태로 남아 있던 과거 `/update` 명령을 선제 소각(Ack)한다.
+        MODIFIED: 데몬 기동 직후 텔레그램 큐의 가장 마지막 항목(offset=-1)을 조회하여,
+        메시지 종류나 발송 시각과 무관하게 부팅 전에 쌓여 있던 모든 적체 이벤트를 조건 없이
+        즉시 소각(Ack)한다.
         """
         try:
             res = await self._call_tg(
                 "getUpdates",
-                {
-                    "offset": (
-                        self._last_update_id + 1
-                        if self._last_update_id > 0
-                        else -1
-                    ),
-                    "timeout": 0,
-                },
+                {"offset": -1, "timeout": 0},
                 timeout_sec=6.0,
             )
             if not (isinstance(res, dict) and bool(res.get("ok"))):
@@ -590,30 +587,15 @@ class TelegramCommandController:
 
             max_stale_uid = 0
             for upd in updates:
-                if not isinstance(upd, dict):
-                    continue
-                uid = safe_int(upd.get("update_id"), 0)
-                m_obj = (
-                    upd.get("message")
-                    if isinstance(upd.get("message"), dict)
-                    else {}
-                )
-                msg_date = safe_float(m_obj.get("date"), 0.0)
-                raw_txt = str(m_obj.get("text") or "").strip().lower()
-
-                # 부팅 이전에 발송된 메시지이거나 큐에 잔류하던 /update 명령은 즉시 소각 대상에 포함
-                if (
-                    (msg_date > 0.0 and msg_date < (self._boot_epoch - 2.0))
-                    or raw_txt.startswith("/update")
-                    or raw_txt == "🚀 시스템 업데이트"
-                ):
+                if isinstance(upd, dict):
+                    uid = safe_int(upd.get("update_id"), 0)
                     if uid > max_stale_uid:
                         max_stale_uid = uid
 
             if max_stale_uid > 0:
                 await self._ack_telegram_offset(max_stale_uid)
                 logger.info(
-                    "🧹 [텔레그램 부팅 전 잔류 업데이트 오프셋 소각 완료] last_update_id=%d",
+                    "🧹 [텔레그램 부팅 전 적체 큐 전량 소각 완료] last_update_id=%d",
                     max_stale_uid,
                 )
         except Exception as exc:
@@ -640,7 +622,6 @@ class TelegramCommandController:
 
         res = await self._call_tg("sendMessage", payload, timeout_sec=10.0)
         if not bool(res.get("ok")):
-            # HTML 태그 파싱 실패 시 일반 텍스트 폴백 전송
             payload.pop("parse_mode", None)
             res = await self._call_tg("sendMessage", payload, timeout_sec=10.0)
         return bool(res.get("ok"))
@@ -859,8 +840,8 @@ class TelegramCommandController:
         """
         🚨 Case 62 & 무한 재기동 방어:
         1) /update 명령 수신 즉시 _ack_telegram_offset() 으로 텔레그램 서버에 update_id 소비 완료를 확정!
-        2) git fetch & reset 수행 후 독립 서브프로세스로 9대 코어 모듈을 검증하고,
-           이상 없을 시 프로세스를 재기동(os._exit(0))한다.
+        2) execute_git_pull_and_preflight() 수행 후 신규 커밋(changed == True)이 반영되었을 때만
+           데몬을 재기동(os._exit(0))하고, 이미 최신 버전(changed == False)일 때는 재기동 없이 무중단 유지한다!
         """
         await self._ack_telegram_offset(self._last_update_id)
         await self.send_message(
@@ -868,8 +849,11 @@ class TelegramCommandController:
             text="⏳ <b>[시스템 업데이트 개시]</b> GitHub 최신 코드 동기화 및 9대 코어 모듈 프리플라이트 검증 중...",
         )
         upd_res = await execute_git_pull_and_preflight(self.context.base_dir)
+        changed = False
         if isinstance(upd_res, tuple):
             ok = bool(upd_res[0]) if len(upd_res) >= 1 else False
+            if len(upd_res) >= 3 and isinstance(upd_res[2], bool):
+                changed = bool(upd_res[2])
             str_parts = [
                 str(x).strip()
                 for x in upd_res[1:]
@@ -884,6 +868,8 @@ class TelegramCommandController:
             ok = bool(upd_res)
             msg = "✅ 9대 코어 모듈 검증 통과"
 
+        await self._ack_telegram_offset(self._last_update_id)
+
         if not ok:
             await self.send_message(
                 chat_id=chat_id,
@@ -891,10 +877,20 @@ class TelegramCommandController:
             )
             return
 
-        await self._ack_telegram_offset(self._last_update_id)
+        if not changed:
+            await self.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✅ <b>[최신 버전 검증 완료 · 무중단 가동 유지]</b>\n"
+                    f"🔸 {escape_html(msg)}\n"
+                    "🔸 원격 변경사항이 없으므로 재기동 없이 현재 스나이퍼 엔진을 계속 가동합니다."
+                ),
+            )
+            return
+
         await self.send_message(
             chat_id=chat_id,
-            text=f"🚀 <b>[업데이트 검증 통과]</b> {escape_html(msg)}\n잠시 후 스나이퍼 데몬을 재기동합니다...",
+            text=f"🚀 <b>[신규 업데이트 검증 통과]</b> {escape_html(msg)}\n잠시 후 스나이퍼 데몬을 재기동합니다...",
         )
         await asyncio.sleep(0.5)
         os._exit(0)
@@ -909,7 +905,6 @@ class TelegramCommandController:
         if not text:
             return
 
-        # 1) 시드머니 입력 대기 중이거나 순수 숫자를 입력한 경우 시드 변경 처리
         clean_num_check = (
             text.replace(",", "").replace("$", "").replace(".", "").strip()
         )
@@ -1089,7 +1084,7 @@ class TelegramCommandController:
 
     async def run_polling_loop(self) -> None:
         """
-        텔레그램 getUpdates 비동기 롱폴링 루프 (부팅 전 잔류 /update 자동 소각 탑재)
+        텔레그램 getUpdates 비동기 롱폴링 루프 (기동 시 적체 큐 무조건부 일괄 소각 탑재)
         """
         if not self.bot_token:
             logger.warning(
@@ -1146,10 +1141,9 @@ class TelegramCommandController:
                                     continue
                                 txt = str(m_obj.get("text") or "").strip()
                                 msg_date = safe_float(m_obj.get("date"), 0.0)
-                                # 부팅 시각 이전에 발송된 과거 /update 메시지는 즉시 소각 후 무시
                                 if (
                                     msg_date > 0.0
-                                    and msg_date < (self._boot_epoch - 2.0)
+                                    and msg_date < (self._boot_epoch - 1.0)
                                     and (
                                         txt.lower().startswith("/update")
                                         or txt == "🚀 시스템 업데이트"
