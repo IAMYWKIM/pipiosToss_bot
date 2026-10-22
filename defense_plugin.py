@@ -1,680 +1,468 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: defense_plugin.py
-방향성 인지(Direction-Aware) 매크로 3단 방어망 (1·2차 NQ=F 진폭 과열방어 & 3차 토스 QQQ 0.0초 실시간 최소 0.80% 역행방어),
-수동 진입(MANUAL) 자동 감지 및 체결 시차 오분류 차단(Case 102), 스나이퍼 OFF->ON 재가동 시 QQQ 0.00% 기준가 재락온,
-08:15 EST 거시지표 선제 컷오프, 15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 정규장 VWAP 도달 즉시 탈출(VWAP_ESCAPE),
-15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 강제 청산 전술 플러그인 (Step 02 / 05)
-- MODIFIED: 제3헌법 및 최신 프롬프트.txt에 의거하여 3차 역행 손절 시 폐기된 activate_bottom_rebound_tracker(RE_BOT_TRAIL)
-  임포트 및 호출을 100% 영구 소각하고, 3차 손절 즉시 당일 본진 세션 안전 마감(CANCELED_STAGE3)으로 직결
-- 제3헌법: 방어/컷오프/정규장 탈출/MOC 상태 머신 전담 분리
-- 제4헌법: 모든 타임라인 판단 ZoneInfo('America/New_York') 단일 소스 락온
-- 🎯 5 & Case 16, 24, 48, 49, 66, 92, 95, 96, 101, 102 완벽 준수
+순수 롱(SOXL) 전용 '오버나이트 지층 원장(soxl_stratum_ledger.json) ↔ 토스 실보유 잔고(/api/v1/holdings)
+무결성 화해(Case 29 유령 잔고 방어 & Case 58 재기동/수동매매 정합성 복원) ·
+04:00 ~ 04:06 EST 프리장 초기 호가 안정화 동기화 ·
+16:00 ~ 16:59 EST 정규장 마감 일일 결산 리포트 및 오버나이트 지층 안전 보존(강제 MOC 없음)' 코어 플러그인 (Step 06 / 09)
+- MODIFIED: 제3헌법에 의거하여 구버전 08:15 EST 거시지표 컷오프, 15:00 EST 정규장 VWAP 덤핑 탈출,
+  15:59 EST 제로-오버나이트 강제 손절 MOC 및 NQ=F/QQQ 매크로 손절 덤핑 데드코드를 100% 영구 소각
+- NEW: 프로세스 재기동 또는 운용자의 토스 앱 수동 매수/매도 발생 시에도 2층 리앵커링 장부단가(book_price)를
+  훼손하지 않고 실보유 수량(holdings_qty) 및 실투입 원금(actual_cost_usd)을 원자적으로 화해(Reconcile)
+- NEW: 16:00 EST 정규장 마감 시 미체결 DAY 주문만 정리하고 보유 지층(1층/2층)은 100% 오버나이트 보존하며
+  당일 세후 실현순익 · 자투리 절약액 · 리앵커링 · 시드보호패스 일일 결산 보고 타전
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 58 완벽 준수
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from quant_engine import (
-    NQ_OVERHEAT_THRESHOLD,
-    calc_qqq_adverse_status,
-    is_qqq_scale_valid,
+    StratumBucket,
+    buckets_from_dicts,
+    buckets_to_dicts,
+    calc_sell_realized_pnl,
+    summarize_stratum_portfolio,
 )
-from quant_indicators_plugin import refresh_metrics_with_live_tick
-from sniper_exit_plugin import (
-    ensure_safety_cap_sell_order,
-    execute_bulletproof_sell_sweep,
-    reconcile_zero_holdings_exit_plugin,
-    update_exit_snapshot_on_hold,
+from quant_indicators_plugin import (
+    get_logical_trading_date_str,
+    is_daily_settlement_window,
+    is_premarket_stabilization_window,
+    refresh_metrics_with_live_tick,
 )
-from toss_api import EST_TZ, REAL_ALLOWED_SYMBOLS, safe_float, safe_int
+from sniper_exit_plugin import update_exit_snapshot_on_hold
+from sniper_plugin import is_within_auto_fill_grace_shield
+from toss_api import (
+    EST_TZ,
+    TARGET_SYMBOL,
+    safe_float,
+    safe_int,
+)
 
 logger = logging.getLogger("toss_sniper.defense_plugin")
 
-# 매수 체결 직후 잔고 인덱싱 시차(0.1 ~ 0.4초) 동안 MANUAL 오분류를 막는 그레이스 쉴드 유지 시간(15.0초)
-AUTO_FILL_GRACE_SHIELD_SEC: float = 15.0
 
-
-# ---------------------------------------------------------------------------
-# 내부 헬퍼 : 자동 체결 그레이스 쉴드 점검 및 실시간 보정 지표 추출
-# ---------------------------------------------------------------------------
-def is_within_auto_fill_grace_shield(context: Any, symbol: str) -> bool:
-    """
-    🎯 5 & Case 102:
-    최근 15.0초 이내에 프리장 본진(PRE_VWAP_M050) 또는 1주 휩소(WHIPSAW_1SH)
-    매수 주문이 체결된 이력이 있으면 True 를 반환하여,
-    잔고 인덱싱 시차 중 자동 진입 물량이 수동(MANUAL)으로 오분류되는 경합을 원천 차단한다.
-    """
-    sym = str(symbol or "").upper().strip()
-    guard_map = getattr(context, "indexing_grace_cache", None)
-    if not isinstance(guard_map, dict):
-        return False
-    info = guard_map.get(sym)
-    if not isinstance(info, dict):
-        return False
-    last_ts = safe_float(info.get("last_auto_fill_ts"), 0.0)
-    if last_ts <= 0.0:
-        return False
-    return (time.monotonic() - last_ts) <= AUTO_FILL_GRACE_SHIELD_SEC
-
-
-def _get_live_symbol_metrics(
+def _get_live_soxl_price(
     context: Any,
-    symbol: str,
     prices: Dict[str, float],
+    holdings: Dict[str, Dict[str, Any]],
     now_est: datetime,
-) -> Dict[str, Any]:
-    sym = str(symbol or "").upper().strip()
+) -> float:
+    lp = safe_float((prices or {}).get(TARGET_SYMBOL), 0.0)
+    if lp > 0.0:
+        return lp
     raw_cache = getattr(context, "candle_metrics_cache", {})
-    base_met = raw_cache.get(sym) if isinstance(raw_cache, dict) else None
-    live_p = safe_float((prices or {}).get(sym), 0.0)
-    if live_p <= 0.0 and isinstance(base_met, dict):
-        live_p = safe_float(base_met.get("live_price"), 0.0)
-    return refresh_metrics_with_live_tick(base_met, live_p, now_est=now_est)
+    base_met = (
+        raw_cache.get(TARGET_SYMBOL) if isinstance(raw_cache, dict) else None
+    )
+    if isinstance(base_met, dict):
+        met = refresh_metrics_with_live_tick(base_met, 0.0, now_est=now_est)
+        lp = safe_float(met.get("live_price"), 0.0)
+        if lp > 0.0:
+            return lp
+    h_info = (holdings or {}).get(TARGET_SYMBOL, {})
+    return safe_float(h_info.get("last_price"), 0.0)
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1] 스나이퍼 OFF ➔ ON 재가동 시 보유 포지션 실시간 QQQ 0.00% 기준가 재락온
+# [핵심 1] 스나이퍼 OFF ➔ ON 재가동 시 지층 원장 및 실보유 잔고 즉시 동기화
 # ---------------------------------------------------------------------------
-async def relock_qqq_baseline_on_bot_resume(
+async def relock_stratum_on_bot_resume(
     context: Any,
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 5 & Case 92:
-    운용자가 전술 제어반에서 스나이퍼를 OFF 했다가 ON 으로 재가동할 때 호출되어,
-    현재 보유 중인 포지션(수동 진입 포함)의 3차 방어 기준가(nq_entry_price)를
-    재가동 시점의 실시간 QQQ 현재가(0.00% 역행 출발점)로 즉시 재락온한다.
+    운용자가 텔레그램 전술 제어반(/settlement)에서 스나이퍼를 OFF 했다가 ON 으로 재가동할 때 호출되어,
+    현재 토스 계좌의 SOXL 실보유 잔고와 실시간 현재가를 지층 원장(soxl_stratum_ledger.json)과 즉시 화해시킨다.
     """
+    dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     holdings = await context.api.get_holdings_all()
-    prices = await context.api.get_current_prices_batch(("SOXS", "SOXL", "QQQ"))
-    qqq_live = await context.macro_cache.ensure_qqq_live_price(
-        safe_float(prices.get("QQQ"), 0.0)
+    prices = await context.api.get_current_prices_batch((TARGET_SYMBOL,))
+    rec_res = await reconcile_stratum_with_broker_holdings_plugin(
+        context=context,
+        holdings=holdings,
+        prices=prices,
+        now_est=dt_now,
+        force_reconcile=True,
     )
-    macro = await context.macro_cache.get_macro_snapshot(
-        live_qqq_price=qqq_live
-    )
-    nq_amp = safe_float(macro.get("nq_amp"), 0.0)
-    ref_price = (
-        qqq_live if qqq_live > 0.0 else safe_float(macro.get("nq_price"), 0.0)
-    )
-
-    relocked_syms = []
-    for sym in REAL_ALLOWED_SYMBOLS:
-        h_info = (holdings or {}).get(sym, {})
-        h_qty = safe_int(h_info.get("qty"), 0)
-        avg_p = safe_float(h_info.get("avg_price"), 0.0)
-        if h_qty <= 0 or avg_p <= 0.0:
-            continue
-
-        st = context.ledger.get_state(sym)
-        entry_sess = str(st.get("entry_session") or "").strip()
-        if not entry_sess or entry_sess in (
-            "CANCELED_MACRO",
-            "CANCELED_STAGE3",
-            "CANCELED_EXTERNAL",
-        ):
-            entry_sess = "MANUAL"
-
-        await context.ledger.update_state(
-            sym,
-            entry_session=entry_sess,
-            nq_entry_price=ref_price,
-            nq_entry_amp=nq_amp,
-            entry_ts=(
-                safe_float(st.get("entry_ts"), 0.0) or time.time()
-            ),
-        )
-        relocked_syms.append(sym)
-        logger.info(
-            "🔒 [OFF->ON 재가동 QQQ 0.00%% 기준가 재락온] %s (%d주, 세션=%s) -> QQQ기준=$%.2f, NQ진폭=%.2f%%",
-            sym,
-            h_qty,
-            entry_sess,
-            ref_price,
-            nq_amp,
-        )
-
     return {
-        "status": "RELOCKED",
-        "symbols": relocked_syms,
-        "qqq_baseline": ref_price,
-        "nq_amp": nq_amp,
+        "status": "RELOCKED_STRATUM_ON_RESUME",
+        "reconcile_result": rec_res,
     }
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 수동 진입(MANUAL) 포지션 자동 감지 · 안전 캡 선장전 · 체결 시차 오분류 방어
+# [핵심 2] Case 29 & Case 58 : 로컬 지층 원장(buckets) ↔ 토스 실보유 잔고 무결성 화해
 # ---------------------------------------------------------------------------
-async def sync_manual_holdings_defense_lock(
+async def reconcile_stratum_with_broker_holdings_plugin(
     context: Any,
     holdings: Dict[str, Dict[str, Any]],
     prices: Dict[str, float],
-    macro: Dict[str, Any],
     now_est: Optional[datetime] = None,
+    force_reconcile: bool = False,
 ) -> Dict[str, Any]:
     """
-    🎯 4 & 🎯 5 & Case 49, 92, 102:
-    - 토스 계좌에 실보유 잔고(holdings_qty > 0)가 감지되었을 때:
-    1) 만약 장부에 자동 진입 세션(PRE_VWAP_M050, WHIPSAW_1SH)이 기록되어 있거나
-       15.0초 자동 체결 그레이스 쉴드(is_within_auto_fill_grace_shield) 구간 내라면,
-       절대로 MANUAL 로 덮어쓰지 않고 기존 자동 진입 세션을 100% 보존한다(Case 102).
-    2) 자동 주문 없이 운용자가 직접 수동 매수한 물량이면 즉시 entry_session = "MANUAL" 로 각인하고,
-       현재 실시간 QQQ 가격을 nq_entry_price(0.00% 출발점)로 락온하며,
-       상단 안전 캡(+5.00% LIMIT) 매도 주문을 선장전한다(수동 물량은 2차 과열 방어 패스, 3차 QQQ 역행 방어 가동).
-    3) 기존 장부의 nq_entry_price 가 선물 스케일(>= 2000)로 오염되어 있으면 즉시 실시간 QQQ 가격으로 자가 치유한다.
+    🚨 Case 29 (유령 잔고 방어) & Case 58 (재기동/수동매매 지층 복원):
+    로컬 원장(soxl_stratum_ledger.json)의 지층 수량 합계(ledger_qty)와
+    토스 실제 보유 잔고(/api/v1/holdings 의 h_qty, avg_price)를 대조한다:
+    1) 미체결 주문(buy_order_id / sell_order_id)이 진행 중이거나 매수 직후 15.0초 인덱싱 시차
+       그레이스 쉴드 구간이면 화해를 보류하여 정상 체결 프로세스를 보호한다.
+    2) [케이스 A : 원장 0주인데 실제 토스 잔고 h_qty > 0 존재 (재기동 복원 또는 수동 매수)]
+       즉시 실보유 수량(h_qty)과 평단가(avg_price)로 1층(StratumBucket)을 생성하여 지층 관리에 편입한다.
+    3) [케이스 B : 원장 > 0주인데 실제 토스 잔고 h_qty == 0 (토스 앱에서 수동 전량 매도)]
+       실시간 가격(또는 직전 스냅샷 가격)으로 수동 청산 손익을 정산하고 지층 큐를 비워
+       유령 잔고 매도 에러를 원천 차단한다.
+    4) [케이스 C : 원장 수량 != 실제 토스 잔고 수량 (부분 수동 매수/매도)]
+       기존 2층의 리앵커링 단가 비율을 유지하면서 총 수량과 실제 원금(actual_cost_usd)을
+       토스 실잔고 팩트에 맞게 정밀 보정한다.
     """
-    qqq_curr = await context.macro_cache.ensure_qqq_live_price(
-        safe_float((macro or {}).get("qqq_price"), 0.0)
-    )
-    nq_amp = safe_float((macro or {}).get("nq_amp"), 0.0)
-    ref_price = (
-        qqq_curr
-        if qqq_curr > 0.0
-        else safe_float((macro or {}).get("nq_price"), 0.0)
-    )
+    dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+    st = context.ledger.get_state(TARGET_SYMBOL)
 
-    for sym in REAL_ALLOWED_SYMBOLS:
-        h_info = (holdings or {}).get(sym, {})
-        h_qty = safe_int(h_info.get("qty"), 0)
-        avg_p = safe_float(h_info.get("avg_price"), 0.0)
-        if h_qty <= 0 or avg_p <= 0.0:
-            continue
+    buy_oid = str(st.get("buy_order_id") or "").strip()
+    sell_oid = str(st.get("sell_order_id") or "").strip()
+    if (buy_oid or sell_oid) and not force_reconcile:
+        return {"status": "SKIP_RECONCILE_ACTIVE_ORDER"}
 
-        live_p = safe_float(
-            (prices or {}).get(sym), safe_float(h_info.get("last_price"), avg_p)
+    if (
+        is_within_auto_fill_grace_shield(context, TARGET_SYMBOL)
+        and not force_reconcile
+    ):
+        return {"status": "SKIP_RECONCILE_GRACE_SHIELD"}
+
+    h_info = (holdings or {}).get(TARGET_SYMBOL, {})
+    h_qty = max(0, safe_int(h_info.get("qty"), 0))
+    avg_p = max(0.0, safe_float(h_info.get("avg_price"), 0.0))
+    live_p = _get_live_soxl_price(context, prices, holdings, dt_now)
+    if live_p <= 0.0:
+        live_p = avg_p
+
+    if h_qty > 0 and avg_p > 0.0:
+        update_exit_snapshot_on_hold(
+            context, TARGET_SYMBOL, h_qty, avg_p, live_p
         )
-        update_exit_snapshot_on_hold(context, sym, h_qty, avg_p, live_p)
 
-        st = context.ledger.get_state(sym)
-        if not bool(st.get("is_active", True)):
-            continue
+    buckets = buckets_from_dicts(st.get("buckets", []))
+    ledger_qty = sum(b.qty for b in buckets)
 
-        entry_sess = str(st.get("entry_session") or "").strip()
-        buy_oid = str(st.get("buy_order_id") or "").strip()
-
-        # Case 102: 자동 체결 그레이스 쉴드 기간 내에는 자동 진입 세션 강제 복원/보존
-        if is_within_auto_fill_grace_shield(context, sym):
-            grace_info = getattr(context, "indexing_grace_cache", {}).get(
-                sym, {}
-            )
-            auto_sess = str(
-                grace_info.get("entry_session")
-                or entry_sess
-                or "PRE_VWAP_M050"
-            )
-            if auto_sess == "MANUAL":
-                auto_sess = "PRE_VWAP_M050"
-            if entry_sess != auto_sess:
-                await context.ledger.update_state(sym, entry_session=auto_sess)
-                entry_sess = auto_sess
-
-        # 수동 진입(MANUAL) 최초 감지 및 락온
-        elif not entry_sess or entry_sess in (
-            "CANCELED_MACRO",
-            "CANCELED_STAGE3",
-            "CANCELED_EXTERNAL",
-        ):
-            if not buy_oid:
-                entry_sess = "MANUAL"
-                other_sym = "SOXL" if sym == "SOXS" else "SOXS"
-                await context.ledger.update_state(
-                    sym,
-                    entry_session="MANUAL",
-                    buy_price=avg_p,
-                    ordered_qty=h_qty,
-                    nq_entry_price=ref_price,
-                    nq_entry_amp=nq_amp,
-                    is_session_done=True,
-                    entry_ts=time.time(),
-                )
-                await context.ledger.update_state(
-                    other_sym, is_session_done=True
-                )
-                if hasattr(context, "send_slim_alert"):
-                    arm_p = math.ceil((avg_p * 1.0100) * 100.0) / 100.0
-                    await context.send_slim_alert(
-                        title=f"🎯 [수동 스나이퍼 자동 결속] {sym} {h_qty}주",
-                        body=(
-                            f"평단 ${avg_p:.2f} · 점화가 ${arm_p:.2f}(+1.00%) · "
-                            f"2차 과열방어 패스 & 3차 QQQ기준 ${ref_price:.2f} 락온"
-                        ),
-                    )
-
-        # 3차 방어 기준가 스케일 오염(0.0 이하 또는 NQ=F 선물 스케일 >= 2000) 자가 치유
-        cur_nq_ref = safe_float(st.get("nq_entry_price"), 0.0)
-        if qqq_curr > 0.0 and not is_qqq_scale_valid(cur_nq_ref):
+    # 수량이 정확히 일치하는 정상 상태
+    if ledger_qty == h_qty:
+        if h_qty > 0 and safe_float(st.get("anchor_price"), 0.0) <= 0.0:
             await context.ledger.update_state(
-                sym,
-                nq_entry_price=qqq_curr,
-                nq_entry_amp=(
-                    safe_float(st.get("nq_entry_amp"), 0.0) or nq_amp
+                TARGET_SYMBOL,
+                anchor_price=buckets[0].book_price,
+                cycle_min_buy_price=min(b.book_price for b in buckets),
+                ratchet_anchor_price=buckets[0].book_price,
+            )
+        return {"status": "STRATUM_HOLDINGS_MATCHED", "qty": h_qty}
+
+    # -----------------------------------------------------------------------
+    # [케이스 A] 원장은 0주인데 토스 계좌에 실제 보유 잔고(h_qty > 0)가 존재하는 경우
+    # -----------------------------------------------------------------------
+    if ledger_qty == 0 and h_qty > 0 and avg_p > 0.0:
+        actual_cost = round(float(h_qty) * avg_p, 4)
+        new_b1 = StratumBucket(
+            qty=h_qty,
+            book_price=round(avg_p, 4),
+            book_invested_usd=actual_cost,
+            actual_cost_usd=actual_cost,
+            lot_count=1,
+            lot_type="SYNCED_1FL",
+        )
+        await context.ledger.update_state(
+            TARGET_SYMBOL,
+            buckets=buckets_to_dicts([new_b1]),
+            anchor_price=round(avg_p, 4),
+            cycle_min_buy_price=round(avg_p, 4),
+            ratchet_anchor_price=round(avg_p, 4),
+            entry_ts=time.time(),
+        )
+        logger.info(
+            "🔗 [SOXL 실잔고 지층 편입 완료] %d주 @ 평단 $%.2f (원금 $%.2f)",
+            h_qty,
+            avg_p,
+            actual_cost,
+        )
+        if hasattr(context, "send_slim_alert"):
+            await context.send_slim_alert(
+                title=f"🔗 [SOXL 실보유 잔고 지층 자동 편입] {h_qty}주",
+                body=(
+                    f"평단가 ${avg_p:.2f} (원금 ${actual_cost:,.2f}) · "
+                    f"1층 목표 +1.50% 스나이퍼 매도 및 10m/30m 매수게이트 결속 완료"
                 ),
             )
-
-        # 상단 안전 캡(+5.00% LIMIT, 1주 휩소는 +1.00% LIMIT) 매도 주문이 없으면 즉시 선장전
-        if not str(st.get("sell_order_id") or "").strip():
-            await ensure_safety_cap_sell_order(context, sym, h_qty, avg_p)
-
-    return {"status": "SYNCED"}
-
-
-# ---------------------------------------------------------------------------
-# [핵심 3] 방향성 인지(Direction-Aware) 매크로 3단 방어망
-# ---------------------------------------------------------------------------
-async def execute_macro_3stage_defense_plugin(
-    context: Any,
-    holdings: Dict[str, Dict[str, Any]],
-    prices: Dict[str, float],
-    macro: Dict[str, Any],
-    now_est: Optional[datetime] = None,
-) -> Dict[str, Any]:
-    """
-    🎯 5 & Case 66, 92, 95, 96:
-    - [1차 방어선] : NQ=F 당일 진폭 >= 2.0% 일 때 본진 자동 신규 매수 차단 및
-      본진 미체결 매수 주문(PRE_VWAP_M050) 즉시 취소·장부 소각(CANCELED_MACRO).
-      (단, 1주 휩소 노출 작전 WHIPSAW_1SH 은 1·2차 과열 방어를 100% 패스!)
-    - [2차 방어선] : 본진 자동 진입 보유 물량(PRE_VWAP_M050)이 손실 구간(0 < live_p < avg_price)에서
-      NQ=F 당일 진폭 >= 2.0% 돌파 시 즉시 매수 1호가(Bid 1) LIMIT 스윕 손절 덤핑 후 당일 마감.
-      (단, 수동 진입 MANUAL 및 1주 휩소 WHIPSAW_1SH 은 2차 방어선을 100% 패스!)
-    - [3차 방어선] : 포지션 자체 손실률 기반 즉시 손절 절대 금지!
-      오직 손실 구간(0 < live_p < avg_price) 전제 하에 진입/수동락온 시점 QQQ 기준가(nq_entry_price) 대비
-      실시간 QQQ 가격(qqq_curr)이 dynamic_threshold = max(nq_entry_amp * 0.5, 0.80%) 이상
-      반대 방향으로 역행했을 때만 매수 1호가 LIMIT 스윕으로 손절 덤핑하고
-      즉시 당일 본진 세션을 안전 마감(CANCELED_STAGE3)한다 (폐기된 RE_BOT_TRAIL 호출 영구 제거 완료).
-    """
-    dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
-
-    # 스동 진입 물량 결속 및 QQQ 기준가 스케일 점검 선행
-    await sync_manual_holdings_defense_lock(
-        context, holdings, prices, macro, dt_now
-    )
-
-    nq_amp = safe_float((macro or {}).get("nq_amp"), 0.0)
-    qqq_curr = await context.macro_cache.ensure_qqq_live_price(
-        safe_float((macro or {}).get("qqq_price"), 0.0)
-    )
-    is_overheated = bool(nq_amp >= NQ_OVERHEAT_THRESHOLD)
+        return {
+            "status": "RECONCILED_NEW_HOLDINGS_TO_1FL",
+            "qty": h_qty,
+            "avg_price": avg_p,
+        }
 
     # -----------------------------------------------------------------------
-    # [1차 방어선] NQ=F 진폭 >= 2.0% 과열 시 본진 미체결 매수 주문 즉시 파기
+    # [케이스 B] 원장에는 지층이 있으나 토스 계좌 실잔고가 0주(h_qty == 0)인 경우 (수동 전량 매도)
     # -----------------------------------------------------------------------
-    if is_overheated:
-        for sym in REAL_ALLOWED_SYMBOLS:
-            st = context.ledger.get_state(sym)
-            if not bool(st.get("is_active", True)):
-                continue
-            entry_sess = str(st.get("entry_session") or "")
-            # Case 95 & 96: 1주 휩소 작전(WHIPSAW_1SH)은 과열차단 독립 가동!
-            if entry_sess == "WHIPSAW_1SH":
-                continue
-
-            buy_oid = str(st.get("buy_order_id") or "").strip()
-            h_qty = safe_int((holdings or {}).get(sym, {}).get("qty"), 0)
-
-            if buy_oid and h_qty == 0:
-                try:
-                    await context.api.cancel_order(buy_oid)
-                except Exception as exc:
-                    logger.warning(
-                        "⚠️ [%s] 1차 과열방어 미체결 매수 취소 예외: %s",
-                        sym,
-                        exc,
-                    )
-
-                for s in REAL_ALLOWED_SYMBOLS:
-                    await context.ledger.update_state(
-                        s,
-                        buy_order_id="" if s == sym else context.ledger.get_state(s).get("buy_order_id", ""),
-                        ordered_qty=0 if s == sym else context.ledger.get_state(s).get("ordered_qty", 0),
-                        buy_price=0.0 if s == sym else context.ledger.get_state(s).get("buy_price", 0.0),
-                        entry_session="CANCELED_MACRO",
-                        is_session_done=True,
-                    )
-                if hasattr(context, "send_slim_alert"):
-                    await context.send_slim_alert(
-                        title=f"🛑 [1차 과열방어 발동 · 미체결 매수 파기] {sym}",
-                        body=f"NQ=F 당일 진폭 {nq_amp:.2f}% >= 2.00% 도달 · 본진 자동매수 영구 차단",
-                    )
-                return {"status": "STAGE1_CANCELED_BUY", "symbol": sym, "nq_amp": nq_amp}
-
-    # -----------------------------------------------------------------------
-    # [2차 & 3차 방어선] 보유 포지션(holdings_qty > 0) 정밀 방어 감시
-    # -----------------------------------------------------------------------
-    for sym in REAL_ALLOWED_SYMBOLS:
-        h_info = (holdings or {}).get(sym, {})
-        h_qty = safe_int(h_info.get("qty"), 0)
-        avg_p = safe_float(h_info.get("avg_price"), 0.0)
-        if h_qty <= 0 or avg_p <= 0.0:
-            continue
-
-        st = context.ledger.get_state(sym)
-        if not bool(st.get("is_active", True)):
-            continue
-
-        # 이미 트레일링 익절이 점화(armed)된 수익권 포지션은 sniper_exit_plugin 이 전담
-        t_state = getattr(context, "trail_runtime_cache", {}).get(sym, {})
-        if isinstance(t_state, dict) and t_state.get("armed"):
-            continue
-
-        live_p = safe_float(
-            (prices or {}).get(sym), safe_float(h_info.get("last_price"), avg_p)
+    if ledger_qty > 0 and h_qty == 0:
+        sold_cost = sum(b.actual_cost_usd for b in buckets)
+        ref_exit_p = (
+            live_p
+            if live_p > 0.0
+            else (
+                sold_cost / float(ledger_qty)
+                if ledger_qty > 0
+                else 0.0
+            )
         )
-        if live_p <= 0.0 or live_p >= avg_p:
-            # 수익 또는 본전 구간(live_p >= avg_p)에서는 2·3차 손절을 절대 발동하지 않는다
-            continue
+        pnl_info = calc_sell_realized_pnl(
+            sold_qty=ledger_qty,
+            sell_exec_price=ref_exit_p,
+            sold_actual_cost_usd=sold_cost,
+        )
+        net_pnl = pnl_info["net_pnl_usd"]
+        gross_pnl = pnl_info["gross_pnl_usd"]
+        fee_usd = pnl_info["fee_usd"]
 
-        entry_sess = str(st.get("entry_session") or "MANUAL")
-        if is_within_auto_fill_grace_shield(context, sym) and entry_sess == "MANUAL":
-            entry_sess = "PRE_VWAP_M050"
+        cum_gross = round(
+            safe_float(st.get("cumulative_realized_gross_usd"), 0.0)
+            + gross_pnl,
+            4,
+        )
+        cum_fee = round(
+            safe_float(st.get("cumulative_realized_fee_usd"), 0.0) + fee_usd, 4
+        )
+        cum_net = round(
+            safe_float(st.get("cumulative_realized_net_usd"), 0.0) + net_pnl, 4
+        )
+        day_net = round(
+            safe_float(st.get("daily_realized_net_usd"), 0.0) + net_pnl, 4
+        )
 
-        # -------------------------------------------------------------------
-        # [2차 방어선] 본진 자동 진입 물량 손실 구간 + NQ=F >= 2.0% 과열 즉시 덤핑
-        # (단, 수동 진입 MANUAL 및 1주 휩소 WHIPSAW_1SH 는 100% 패스!)
-        # -------------------------------------------------------------------
-        if is_overheated and entry_sess not in ("MANUAL", "WHIPSAW_1SH"):
-            bid1_p = await context.api.get_best_bid_price(
-                sym, fallback_price=live_p
+        updated_st = await context.ledger.update_state(
+            TARGET_SYMBOL,
+            buckets=[],
+            anchor_price=round(ref_exit_p, 4) if ref_exit_p > 0.0 else 0.0,
+            ratchet_anchor_price=(
+                round(ref_exit_p, 4) if ref_exit_p > 0.0 else 0.0
+            ),
+            sell_order_id="",
+            buy_order_id="",
+            ordered_qty=0,
+            pending_sell_mode="",
+            cumulative_realized_gross_usd=cum_gross,
+            cumulative_realized_fee_usd=cum_fee,
+            cumulative_realized_net_usd=cum_net,
+            daily_realized_net_usd=day_net,
+        )
+        logger.info(
+            "🧹 [SOXL 수동 전량매도 감지 ➔ 원장 0주 동기화] %d주 정산 (세후 %+.2f$, 가용현금 $%.2f)",
+            ledger_qty,
+            net_pnl,
+            safe_float(updated_st.get("free_cash_usd"), 0.0),
+        )
+        return {
+            "status": "RECONCILED_MANUAL_ZERO_EXIT",
+            "settled_qty": ledger_qty,
+            "net_pnl_usd": net_pnl,
+        }
+
+    # -----------------------------------------------------------------------
+    # [케이스 C] 원장 수량(ledger_qty)과 토스 실잔고(h_qty)가 부분 불일치하는 경우
+    # -----------------------------------------------------------------------
+    if h_qty > 0 and avg_p > 0.0:
+        total_actual_cost = round(float(h_qty) * avg_p, 4)
+        if len(buckets) >= 2 and h_qty > buckets[0].qty:
+            # 1층 수량은 그대로 유지하고 차이를 2층(MERGED_UPPER)에 반영
+            b1 = buckets[0]
+            b2_old = buckets[1]
+            new_b2_q = h_qty - b1.qty
+            b1_cost = min(total_actual_cost - 0.01, b1.actual_cost_usd)
+            b2_cost = max(0.01 * float(new_b2_q), total_actual_cost - b1_cost)
+            b2_book_p = min(b2_old.book_price, b2_cost / float(new_b2_q))
+            new_b2 = StratumBucket(
+                qty=new_b2_q,
+                book_price=round(b2_book_p, 4),
+                book_invested_usd=round(b2_book_p * float(new_b2_q), 4),
+                actual_cost_usd=round(b2_cost, 4),
+                lot_count=max(1, b2_old.lot_count),
+                lot_type="MERGED_UPPER",
             )
-            sweep_p = math.floor(min(live_p, bid1_p) * 100.0) / 100.0
-            await execute_bulletproof_sell_sweep(
-                context=context,
-                symbol=sym,
-                holdings_qty=h_qty,
-                sweep_price=sweep_p,
-                reason_tag="STAGE2_OVERHEAT_DUMP",
-            )
-            for s in REAL_ALLOWED_SYMBOLS:
-                await context.ledger.update_state(
-                    s,
-                    entry_session="CANCELED_MACRO",
-                    is_session_done=True,
+            adj_buckets = [b1, new_b2]
+        else:
+            # 단일 지층으로 깔끔하게 수량 및 원금 동기화 (리앵커링된 book_price 가 더 낮으면 보존)
+            old_b0 = buckets[0]
+            adj_book_p = min(old_b0.book_price, avg_p)
+            adj_buckets = [
+                StratumBucket(
+                    qty=h_qty,
+                    book_price=round(adj_book_p, 4),
+                    book_invested_usd=round(adj_book_p * float(h_qty), 4),
+                    actual_cost_usd=total_actual_cost,
+                    lot_count=max(1, sum(b.lot_count for b in buckets)),
+                    lot_type=old_b0.lot_type,
                 )
-            await reconcile_zero_holdings_exit_plugin(
-                context=context,
-                holdings={sym: {"qty": 0, "avg_price": 0.0}},
-                macro=macro,
-                now_est=dt_now,
-                override_exit_price=sweep_p,
-                override_exit_reason="STAGE2_OVERHEAT_DUMP",
-            )
-            return {
-                "status": "STAGE2_OVERHEAT_DUMPED",
-                "symbol": sym,
-                "sweep_price": sweep_p,
-                "nq_amp": nq_amp,
-            }
+            ]
 
-        # -------------------------------------------------------------------
-        # [3차 방어선] 실시간 QQQ 최소 0.80% 방향성 인지 역행 하드 스톱
-        # (포지션 자체 손실률 기반 즉시 손절 절대 금지!)
-        # -------------------------------------------------------------------
-        if qqq_curr <= 0.0:
-            continue
-
-        qqq_entry_p = safe_float(st.get("nq_entry_price"), 0.0)
-        nq_entry_amp = safe_float(st.get("nq_entry_amp"), nq_amp)
-        adv = calc_qqq_adverse_status(
-            symbol=sym,
-            qqq_entry_price=qqq_entry_p,
-            qqq_curr_price=qqq_curr,
-            nq_entry_amp=nq_entry_amp,
-            position_avg_price=avg_p,
-            position_live_price=live_p,
+        await context.ledger.update_state(
+            TARGET_SYMBOL,
+            buckets=buckets_to_dicts(adj_buckets),
         )
-
-        # 만약 장부의 qqq_entry_price 가 선물 스케일로 오염되어 있었다면 현재 QQQ 로 즉시 교정 후 패스
-        if not adv.get("scale_valid"):
-            await context.ledger.update_state(sym, nq_entry_price=qqq_curr)
-            continue
-
-        if adv.get("should_stop"):
-            bid1_p = await context.api.get_best_bid_price(
-                sym, fallback_price=live_p
-            )
-            sweep_p = math.floor(min(live_p, bid1_p) * 100.0) / 100.0
-            await execute_bulletproof_sell_sweep(
-                context=context,
-                symbol=sym,
-                holdings_qty=h_qty,
-                sweep_price=sweep_p,
-                reason_tag="STAGE3_QQQ_STOP",
-            )
-
-            # MODIFIED: 폐기된 RE_BOT_TRAIL 호출을 제거하고 당일 본진 세션 안전 마감(CANCELED_STAGE3) 직결
-            await reconcile_zero_holdings_exit_plugin(
-                context=context,
-                holdings={sym: {"qty": 0, "avg_price": 0.0}},
-                macro=macro,
-                now_est=dt_now,
-                override_exit_price=sweep_p,
-                override_exit_reason=(
-                    f"STAGE3_QQQ_STOP(QQQ역행 +{adv['adverse_move_pct']:.2f}% >= +{adv['dynamic_threshold_pct']:.2f}%)"
-                ),
-            )
-
-            if entry_sess != "WHIPSAW_1SH":
-                for s in REAL_ALLOWED_SYMBOLS:
-                    await context.ledger.update_state(
-                        s,
-                        entry_session="CANCELED_STAGE3",
-                        is_session_done=True,
-                    )
-
-            return {
-                "status": "STAGE3_QQQ_STOPPED",
-                "symbol": sym,
-                "sweep_price": sweep_p,
-                "adverse_move_pct": adv["adverse_move_pct"],
-                "threshold_pct": adv["dynamic_threshold_pct"],
-            }
-
-    return {"status": "DEFENSE_OK"}
-
-
-# ---------------------------------------------------------------------------
-# [핵심 4] 08:15 EST 거시지표 발표 15분 전 선제 컷오프 (Case 48)
-# ---------------------------------------------------------------------------
-async def enforce_0815_macro_cutoff_plugin(
-    context: Any,
-    holdings: Dict[str, Dict[str, Any]],
-    now_est: Optional[datetime] = None,
-) -> Dict[str, Any]:
-    """
-    🎯 5 & Case 48:
-    08:15:00 ~ 15:58:59 EST 구간에 도달하면 프리장 미체결 매수 주문(buy_order_id)을
-    즉시 선취소하고 당일 신규 자동 매수를 전면 마감(is_session_done = True)한다.
-    """
-    dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
-    hm = dt_now.hour * 100 + dt_now.minute
-    if not (815 <= hm <= 1558):
-        return {"status": "OUTSIDE_WINDOW"}
-
-    canceled_syms = []
-    for sym in REAL_ALLOWED_SYMBOLS:
-        st = context.ledger.get_state(sym)
-        buy_oid = str(st.get("buy_order_id") or "").strip()
-        h_qty = safe_int((holdings or {}).get(sym, {}).get("qty"), 0)
-
-        if buy_oid and h_qty == 0:
-            try:
-                await context.api.cancel_order(buy_oid)
-            except Exception as exc:
-                logger.warning(
-                    "⚠️ [%s] 08:15 컷오프 미체결 매수 취소 예외: %s", sym, exc
-                )
-            await context.ledger.update_state(
-                sym,
-                buy_order_id="",
-                ordered_qty=0,
-                buy_price=0.0,
-                is_session_done=True,
-            )
-            canceled_syms.append(sym)
-        elif not bool(st.get("is_session_done", False)):
-            await context.ledger.update_state(sym, is_session_done=True)
-
-    if canceled_syms and hasattr(context, "send_slim_alert"):
-        await context.send_slim_alert(
-            title=f"🔒 [08:15 EST 거시지표 선제 컷오프] {', '.join(canceled_syms)}",
-            body="미체결 매수덫 취소 완료 · 당일 신규 자동매수 마감 (보유분 트레일링/3차방어 유지)",
+        logger.info(
+            "🔄 [SOXL 지층 수량 정합성 보정] 원장 %d주 -> 실잔고 %d주 (평단 $%.2f)",
+            ledger_qty,
+            h_qty,
+            avg_p,
         )
+        return {
+            "status": "RECONCILED_PARTIAL_DIFF",
+            "old_qty": ledger_qty,
+            "new_qty": h_qty,
+        }
 
-    return {"status": "CUTOFF_ENFORCED", "canceled": canceled_syms}
+    return {"status": "RECONCILE_NO_ACTION"}
 
 
 # ---------------------------------------------------------------------------
-# [핵심 5] 15:00 ~ 15:58 EST 정규장 마감 1시간 전 미익절 정규장 VWAP 도달 탈출 (VWAP_ESCAPE)
+# [핵심 3] 04:00 ~ 04:06 EST 프리장 초기 호가 안정화 및 오버나이트 이월 동기화
 # ---------------------------------------------------------------------------
-async def execute_1500_vwap_escape_plugin(
+async def execute_0400_premarket_stabilization_plugin(
     context: Any,
     holdings: Dict[str, Dict[str, Any]],
     prices: Dict[str, float],
-    macro: Dict[str, Any],
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 5 & Case 101:
-    15:00:00 ~ 15:58:59 EST (정규장 마감 1시간 전)까지 아직 +1.00% 트레일링이 점화되지 않은
-    미익절 보유 물량(수동 포함)이 존재할 때, 해당 종목의 실시간 현재가가
-    당일 정규장(09:30 EST ~) 누적 VWAP(reg_vwap) 이상에 도달하면
-    즉시 매수 1호가 LIMIT 스윕으로 전량 탈출(VWAP_ESCAPE)한다.
+    🔹 04:00 ~ 04:06 EST:
+    프리장 개장 초기 호가 안정화 대기 구간에서:
+    1) 전일 세션에서 미처 정리되지 않은 잔류 주문 ID 가 있으면 거래소 OPEN 목록과 대조하여 청소한다.
+    2) 날짜가 변경되었으면 일일 결산 카운터(daily_*)를 0으로 초기화한다.
+    3) 오버나이트 이월된 SOXL 지층(1층 / 2층)과 토스 실보유 잔고의 무결성을 대조 동기화한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
-    if not (1500 <= hm <= 1558):
-        return {"status": "OUTSIDE_WINDOW"}
+    if not is_premarket_stabilization_window(hm):
+        return {"status": "OUTSIDE_0400_STABILIZATION_WINDOW"}
 
-    for sym in REAL_ALLOWED_SYMBOLS:
-        h_info = (holdings or {}).get(sym, {})
-        h_qty = safe_int(h_info.get("qty"), 0)
-        avg_p = safe_float(h_info.get("avg_price"), 0.0)
-        if h_qty <= 0 or avg_p <= 0.0:
-            continue
+    today_str = dt_now.strftime("%Y-%m-%d")
+    st = context.ledger.get_state(TARGET_SYMBOL)
 
-        st = context.ledger.get_state(sym)
-        if not bool(st.get("is_active", True)):
-            continue
+    # 새 거래일 진입 시 일일 통계 카운터 초기화
+    if str(st.get("last_evaluated_date") or "") != today_str:
+        await context.ledger.update_state(
+            TARGET_SYMBOL,
+            last_evaluated_date=today_str,
+            last_evaluated_buy_bucket_id=-1,
+            daily_realized_net_usd=0.0,
+            daily_buy_events=0,
+            daily_sell_events=0,
+            daily_seed_protect_pass_cnt=0,
+            daily_leftover_saved_usd=0.0,
+            daily_reanchor_cnt=0,
+        )
 
-        t_state = getattr(context, "trail_runtime_cache", {}).get(sym, {})
-        if isinstance(t_state, dict) and t_state.get("armed"):
-            continue
-
-        met = _get_live_symbol_metrics(context, sym, prices, dt_now)
-        live_p = safe_float(met.get("live_price"), 0.0)
-        reg_vwap = safe_float(met.get("reg_vwap"), 0.0)
-        if live_p <= 0.0 or reg_vwap <= 0.0:
-            continue
-
-        if live_p >= reg_vwap:
-            bid1_p = await context.api.get_best_bid_price(
-                sym, fallback_price=live_p
-            )
-            sweep_p = math.floor(min(live_p, bid1_p) * 100.0) / 100.0
-            await execute_bulletproof_sell_sweep(
-                context=context,
-                symbol=sym,
-                holdings_qty=h_qty,
-                sweep_price=sweep_p,
-                reason_tag="VWAP_ESCAPE",
-            )
-            await reconcile_zero_holdings_exit_plugin(
-                context=context,
-                holdings={sym: {"qty": 0, "avg_price": 0.0}},
-                macro=macro,
-                now_est=dt_now,
-                override_exit_price=sweep_p,
-                override_exit_reason=f"VWAP_ESCAPE(정규장VWAP ${reg_vwap:.2f} 도달 탈출)",
-            )
-            return {
-                "status": "VWAP_ESCAPE_EXECUTED",
-                "symbol": sym,
-                "sweep_price": sweep_p,
-                "reg_vwap": reg_vwap,
-            }
-
-    return {"status": "MONITORING_1500_VWAP"}
+    # 오버나이트 지층 ↔ 실잔고 무결성 화해
+    rec_res = await reconcile_stratum_with_broker_holdings_plugin(
+        context=context,
+        holdings=holdings,
+        prices=prices,
+        now_est=dt_now,
+    )
+    return {
+        "status": "PREMARKET_0400_STABILIZED",
+        "reconcile": rec_res,
+    }
 
 
 # ---------------------------------------------------------------------------
-# [핵심 6] 15:59 ~ 16:01 EST 제로-오버나이트 MOC 2단계 방탄 강제 청산 (Case 16, 24)
+# [핵심 4] 16:00 ~ 16:59 EST 정규장 마감 일일 결산 보고 및 오버나이트 지층 보존 (MOC 없음!)
 # ---------------------------------------------------------------------------
-async def execute_1559_moc_liquidation_plugin(
+async def execute_1600_daily_closing_settlement_plugin(
     context: Any,
     holdings: Dict[str, Dict[str, Any]],
     prices: Dict[str, float],
-    macro: Dict[str, Any],
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 5 & Case 10, 16, 24:
-    15:59:00 ~ 16:01:59 EST 구간에 도달하면(스나이퍼 가동 ON 상태 기준)
-    계좌에 남아 있는 모든 SOXS / SOXL 보유 물량 및 미체결 주문을
-    2단계 방탄 긴급 매도(modify_order 매수 1호가 정정 + 실패 시 선취소 후 신규 LIMIT 발사)로
-    100% 강제 청산하고 실발생 순수익금을 정산하여 제로-오버나이트를 사수한다.
+    🔹 16:00 ~ 16:59 EST:
+    정규장 마감 후:
+    1) 절대로 보유 지층을 강제 손절(MOC)하지 않고 100% 오버나이트 안전 보존한다!
+    2) 만약 장부에 미체결된 당일(DAY) 주문 ID 가 남아 있으면 안전하게 취소 정리한다.
+    3) 당일 세후 실현수익금, 자투리 절약액, 리앵커링 횟수, 🛡️시드보호패스 횟수 및
+       오버나이트 이월 지층 현황을 일일 결산 알림으로 단 1회 타전한다.
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
-    if not (1559 <= hm <= 1601):
-        return {"status": "OUTSIDE_WINDOW"}
+    if not is_daily_settlement_window(hm):
+        return {"status": "OUTSIDE_1600_SETTLEMENT_WINDOW"}
 
-    liquidated_syms = []
-    for sym in REAL_ALLOWED_SYMBOLS:
-        st = context.ledger.get_state(sym)
-        if not bool(st.get("is_active", True)):
-            continue
+    today_str = get_logical_trading_date_str(dt_now, rollover_hour=18)
+    st = context.ledger.get_state(TARGET_SYMBOL)
 
-        buy_oid = str(st.get("buy_order_id") or "").strip()
-        if buy_oid:
+    # 미체결 잔류 주문이 있으면 취소 및 클리어
+    for oid_key in ("buy_order_id", "sell_order_id"):
+        oid = str(st.get(oid_key) or "").strip()
+        if oid:
             try:
-                await context.api.cancel_order(buy_oid)
+                await context.api.cancel_order(oid)
             except Exception:
                 pass
             await context.ledger.update_state(
-                sym, buy_order_id="", ordered_qty=0
+                TARGET_SYMBOL,
+                buy_order_id="" if oid_key == "buy_order_id" else st.get("buy_order_id", ""),
+                sell_order_id="" if oid_key == "sell_order_id" else st.get("sell_order_id", ""),
+                ordered_qty=0,
+                pending_sell_mode="",
             )
 
-        h_info = (holdings or {}).get(sym, {})
-        h_qty = safe_int(h_info.get("qty"), 0)
-        avg_p = safe_float(h_info.get("avg_price"), 0.0)
-        if h_qty <= 0:
-            continue
+    if str(st.get("last_daily_report_date") or "") == today_str:
+        return {"status": "DAILY_REPORT_ALREADY_SENT", "date": today_str}
 
-        live_p = safe_float(
-            (prices or {}).get(sym), safe_float(h_info.get("last_price"), avg_p)
-        )
-        bid1_p = await context.api.get_best_bid_price(
-            sym, fallback_price=live_p
-        )
-        # 체결 100% 보장을 위해 매수 1호가 대비 0.2% 공격적 하향 지정가(최소 $0.01) 투하
-        moc_sweep_p = (
-            math.floor((min(live_p, bid1_p) * 0.9980) * 100.0) / 100.0
-            if bid1_p > 0.0
-            else math.floor(live_p * 100.0) / 100.0
-        )
-        moc_sweep_p = max(0.01, moc_sweep_p)
+    live_p = _get_live_soxl_price(context, prices, holdings, dt_now)
+    st_latest = await context.ledger.update_state(
+        TARGET_SYMBOL,
+        last_daily_report_date=today_str,
+    )
+    summary = summarize_stratum_portfolio(st_latest, live_price=live_p)
 
-        await execute_bulletproof_sell_sweep(
-            context=context,
-            symbol=sym,
-            holdings_qty=h_qty,
-            sweep_price=moc_sweep_p,
-            reason_tag="MOC_ZERO_OVERNIGHT",
-        )
-        await context.ledger.update_state(sym, is_session_done=True)
-        await reconcile_zero_holdings_exit_plugin(
-            context=context,
-            holdings={sym: {"qty": 0, "avg_price": 0.0}},
-            macro=macro,
-            now_est=dt_now,
-            override_exit_price=moc_sweep_p,
-            override_exit_reason="MOC_ZERO_OVERNIGHT(15:59 제로-오버나이트 강제청산)",
-        )
-        liquidated_syms.append(sym)
+    day_net = safe_float(st_latest.get("daily_realized_net_usd"), 0.0)
+    day_buys = safe_int(st_latest.get("daily_buy_events"), 0)
+    day_sells = safe_int(st_latest.get("daily_sell_events"), 0)
+    day_pass = safe_int(st_latest.get("daily_seed_protect_pass_cnt"), 0)
+    day_saved = safe_float(st_latest.get("daily_leftover_saved_usd"), 0.0)
+    day_reanchor = safe_int(st_latest.get("daily_reanchor_cnt"), 0)
 
-    return {"status": "MOC_CHECKED", "liquidated": liquidated_syms}
+    held_sh = safe_int(summary.get("held_shares"), 0)
+    held_lots = safe_int(summary.get("held_lots"), 0)
+    free_cash = safe_float(summary.get("free_cash_usd"), 0.0)
+    tot_eq = safe_float(summary.get("total_mark_equity_usd"), 0.0)
+    tot_roi = safe_float(summary.get("total_roi_pct"), 0.0)
+
+    if hasattr(context, "send_slim_alert"):
+        d_sign = "+" if day_net >= 0.0 else "-"
+        r_sign = "+" if tot_roi >= 0.0 else ""
+        await context.send_slim_alert(
+            title=(
+                f"🌙 [16:00 EST 일일 결산 & 오버나이트 지층 보존] "
+                f"금일실현 {d_sign}${abs(day_net):,.2f}"
+            ),
+            body=(
+                f"매수 {day_buys}회 · 매도 {day_sells}회 · ♻️리앵커 {day_reanchor}회 · "
+                f"🛡️시드보호패스 {day_pass}회 · 자투리절약 +${day_saved:,.2f} · "
+                f"이월보유 {held_sh}주({held_lots}회차) · 가용현금 ${free_cash:,.2f} "
+                f"· 총자산 ${tot_eq:,.2f}({r_sign}{tot_roi:.1f}%)"
+            ),
+        )
+
+    return {
+        "status": "DAILY_CLOSING_REPORT_SENT",
+        "date": today_str,
+        "daily_realized_net_usd": day_net,
+        "held_shares": held_sh,
+        "free_cash_usd": free_cash,
+    }
+
+
+# 하위 호환 별칭 (타 모듈에서 구 함수명으로 호출하더라도 안전하게 작동)
+relock_qqq_baseline_on_bot_resume = relock_stratum_on_bot_resume
+execute_macro_3stage_defense_plugin = reconcile_stratum_with_broker_holdings_plugin

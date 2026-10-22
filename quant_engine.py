@@ -1,619 +1,631 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: quant_engine.py
-나스닥 100 선물(NQ=F · 18:00 EST 신세션 하드 컷오프 시 전일 fast_info/1d 잔재 혼입 100% 차단·자가 치유
-및 17:00 ~ 17:59 EST 마감 휴장 중 직전 마감 세션 고/저가·마감가 단조 보존) &
-토스 Open API QQQ 0.0초 실시간 시세 기반 3차 방향성 인지 역행 방어망 &
-실시간 QQQ 10m/3m ±0.20% 급등락 시 HA음봉 바이패스(🚀 NQ_VEL_BYPASS) 코어 엔진 (Step 02 / 03)
-- 제1헌법: yfinance 외부 I/O의 asyncio.to_thread 비동기 격리 및 타임아웃 강제
-- 제4헌법: 모든 논리 시계열 ZoneInfo('America/New_York') 단일 소스 락온
-- 🎯 4 & 🎯 5 & Case 61, 62, 66, 91, 92, 93, 94 완벽 구현
+순수 롱(SOXL) 전용 '8%(12.5분할) 황금비율 정액제 기반 정량 산출기 · 자투리/수익금 복리 산입 ·
+보유 회차별 3단 점진 단차(1~6회 -1.0% / 7~11회 -1.5% / 12회+ -2.0%) ·
+프롬프트 2-Tier 가중평균 자동 병합(Case 53 하드 캡핑) · 단일 지층 수익금 리앵커링(0.994 버퍼) ·
+실물 원가(actual_cost_usd) 분리 회계 및 TDD 사전 무결성 검증' 코어 수리 엔진 (Step 03 / 09)
+- MODIFIED: 제3헌법에 의거하여 구버전 NQ=F 과열 덤핑 및 QQQ 3차 역행 손절 데드코드를 100% 영구 소각
+- NEW: 5개년(2022 ~ 2026년 · 846,512분봉) 백테스트 챔피언(👑 06_CMP08_10_01 & 🔥 08_CMP08_30_01 & 🛡️ 01_FIX08_10_10)
+  수리 모델을 실전 원장(AssassinLedger)과 1:1 직결
+- 제1헌법 ~ 제6헌법 및 Case 19, 23, 25 ~ 58 완벽 준수
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import threading
-import time
-from collections import deque
-from datetime import datetime, time as dt_time, timedelta
-from typing import Any, Deque, Dict, Optional, Tuple
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import pandas as pd
-import yfinance as yf
-
-from quant_indicators_plugin import get_logical_trading_date_str
-from toss_api import EST_TZ, safe_float
+from toss_api import (
+    DEFAULT_INITIAL_SEED_USD,
+    PORTION_RATIO_LOCKED,
+    safe_float,
+    safe_int,
+)
 
 logger = logging.getLogger("toss_sniper.quant_engine")
 
 # ---------------------------------------------------------------------------
-# 🎯 5 : 매크로 3단 방어망 및 실시간 QQQ 급등락 바이패스 핵심 상수
+# 📈 핵심 퀀트 상수 (5개년 백테스트 검증 황금 파라미터 락온)
 # ---------------------------------------------------------------------------
-NQ_OVERHEAT_THRESHOLD: float = 2.00          # 1·2차 매크로 과열 방어 임계치 (NQ=F 당일 진폭 2.00%)
-MIN_QQQ_ADVERSE_STOP_PCT: float = 0.80       # 3차 실시간 QQQ 역행 방어 최소 하한선 (0.80%)
-STAGE3_AMP_MULTIPLIER: float = 0.50          # 3차 동적 임계치 산출용 선물 진폭 가중치 (진폭 * 0.50)
-NQ_VEL_BYPASS_THRESHOLD_PCT: float = 0.20    # 실시간 QQQ 10m/3m 급등락 HA음봉 바이패스 임계치 (±0.20%)
+GOLDEN_PORTION_RATIO: float = PORTION_RATIO_LOCKED  # 0.08 (8% · 12.5분할 황금비율 고정)
+BASE_MAX_LOTS_8PCT: int = 12                        # 8% 분할 기본 회차 (13회차부터 확장 매수로 집계)
+TIER1_EXPAND_LOT: int = 7                           # 7 ~ 11회차: -1.50% 매수 단차 확장
+TIER2_EXPAND_LOT: int = 12                          # 12회차 이상: -2.00% 매수 단차 확장
 
-# 캐시 유효 주기 상수 (Case 61: NQ=F 15.0초 캐싱, 보유 중 QQQ 1.5초 프로빙)
-NQ_CACHE_TTL_SEC: float = 15.0
-QQQ_ACTIVE_PROBE_TTL_SEC: float = 1.5
-QQQ_IDLE_PROBE_TTL_SEC: float = 5.0
+ROUND_TRIP_FEE_RATE: float = 0.0014                 # 토스증권 해외주식 왕복 수수료율 (0.14% = 편도 0.07% * 2)
+ROUND_TRIP_FEE_RATE_PCT: float = 0.14               # 왕복 수수료 퍼센트 (0.14%)
+REANCHOR_NET_BUFFER_MULT: float = 0.994             # 리앵커링 순수 회수금 안전 버퍼 (0.6% 차감 = * 0.994)
 
 
 # ---------------------------------------------------------------------------
-# 순수 함수 : QQQ 스케일 검증 · 3차 동적 임계치 · 방향성 인지 3차 역행 판정기
+# 🎯 3 : StratumBucket (실제 매수 원가와 리앵커링 장부 목표 단가의 분리 회계 객체)
 # ---------------------------------------------------------------------------
-def is_qqq_scale_valid(price: float) -> bool:
+@dataclass
+class StratumBucket:
     """
-    🚨 Case 93:
-    3차 방어 기준가(nq_entry_price)에 NQ=F 선물 지수(약 15,000 ~ 25,000)나 0.0 이
-    오염되어 들어가는 것을 차단하기 위해 QQQ 유효 가격 스케일(100.0 ~ 2,000.0 USD)을 검증한다.
+    🎯 3 & Case 46 ~ 58:
+    실제 현금 시드에서 지출된 순수 매수 원금(actual_cost_usd)과
+    리앵커링 목표 매도 판정용 장부 단가(book_price) / 장부 투자금(book_invested_usd)을
+    엄격히 분리 보존하는 지층 데이터 클래스.
     """
-    p = safe_float(price, 0.0)
-    return bool(100.0 <= p < 2000.0)
+    qty: int
+    book_price: float
+    book_invested_usd: float
+    actual_cost_usd: float
+    lot_count: int = 1
+    lot_type: str = "QUOTA_L1"
 
+    @property
+    def actual_avg_price(self) -> float:
+        if self.qty <= 0:
+            return 0.0
+        return round(self.actual_cost_usd / float(self.qty), 4)
 
-def calc_dynamic_stage3_threshold(nq_entry_amp: float) -> float:
-    """
-    🎯 5: 3차 역행 방어 동적 임계치 산출 공식
-    dynamic_threshold = max(nq_entry_amp * 0.5, 0.80%)
-    """
-    amp = max(0.0, safe_float(nq_entry_amp, 0.0))
-    return round(max(amp * STAGE3_AMP_MULTIPLIER, MIN_QQQ_ADVERSE_STOP_PCT), 4)
-
-
-def calc_qqq_adverse_status(
-    symbol: str,
-    qqq_entry_price: float,
-    qqq_curr_price: float,
-    nq_entry_amp: float,
-    position_avg_price: float = 0.0,
-    position_live_price: float = 0.0,
-) -> Dict[str, Any]:
-    """
-    🎯 5 & Case 66, 92, 93, 94:
-    - 보유 포지션 자체의 평가손실률(-0.80% 등)로 즉시 손절하는 것을 100% 금지한다!
-    - 오직 포지션이 평가손실 구간(0 < position_live_price < position_avg_price)에 있다는 전제 하에,
-      진입(또는 수동 ON 락온) 시점의 실시간 QQQ 기준가(qqq_entry_price) 대비
-      현재 실시간 QQQ 가격(qqq_curr_price)이 반대 방향으로 dynamic_threshold = max(nq_entry_amp * 0.5, 0.80%)
-      이상 역행했을 때만 should_stop = True 를 반환한다.
-      * SOXS (숏) 보유 시: QQQ 가 기준가 대비 +dynamic_threshold 이상 상승하면 역행
-      * SOXL (롱) 보유 시: QQQ 가 기준가 대비 -dynamic_threshold 이하 하락하면 역행 (역행폭 양수 환산)
-    """
-    sym = str(symbol or "SOXS").upper().strip()
-    ref_entry = safe_float(qqq_entry_price, 0.0)
-    ref_curr = safe_float(qqq_curr_price, 0.0)
-    dyn_thr = calc_dynamic_stage3_threshold(nq_entry_amp)
-
-    avg_p = safe_float(position_avg_price, 0.0)
-    live_p = safe_float(position_live_price, 0.0)
-    in_loss_zone = bool(0.0 < live_p < avg_p) if (avg_p > 0.0 and live_p > 0.0) else True
-
-    scale_ok = bool(is_qqq_scale_valid(ref_entry) and is_qqq_scale_valid(ref_curr))
-    if not scale_ok or ref_entry <= 0.0 or ref_curr <= 0.0:
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            "symbol": sym,
-            "scale_valid": False,
-            "in_loss_zone": in_loss_zone,
-            "qqq_entry_price": ref_entry,
-            "qqq_curr_price": ref_curr,
-            "raw_qqq_chg_pct": 0.0,
-            "adverse_move_pct": 0.0,
-            "dynamic_threshold_pct": dyn_thr,
-            "should_stop": False,
+            "qty": int(self.qty),
+            "book_price": round(float(self.book_price), 4),
+            "book_invested_usd": round(float(self.book_invested_usd), 4),
+            "actual_cost_usd": round(float(self.actual_cost_usd), 4),
+            "lot_count": max(1, int(self.lot_count)),
+            "lot_type": str(self.lot_type or "QUOTA_L1"),
         }
 
-    raw_chg_pct = ((ref_curr - ref_entry) / ref_entry) * 100.0
-    # SOXS 는 QQQ 상승(+)이 역행, SOXL 은 QQQ 하락(-)이 역행
-    adverse_pct = raw_chg_pct if sym == "SOXS" else (-raw_chg_pct)
-    should_stop = bool(in_loss_zone and (adverse_pct >= dyn_thr))
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> Optional["StratumBucket"]:
+        if not isinstance(data, dict):
+            return None
+        q = safe_int(data.get("qty"), 0)
+        if q <= 0:
+            return None
+        bp = max(0.01, safe_float(data.get("book_price"), 0.01))
+        binv = max(
+            0.01 * float(q),
+            safe_float(data.get("book_invested_usd"), bp * float(q)),
+        )
+        acost = max(
+            0.01 * float(q),
+            safe_float(data.get("actual_cost_usd"), binv),
+        )
+        lcnt = max(1, safe_int(data.get("lot_count"), 1))
+        ltype = str(data.get("lot_type") or "QUOTA_L1").strip()
+        return cls(
+            qty=q,
+            book_price=round(bp, 4),
+            book_invested_usd=round(binv, 4),
+            actual_cost_usd=round(acost, 4),
+            lot_count=lcnt,
+            lot_type=ltype,
+        )
+
+
+def buckets_from_dicts(raw_list: Iterable[Any]) -> List[StratumBucket]:
+    """
+    원장(JSON)의 딕셔너리 리스트를 StratumBucket 객체 리스트로 안전하게 변환한다.
+    """
+    out: List[StratumBucket] = []
+    if not isinstance(raw_list, Iterable):
+        return out
+    for item in raw_list:
+        if isinstance(item, StratumBucket):
+            if item.qty > 0:
+                out.append(item)
+        elif isinstance(item, dict):
+            b_obj = StratumBucket.from_dict(item)
+            if b_obj is not None:
+                out.append(b_obj)
+    return out
+
+
+def buckets_to_dicts(buckets: Iterable[StratumBucket]) -> List[Dict[str, Any]]:
+    """
+    StratumBucket 객체 리스트를 JSON 직렬화 가능한 딕셔너리 리스트로 변환한다.
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(buckets, Iterable):
+        return out
+    for b in buckets:
+        if isinstance(b, StratumBucket) and b.qty > 0:
+            out.append(b.to_dict())
+        elif isinstance(b, dict):
+            b_obj = StratumBucket.from_dict(b)
+            if b_obj is not None:
+                out.append(b_obj.to_dict())
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 🎯 1 : 8%(12.5분할) 황금비율 정액제 기반 정량 산출기 및 가용 현금 캡핑
+# ---------------------------------------------------------------------------
+def compute_golden8_quota_qty(
+    anchor_price: float,
+    current_total_equity: float,
+    initial_seed_usd: float = DEFAULT_INITIAL_SEED_USD,
+    portion_mode: str = "COMP_08PCT",
+) -> Tuple[int, float]:
+    """
+    🎯 1 & Case 25:
+    [8%(12.5분할) 황금비율 고정 기반 정량 산출 공식]
+    1) 1회분 기준 예산(portion_budget) 산출:
+       - COMP_08PCT : max(initial_seed_usd, current_total_equity) * 0.08 (총자산 비례 동적 복리 증액)
+       - FIXED_800  : initial_seed_usd * 0.08 (원금 고정 안정 모드, 기본 $800.00 고정)
+    2) 직전 매매 기준가격(anchor_price)을 기반으로 다음 매수할 고정 정수 수량(target_qty) 선행 확정:
+       target_qty = max(1, int(math.floor(portion_budget / max(0.01, anchor_price))))
+       * 하락장에서는 낮은 anchor_price 로 인해 target_qty 가 자동 증가(다량 매수)하고,
+       * 상승장에서는 높은 anchor_price 로 인해 target_qty 가 자동 감소(소수 매수)한다.
+    """
+    init_seed = max(100.0, safe_float(initial_seed_usd, DEFAULT_INITIAL_SEED_USD))
+    base_unit_usd = round(init_seed * GOLDEN_PORTION_RATIO, 4)
+
+    mode = str(portion_mode or "COMP_08PCT").upper().strip()
+    if mode == "COMP_08PCT":
+        eff_equity = max(init_seed, safe_float(current_total_equity, init_seed))
+        portion_budget = round(eff_equity * GOLDEN_PORTION_RATIO, 4)
+    else:
+        portion_budget = base_unit_usd
+
+    ref_p = max(0.01, safe_float(anchor_price, 0.01))
+    target_qty = max(1, int(math.floor((portion_budget + 1e-9) / ref_p)))
+    return target_qty, portion_budget
+
+
+def resolve_affordable_buy_qty(
+    target_qty: int,
+    price_t: float,
+    free_cash_usd: float,
+    broker_buying_power_usd: Optional[float] = None,
+) -> Tuple[int, float]:
+    """
+    🚨 Case 25:
+    가용 현금 시드(free_cash_usd, 그리고 토스 실제 USD 매수가능금액 broker_buying_power_usd 제공 시 둘 중 작은 값)
+    내에서 목표 정량(target_qty)을 매수할 수 있는지 확인하고,
+    현금이 부족할 경우 남은 현금으로 살 수 있는 최대 정수 주수(max_affordable)로 안전 캡핑한다.
+    왕복 수수료(0.14%) 버퍼를 반영하여 미수 주문 거절(422 insufficient-buying-power)을 100% 원천 차단한다.
+    """
+    t_qty = safe_int(target_qty, 0)
+    exec_p = safe_float(price_t, 0.0)
+    avail_cash = max(0.0, safe_float(free_cash_usd, 0.0))
+
+    if broker_buying_power_usd is not None and safe_float(broker_buying_power_usd, 0.0) > 0.0:
+        avail_cash = min(avail_cash, safe_float(broker_buying_power_usd, 0.0))
+
+    if t_qty <= 0 or exec_p <= 0.0 or avail_cash <= 0.0:
+        return 0, 0.0
+
+    unit_cost_with_fee = exec_p * (1.0 + ROUND_TRIP_FEE_RATE)
+    max_affordable = int(math.floor((avail_cash + 1e-9) / unit_cost_with_fee))
+    if max_affordable <= 0:
+        return 0, 0.0
+
+    final_qty = min(t_qty, max_affordable)
+    actual_spent_usd = round(float(final_qty) * exec_p, 4)
+    return final_qty, actual_spent_usd
+
+
+# ---------------------------------------------------------------------------
+# 🎯 2 : 보유 회차(held_lots)에 따른 3단 점진 단차 및 스나이퍼 매도 목표율 산출기
+# ---------------------------------------------------------------------------
+def get_golden8_prog_thresholds(
+    held_lots: int,
+    threshold_mode: str = "08_VREV_PROG",
+) -> Tuple[float, float, float]:
+    """
+    🎯 2 [Step 1 & Step 2]:
+    8%(12.5분할) 황금비율 기준 현재 보유 회차(held_lots)에 따른
+    (drop_buy_pct, rise_sell_l1_pct, rise_sell_l2_pct) 튜플을 반환한다.
+    - 매수(떨사) 요구 하락률 (전 모드 공통):
+      * 1 ~  6회차 보유 중 : -1.00% 이하 하락 시에만 매수 (미달 시 100% 매수 패스하여 시드 보호!)
+      * 7 ~ 11회차 보유 중 : -1.50% 이하 하락 시에만 매수
+      * 12회차 이상 보유 중: -2.00% 이하 하락 시에만 매수
+    - 매도(오팔) 목표 상승률:
+      * 08_VREV_PROG (복리 챔피언 기본값) : 1층 +1.50% / 2층 통합층 +1.00%
+      * 01_PROG_LOT  (고정 정량 선택 시)  : 1~6회차 +1.00% / 7~11회차 +1.50% / 12회차+ +2.00%
+    """
+    lots = max(0, safe_int(held_lots, 0))
+    t_mode = str(threshold_mode or "08_VREV_PROG").upper().strip()
+
+    if lots >= TIER2_EXPAND_LOT:
+        drop_p = -2.00
+    elif lots >= TIER1_EXPAND_LOT:
+        drop_p = -1.50
+    else:
+        drop_p = -1.00
+
+    if t_mode == "01_PROG_LOT":
+        sell_p = abs(drop_p)
+        return drop_p, sell_p, sell_p
+
+    # 기본 챔피언 모드: 08_VREV_PROG (1층 +1.50%, 2층 +1.00%)
+    return drop_p, 1.50, 1.00
+
+
+def calc_target_sell_prices_for_buckets(
+    buckets: List[StratumBucket],
+    threshold_mode: str = "08_VREV_PROG",
+) -> Dict[str, float]:
+    """
+    현재 지층 큐(buckets)의 보유 회차 및 장부 단가(book_price)를 기반으로
+    1층 목표 매도가(l1_target_price)와 2층 목표 매도가(l2_target_price)를 산출한다.
+    """
+    clean_b = buckets_from_dicts(buckets)
+    if not clean_b:
+        return {
+            "drop_buy_pct": -1.00,
+            "rise_sell_l1_pct": 1.50,
+            "rise_sell_l2_pct": 1.00,
+            "l1_book_price": 0.0,
+            "l1_target_price": 0.0,
+            "l2_book_price": 0.0,
+            "l2_target_price": 0.0,
+        }
+
+    held_lots = sum(b.lot_count for b in clean_b)
+    drop_p, sell_l1_p, sell_l2_p = get_golden8_prog_thresholds(
+        held_lots=held_lots, threshold_mode=threshold_mode
+    )
+
+    # 만약 장부에 2층(MERGED_UPPER) 단독 1개만 남아 있는 상태라면 해당 층의 탈출 목표율은 sell_l2_p 적용
+    if len(clean_b) == 1 and clean_b[0].lot_type == "MERGED_UPPER":
+        b2 = clean_b[0]
+        t2 = round(b2.book_price * (1.0 + sell_l2_p / 100.0), 4)
+        return {
+            "drop_buy_pct": drop_p,
+            "rise_sell_l1_pct": sell_l1_p,
+            "rise_sell_l2_pct": sell_l2_p,
+            "l1_book_price": 0.0,
+            "l1_target_price": 0.0,
+            "l2_book_price": b2.book_price,
+            "l2_target_price": t2,
+        }
+
+    b1 = clean_b[0]
+    t1 = round(b1.book_price * (1.0 + sell_l1_p / 100.0), 4)
+    l2_bp = 0.0
+    t2 = 0.0
+    if len(clean_b) >= 2:
+        b2 = clean_b[1]
+        l2_bp = b2.book_price
+        t2 = round(b2.book_price * (1.0 + sell_l2_p / 100.0), 4)
 
     return {
-        "symbol": sym,
-        "scale_valid": True,
-        "in_loss_zone": in_loss_zone,
-        "qqq_entry_price": round(ref_entry, 4),
-        "qqq_curr_price": round(ref_curr, 4),
-        "raw_qqq_chg_pct": round(raw_chg_pct, 4),
-        "adverse_move_pct": round(adverse_pct, 4),
-        "dynamic_threshold_pct": round(dyn_thr, 4),
-        "should_stop": should_stop,
+        "drop_buy_pct": drop_p,
+        "rise_sell_l1_pct": sell_l1_p,
+        "rise_sell_l2_pct": sell_l2_p,
+        "l1_book_price": b1.book_price,
+        "l1_target_price": t1,
+        "l2_book_price": l2_bp,
+        "l2_target_price": t2,
     }
 
 
 # ---------------------------------------------------------------------------
-# CME 선물 세션(18:00 EST 오픈 ~ 익일 17:00 EST 마감) 경계 시각 계산 헬퍼
+# 🎯 3 : 프롬프트 2-Tier Auto-Merge Protocol & 단일 지층 수익금 리앵커링
 # ---------------------------------------------------------------------------
-def _get_cme_session_bounds_est(now_est: datetime) -> Tuple[datetime, datetime, bool]:
+def vrev_add_quota_lot_and_merge_2tier(
+    queue: List[StratumBucket],
+    buy_qty: int,
+    buy_price: float,
+    actual_spent_usd: Optional[float] = None,
+    lot_type: str = "QUOTA_L1",
+) -> List[StratumBucket]:
     """
-    현재 EST 시각을 기준으로:
-    - 현재 진행 중인 CME 선물 세션의 시작 시각(session_start_est, 18:00:00 EST),
-    - 직전 마감된 CME 선물 세션의 시작 시각(prev_session_start_est),
-    - 현재가 17:00 ~ 17:59 EST 마감 휴장 또는 주말 휴장 구간인지 여부(is_break_or_weekend)를 반환한다.
+    🎯 3 & Case 46, 53:
+    [프롬프트 2-Tier Auto-Merge Protocol & Case 53 풍선효과 방지 상한 하드 캡핑]
+    1) 방금 가장 낮은 가격(buy_price)에 매수한 정량 묶음(buy_qty 주)은 무조건
+       새로운 1층(queue[0])으로 배치하고 순수 체결 단가를 100% 보존한다.
+    2) 기존에 보유 중이던 모든 지층들은 단일 상위 통합층인 2층(queue[1], lot_type="MERGED_UPPER")으로
+       수량, 장부 투자금, 실제 매수 원금, 회차를 원자적으로 합산하며,
+       2층의 장부 단가가 기존 전체 장부 평단가를 초과하지 않도록 하드 캡핑(Case 53)한다.
     """
-    dt = now_est.astimezone(EST_TZ)
-    wd = dt.weekday()  # 0=Mon ... 4=Fri, 5=Sat, 6=Sun
-    hm = dt.hour * 100 + dt.minute
-
-    is_weekend = bool(
-        (wd == 4 and hm >= 1700) or (wd == 5) or (wd == 6 and hm < 1800)
+    existing = buckets_from_dicts(queue)
+    q_int = max(1, safe_int(buy_qty, 1))
+    bp = max(0.01, safe_float(buy_price, 0.01))
+    cost_usd = (
+        round(max(0.01 * float(q_int), safe_float(actual_spent_usd, 0.0)), 4)
+        if (actual_spent_usd is not None and safe_float(actual_spent_usd, 0.0) > 0.0)
+        else round(float(q_int) * bp, 4)
     )
-    is_daily_break = bool(1700 <= hm <= 1759)
-    is_break_or_weekend = bool(is_weekend or is_daily_break)
 
-    if dt.hour >= 18:
-        sess_start_date = dt.date()
-    elif dt.hour == 17 or is_weekend:
-        # 17:00 ~ 17:59 마감 휴장 또는 주말에는 직전 마감 세션의 시작일(전일 18:00 EST)을 기준으로 조회
-        days_back = 1
-        if wd == 5:
-            days_back = 2
-        elif wd == 6 and dt.hour < 18:
-            days_back = 3
-        sess_start_date = dt.date() - timedelta(days=days_back)
-    else:
-        sess_start_date = dt.date() - timedelta(days=1)
-
-    session_start_est = datetime.combine(
-        sess_start_date, dt_time(18, 0, 0), tzinfo=EST_TZ
+    new_l1 = StratumBucket(
+        qty=q_int,
+        book_price=round(bp, 4),
+        book_invested_usd=cost_usd,
+        actual_cost_usd=cost_usd,
+        lot_count=1,
+        lot_type=str(lot_type or "QUOTA_L1"),
     )
-    prev_session_start_est = session_start_est - timedelta(days=1)
-    return session_start_est, prev_session_start_est, is_break_or_weekend
+    if not existing:
+        return [new_l1]
+
+    old_total_qty = sum(b.qty for b in existing if b.qty > 0)
+    if old_total_qty <= 0:
+        return [new_l1]
+
+    old_book_inv = sum(b.book_invested_usd for b in existing if b.qty > 0)
+    old_actual_cost = sum(b.actual_cost_usd for b in existing if b.qty > 0)
+    old_lot_cnt = sum(b.lot_count for b in existing if b.qty > 0)
+    old_overall_book_avg = old_book_inv / float(old_total_qty)
+
+    raw_upper_book_p = max(0.01, old_book_inv / float(old_total_qty))
+    capped_upper_book_p = min(raw_upper_book_p, old_overall_book_avg)
+    capped_upper_book_inv = capped_upper_book_p * float(old_total_qty)
+
+    merged_l2 = StratumBucket(
+        qty=old_total_qty,
+        book_price=round(capped_upper_book_p, 4),
+        book_invested_usd=round(capped_upper_book_inv, 4),
+        actual_cost_usd=round(old_actual_cost, 4),
+        lot_count=max(1, old_lot_cnt),
+        lot_type="MERGED_UPPER",
+    )
+    return [new_l1, merged_l2]
+
+
+def vrev_reanchor_single_tier_quota(
+    queue: List[StratumBucket],
+    net_realized_cash_profit: float,
+) -> Tuple[List[StratumBucket], float]:
+    """
+    🎯 3 & Case 47:
+    [단일 지층 수익금 리앵커링 (Re-anchoring)]
+    1층(하부 공격수)이 익절 매도되어 장부에 상위 통합층인 2층(단일 지층, len(queue) == 1)만 남았을 때,
+    회수된 세후 실현 순수익금(net_realized_cash_profit)에 안전 버퍼(0.994)를 곱한 금액(credit_usd)만큼
+    잔여 2층의 장부 투자원금(book_invested_usd)만 즉시 차감하여 목표 탈출 단가(book_price)를 인하한다.
+    (실제 매수 원금 actual_cost_usd 는 절대 건드리지 않아 회계 무결성을 100% 보존한다!)
+    """
+    existing = buckets_from_dicts(queue)
+    if (
+        len(existing) != 1
+        or existing[0].qty <= 0
+        or safe_float(net_realized_cash_profit, 0.0) <= 0.0
+    ):
+        return existing, 0.0
+
+    rem = existing[0]
+    credit_usd = max(
+        0.0,
+        safe_float(net_realized_cash_profit, 0.0) * REANCHOR_NET_BUFFER_MULT,
+    )
+    old_book_p = rem.book_price
+
+    new_book_inv = max(
+        0.01 * float(rem.qty), rem.book_invested_usd - credit_usd
+    )
+    new_pure_price = max(0.01, new_book_inv / float(rem.qty))
+    rem.book_invested_usd = round(new_book_inv, 4)
+    rem.book_price = round(new_pure_price, 4)
+    price_drop_amt = round(max(0.0, old_book_p - rem.book_price), 4)
+    return [rem], price_drop_amt
 
 
 # ---------------------------------------------------------------------------
-# MacroDataCache : NQ=F 18:00 신세션 자가 치유 캐시 & 토스 QQQ 0.0초 실시간 시세/속도 추적기
+# 🎯 5 : 매도 세후 실현손익 산출 및 포트폴리오/회계 항등식 요약기
 # ---------------------------------------------------------------------------
-class MacroDataCache:
+def calc_sell_realized_pnl(
+    sold_qty: int,
+    sell_exec_price: float,
+    sold_actual_cost_usd: float,
+) -> Dict[str, float]:
     """
-    🎯 4 & 🎯 5 & Case 61, 62, 91, 93:
-    1) yfinance NQ=F 15초 백그라운드 캐싱 및 18:00 EST 신세션 전일 잔재 혼입 100% 차단/자가 치유
-    2) 17:00 ~ 17:59 EST 마감 휴장 및 주말 동안 직전 마감 세션 고/저가/마감가 단조 보존
-    3) 토스 Open API QQQ 0.0초 실시간 시세 연동 및 10분/3분 변화율 기반 NQ_VEL_BYPASS(±0.20%) 산출
+    매도 체결 수량(sold_qty), 실제 매도 체결 단가(sell_exec_price),
+    매도된 지층들의 실제 매수 원금 합계(sold_actual_cost_usd)를 받아
+    왕복 수수료(0.14%)를 차감한 세후 실현 순수익금(net_pnl_usd)을 정확히 계산한다.
     """
+    sq = max(0, safe_int(sold_qty, 0))
+    sp = max(0.0, safe_float(sell_exec_price, 0.0))
+    scost = max(0.0, safe_float(sold_actual_cost_usd, 0.0))
 
-    def __init__(self, toss_api: Optional[Any] = None) -> None:
-        self.toss_api = toss_api
-        self._lock = threading.RLock()
-
-        now_est = datetime.now(EST_TZ)
-        logical_date = get_logical_trading_date_str(now_est, rollover_hour=18)
-
-        self._nq_state: Dict[str, Any] = {
-            "logical_date": logical_date,
-            "nq_price": 0.0,
-            "nq_high": 0.0,
-            "nq_low": 0.0,
-            "nq_amp": 0.0,
-            "prev_session_high": 0.0,
-            "prev_session_low": 0.0,
-            "updated_mono": 0.0,
-        }
-        self._qqq_price: float = 0.0
-        self._qqq_updated_mono: float = 0.0
-        # (epoch_sec, qqq_price) 링버퍼 (최근 15분 보관)
-        self._qqq_history: Deque[Tuple[float, float]] = deque(maxlen=600)
-
-    def reset_runtime_cache(self) -> None:
-        """
-        Case 02: /reset 명령 시 매크로 런타임 캐시를 안전하게 재초기화한다.
-        """
-        now_est = datetime.now(EST_TZ)
-        logical_date = get_logical_trading_date_str(now_est, rollover_hour=18)
-        with self._lock:
-            self._nq_state["logical_date"] = logical_date
-            self._nq_state["updated_mono"] = 0.0
-            self._qqq_updated_mono = 0.0
-            self._qqq_history.clear()
-
-    def _record_qqq_tick(
-        self, qqq_price: float, now_epoch: Optional[float] = None
-    ) -> None:
-        qp = safe_float(qqq_price, 0.0)
-        if not is_qqq_scale_valid(qp):
-            return
-        ts = float(now_epoch if now_epoch is not None else time.time())
-        with self._lock:
-            self._qqq_price = qp
-            self._qqq_updated_mono = time.monotonic()
-            self._qqq_history.append((ts, qp))
-            cutoff = ts - 900.0
-            while self._qqq_history and self._qqq_history[0][0] < cutoff:
-                self._qqq_history.popleft()
-
-    def _compute_qqq_velocities(self) -> Tuple[float, float, bool, bool]:
-        """
-        🎯 4: 최근 10분(600초) 및 3분(180초) 동안의 실시간 QQQ 변화율(%)을 계산하여
-        - bypass_soxl: QQQ 10m 또는 3m 변화율 >= +0.20% (SOXL 급등 중 HA음봉 바이패스)
-        - bypass_soxs: QQQ 10m 또는 3m 변화율 <= -0.20% (SOXS 급등 중 HA음봉 바이패스)
-        를 반환한다.
-        """
-        with self._lock:
-            if len(self._qqq_history) < 2 or self._qqq_price <= 0.0:
-                return 0.0, 0.0, False, False
-
-            now_ts, cur_p = self._qqq_history[-1]
-            p_10m = cur_p
-            p_3m = cur_p
-
-            target_10m = now_ts - 600.0
-            target_3m = now_ts - 180.0
-
-            for ts, p in self._qqq_history:
-                if ts >= target_10m:
-                    p_10m = p
-                    break
-
-            for ts, p in self._qqq_history:
-                if ts >= target_3m:
-                    p_3m = p
-                    break
-
-        vel_10m = ((cur_p - p_10m) / p_10m) * 100.0 if p_10m > 0.0 else 0.0
-        vel_3m = ((cur_p - p_3m) / p_3m) * 100.0 if p_3m > 0.0 else 0.0
-
-        bypass_soxl = bool(
-            vel_10m >= NQ_VEL_BYPASS_THRESHOLD_PCT
-            or vel_3m >= NQ_VEL_BYPASS_THRESHOLD_PCT
-        )
-        bypass_soxs = bool(
-            vel_10m <= -NQ_VEL_BYPASS_THRESHOLD_PCT
-            or vel_3m <= -NQ_VEL_BYPASS_THRESHOLD_PCT
-        )
-        return round(vel_10m, 4), round(vel_3m, 4), bypass_soxs, bypass_soxl
-
-    async def ensure_qqq_live_price(self, fallback_qqq: float = 0.0) -> float:
-        """
-        🚨 Case 93:
-        17:00 ~ 18:59 EST 구간을 포함하여 전 시간대에서 3차 역행 방어 기준가용
-        토스 실시간 QQQ 현재가를 즉시 확보한다 (현재가 API 실패 시 QQQ 1분봉 종가 폴백).
-        """
-        fb = safe_float(fallback_qqq, 0.0)
-        if is_qqq_scale_valid(fb):
-            self._record_qqq_tick(fb)
-            return fb
-
-        with self._lock:
-            cached_q = self._qqq_price
-            age = time.monotonic() - self._qqq_updated_mono
-        if is_qqq_scale_valid(cached_q) and age < QQQ_ACTIVE_PROBE_TTL_SEC:
-            return cached_q
-
-        if self.toss_api is not None:
-            try:
-                prices = await self.toss_api.get_current_prices_batch(("QQQ",))
-                live_q = safe_float((prices or {}).get("QQQ"), 0.0)
-                if is_qqq_scale_valid(live_q):
-                    self._record_qqq_tick(live_q)
-                    return live_q
-            except Exception as exc:
-                logger.debug("QQQ 실시간 현재가 조회 예외: %s", exc)
-
-            # 17:00 ~ 18:59 EST 등에서 lastPrice 가 비어 있을 경우 QQQ 최신 1분봉 종가 폴백
-            try:
-                c_list, _ = await self.toss_api.get_candles(
-                    symbol="QQQ", interval="1m", count=5, adjusted=True
-                )
-                if isinstance(c_list, list) and c_list:
-                    for c_item in c_list:
-                        if isinstance(c_item, dict):
-                            cp = safe_float(c_item.get("closePrice"), 0.0)
-                            if is_qqq_scale_valid(cp):
-                                self._record_qqq_tick(cp)
-                                return cp
-            except Exception as exc:
-                logger.debug("QQQ 1분봉 폴백 조회 예외: %s", exc)
-
-        return cached_q if is_qqq_scale_valid(cached_q) else 0.0
-
-    def _fetch_nq_sync(self, now_est: Optional[datetime] = None) -> Dict[str, Any]:
-        """
-        🎯 5 & Case 61, 62, 91:
-        yfinance NQ=F(나스닥 100 선물) 조회 및 18:00 EST 신세션 전일 잔재 혼입 100% 차단·자가 치유 엔진.
-        - 18:00:00 EST 신세션 롤오버 감지 시 이전 캐시(prev_h, prev_l)를 즉시 초기화한다.
-        - 18:00 ~ 18:10 EST 구간에 yfinance 1분봉 지연으로 df_session 이 비어 있을 때는
-          전일 세션 잔재가 남아 있는 fast_info.day_high / day_low 병합을 100% 금지하고
-          오직 실시간 체결가 fast_last 단일 영점(high = low = close = fast_last, 진폭 0.00%)으로 출발한다!
-        - 18:10 EST 이후 df_session 이 존재할 때도 fast_high / fast_low 나 기존 캐시가
-          직전 마감 세션 고/저가와 일치하거나 신세션 1분봉+현재가 범위를 0.20% 이상 벗어나면
-          전일 잔재 오염으로 판정하여 즉시 폐기하고 신세션 실데이터 범위로 자가 치유(Self-Healing)한다.
-        - 17:00 ~ 17:59 EST 마감 휴장 및 주말에는 직전 마감 세션의 고/저가/마감가를 단조 보존한다.
-        """
-        dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
-        logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
-        sess_start_est, prev_sess_start_est, is_break_or_weekend = (
-            _get_cme_session_bounds_est(dt_now)
-        )
-
-        with self._lock:
-            prev_logical = str(self._nq_state.get("logical_date") or "")
-            if prev_logical != logical_date and not is_break_or_weekend:
-                # 18:00 EST 신세션 진입 시 이전 세션 고/저가 잔재를 prev_session 으로 이관하고 당일 캐시 영점 리셋
-                self._nq_state = {
-                    "logical_date": logical_date,
-                    "nq_price": 0.0,
-                    "nq_high": 0.0,
-                    "nq_low": 0.0,
-                    "nq_amp": 0.0,
-                    "prev_session_high": safe_float(
-                        self._nq_state.get("nq_high"), 0.0
-                    ),
-                    "prev_session_low": safe_float(
-                        self._nq_state.get("nq_low"), 0.0
-                    ),
-                    "updated_mono": 0.0,
-                }
-            cached_snapshot = dict(self._nq_state)
-
-        ticker = yf.Ticker("NQ=F")
-        fast_last = 0.0
-        fast_high = 0.0
-        fast_low = 0.0
-        try:
-            fi = ticker.fast_info
-            if fi is not None:
-                fast_last = safe_float(getattr(fi, "last_price", 0.0), 0.0)
-                fast_high = safe_float(getattr(fi, "day_high", 0.0), 0.0)
-                fast_low = safe_float(getattr(fi, "day_low", 0.0), 0.0)
-        except Exception:
-            pass
-
-        df_1m = pd.DataFrame()
-        try:
-            raw_df = ticker.history(period="2d", interval="1m", prepost=True)
-            if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
-                idx = raw_df.index
-                if idx.tz is None:
-                    idx = idx.tz_localize("UTC").tz_convert(EST_TZ)
-                else:
-                    idx = idx.tz_convert(EST_TZ)
-                df_1m = raw_df.copy()
-                df_1m.index = idx
-        except Exception as exc:
-            logger.debug("yfinance NQ=F 1m history 조회 예외: %s", exc)
-
-        # 1) 17:00 ~ 17:59 EST 마감 휴장 또는 주말 휴장 구간: 직전 마감 세션 데이터 보존
-        if is_break_or_weekend:
-            if not df_1m.empty:
-                df_closed = df_1m[df_1m.index >= sess_start_est]
-                if not df_closed.empty:
-                    c_last = safe_float(df_closed["Close"].iloc[-1], fast_last)
-                    c_high = safe_float(df_closed["High"].max(), c_last)
-                    c_low = safe_float(df_closed["Low"].min(), c_last)
-                    if c_low > 0.0 and c_high >= c_low:
-                        c_amp = ((c_high - c_low) / c_low) * 100.0
-                        with self._lock:
-                            self._nq_state.update(
-                                {
-                                    "nq_price": round(c_last, 2),
-                                    "nq_high": round(c_high, 2),
-                                    "nq_low": round(c_low, 2),
-                                    "nq_amp": round(c_amp, 2),
-                                    "updated_mono": time.monotonic(),
-                                }
-                            )
-                            return dict(self._nq_state)
-            # 이미 보존된 캐시가 있으면 그대로 유지
-            if safe_float(cached_snapshot.get("nq_price"), 0.0) > 0.0:
-                with self._lock:
-                    self._nq_state["updated_mono"] = time.monotonic()
-                    return dict(self._nq_state)
-
-        # 2) 직전 세션(prev_sess_start_est ~ sess_start_est) 고/저가 추출 (전일 잔재 대조용)
-        prev_sess_h = safe_float(cached_snapshot.get("prev_session_high"), 0.0)
-        prev_sess_l = safe_float(cached_snapshot.get("prev_session_low"), 0.0)
-        if not df_1m.empty:
-            df_prev = df_1m[
-                (df_1m.index >= prev_sess_start_est)
-                & (df_1m.index < sess_start_est)
-            ]
-            if not df_prev.empty:
-                prev_sess_h = max(
-                    prev_sess_h, safe_float(df_prev["High"].max(), 0.0)
-                )
-                pl_cand = safe_float(df_prev["Low"].min(), 0.0)
-                if pl_cand > 0.0:
-                    prev_sess_l = (
-                        min(prev_sess_l, pl_cand)
-                        if prev_sess_l > 0.0
-                        else pl_cand
-                    )
-
-        # 3) 현재 신세션(index >= 18:00:00 EST) 1분봉 슬라이싱
-        df_session = (
-            df_1m[df_1m.index >= sess_start_est]
-            if not df_1m.empty
-            else pd.DataFrame()
-        )
-
-        # 🚨 [핵심 방어 1] 18:00 ~ 18:10 EST 신세션 직후 df_session 이 비어 있을 때:
-        # 전일 fast_info.day_high / day_low 병합을 100% 금지하고 fast_last 단일 영점(0.00%)으로 출발!
-        if df_session.empty:
-            ref_p = (
-                fast_last
-                if fast_last > 0.0
-                else safe_float(cached_snapshot.get("nq_price"), 0.0)
-            )
-            if ref_p <= 0.0 and not df_1m.empty:
-                ref_p = safe_float(df_1m["Close"].iloc[-1], 0.0)
-
-            prev_h = safe_float(cached_snapshot.get("nq_high"), 0.0)
-            prev_l = safe_float(cached_snapshot.get("nq_low"), 0.0)
-
-            # 기존 캐시가 비어 있거나 직전 마감 세션 고/저가와 일치(오염)하거나 현재가 대비 0.20% 이상 괴리 시 영점 리셋
-            cache_contaminated = bool(
-                prev_h <= 0.0
-                or prev_l <= 0.0
-                or (prev_sess_h > 0.0 and abs(prev_h - prev_sess_h) < 1.0)
-                or (prev_sess_l > 0.0 and abs(prev_l - prev_sess_l) < 1.0)
-                or (ref_p > 0.0 and ((prev_h - prev_l) / ref_p) * 100.0 > 0.20)
-            )
-            if cache_contaminated or (
-                dt_now.hour == 18 and dt_now.minute <= 12
-            ):
-                cur_h = ref_p
-                cur_l = ref_p
-            else:
-                cur_h = max(prev_h, ref_p) if ref_p > 0.0 else prev_h
-                cur_l = min(prev_l, ref_p) if ref_p > 0.0 else prev_l
-
-            cur_amp = (
-                ((cur_h - cur_l) / cur_l) * 100.0
-                if (cur_l > 0.0 and cur_h >= cur_l)
-                else 0.0
-            )
-            with self._lock:
-                self._nq_state.update(
-                    {
-                        "logical_date": logical_date,
-                        "nq_price": round(ref_p, 2),
-                        "nq_high": round(cur_h, 2),
-                        "nq_low": round(cur_l, 2),
-                        "nq_amp": round(cur_amp, 2),
-                        "prev_session_high": prev_sess_h,
-                        "prev_session_low": prev_sess_l,
-                        "updated_mono": time.monotonic(),
-                    }
-                )
-                return dict(self._nq_state)
-
-        # 🚨 [핵심 방어 2] 신세션 1분봉(df_session)이 존재할 때:
-        # 신세션 1분봉 고/저가 + 실시간 fast_last 로 순수 신세션 기준 범위(pure_h, pure_l) 산출 후
-        # 오염된 fast_high / fast_low 나 오염된 이전 캐시(prev_h, prev_l)를 자가 치유(Self-Healing)한다!
-        bar_last = safe_float(df_session["Close"].iloc[-1], 0.0)
-        cur_p = fast_last if fast_last > 0.0 else bar_last
-        bar_h = safe_float(df_session["High"].max(), cur_p)
-        bar_l = safe_float(df_session["Low"].min(), cur_p)
-
-        pure_h = max(bar_h, cur_p) if cur_p > 0.0 else bar_h
-        pure_l = (
-            min(bar_l, cur_p) if (cur_p > 0.0 and bar_l > 0.0) else max(bar_l, cur_p)
-        )
-
-        # fast_high / fast_low 가 직전 세션 고/저가와 일치하지 않고 pure_h/pure_l 대비 0.20% 이내일 때만 병합 허용
-        if (
-            fast_high > pure_h
-            and (prev_sess_h <= 0.0 or abs(fast_high - prev_sess_h) > 1.5)
-            and ((fast_high - pure_h) / pure_h) * 100.0 <= 0.20
-        ):
-            pure_h = fast_high
-
-        if (
-            0.0 < fast_low < pure_l
-            and (prev_sess_l <= 0.0 or abs(fast_low - prev_sess_l) > 1.5)
-            and ((pure_l - fast_low) / pure_l) * 100.0 <= 0.20
-        ):
-            pure_l = fast_low
-
-        # 기존 인메모리 캐시(prev_h, prev_l)가 오염되지 않았을 때만 단조 병합(Self-Healing)
-        prev_h = safe_float(cached_snapshot.get("nq_high"), 0.0)
-        prev_l = safe_float(cached_snapshot.get("nq_low"), 0.0)
-        if (
-            prev_h > pure_h
-            and (prev_sess_h <= 0.0 or abs(prev_h - prev_sess_h) > 1.5)
-            and ((prev_h - pure_h) / pure_h) * 100.0 <= 0.25
-        ):
-            pure_h = prev_h
-
-        if (
-            0.0 < prev_l < pure_l
-            and (prev_sess_l <= 0.0 or abs(prev_l - prev_sess_l) > 1.5)
-            and ((pure_l - prev_l) / pure_l) * 100.0 <= 0.25
-        ):
-            pure_l = prev_l
-
-        cur_amp = (
-            ((pure_h - pure_l) / pure_l) * 100.0
-            if (pure_l > 0.0 and pure_h >= pure_l)
-            else 0.0
-        )
-
-        with self._lock:
-            self._nq_state.update(
-                {
-                    "logical_date": logical_date,
-                    "nq_price": round(cur_p, 2),
-                    "nq_high": round(pure_h, 2),
-                    "nq_low": round(pure_l, 2),
-                    "nq_amp": round(cur_amp, 2),
-                    "prev_session_high": prev_sess_h,
-                    "prev_session_low": prev_sess_l,
-                    "updated_mono": time.monotonic(),
-                }
-            )
-            return dict(self._nq_state)
-
-    async def get_macro_snapshot(
-        self,
-        live_qqq_price: float = 0.0,
-        has_active_position: bool = False,
-        now_est: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
-        """
-        제1헌법 & Case 61:
-        - NQ=F 선물 데이터는 15.0초 주기로 백그라운드 스레드(asyncio.to_thread)에서 갱신하고,
-        - QQQ 실시간 시세는 외부 주입값(live_qqq_price) 또는 보유 중 1.5초 프로빙으로 즉시 갱신하여
-          통합 매크로 스냅샷을 반환한다.
-        """
-        dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
-        logical_date = get_logical_trading_date_str(dt_now, rollover_hour=18)
-
-        # 1) 실시간 QQQ 가격 갱신
-        if is_qqq_scale_valid(live_qqq_price):
-            self._record_qqq_tick(live_qqq_price)
-            qqq_p = safe_float(live_qqq_price, 0.0)
-        else:
-            with self._lock:
-                qqq_age = time.monotonic() - self._qqq_updated_mono
-                qqq_p = self._qqq_price
-            probe_ttl = (
-                QQQ_ACTIVE_PROBE_TTL_SEC
-                if has_active_position
-                else QQQ_IDLE_PROBE_TTL_SEC
-            )
-            if not is_qqq_scale_valid(qqq_p) or qqq_age >= probe_ttl:
-                qqq_p = await self.ensure_qqq_live_price()
-
-        # 2) NQ=F 선물 캐시 TTL(15.0초) 또는 18:00 EST 신세션 롤오버 확인
-        with self._lock:
-            nq_age = time.monotonic() - safe_float(
-                self._nq_state.get("updated_mono"), 0.0
-            )
-            nq_logical = str(self._nq_state.get("logical_date") or "")
-            nq_ready = safe_float(self._nq_state.get("nq_price"), 0.0) > 0.0
-
-        if not nq_ready or nq_age >= NQ_CACHE_TTL_SEC or nq_logical != logical_date:
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self._fetch_nq_sync, dt_now),
-                    timeout=10.0,
-                )
-            except Exception as exc:
-                logger.debug("NQ=F 백그라운드 갱신 폴백(기존 캐시 유지): %s", exc)
-
-        with self._lock:
-            nq_snap = dict(self._nq_state)
-
-        nq_amp = safe_float(nq_snap.get("nq_amp"), 0.0)
-        dyn_thr = calc_dynamic_stage3_threshold(nq_amp)
-        vel_10m, vel_3m, bypass_soxs, bypass_soxl = (
-            self._compute_qqq_velocities()
-        )
-
+    if sq <= 0 or sp <= 0.0 or scost <= 0.0:
         return {
-            "logical_date": logical_date,
-            "nq_price": safe_float(nq_snap.get("nq_price"), 0.0),
-            "nq_high": safe_float(nq_snap.get("nq_high"), 0.0),
-            "nq_low": safe_float(nq_snap.get("nq_low"), 0.0),
-            "nq_amp": nq_amp,
-            "is_overheated": bool(nq_amp >= NQ_OVERHEAT_THRESHOLD),
-            "qqq_price": round(qqq_p, 4) if is_qqq_scale_valid(qqq_p) else 0.0,
-            "dynamic_threshold_pct": dyn_thr,
-            "qqq_vel_10m_pct": vel_10m,
-            "qqq_vel_3m_pct": vel_3m,
-            "bypass_soxs": bypass_soxs,
-            "bypass_soxl": bypass_soxl,
-            "updated_at": dt_now.strftime("%Y-%m-%d %H:%M:%S EST"),
+            "gross_proceeds_usd": 0.0,
+            "sold_cost_usd": scost,
+            "gross_pnl_usd": 0.0,
+            "fee_usd": 0.0,
+            "net_pnl_usd": 0.0,
+            "net_rate_pct": 0.0,
         }
+
+    gross_proceeds = sp * float(sq)
+    gross_pnl = gross_proceeds - scost
+    fee_usd = (gross_proceeds + scost) * (ROUND_TRIP_FEE_RATE * 0.5)
+    net_pnl = gross_pnl - fee_usd
+    net_rate_pct = (net_pnl / scost) * 100.0 if scost > 0.0 else 0.0
+
+    return {
+        "gross_proceeds_usd": round(gross_proceeds, 4),
+        "sold_cost_usd": round(scost, 4),
+        "gross_pnl_usd": round(gross_pnl, 4),
+        "fee_usd": round(fee_usd, 4),
+        "net_pnl_usd": round(net_pnl, 4),
+        "net_rate_pct": round(net_rate_pct, 2),
+    }
+
+
+def summarize_stratum_portfolio(
+    state: Dict[str, Any],
+    live_price: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    원장 상태(state)와 실시간 현재가(live_price)를 기반으로:
+    - 보유 지층(1층 / 2층) 상세, 총 보유 주수, 총 보유 회차(held_lots),
+    - 실투입 원금(actual_invested_usd), 가용 현금(free_cash_usd),
+    - 현재 총자산(total_equity_usd = free_cash + market_value) 및 원금 기준 총자산(cost_equity_usd),
+    - 미실현 평가손익(unrealized_pnl_usd) 및 다음 8% 목표 정량(next_target_qty, next_portion_budget)
+    을 한 번에 계산하여 반환한다.
+    """
+    buckets = buckets_from_dicts(state.get("buckets", []))
+    held_shares = sum(b.qty for b in buckets)
+    held_lots = sum(b.lot_count for b in buckets)
+    actual_invested = round(sum(b.actual_cost_usd for b in buckets), 4)
+    book_invested = round(sum(b.book_invested_usd for b in buckets), 4)
+
+    init_seed = max(
+        100.0,
+        safe_float(state.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD),
+    )
+    cum_realized_net = safe_float(state.get("cumulative_realized_net_usd"), 0.0)
+    free_cash = max(
+        0.0,
+        safe_float(
+            state.get("free_cash_usd"),
+            (init_seed + cum_realized_net) - actual_invested,
+        ),
+    )
+    cost_equity = round(free_cash + actual_invested, 4)
+
+    lp = safe_float(live_price, 0.0)
+    if lp <= 0.0 and buckets:
+        lp = buckets[0].book_price
+
+    market_val = round(lp * float(held_shares), 4) if held_shares > 0 else 0.0
+    unrealized_pnl = (
+        round(market_val - actual_invested, 4) if held_shares > 0 else 0.0
+    )
+    unrealized_rate = (
+        round((unrealized_pnl / actual_invested) * 100.0, 2)
+        if actual_invested > 0.0
+        else 0.0
+    )
+    total_mark_equity = round(free_cash + market_val, 4)
+    total_net_pnl = round(cum_realized_net + unrealized_pnl, 4)
+    total_roi_pct = round((total_net_pnl / init_seed) * 100.0, 2)
+
+    portion_mode = str(state.get("portion_mode") or "COMP_08PCT").upper()
+    threshold_mode = str(state.get("threshold_mode") or "08_VREV_PROG").upper()
+    buy_interval_min = safe_int(state.get("buy_interval_min"), 10)
+
+    # 현재 매수 기준가(active_buy_anchor) 판별
+    anchor_p = safe_float(state.get("anchor_price"), lp)
+    cycle_min_p = safe_float(state.get("cycle_min_buy_price"), anchor_p)
+    ratchet_p = safe_float(state.get("ratchet_anchor_price"), anchor_p)
+
+    is_l2_only_anti_bloat = bool(
+        len(buckets) == 1 and buckets[0].lot_type == "MERGED_UPPER"
+    )
+    if is_l2_only_anti_bloat:
+        candidates = [p for p in (cycle_min_p, ratchet_p) if p > 0.0]
+        active_buy_anchor = min(candidates) if candidates else buckets[0].book_price
+    elif buckets:
+        active_buy_anchor = (
+            min(buckets[0].book_price, anchor_p)
+            if anchor_p > 0.0
+            else buckets[0].book_price
+        )
+    else:
+        active_buy_anchor = lp if lp > 0.0 else max(0.01, anchor_p)
+
+    next_qty, next_budget = compute_golden8_quota_qty(
+        anchor_price=active_buy_anchor if active_buy_anchor > 0.0 else 100.0,
+        current_total_equity=cost_equity,
+        initial_seed_usd=init_seed,
+        portion_mode=portion_mode,
+    )
+
+    targets = calc_target_sell_prices_for_buckets(
+        buckets=buckets, threshold_mode=threshold_mode
+    )
+    drop_buy_pct = targets["drop_buy_pct"]
+    trigger_buy_price = (
+        round(active_buy_anchor * (1.0 + drop_buy_pct / 100.0), 4)
+        if active_buy_anchor > 0.0
+        else 0.0
+    )
+
+    return {
+        "buckets": buckets,
+        "tier_count": len(buckets),
+        "is_l2_only_anti_bloat": is_l2_only_anti_bloat,
+        "held_shares": held_shares,
+        "held_lots": held_lots,
+        "initial_seed_usd": init_seed,
+        "free_cash_usd": round(free_cash, 2),
+        "actual_invested_usd": round(actual_invested, 2),
+        "book_invested_usd": round(book_invested, 2),
+        "cost_equity_usd": round(cost_equity, 2),
+        "market_value_usd": round(market_val, 2),
+        "unrealized_pnl_usd": round(unrealized_pnl, 2),
+        "unrealized_rate_pct": unrealized_rate,
+        "cumulative_realized_net_usd": round(cum_realized_net, 2),
+        "total_net_pnl_usd": round(total_net_pnl, 2),
+        "total_mark_equity_usd": round(total_mark_equity, 2),
+        "total_roi_pct": total_roi_pct,
+        "portion_mode": portion_mode,
+        "threshold_mode": threshold_mode,
+        "buy_interval_min": buy_interval_min,
+        "active_buy_anchor": round(active_buy_anchor, 4),
+        "trigger_buy_price": trigger_buy_price,
+        "ratchet_anchor_price": round(ratchet_p, 4),
+        "cycle_min_buy_price": round(cycle_min_p, 4),
+        "next_target_qty": next_qty,
+        "next_portion_budget": round(next_budget, 2),
+        **targets,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 🛠️ TDD 사전 무결성 검증 (run_quant_engine_tdd)
+# ---------------------------------------------------------------------------
+def run_quant_engine_tdd() -> None:
+    """
+    백테스트 및 프롬프트 절대기준 수식이 100% 오차 없이 작동하는지 기동 시 자동 검증한다.
+    """
+    # 1) 8%($800) 황금비율 정액 기반 정량 산출 및 $90 하락 매수 시 $80 자투리 시드 보존 검증
+    q8, b8 = compute_golden8_quota_qty(
+        anchor_price=100.0,
+        current_total_equity=10000.0,
+        initial_seed_usd=10000.0,
+        portion_mode="COMP_08PCT",
+    )
+    assert q8 == 8 and abs(b8 - 800.0) < 1e-6, "8% 정량 8주 산출 오류"
+
+    buy_q, spent_u = resolve_affordable_buy_qty(
+        target_qty=q8,
+        price_t=90.0,
+        free_cash_usd=10000.0,
+    )
+    saved_u = b8 - spent_u
+    assert buy_q == 8 and abs(spent_u - 720.0) < 1e-6 and abs(saved_u - 80.0) < 1e-6
+
+    # 2) 총자산 증가($15,000) 시 COMP_08PCT(8% = $1,200) vs FIXED_800($800) 비교 검증
+    q_comp, b_comp = compute_golden8_quota_qty(
+        anchor_price=100.0,
+        current_total_equity=15000.0,
+        initial_seed_usd=10000.0,
+        portion_mode="COMP_08PCT",
+    )
+    q_fix, b_fix = compute_golden8_quota_qty(
+        anchor_price=100.0,
+        current_total_equity=15000.0,
+        initial_seed_usd=10000.0,
+        portion_mode="FIXED_800",
+    )
+    assert q_comp == 12 and abs(b_comp - 1200.0) < 1e-6
+    assert q_fix == 8 and abs(b_fix - 800.0) < 1e-6
+
+    # 3) 보유 회차별(1~6회 / 7~11회 / 12회+) 점진 단차 검증
+    assert get_golden8_prog_thresholds(1, "08_VREV_PROG") == (-1.00, 1.50, 1.00)
+    assert get_golden8_prog_thresholds(6, "08_VREV_PROG") == (-1.00, 1.50, 1.00)
+    assert get_golden8_prog_thresholds(7, "08_VREV_PROG") == (-1.50, 1.50, 1.00)
+    assert get_golden8_prog_thresholds(11, "08_VREV_PROG") == (-1.50, 1.50, 1.00)
+    assert get_golden8_prog_thresholds(12, "08_VREV_PROG") == (-2.00, 1.50, 1.00)
+
+    # 4) 2-Tier 가중병합 및 단일 지층 수익금 리앵커링 검증
+    q_list: List[StratumBucket] = []
+    q_list = vrev_add_quota_lot_and_merge_2tier(q_list, 8, 100.0)
+    q_list = vrev_add_quota_lot_and_merge_2tier(q_list, 8, 98.0)
+    q_list = vrev_add_quota_lot_and_merge_2tier(q_list, 9, 96.0)
+    assert (
+        len(q_list) == 2
+        and q_list[0].qty == 9
+        and q_list[1].qty == 16
+        and q_list[1].lot_count == 2
+    )
+    re_q, drop_amt = vrev_reanchor_single_tier_quota([q_list[1]], 16.0)
+    assert len(re_q) == 1 and drop_amt > 0.99 and re_q[0].actual_cost_usd == q_list[1].actual_cost_usd
+
+
+# 모듈 로드 시 즉시 TDD 무결성 검증 실행
+run_quant_engine_tdd()
