@@ -2,7 +2,7 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 06 / 06)
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 04 / 04)
 - 전술 A 챔피언 (🛡️ 05_AF_WIDE_10_01) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67) &
      자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
@@ -11,17 +11,16 @@
      (상승돌파 시 Case 67 이중 캡핑으로 1회분 8% 시드 예산 초과 원천 차단!)
   4) 기억된 사이클 최저 매수가(cycle_min_buy_price) 잠금 기반 10분 고정 4단 와이드 활주로 시드보호 매수 게이트
      (WIDE_RUNWAY : 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 신저가 도달 시에만 현재가 지정가 추매)
-  5) 매수 후 60초 타임쉴드 & 1분 상시 순수 현재가 지정가 스나이퍼 매도(1층 +1.50% 익절 & 2층 리앵커링 / 2층 +1.00% 전량 졸업)
+  5) 🛡️ [NEW · Case 65 & Case 70] 매수 후 최초 60초 타임쉴드 및 보유 중 매 60.0초 타임쉴드 주기 순수 현재가 지정가 스나이퍼 매도 모니터
+     (60.0초 타임쉴드가 해제된 시점에만 현재가를 조회하여 1층 +1.50% 이상 익절 & 2층 리앵커링 / 2층 +1.00% 이상 전량 졸업하며,
+      목표 미달 시 즉시 다음 60.0초 매도 타임쉴드를 재장전! 목표가 근접 시 0.4초 턱걸이 매도 가속기 영구 제거!)
   6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
   7) 📡 [Case 11 & Case 62 부팅 중 SIGTERM 0.1초 고속 종료 가드 & 텔레그램 적체 큐 무조건부 일괄 소각]
      부팅 초기화 도중 SIGTERM 수신 시 0.1초 내에 즉시 탈출하여 systemd stop-sigterm 타임아웃을 원천 차단하고,
      기동 시 적체 큐 일괄 소각 및 무변경(changed == False) 시 무중단 가동 유지를 통해 9초 무한 재기동 루프를 영구 종결!
-  8) 🚨 [NEW · Case 68 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 시드 $100 변조 방어]
-     - "/home/pipiosToss" 고정 경로 하드코딩 100% 영구 제거 -> 오직 현재 실행 폴더(base_dir)의 .env 와 원장만 로드
-     - 기존 soxl_stratum_ledger.json 무손실 자동 이관 및 폴더별 3중 원장(고유 원장 · 호환 원장 · 백업 금고) 결속
-     - 평시 채팅창 숫자 오입력 시드 변조 잠금([💵 기준 시드머니($) 설정] 버튼 클릭 후 5분 내 또는 `/seed 금액` 만 허용)
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 68 전수 락온
+  8) 🚨 [Case 68 & Case 69 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 이동평균 원가오염 방어]
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 70 전수 락온
 """
 
 from __future__ import annotations
@@ -76,6 +75,9 @@ from quant_indicators_plugin import (
 )
 from sniper_exit_plugin import (
     execute_1m_sniper_sell_and_reanchor_plugin,
+    is_within_post_buy_time_shield,
+    is_within_post_sell_time_shield,
+    is_within_sell_monitor_time_shield,
     sync_pending_sell_order_plugin,
     update_exit_snapshot_on_hold,
 )
@@ -106,12 +108,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("toss_sniper.main")
 
-# 메인 루프 주기 상수 (평시 1.5초 / 고주파 스나이퍼 부스터 0.4초)
+# 메인 루프 주기 상수 (평시 1.5초 / 미체결 주문 체결 확인 부스터 0.4초)
 NORMAL_LOOP_INTERVAL_SEC: float = 1.50
 FAST_SHIELD_LOOP_INTERVAL_SEC: float = 0.40
 KRW_PER_USD_DEFAULT: float = 1380.0
 
-# NEW (Case 68): [💵 기준 시드머니($) 설정] 버튼 클릭 후 일반 숫자 입력을 허용하는 유효 시간(초)
+# Case 68: [💵 기준 시드머니($) 설정] 버튼 클릭 후 일반 숫자 입력을 허용하는 유효 시간(초)
 SEED_INPUT_PROMPT_TIMEOUT_SEC: float = 300.0
 
 # URL("https://...") 오매칭을 100% 차단하는 엄격한 텔레그램 봇 토큰 정규식
@@ -1339,7 +1341,7 @@ def _resolve_folder_identity_badge(
     context: Optional[Any], st: Optional[Dict[str, Any]] = None
 ) -> Tuple[str, str]:
     """
-    NEW [Case 68]:
+    Case 68:
     현재 봇이 가동 중인 폴더 식별자(folder_slug)와 고유 원장 파일명을 반환한다.
     """
     slug = ""
@@ -1456,10 +1458,9 @@ class _AdaptiveTelegramBridge:
          변경 사항이 없을 때(changed == False)는 무중단 가동을 유지하여 9초 주기 무한 재기동 루프를 영구 차단한다.
       3) Case 67: /avwap 레이더 및 /settlement 제어반에서 min(1회분 예산 상한 주수, 기준가 고정 정량)
          캡핑 상태를 실시간 표출한다.
-      4) 🚨 [Case 68 폴더 식별 배지 표출 & 평시 숫자 오입력 시드 변조 잠금]:
-         기동 배너 및 4대 보드에 현재 폴더 식별자(📂 폴더명)와 격리 원장 파일명을 표출하고,
-         [💵 기준 시드머니($) 설정] 버튼 클릭 후 5분(300초) 이내이거나 `/seed 금액` 명령일 때만
-         시드머니 변경을 허용하여 평시 오입력으로 인한 $100 시드 변조를 원천 차단한다.
+      4) Case 68: 폴더 식별 배지 표출 및 평시 숫자 오입력 시드 변조 잠금.
+      5) 🛡️ [NEW · Case 70]: /avwap 레이더 보드 내 매수 직후 60초 · 보유 중 매 60초 주기 매도 모니터 ·
+         매도 후 60초 타임쉴드 잔여 시간을 실시간 표출한다.
     """
 
     def __init__(self, context: Any) -> None:
@@ -1715,7 +1716,7 @@ class _AdaptiveTelegramBridge:
         text = (
             "<b>✅ 서버가 정상 작동 중입니다.</b>\n"
             f"🔸 폴더격리: 📂 <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code> · 3중 백업금고 ON)\n"
-            "🔸 🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향 60초 타임쉴드 &amp; 선행 체결정산 &amp; min(1회분,고정정량) 캡핑 &amp; 장외업데이트 원장보호(Case 65~68) 가동 완료\n"
+            "🔸 🐂 [인피니트 스노우볼 v3.0 · 🛡️ 05_AF_WIDE_10_01] 양방향·주기 60초 타임쉴드 매도 모니터 &amp; 선행 체결정산 &amp; min(1회분,고정정량) 캡핑 &amp; 이동평균 이중차감 방어(Case 65~70) 가동 완료\n"
             f"🔸 기준시드: <b>${init_seed:,.2f}</b> · 가용현금: <b>${free_cash:,.2f}</b> · 보유: <b>{held_sh}주</b>"
         )
         sent = await self.send_message(
@@ -1747,14 +1748,14 @@ class _AdaptiveTelegramBridge:
             "▫️ 전략: 🛡️ 05_AF_WIDE_10_01 (8% 황금정량 · 눌림/돌파 독립 1층 재장전 · 기억저가 와이드 활주로)",
             "▫️ 정량: 📐 min(1회분 8% 예산 상한 주수, 기준가 고정 정량) 이중 캡핑으로 돌파 시 예산 초과 차단 (Case 67)",
             "▫️ 매수: 🛡️ 10분 고정 4단 와이드 게이트 (기억저가 대비 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%)",
-            "▫️ 재장전: 🔥 0주 즉시 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
-            "▫️ 매도: ⚡ 1분 상시 실물 스나이퍼 매도 (1층 +1.50% 익절&amp;리앵커링 / 2층 +1.00% 졸업)",
-            "▫️ 방어: ⏱️ 양방향 60초 타임쉴드 &amp; 장외업데이트 원장 철벽보존 (Case 65~68)",
+            "▫️ 재장전: 🔥 0주 60초 타임쉴드 후 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
+            "▫️ 매도: ⚡ 60초 타임쉴드 주기 현재가 지정가 모니터 (1층 +1.50% 이상 익절&amp;리앵커링 / 2층 +1.00% 이상 졸업 · Case 70)",
+            "▫️ 방어: ⏱️ 양방향·주기 60초 강제 타임쉴드 &amp; 이동평균 이중차감 방어 &amp; 3중 원장 철벽보존 (Case 65~70)",
             f"▫️ 기준 시드머니: <b>${init_seed:,.2f}</b> (1회 8% 정량 자동 산출)",
             "──────────────",
             "🔹 04:00 ~ 04:06: 🌅 프리장 호가 안정화 &amp; 오버나이트 지층 동기화",
-            "🔹 04:07 ~ 09:29: 🔫 프리장 지층관리 가동 (10분 와이드매수게이트 · 1분 상시매도)",
-            "🔹 09:30 ~ 16:00: 🔥 정규장 지층관리 가동 (10분 와이드매수게이트 · 1분 상시매도)",
+            "🔹 04:07 ~ 09:29: 🔫 프리장 지층관리 가동 (10분 와이드매수게이트 · 60초 타임쉴드 매도모니터)",
+            "🔹 09:30 ~ 16:00: 🔥 정규장 지층관리 가동 (10분 와이드매수게이트 · 60초 타임쉴드 매도모니터)",
             "🔹 16:00 ~ 16:59: 🌙 정규장 마감 일일 결산 &amp; 보유 지층 오버나이트 보존",
             "🔹 17:00 ~ 03:59: 🧹 일일 GC · 날짜별 금고 백업 및 장외 대기",
             "──────────────",
@@ -1786,9 +1787,9 @@ class _AdaptiveTelegramBridge:
         is_active = bool(st.get("is_active", True))
         active_badge = "🟢 ON" if is_active else "🔴 OFF"
         fast_badge = (
-            "⚡0.4s 부스터"
+            "⚡0.4s 체결감시"
             if getattr(self.context, "fast_shield_mode", False)
-            else "⏱️1.5s 표준"
+            else "⏱️60s 타임쉴드"
         )
         folder_slug, _ = _resolve_folder_identity_badge(self.context, st)
 
@@ -1813,21 +1814,32 @@ class _AdaptiveTelegramBridge:
         held_lots = safe_int(summary.get("held_lots"), 0)
         buckets = summary.get("buckets", [])
 
+        # 🛡️ Case 65 & Case 70: 매수 직후 60초 / 보유 중 매 60초 주기 매도 모니터 / 매도(0주 종료) 후 60초 타임쉴드 상태 확인
+        in_b, rem_b = is_within_post_buy_time_shield(
+            self.context, st, TARGET_SYMBOL
+        )
+        in_m, rem_m = is_within_sell_monitor_time_shield(
+            self.context, st, TARGET_SYMBOL
+        )
+        in_s, rem_s = is_within_post_sell_time_shield(
+            self.context, st, TARGET_SYMBOL
+        )
         shield_line = ""
-        fn_buy_sh = getattr(
-            sniper_exit_plugin, "is_within_post_buy_time_shield", None
-        )
-        fn_sell_sh = getattr(
-            sniper_exit_plugin, "is_within_post_sell_time_shield", None
-        )
-        if callable(fn_buy_sh):
-            in_b, rem_b = fn_buy_sh(self.context, st, TARGET_SYMBOL)
-            if in_b:
-                shield_line = f"🛡️ <b>[매수 후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_b:.1f}초</b> 후 현재가 조회 &amp; 매도 감시 개시"
-        if not shield_line and callable(fn_sell_sh):
-            in_s, rem_s = fn_sell_sh(self.context, st, TARGET_SYMBOL)
-            if in_s:
-                shield_line = f"🛡️ <b>[매도 후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_s:.1f}초</b> 후 현재가 조회 &amp; 매수 감시 개시"
+        if in_b:
+            shield_line = (
+                f"🛡️ <b>[매수 직후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_b:.1f}초</b> 후 "
+                "실시간 현재가 조회 &amp; 1차 매도 검문"
+            )
+        elif held_sh > 0 and in_m:
+            shield_line = (
+                f"🛡️ <b>[60초 매도 모니터 타임쉴드 가동 중]</b> 잔여 <b>{rem_m:.1f}초</b> 후 "
+                "현재가 조회 &amp; 익절(+1.5%/+1.0% 이상) 검문"
+            )
+        elif in_s:
+            shield_line = (
+                f"🛡️ <b>[매도 후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_s:.1f}초</b> 후 "
+                "현재가 조회 &amp; 매수 감시 개시"
+            )
 
         stratum_lines: List[str] = []
         if held_sh <= 0 or not buckets:
@@ -1844,7 +1856,7 @@ class _AdaptiveTelegramBridge:
             )
             stratum_lines.append(
                 f"📦 <b>[2층: 통합층 {b2.qty}주({b2.lot_count}회차)]</b> 장부 <b>${b2.book_price:.2f}</b>"
-                f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0%) [{g_sign}{l2_g:.2f}%]"
+                f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0% 이상) [{g_sign}{l2_g:.2f}%]"
             )
         else:
             b1 = buckets[0]
@@ -1853,7 +1865,7 @@ class _AdaptiveTelegramBridge:
             g1_sign = "+" if l1_g >= 0.0 else ""
             stratum_lines.append(
                 f"⚡ <b>[1층: 공격수 {b1.qty}주]</b> 단가 <b>${b1.book_price:.2f}</b> · "
-                f"익절목표 <b>${l1_t:.2f}</b>(+1.5%) [{g1_sign}{l1_g:.2f}%]"
+                f"익절목표 <b>${l1_t:.2f}</b>(+1.5% 이상 · 60초주기) [{g1_sign}{l1_g:.2f}%]"
             )
             if len(buckets) >= 2:
                 b2 = buckets[1]
@@ -1862,7 +1874,7 @@ class _AdaptiveTelegramBridge:
                 g2_sign = "+" if l2_g >= 0.0 else ""
                 stratum_lines.append(
                     f"📦 <b>[2층: 통합층 {b2.qty}주({b2.lot_count}회차)]</b> 장부 <b>${b2.book_price:.2f}</b>"
-                    f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0%) [{g2_sign}{l2_g:.2f}%]"
+                    f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0% 이상) [{g2_sign}{l2_g:.2f}%]"
                 )
 
         _, _, _, gate_info = evaluate_buy_gate_bucket_status(
@@ -2025,7 +2037,7 @@ class _AdaptiveTelegramBridge:
             f"0️⃣ 격리 폴더: 📂 <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code>)",
             f"1️⃣ 마스터 전원: <b>{power_str}</b>",
             f"2️⃣ 기준 시드머니: <b>${init_seed:,.2f}</b> (실현기준 총자산 ${real_eq:,.2f})",
-            "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 1분 지정가매도 · 60초 타임쉴드</b> (고정)",
+            "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 60초 타임쉴드 주기 지정가매도(Case 70)</b> (고정)",
             f"4️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str} (가용현금 ${free_cash:,.2f})",
             f"5️⃣ 현재 보유 지층: <b>{held_sh}주</b> ({held_lots}회차)",
             "──────────────",
@@ -2287,11 +2299,16 @@ class _AdaptiveTelegramBridge:
                 preserve_realized_profit=(new_seed_usd is None),
             )
         else:
+            now_reset_ts = time.time()
             kw: Dict[str, Any] = {
                 "buckets": [],
                 "anchor_price": 0.0,
                 "cycle_min_buy_price": 0.0,
                 "ratchet_anchor_price": 0.0,
+                "cycle_reanchor_credit_usd": 0.0,
+                "last_sell_fill_ts": now_reset_ts,
+                "last_cycle_end_ts": now_reset_ts,
+                "last_sell_gate_eval_ts": 0.0,
                 "buy_order_id": "",
                 "sell_order_id": "",
                 "ordered_qty": 0,
@@ -2318,7 +2335,7 @@ class _AdaptiveTelegramBridge:
                 "🧹 <b>[SOXL 지층 원장 0점 소각 완료]</b>\n"
                 f"🔸 기준 시드머니: <b>${safe_float(st_reset.get('initial_seed_usd'), 10000.0):,.2f}</b>\n"
                 f"🔸 가용 현금시드: <b>${safe_float(st_reset.get('free_cash_usd'), 10000.0):,.2f}</b>\n"
-                "🔸 미체결 주문 취소 및 지층 큐·기억저가(cycle_min_buy_price) 초기화 완료"
+                "🔸 미체결 주문 취소 및 지층 큐·기억저가(cycle_min_buy_price) 초기화 완료 (🛡️60초 첫 진입 타임쉴드 작동)"
             ),
         )
 
@@ -2773,6 +2790,13 @@ def _evaluate_fast_shield_mode(
     now_est: datetime,
     live_p: float,
 ) -> bool:
+    """
+    🚨 MODIFIED [Case 70 : 목표가 근접 시 0.4초 턱걸이 매도 가속 조건 영구 소각]:
+    - 매도 모니터는 매수 직후 60초 및 보유 중 매 60.0초 타임쉴드 주기로만 작동하므로,
+      현재가가 l1_target / l2_target 에 근접했다고 0.4초 부스터를 켜서 턱걸이 매도를 유발하던 조건을 완전히 제거한다.
+    - 0.4초 고속 루프는 오직 미체결 주문(buy_order_id / sell_order_id) 체결 확인 시점 및
+      10분 매수 게이트 정각 오픈 경계에서만 작동한다.
+    """
     hm = now_est.hour * 100 + now_est.minute
     if not is_active_trading_window(hm):
         return False
@@ -2781,17 +2805,13 @@ def _evaluate_fast_shield_mode(
     if not bool(st.get("is_active", True)):
         return False
 
+    # 1) 미체결 매수/매도 주문이 거래소에 올라가 있을 때만 빠른 체결 확인을 위해 0.4초 모드 가동
     if str(st.get("buy_order_id") or "").strip() or str(
         st.get("sell_order_id") or ""
     ).strip():
         return True
 
-    summary = summarize_stratum_portfolio(st, live_price=live_p)
-    held_sh = safe_int(summary.get("held_shares"), 0)
-
-    if held_sh <= 0:
-        return True
-
+    # 2) 10분 매수 게이트 정각 경계에서만 0.4초 모드 가동
     is_gate_open, _, _, b_info = evaluate_buy_gate_bucket_status(
         now_est=now_est,
         buy_interval_min=LOCKED_BUY_INTERVAL_MIN,
@@ -2800,24 +2820,8 @@ def _evaluate_fast_shield_mode(
         ),
         last_evaluated_date=str(st.get("last_evaluated_date") or ""),
     )
-    if is_gate_open or bool(b_info.get("is_exact_boundary_min")):
+    if is_gate_open and bool(b_info.get("is_exact_boundary_min")):
         return True
-
-    l1_target = safe_float(summary.get("l1_target_price"), 0.0)
-    l2_target = safe_float(summary.get("l2_target_price"), 0.0)
-    if live_p > 0.0 and l1_target > 0.0 and live_p >= (l1_target * 0.997):
-        return True
-    if live_p > 0.0 and l2_target > 0.0 and live_p >= (l2_target * 0.997):
-        return True
-
-    if bool(summary.get("is_l2_only_anti_bloat")):
-        pull_p = safe_float(summary.get("reentry_pullback_price"), 0.0)
-        brk_p = safe_float(summary.get("reentry_breakout_price"), 0.0)
-        if live_p > 0.0 and (
-            (pull_p > 0.0 and live_p <= pull_p * 1.003)
-            or (brk_p > 0.0 and live_p >= brk_p * 0.997)
-        ):
-            return True
 
     return False
 
@@ -2898,7 +2902,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                         now_est=now_est,
                     )
 
-                # 3-1) 로컬 지층 원장 ↔ 토스 실보유 잔고 무결성 화해 (Case 66/68 가드 내장)
+                # 3-1) 로컬 지층 원장 ↔ 토스 실보유 잔고 무결성 화해 (Case 66/68/69 가드 내장)
                 await _call_plugin_adaptive(
                     reconcile_stratum_with_broker_holdings_plugin,
                     context=context,
@@ -2907,7 +2911,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     now_est=now_est,
                 )
 
-                # 3-2) 매수 후 60초 타임쉴드 검문 & 1분 상시 순수 현재가 지정가 스나이퍼 매도 (Case 44, 65)
+                # 3-2) 매수 후 60초 & 보유 중 매 60초 타임쉴드 주기 순수 현재가 지정가 스나이퍼 매도 모니터 (Case 44, 65, 69, 70)
                 sell_res = await _call_plugin_adaptive(
                     execute_1m_sniper_sell_and_reanchor_plugin,
                     context=context,
@@ -3079,7 +3083,7 @@ async def async_main() -> None:
 
     run_quant_engine_tdd()
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · Case 67 min(1회분, 고정정량) 캡핑 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60/65/66/67/68) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · Case 67 min(1회분, 고정정량) 캡핑 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60/65/66/67/68/69/70) 검증 완료"
     )
 
     context = SniperAppContext(base_dir=base_dir)
@@ -3192,7 +3196,7 @@ async def async_main() -> None:
     ]
 
     logger.info(
-        "🚀 [SOXL 지층관리 스나이퍼 가동 완료 · 폴더=%s] 04:07 ~ 16:00 EST · 전술 A (🛡️ 05_AF_WIDE_10_01) · 8%% 황금정량 · Case 67 min(1회분,고정정량) 캡핑 · 10분 4단 와이드 매수게이트 · 1분 상시 매도 · 양방향 60초 타임쉴드 & 폴더별 3중 원장 금고(Case 65/66/67/68)",
+        "🚀 [SOXL 지층관리 스나이퍼 가동 완료 · 폴더=%s] 04:07 ~ 16:00 EST · 전술 A (🛡️ 05_AF_WIDE_10_01) · 8%% 황금정량 · Case 67 min(1회분,고정정량) 캡핑 · 10분 4단 와이드 매수게이트 · 60초 타임쉴드 주기 스나이퍼 매도 모니터(Case 70) · 폴더별 3중 원장 금고(Case 65~70)",
         context.folder_slug,
     )
 

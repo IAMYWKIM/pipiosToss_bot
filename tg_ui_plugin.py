@@ -2,7 +2,7 @@
 """
 # MODIFIED: tg_ui_plugin.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-텔레그램 관제탑 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 05 / 06)
+텔레그램 관제탑 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 03 / 04)
 - 제1헌법: 모든 텔레그램 HTTP API 호출을 asyncio.to_thread 로 비동기 격리 및 타임아웃 적용
 - 제4헌법: 모든 논리 시계열은 미국 동부 시간(EST/EDT) 100% 락온
 - Case 11 & Case 62:
@@ -14,10 +14,12 @@
 - Case 15 & Case 16: 모바일 가독성 최적화, html.escape 전역 적용, 세로바 대신 가운뎃점(·) 사용,
   기동 완료 시 "✅ 서버가 정상 작동 중입니다." 생존 신호 자동 타전
 - Case 64: 전술 제어반(/settlement) 내 30분 옵션 완전 제거 -> 오직 [작동 ON/OFF 버튼]과 [시드머니 설정 버튼] 2가지 옵션만 유지
-- Case 65 & Case 66: /avwap 레이더 내 양방향 60초 타임쉴드(매수 후 60초 / 매도 후 60초) 상태 및 4단 와이드 활주로 실시간 표출
+- Case 65, Case 66 & Case 70:
+  /avwap 레이더 내 양방향 60초 타임쉴드(매수 후 60초 / 매도 후 60초) 및 보유 중 매 60초 주기 매도 모니터 타임쉴드
+  (is_within_sell_monitor_time_shield) 잔여 시간과 4단 와이드 활주로를 실시간 표출!
 - Case 67: /avwap 레이더 및 /settlement 전술 제어반에서 차기 8% 정량 표출 시
   min(1회분 예산 상한 주수 budget_cap_qty, 기준가 고정 정량 anchor_quota_qty) 캡핑 상태를 실시간 반영!
-- 🚨 [NEW · Case 68 폴더 위치(base_dir) 식별 배지 표출 & 평시 숫자 오입력 시드 변조 잠금]:
+- Case 68 [폴더 위치(base_dir) 식별 배지 표출 & 평시 숫자 오입력 시드 변조 잠금]:
   1) 기동 배너 및 4대 관제 보드(/start, /avwap, /sync, /settlement)에 현재 봇의 운용 폴더(folder_slug)와
      격리된 고유 원장 파일명(soxl_stratum_ledger_<폴더명>.json)을 명시하여 멀티 봇 혼선을 100% 차단!
   2) 채팅창 일반 숫자 입력을 통한 시드 변경은 [💵 기준 시드머니($) 설정] 버튼 클릭 후 5분(300초) 이내이거나
@@ -53,6 +55,7 @@ from quant_indicators_plugin import (
 from sniper_exit_plugin import (
     is_within_post_buy_time_shield,
     is_within_post_sell_time_shield,
+    is_within_sell_monitor_time_shield,
 )
 from toss_api import (
     DEFAULT_INITIAL_SEED_USD,
@@ -70,7 +73,7 @@ logger = logging.getLogger("toss_sniper.tg_ui_plugin")
 # toss_api.py 와의 AST 심볼 임포트 불일치를 원천 차단하기 위해 기본 환율 상수를 모듈 내부에 직접 정의
 KRW_PER_USD_DEFAULT: float = 1380.0
 
-# NEW (Case 68): [💵 기준 시드머니($) 설정] 버튼 클릭 후 숫자 입력을 허용하는 유효 시간(초)
+# Case 68: [💵 기준 시드머니($) 설정] 버튼 클릭 후 숫자 입력을 허용하는 유효 시간(초)
 SEED_INPUT_PROMPT_TIMEOUT_SEC: float = 300.0
 
 
@@ -107,7 +110,7 @@ def _resolve_folder_identity_badge(
     context: Optional[Any], st: Optional[Dict[str, Any]] = None
 ) -> Tuple[str, str]:
     """
-    NEW [Case 68]:
+    Case 68:
     현재 봇이 가동 중인 폴더 식별자(folder_slug)와 고유 원장 파일명을 반환한다.
     """
     slug = ""
@@ -239,14 +242,14 @@ def build_start_schedule_message(
         "▫️ 전략: 🛡️ 05_AF_WIDE_10_01 (8% 황금정량 · 눌림/돌파 독립 1층 재장전 · 기억저가 와이드 활주로)",
         "▫️ 정량: 📐 min(1회분 8% 예산 상한 주수, 기준가 고정 정량) 이중 캡핑으로 돌파 시 예산 초과 차단 (Case 67)",
         "▫️ 매수: 🛡️ 10분 고정 4단 와이드 게이트 (기억저가 대비 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%)",
-        "▫️ 재장전: 🔥 0주 즉시 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
-        "▫️ 매도: ⚡ 1분 상시 현재가 지정가 매도 (1층 +1.50% 익절&amp;리앵커링 / 2층 +1.00% 졸업)",
-        "▫️ 방어: ⏱️ 양방향 60초 강제 타임쉴드 &amp; 장외업데이트 원장 철벽보존 (Case 65~68)",
+        "▫️ 재장전: 🔥 0주 60초 타임쉴드 후 진입 · 2층 단독 시 10분 게이트 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 산입",
+        "▫️ 매도: ⚡ 60초 타임쉴드 주기 현재가 지정가 모니터 (1층 +1.50% 이상 익절&amp;리앵커링 / 2층 +1.00% 이상 졸업 · Case 70)",
+        "▫️ 방어: ⏱️ 양방향·주기 60초 강제 타임쉴드 &amp; 이동평균 이중차감 방어 &amp; 3중 원장 철벽보존 (Case 65~70)",
         f"▫️ 기준 시드머니: <b>${init_seed:,.2f}</b> (1회 8% 정량 자동 산출)",
         "──────────────",
         "🔹 04:00 ~ 04:06: 🌅 프리장 호가 안정화 &amp; 오버나이트 지층 동기화",
-        "🔹 04:07 ~ 09:29: 🔫 프리장 지층관리 가동 (10분 와이드매수게이트 · 1분 지정가매도)",
-        "🔹 09:30 ~ 16:00: 🔥 정규장 지층관리 가동 (10분 와이드매수게이트 · 1분 지정가매도)",
+        "🔹 04:07 ~ 09:29: 🔫 프리장 지층관리 가동 (10분 와이드매수게이트 · 60초 타임쉴드 매도모니터)",
+        "🔹 09:30 ~ 16:00: 🔥 정규장 지층관리 가동 (10분 와이드매수게이트 · 60초 타임쉴드 매도모니터)",
         "🔹 16:00 ~ 16:59: 🌙 정규장 마감 일일 결산 &amp; 보유 지층 오버나이트 보존",
         "🔹 17:00 ~ 03:59: 🧹 일일 GC · 날짜별 금고 백업 및 장외 대기",
         "──────────────",
@@ -267,7 +270,7 @@ def build_avwap_radar_message(
     now_est: Optional[datetime] = None,
 ) -> str:
     """
-    📡 /avwap 스나이퍼 레이더 관제탑 메시지 생성 (Case 15, 59, 60, 64, 65, 66, 67, 68)
+    📡 /avwap 스나이퍼 레이더 관제탑 메시지 생성 (Case 15, 59, 60, 64, 65, 66, 67, 68, 69, 70)
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     met = refresh_metrics_with_live_tick(metrics, live_price, now_est=dt_now)
@@ -282,9 +285,9 @@ def build_avwap_radar_message(
     is_active = bool(st.get("is_active", True))
     active_badge = "🟢 ON" if is_active else "🔴 OFF"
     fast_badge = (
-        "⚡0.4s 부스터"
+        "⚡0.4s 체결감시"
         if getattr(context, "fast_shield_mode", False)
-        else "⏱️1.5s 표준"
+        else "⏱️60s 타임쉴드"
     )
     folder_slug, _ = _resolve_folder_identity_badge(context, st)
 
@@ -309,8 +312,11 @@ def build_avwap_radar_message(
     held_lots = safe_int(summary.get("held_lots"), 0)
     buckets = summary.get("buckets", [])
 
-    # 🛡️ Case 65: 양방향 60초 타임쉴드 작동 상태 확인
+    # 🛡️ Case 65 & Case 70: 매수 직후 60초 / 보유 중 매 60초 주기 매도 모니터 / 매도(0주 종료) 후 60초 타임쉴드 상태 확인
     in_buy_shield, rem_buy_sec = is_within_post_buy_time_shield(
+        context, st, TARGET_SYMBOL
+    )
+    in_mon_shield, rem_mon_sec = is_within_sell_monitor_time_shield(
         context, st, TARGET_SYMBOL
     )
     in_sell_shield, rem_sell_sec = is_within_post_sell_time_shield(
@@ -318,9 +324,20 @@ def build_avwap_radar_message(
     )
     shield_line = ""
     if in_buy_shield:
-        shield_line = f"🛡️ <b>[매수 후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_buy_sec:.1f}초</b> 후 현재가 조회 &amp; 매도 감시 개시"
+        shield_line = (
+            f"🛡️ <b>[매수 직후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_buy_sec:.1f}초</b> 후 "
+            "실시간 현재가 조회 &amp; 1차 매도 검문"
+        )
+    elif held_sh > 0 and in_mon_shield:
+        shield_line = (
+            f"🛡️ <b>[60초 매도 모니터 타임쉴드 가동 중]</b> 잔여 <b>{rem_mon_sec:.1f}초</b> 후 "
+            "현재가 조회 &amp; 익절(+1.5%/+1.0% 이상) 검문"
+        )
     elif in_sell_shield:
-        shield_line = f"🛡️ <b>[매도 후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_sell_sec:.1f}초</b> 후 현재가 조회 &amp; 매수 감시 개시"
+        shield_line = (
+            f"🛡️ <b>[매도 후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_sell_sec:.1f}초</b> 후 "
+            "현재가 조회 &amp; 매수 감시 개시"
+        )
 
     # 2-Tier 지층 상태 라인 구성
     stratum_lines: List[str] = []
@@ -338,7 +355,7 @@ def build_avwap_radar_message(
         )
         stratum_lines.append(
             f"📦 <b>[2층: 통합층 {b2.qty}주({b2.lot_count}회차)]</b> 장부 <b>${b2.book_price:.2f}</b>"
-            f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0%) [{g_sign}{l2_g:.2f}%]"
+            f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0% 이상) [{g_sign}{l2_g:.2f}%]"
         )
     else:
         b1 = buckets[0]
@@ -347,7 +364,7 @@ def build_avwap_radar_message(
         g1_sign = "+" if l1_g >= 0.0 else ""
         stratum_lines.append(
             f"⚡ <b>[1층: 공격수 {b1.qty}주]</b> 단가 <b>${b1.book_price:.2f}</b> · "
-            f"익절목표 <b>${l1_t:.2f}</b>(+1.5%) [{g1_sign}{l1_g:.2f}%]"
+            f"익절목표 <b>${l1_t:.2f}</b>(+1.5% 이상 · 60초주기) [{g1_sign}{l1_g:.2f}%]"
         )
         if len(buckets) >= 2:
             b2 = buckets[1]
@@ -356,7 +373,7 @@ def build_avwap_radar_message(
             g2_sign = "+" if l2_g >= 0.0 else ""
             stratum_lines.append(
                 f"📦 <b>[2층: 통합층 {b2.qty}주({b2.lot_count}회차)]</b> 장부 <b>${b2.book_price:.2f}</b>"
-                f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0%) [{g2_sign}{l2_g:.2f}%]"
+                f"(실평단 ${b2.actual_avg_price:.2f}) · 졸업가 <b>${l2_t:.2f}</b>(+1.0% 이상) [{g2_sign}{l2_g:.2f}%]"
             )
 
     # 10분 고정 와이드 매수 게이트 상태 구성
@@ -506,7 +523,7 @@ def build_settlement_control_message(
     context: Optional[Any] = None,
 ) -> str:
     """
-    ⚙️ /settlement 초단순 전술 제어반 메시지 생성 (Case 64: 오직 ON/OFF 와 시드설정 2가지만 표출 + Case 67/68 반영)
+    ⚙️ /settlement 초단순 전술 제어반 메시지 생성 (Case 64: 오직 ON/OFF 와 시드설정 2가지만 표출 + Case 67/68/70 반영)
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     lp = safe_float(live_price, safe_float(st.get("anchor_price"), 100.0))
@@ -532,7 +549,7 @@ def build_settlement_control_message(
         f"0️⃣ 격리 폴더: 📂 <b>{escape_html(folder_slug)}</b> (<code>{escape_html(primary_ledger_name)}</code>)",
         f"1️⃣ 마스터 전원: <b>{power_str}</b>",
         f"2️⃣ 기준 시드머니: <b>${init_seed:,.2f}</b> (실현기준 총자산 ${real_eq:,.2f})",
-        "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 1분 지정가매도 · 60초 타임쉴드</b> (고정)",
+        "3️⃣ 운용 엔진: 🛡️ <b>8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 60초 타임쉴드 주기 지정가매도(Case 70)</b> (고정)",
         f"4️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str} (가용현금 ${free_cash:,.2f})",
         f"5️⃣ 현재 보유 지층: <b>{held_sh}주</b> ({held_lots}회차)",
         "──────────────",
@@ -547,7 +564,7 @@ def build_settlement_control_message(
 # ---------------------------------------------------------------------------
 class TelegramCommandController:
     """
-    🚨 제1헌법 & Case 02, 15, 16, 62, 64, 65, 66, 67, 68:
+    🚨 제1헌법 & Case 02, 15, 16, 62, 64, 65, 66, 67, 68, 70:
     main.py 의 SniperAppContext 와 정식 결속되는 텔레그램 봇 컨트롤러.
     - 기동 직후 _flush_stale_updates_on_startup() 에서 조건 없이 큐의 마지막 update_id 를
       즉시 소비 확정(Ack)하고, /update 실행 시 변경 사항이 없으면(changed == False) 재기동하지 않고
@@ -763,7 +780,7 @@ class TelegramCommandController:
 
     async def send_startup_alive_banner(self) -> bool:
         """
-        🚨 Case 16, Case 67 & Case 68:
+        🚨 Case 16, Case 67, Case 68 & Case 70:
         기동 완료 후 "✅ 서버가 정상 작동 중입니다." 생존 신호와 함께
         현재 봇이 가동 중인 폴더명(folder_slug) 및 고유 원장 파일명을 타전한다.
         """
@@ -779,7 +796,7 @@ class TelegramCommandController:
         text = (
             "<b>✅ 서버가 정상 작동 중입니다.</b>\n"
             f"🔸 폴더격리: 📂 <b>{escape_html(folder_slug)}</b> (<code>{escape_html(primary_ledger_name)}</code> · 3중 백업금고 ON)\n"
-            "🔸 전략: 🛡️ 05_AF_WIDE_10_01 (8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 1분 지정가매도)\n"
+            "🔸 전략: 🛡️ 05_AF_WIDE_10_01 (8% 동적복리 · min(1회분,고정정량) 캡핑 · 10분 4단 와이드 · 60초 타임쉴드 주기 지정가매도 Case 70)\n"
             f"🔸 기준시드: <b>${init_seed:,.2f}</b> · 가용현금: <b>${free_cash:,.2f}</b> · 보유: <b>{held_sh}주</b>"
         )
         return await self.send_message(
@@ -1125,7 +1142,7 @@ class TelegramCommandController:
                     "🧹 <b>[SOXL 지층 및 시드 원자적 초기화 완료]</b>\n"
                     f"🔸 기준 시드머니: <b>${safe_float(st_reset.get('initial_seed_usd'), 10000.0):,.2f}</b>\n"
                     f"🔸 가용 현금시드: <b>${safe_float(st_reset.get('free_cash_usd'), 10000.0):,.2f}</b>\n"
-                    "🔸 보유 지층 큐 및 기억된 최저가(cycle_min_buy_price) 0점 소각 완료"
+                    "🔸 보유 지층 큐 및 기억된 최저가(cycle_min_buy_price) 0점 소각 완료 (🛡️60초 첫 진입 타임쉴드 작동)"
                 ),
             )
             return
@@ -1144,7 +1161,7 @@ class TelegramCommandController:
                 chat_id=chat_id,
                 text=(
                     "🧹 <b>[SOXL 지층 원장 0점 소각 완료]</b>\n"
-                    "🔸 미체결 주문 취소 및 지층 큐·기억저가 초기화 완료\n"
+                    "🔸 미체결 주문 취소 및 지층 큐·기억저가 초기화 완료 (🛡️60초 첫 진입 타임쉴드 작동)\n"
                     f"🔸 보존된 가용 현금시드: <b>${safe_float(st_reset.get('free_cash_usd'), 10000.0):,.2f}</b>"
                 ),
             )
