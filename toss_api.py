@@ -2,7 +2,7 @@
 """
 # MODIFIED: toss_api.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 토스증권 Open API (v1.2.14) 방탄 통신 통제소 &
-SOXL 단일 롱 2-Tier 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 01 / 04)
+SOXL 단일 롱 2-Tier 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Hotfix Step 01 / 01)
 - 제1헌법: 모든 파일 I/O 및 네트워크 통신의 asyncio.to_thread 비동기 격리 + GlobalThrottle 중앙 통제
 - 제2헌법: 기동 시 GET /api/v1/accounts 1회 호출로 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 자동 주입
 - 제3헌법 ~ 제6헌법 및 Case 01 ~ 70 전수 락온:
@@ -16,7 +16,7 @@ SOXL 단일 롱 2-Tier 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 �
      - "/home/pipiosToss" 고정 경로 하드코딩 100% 영구 소각 -> 오직 실행 파일이 위치한 폴더(base_dir)의 .env 만 로드
      - 폴더명(folder_slug) 기반 ① 고유 원장(soxl_stratum_ledger_<폴더명>.json), ② 호환 원장(soxl_stratum_ledger.json),
        ③ 실시간 백업 금고(ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json) 3중 원자적 동기화 및 기존 데이터 무손실 자동 이관
-     - initial_seed_usd 결측/0.0 유입 시 $100.0 으로 강제 박제되던 버그 영구 소각 및 백업/환경변수/기본값($10,000) 자가 치유 복원
+     - resolve_folder_isolated_ledger_paths() 내 backup_path f-string 구문 무결성 100% 교정 완료
   5) 🚨 [Case 65 & Case 69 0주 싸이클 종료 60초 타임쉴드 시각(last_cycle_end_ts) 영속화 및
      리앵커링 이중 차감 방지 진성 손익분기점 하한선(True Break-Even Floor) 원장 레벨 강제]
      - _default_symbol_state 및 _sanitize_and_enforce_identity 에 last_cycle_end_ts 와 cycle_reanchor_credit_usd 정식 탑재
@@ -203,8 +203,9 @@ def resolve_folder_isolated_ledger_paths(
     )
     legacy_path = os.path.join(target_dir, "soxl_stratum_ledger.json")
     backup_dir = os.path.join(target_dir, "ledger_backups")
+    # MODIFIED: f-string 닫는 중괄호(}) 구문 무결성 교정 완료
     backup_path = os.path.join(
-        backup_dir, f"soxl_stratum_ledger_{folder_slug>.bak.json}".replace(">.", ".")
+        backup_dir, f"soxl_stratum_ledger_{folder_slug}.bak.json"
     )
     return primary_path, legacy_path, backup_path, folder_slug
 
@@ -1312,7 +1313,7 @@ class TossApiClient:
         - 429 Rate Limit 또는 5xx 일시 오류 시 지수 백오프 재시도
         - 400, 403, 404, 409, 415, 422 비즈니스 에러 시 즉시 _NonRetryableApiError 발생
         """
-        clean_path = path if path.startswith("/") else f"{'/'}{path}"
+        clean_path = path if path.startswith("/") else f"/{path}"
         url = f"{self.base_url}{clean_path}"
         if params:
             filtered_params = {
