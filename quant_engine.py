@@ -6,7 +6,8 @@
 전술 A 챔피언(🛡️ 05_AF_WIDE_10_01) 보유 회차별 4단 와이드 점진 활주로(1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 및 1층 +1.50% / 2층 +1.00%) ·
 2층 단독 보유 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 1층(REENTRY_1FL) 재장전 판정기 ·
 프롬프트 2-Tier 가중평균 자동 병합(REENTRY_1FL 독립 1층 배치 vs DIP_1FL 2층 통합 · Case 53 하드 캡핑) ·
-단일 지층 실물 수익금 리앵커링(0.994 버퍼) · 기억된 최저 매수가(cycle_min_buy_price) 잠금 요약 및 TDD 검증' 코어 모듈 (Step 02 / 05)
+단일 지층 실물 수익금 리앵커링(0.994 버퍼) · 리앵커링 이중 차감 방지 진성 손익분기점 하한선(True Break-Even Floor · Case 69) ·
+기억된 최저 매수가(cycle_min_buy_price) 잠금 요약 및 TDD 검증' 코어 모듈 (Step 04 / 05)
 - MODIFIED (🎯 1 & Case 67): 정액제를 기반으로 한 정량제에서 상승 돌파 매수(exec_price > anchor_price) 시
   기존 고정 주수(anchor_quota_qty)로 인해 1회분(8%) 시드 예산(portion_budget)을 초과하는 현상을 원천 차단하기 위해
   target_qty = min(budget_cap_qty, anchor_quota_qty) 이중 캡핑 공식을 compute_golden8_quota_qty 및
@@ -16,7 +17,12 @@
 - MODIFIED (🎯 4 & Case 59): 2층(MERGED_UPPER) 단독 보유 시 직전 익절가(anchor_price) 대비 -1.00% 이하 눌림목(PULLBACK_RELOAD)
   또는 +1.00% 이상 상승 돌파(BREAKOUT_RELOAD) 시에만 독립 실물 1층(REENTRY_1FL) 재장전을 승인하는
   evaluate_l2_only_hybrid_reentry_signal() 함수 및 관제탑(main.py / tg_ui_plugin.py / defense_plugin.py) 전 필드 100% 매핑!
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 67 완벽 준수
+- NEW (🎯 3 & Case 69):
+  1) enforce_true_breakeven_floor_on_buckets() 및 vrev_reanchor_single_tier_quota() 내 max_allowed_total_discount_usd 상한 캡핑으로
+     보유 지층의 리앵커링 할인 총액(actual_cost_usd - book_invested_usd)이 현재 사이클 내 실수확된 리앵커링 크레딧 한도를
+     절대 초과할 수 없도록 진성 손익분기점 하한선(True Break-Even Floor)을 물리적으로 강제!
+  2) run_quant_engine_tdd() 에 Case 69 (이동평균 희석 이중 차감 차단 및 진성 흑자 졸업 보장) 검증 테스트 추가!
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 69 완벽 준수
 """
 
 from __future__ import annotations
@@ -48,7 +54,7 @@ ROUND_TRIP_FEE_RATE_PCT: float = float(
 # 8%(12.5분할) 황금비율 기준 기본 분할 회차 상수
 BASE_MAX_LOTS_8PCT: int = 12
 
-# NEW (🎯 4 & Case 59): 2층 단독 보유 시 10분 게이트 독립 1층(REENTRY_1FL) 눌림목/상승돌파 임계치(%)
+# 🎯 4 & Case 59: 2층 단독 보유 시 10분 게이트 독립 1층(REENTRY_1FL) 눌림목/상승돌파 임계치(%)
 REENTRY_PULLBACK_DROP_PCT: float = -1.00
 REENTRY_BREAKOUT_RISE_PCT: float = 1.00
 
@@ -59,7 +65,7 @@ REENTRY_BREAKOUT_RISE_PCT: float = 1.00
 @dataclass
 class StratumBucket:
     """
-    🎯 3 & Case 46 ~ 60:
+    🎯 3 & Case 46 ~ 69:
     SOXL 지층(1층 L1 / 2층 통합층 MERGED_UPPER) 개별 버킷 데이터 구조체.
     - qty              : 보유 정수 주식 수 (주)
     - book_price       : 리앵커링이 반영된 목표 탈출 기준 장부 단가 ($)
@@ -159,6 +165,62 @@ def buckets_to_dicts(
         for b in (buckets or [])
         if isinstance(b, StratumBucket) and b.qty > 0
     ]
+
+
+# ---------------------------------------------------------------------------
+# [핵심 1-B · NEW Case 69] 진성 손익분기점 하한선(True Break-Even Floor) 강제 정규화기
+# ---------------------------------------------------------------------------
+def enforce_true_breakeven_floor_on_buckets(
+    buckets: Sequence[StratumBucket],
+    max_allowed_discount_usd: Optional[float] = None,
+) -> List[StratumBucket]:
+    """
+    🚨 NEW [Case 69 진성 손익분기점 하한선(True Break-Even Floor) 강제]:
+    보유 지층(특히 2층 MERGED_UPPER)의 리앵커링 할인 총액(actual_cost_usd - book_invested_usd)이
+    현재 사이클에서 실제 1층 익절로 수확된 리앵커링 크레딧 상한(max_allowed_discount_usd)을
+    절대 초과하지 못하도록 book_invested_usd 와 book_price 의 하한선을 물리적으로 강제한다.
+    (토스 이동평균 희석 단가 덮어쓰기 및 리앵커링 이중 차감으로 인한 조기 손절 졸업 영구 봉쇄!)
+    """
+    valid = [
+        b
+        for b in (buckets or [])
+        if isinstance(b, StratumBucket) and b.qty > 0
+    ]
+    if not valid or max_allowed_discount_usd is None:
+        return valid
+
+    rem_allowable_disc = max(0.0, safe_float(max_allowed_discount_usd, 0.0))
+    adjusted: List[StratumBucket] = []
+
+    # 2층(MERGED_UPPER)이 존재하는 경우 2층에 우선적으로 허용 크레딧을 배정하고 1층은 순수 단가 유지
+    for idx, b in enumerate(valid):
+        cur_disc = max(0.0, b.actual_cost_usd - b.book_invested_usd)
+        if len(valid) >= 2 and idx == 0 and str(b.lot_type).upper() != "MERGED_UPPER":
+            capped_disc = 0.0
+        else:
+            capped_disc = min(cur_disc, rem_allowable_disc)
+            rem_allowable_disc = max(0.0, rem_allowable_disc - capped_disc)
+
+        min_floor_inv = max(
+            0.01 * float(b.qty),
+            round(b.actual_cost_usd - capped_disc, 4),
+        )
+        eff_book_inv = max(b.book_invested_usd, min_floor_inv)
+        eff_book_p = round(
+            min(b.actual_avg_price, max(0.01, eff_book_inv / float(b.qty))),
+            4,
+        )
+        adjusted.append(
+            StratumBucket(
+                qty=b.qty,
+                book_price=eff_book_p,
+                book_invested_usd=round(eff_book_p * float(b.qty), 4),
+                actual_cost_usd=round(b.actual_cost_usd, 4),
+                lot_count=b.lot_count,
+                lot_type=b.lot_type,
+            )
+        )
+    return adjusted
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +442,7 @@ def evaluate_l2_only_hybrid_reentry_signal(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 4] 2-Tier 가중평균 자동 병합 (REENTRY_1FL 독립 배치 vs DIP_1FL 병합) & 리앵커링
+# [핵심 4] 2-Tier 가중평균 자동 병합 (REENTRY_1FL 독립 배치 vs DIP_1FL 병합) & 리앵커링 (Case 69 탑재)
 # ---------------------------------------------------------------------------
 def vrev_add_quota_lot_and_merge_2tier(
     queue: Sequence[StratumBucket],
@@ -479,13 +541,17 @@ def vrev_add_quota_lot_and_merge_2tier(
 def vrev_reanchor_single_tier_quota(
     queue: Sequence[StratumBucket],
     net_realized_cash_profit: float,
+    max_allowed_total_discount_usd: Optional[float] = None,
 ) -> Tuple[List[StratumBucket], float]:
     """
-    🎯 3 & Case 47, 59:
+    🎯 3 & Case 47, 59, 69:
     1층(하부 공격수)이 실물 익절되어 장부에 상위 통합층(2층) 단 1개 지층(len(queue) == 1)만 남았을 때,
     실제로 회수된 세후 실현 순수익금(net_realized_cash_profit)에 안전 버퍼(0.994)를 곱한 금액만큼
     2층의 장부 투자원금(book_invested_usd)만 차감해 목표 탈출 단가(book_price)를 강제 인하한다.
-    (단, 실제 원금 actual_cost_usd 는 절대 건드리지 않는다!)
+    - 단, 실제 원금 actual_cost_usd 는 절대 건드리지 않는다!
+    - 🚨 NEW [Case 69]: max_allowed_total_discount_usd 가 지정된 경우,
+      누적 할인 총액(actual_cost_usd - new_book_inv)이 max_allowed_total_discount_usd 를 초과하지 못하도록
+      진성 손익분기점 하한선(True Break-Even Floor)을 강제한다!
     반환값: (updated_queue, per_share_price_drop_usd)
     """
     existing = [
@@ -504,6 +570,16 @@ def vrev_reanchor_single_tier_quota(
     credit_usd = max(0.0, net_profit * REANCHOR_NET_BUFFER_MULT)
     old_book_p = rem.book_price
     min_floor_inv = 0.01 * float(rem.qty)
+
+    if (
+        max_allowed_total_discount_usd is not None
+        and safe_float(max_allowed_total_discount_usd, -1.0) >= 0.0
+    ):
+        allowed_disc = max(0.0, safe_float(max_allowed_total_discount_usd, 0.0))
+        min_floor_inv = max(
+            min_floor_inv, round(rem.actual_cost_usd - allowed_disc, 4)
+        )
+
     new_book_inv = round(
         max(min_floor_inv, rem.book_invested_usd - credit_usd), 4
     )
@@ -569,27 +645,29 @@ def calc_sell_realized_pnl(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 5] 포트폴리오 · 지층 · 기억된 최저가 · 하이브리드 1층 재장전 · Case 67 통합 요약기
+# [핵심 5] 포트폴리오 · 지층 · 기억된 최저가 · 하이브리드 1층 재장전 · Case 67/69 통합 요약기
 # ---------------------------------------------------------------------------
 def summarize_stratum_portfolio(
     state_dict: Dict[str, Any],
     live_price: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    🎯 1, 🎯 2, 🎯 4, 🎯 5 & Case 59, 60, 67:
+    🎯 1, 🎯 2, 🎯 4, 🎯 5 & Case 59, 60, 67, 69:
     원장 상태(state_dict)와 현재가(live_price)를 받아:
     - 1층(L1) 및 2층(MERGED_UPPER) 보유 현황, 목표 익절가(l1_target_price, l2_target_price) 및 실시간 수익률(l1_gain_pct, l2_gain_pct)
+    - NEW [Case 69]: cycle_reanchor_credit_usd 가 존재할 때 enforce_true_breakeven_floor_on_buckets() 를 적용하여
+      2층 장부단가(book_price)와 졸업 목표가(l2_target_price)가 진성 손익분기점 밑으로 왜곡되지 않도록 보장!
     - 2층 단독 보유(is_l2_only_anti_bloat) 시 직전 익절가(reentry_ref_anchor) 대비
       눌림목 재장전 타점(reentry_pullback_price, -1.00%) 및 상승돌파 재장전 타점(reentry_breakout_price, +1.00%)
     - 1층 보유 중 기억된 사이클 최저 매수가(cycle_min_buy_price)를 반영한 4단 와이드 활주로
       추가 매수 기준가(active_buy_anchor / ref_buy_anchor) 및 신저가 매수 트리거 가격(trigger_buy_price)
-    - NEW [Case 67]: 기준가 기반 고정 정량(anchor_quota_qty), 현재가 기준 1회분 예산 상한 주수(budget_cap_qty),
+    - Case 67: 기준가 기반 고정 정량(anchor_quota_qty), 현재가 기준 1회분 예산 상한 주수(budget_cap_qty),
       그리고 min(budget_cap_qty, anchor_quota_qty) 가 적용된 최종 목표 매수 주수(next_target_qty)
     - 회계 항등식 기반 총자산(mark_equity_usd / total_mark_equity_usd), 가용현금(free_cash_usd),
       실현기준 총자산(realized_equity_usd), 평가손익, 실현/총 ROI 및 누적 통계 필드를 100% 반환한다.
     """
     st = state_dict if isinstance(state_dict, dict) else {}
-    buckets = buckets_from_dicts(st.get("buckets", []))
+    raw_buckets = buckets_from_dicts(st.get("buckets", []))
 
     init_seed = max(
         100.0, safe_float(st.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD)
@@ -597,6 +675,24 @@ def summarize_stratum_portfolio(
     cum_realized = round(
         safe_float(st.get("cumulative_realized_net_usd"), 0.0), 4
     )
+
+    # 🚨 Case 69: cycle_reanchor_credit_usd 기반 진성 손익분기점 하한선 적용
+    raw_cycle_credit = safe_float(st.get("cycle_reanchor_credit_usd"), -1.0)
+    if raw_cycle_credit >= 0.0:
+        buckets = enforce_true_breakeven_floor_on_buckets(
+            raw_buckets, max_allowed_discount_usd=raw_cycle_credit
+        )
+        eff_cycle_credit = round(raw_cycle_credit, 4)
+    else:
+        buckets = raw_buckets
+        eff_cycle_credit = round(
+            max(
+                0.0,
+                sum(b.actual_cost_usd - b.book_invested_usd for b in buckets),
+            ),
+            4,
+        )
+
     actual_invested = round(sum(b.actual_cost_usd for b in buckets), 4)
     book_invested = round(sum(b.book_invested_usd for b in buckets), 4)
 
@@ -738,7 +834,7 @@ def summarize_stratum_portfolio(
     else:
         ref_for_quota = active_buy_anchor
 
-    # NEW [Case 67]: 기준가 기반 고정 정량(anchor_quota_qty)과 현재가(lp) 기준 1회분 예산 상한 주수(budget_cap_qty)의 min() 산출
+    # Case 67: 기준가 기반 고정 정량(anchor_quota_qty)과 현재가(lp) 기준 1회분 예산 상한 주수(budget_cap_qty)의 min() 산출
     anchor_quota_qty, next_portion_budget = compute_golden8_quota_qty(
         anchor_price=max(0.01, ref_for_quota),
         current_total_equity=cost_equity,
@@ -795,6 +891,7 @@ def summarize_stratum_portfolio(
         "book_invested_usd": book_invested,
         "actual_avg_price": actual_avg_p,
         "book_avg_price": book_avg_p,
+        "cycle_reanchor_credit_usd": eff_cycle_credit,
         "market_eval_usd": market_eval_usd,
         "unrealized_pnl_usd": unrealized_pnl_usd,
         "unrealized_rate_pct": unrealized_rate_pct,
@@ -838,14 +935,14 @@ def summarize_stratum_portfolio(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 67 & 전술 A 4단 와이드 활주로 전수 검증)
+# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 69 & 전술 A 4단 와이드 활주로 전수 검증)
 # ---------------------------------------------------------------------------
 def run_quant_engine_tdd() -> bool:
     """
     기동 직전 8% 황금정량 산출, Case 67 min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑,
     4단 와이드 활주로(-1.0% / -2.0% / -3.5% / -5.5%),
-    2층 단독 시 눌림/돌파 하이브리드 독립 1층 재장전(Case 59), 기억된 최저가 잠금(Case 60) 및
-    관제 UI 필수 요약 필드를 전수 검증한다.
+    2층 단독 시 눌림/돌파 하이브리드 독립 1층 재장전(Case 59), 기억된 최저가 잠금(Case 60),
+    Case 69 (이동평균 희석 이중 차감 방지 진성 손익분기점 하한선) 및 관제 UI 필수 요약 필드를 전수 검증한다.
     """
     # 1) 8% 황금정량 산출 검증 ($10,000 시드 -> $800 예산, 기준가 $100 -> 8주 확정)
     q1, bud1 = compute_golden8_quota_qty(
@@ -856,9 +953,6 @@ def run_quant_engine_tdd() -> bool:
     )
 
     # 1-B) 🚨 Case 67: min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑 검증
-    # $19,155.74 총자산 -> 1회(8%) 예산 $1,532.4592, 직전 익절 기준가 $82.39 -> 고정 정량 18주
-    # - 하락 매수($79.52): budget_cap_qty(19주) vs anchor_quota_qty(18주) -> min(19, 18) = 18주 고정
-    # - 급등 돌파($86.00): budget_cap_qty(17주) vs anchor_quota_qty(18주) -> min(17, 18) = 17주로 캡핑하여 예산 초과 차단!
     q_dip, bud_c67 = compute_golden8_quota_qty(
         82.39, 19155.74, 19000.0, "COMP_08PCT", exec_price=79.52
     )
@@ -926,6 +1020,9 @@ def run_quant_engine_tdd() -> bool:
     assert len(reanchored_q) == 1 and drop_amt > 0.0, (
         "TDD 실패: 2층 리앵커링 미작동"
     )
+    assert abs(reanchored_q[0].actual_cost_usd - 1568.0) < 1e-4, (
+        "TDD 실패(Case 69): 리앵커링 시 actual_cost_usd 변조 발생!"
+    )
 
     sig_hold = evaluate_l2_only_hybrid_reentry_signal(91.00, 91.35, 97.38)
     sig_pull = evaluate_l2_only_hybrid_reentry_signal(90.40, 91.35, 97.38)
@@ -966,18 +1063,41 @@ def run_quant_engine_tdd() -> bool:
         "cycle_min_buy_price": 90.00,
         "ratchet_anchor_price": 90.40,
         "cumulative_realized_net_usd": 10.0,
+        "cycle_reanchor_credit_usd": 9.94,
     }
     sum_info = summarize_stratum_portfolio(mock_state, live_price=90.20)
     assert abs(sum_info["active_buy_anchor"] - 90.00) < 1e-4, (
         f"TDD 실패(Case 60): 기억된 최저가($90.00) 잠금 풀림 -> {sum_info['active_buy_anchor']}"
     )
+
+    # 7) 🚨 Case 69: 이중 차감(Double-Discount) 오염 방어 하한선 검증
+    # 실제 원금이 $11,783.56(133주 @ $88.60)이고 사이클 내 리앵커링 크레딧이 $154.81 일 때,
+    # 누군가 book_invested_usd 를 $11,348.89($85.33)로 과도하게 깎아놓더라도
+    # enforce_true_breakeven_floor_on_buckets 가 $11,628.75($87.4342)로 즉시 복구하여 적자 졸업을 막는지 검증!
+    polluted_b2 = StratumBucket(
+        qty=133,
+        book_price=85.33,
+        book_invested_usd=11348.89,
+        actual_cost_usd=11783.56,
+        lot_count=7,
+        lot_type="MERGED_UPPER",
+    )
+    healed_list = enforce_true_breakeven_floor_on_buckets(
+        [polluted_b2], max_allowed_discount_usd=154.81
+    )
+    assert len(healed_list) == 1
+    assert healed_list[0].book_price >= 87.43, (
+        f"TDD 실패(Case 69): 이중 차감 복구 실패 -> book_price={healed_list[0].book_price}"
+    )
+
     assert (
         "mark_equity_usd" in sum_info
         and "ref_buy_anchor" in sum_info
         and "anchor_quota_qty" in sum_info
         and "budget_cap_qty" in sum_info
+        and "cycle_reanchor_credit_usd" in sum_info
     ), "TDD 실패: 관제 보드 필수 요약 키 누락"
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · Case 67 min(1회분, 고정정량) 캡핑 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 전술 A (8%% 황금정량 · Case 67 min(1회분, 고정정량) 캡핑 · 4단 와이드 활주로 · 눌림/돌파 독립 1층 재장전 · Case 59/60/69) 검증 완료"
     )
     return True

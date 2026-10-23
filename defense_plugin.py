@@ -1,24 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: defense_plugin.py
-순수 롱(SOXL) 오버나이트 지층관리 스나이퍼 전용 (Step 04 / 06):
-1) 🚨 [Case 66 봇 주문 진행 중 가로채기 차단 및 미결 매수 즉시 정산 가드]
-   원장에 미결 매수(buy_order_id)가 존재할 때 reconcile 모듈이 호출되면, 실잔고 증가를 수동 매수로
-   가로채지 않고 즉시 sync_pending_buy_order_plugin() 을 선행 호출한 뒤 SKIP_RECONCILE_BOT_ORDER_PENDING 을 반환하여
-   텔레그램 매수 체결 알림 · 자투리 절약금 누적 · 매수 후 60초 타임쉴드 각인이 100% 완수되도록 보장!
-2) 🔗 [tg_ui_plugin.py 심볼 완벽 호환] 전술 제어반(/settlement)에서 봇 작동 OFF ➔ ON 재개 시 호출되는
+순수 롱(SOXL) 오버나이트 지층관리 스나이퍼 전용 (Step 03 / 05):
+1) 🚨 [Case 66 봇 주문 진행 중 가로채기 차단 및 미결 매수/매도 즉시 정산 가드]
+   원장에 미결 매수(buy_order_id) 또는 미결 매도(sell_order_id)가 존재할 때 reconcile 모듈이 호출되면,
+   실잔고 변화를 수동 매매로 가로채지 않고 즉시 sync_pending_buy_order_plugin() / sync_pending_sell_order_plugin() 을
+   선행 호출한 뒤 SKIP_RECONCILE_BOT_ORDER_PENDING 을 반환하여 텔레그램 체결 알림 · 자투리 절약금 누적 ·
+   양방향 60초 타임쉴드 각인이 100% 완수되도록 보장!
+2) 🛡️ [NEW · Case 61, Case 65 & Case 69 양방향 15초 인덱싱 그레이스 쉴드 전 구간(h_qty != ledger_qty) 최우선 적용]
+   - 매수 체결뿐만 아니라 매도 체결(1층 익절 및 0주 졸업) 직후 15.0초 동안은 모든 수량 불일치(h_qty != ledger_qty)에서
+     즉시 PROTECTED_BY_AUTO_FILL_GRACE_SHIELD 를 반환하여, 토스 잔고 API 인덱싱 시차(0.1 ~ 0.4초)로 인한
+     유령 추매(h_qty > ledger_qty) ➔ 유령 부분매도(h_qty < ledger_qty) 핑퐁 오염 및 0주 졸업 직후 과거 백업 덮어쓰기를 원천 봉쇄!
+   - 수동 전량 청산(CLEARED_TO_ZERO_HOLDINGS)으로 0주 싸이클이 끝나는 순간에도 mark_post_sell_time_shield(is_cycle_end=True) 와
+     last_sell_fill_ts / last_cycle_end_ts 를 즉시 각인하여 다음 첫 진입까지 무조건 60.0초 타임쉴드를 강제!
+3) 🛡️ [NEW · Case 69 토스 이동평균 희석 평단(h_avg / h_pur) 원가 덮어쓰기 영구 금지 및 진성 원가 비례 보존]
+   - h_qty < ledger_qty 화해 시 토스 이동평균법으로 희석된 매입금액(h_pur)을 actual_cost_usd 에 덮어쓰던 로직을 영구 폐기!
+   - 오직 스나이퍼 원장에 보존된 기존 순수 매수원금(old_actual_cost)과 사이클 내 실수확 리앵커링 크레딧(allowed_credit)에
+     잔여 수량 비율(scale_ratio = float(h_qty) / float(ledger_qty))만 곱하여 분리회계 원가와 리앵커링 단가를 무결하게 보존!
+4) 🔗 [tg_ui_plugin.py 심볼 완벽 호환] 전술 제어반(/settlement)에서 봇 작동 OFF ➔ ON 재개 시 호출되는
    relock_stratum_on_bot_resume() 함수를 정식 제공하여 AST 심볼 임포트 무결성 100% 충족!
-3) 04:00 ~ 04:06 EST 프리장 개장 초기 호가 안정화 · 전일 잔류 미체결 청소 · 오버나이트 이월 지층 동기화
-4) 장중/기동 시 로컬 지층 원장(soxl_stratum_ledger_<폴더명>.json) ↔ 토스 실보유 잔고(/api/v1/holdings) 무결성 화해
-   - Case 61: 매수 체결 직후 15.0초 인덱싱 시차 그레이스 쉴드(is_within_auto_fill_grace_shield) 보호
-   - Case 60: 토스 앱 수동 전량 매도(0주) 시 기억된 최저 매수가(cycle_min_buy_price = 0.0) 원자적 리셋
-   - Case 63: 수동 매수/매도 동기화 시 기존에 깎아둔 리앵커링 단가(book_price) 크레딧 보존 및 음수 시드 방지
-   - 🚨 [NEW · Case 68 백업 금고(ledger_backups/) 자가 치유 연동 & 시드 $100 변조 방어]:
-     로컬 원장 지층이 비어 있고 토스 실잔고(h_qty > 0)가 존재할 때, 먼저 백업 금고(recover_from_backup_vault_sync)를
-     조회하여 어제의 1·2층 분리 지층·리앵커링 단가·기억저가·누적 수익·설정 시드머니를 100% 원형 복원!
-5) 16:00 ~ 16:59 EST 정규장 마감 일일 결산 리포트 타전 · 일일 스냅샷 백업 및 보유 지층 오버나이트 안전 보존
-6) 17:00 EST 일일 가비지 컬렉션(GC) · 일일 통계 롤오버 및 ledger_backups/ 날짜별 원장 스냅샷(최근 14일 보관) 물리적 생성
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 68 완벽 준수
+5) 04:00 ~ 04:06 EST 프리장 개장 초기 호가 안정화 · 16:00 EST 일일 결산 · 17:00 EST 일일 GC 및 3중 금고 스냅샷 백업(Case 68)
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 69 완벽 준수
 """
 
 from __future__ import annotations
@@ -32,11 +34,17 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from quant_engine import (
+    REANCHOR_NET_BUFFER_MULT,
     StratumBucket,
     buckets_from_dicts,
     buckets_to_dicts,
     summarize_stratum_portfolio,
     vrev_add_quota_lot_and_merge_2tier,
+)
+from sniper_exit_plugin import (
+    is_within_post_sell_time_shield,
+    mark_post_sell_time_shield,
+    sync_pending_sell_order_plugin,
 )
 from sniper_plugin import (
     is_within_auto_fill_grace_shield,
@@ -73,7 +81,7 @@ def _resolve_valid_seed_from_state(st: Dict[str, Any]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1] 로컬 지층 원장 ↔ 토스 실보유 잔고(/api/v1/holdings) 무결성 화해 (Case 58, 60, 61, 63, 66, 68)
+# [핵심 1] 로컬 지층 원장 ↔ 토스 실보유 잔고(/api/v1/holdings) 무결성 화해 (Case 58, 60, 61, 63, 65, 66, 68, 69)
 # ---------------------------------------------------------------------------
 async def reconcile_stratum_with_broker_holdings_plugin(
     context: Any,
@@ -83,19 +91,23 @@ async def reconcile_stratum_with_broker_holdings_plugin(
     force_sync: bool = False,
 ) -> Dict[str, Any]:
     """
-    🚨 Case 58, Case 60, Case 61, Case 63, Case 66 & Case 68:
+    🚨 Case 58, Case 60, Case 61, Case 63, Case 65, Case 66, Case 68 & Case 69:
     프로세스 재기동 시, 04:00 EST 오프닝 동기화 시, 또는 장중 사용자가 토스 앱에서 수동 매매했을 때
     로컬 지층 원장(buckets)의 총 보유 주수(ledger_qty)와 토스 실계좌 보유 주수(h_qty)를 대조하여 화해한다:
     0) 🛡️ [Case 66 핵심 방어 : 봇 미결 주문(buy_order_id / sell_order_id) 진행 중 가로채기 원천 차단]
-       - force_sync 가 아닌 일반 루프 호출 시 원장에 buy_order_id 가 남아 있다면,
-         거래소 즉시 체결로 실잔고(h_qty)가 먼저 늘어났더라도 reconcile 이 가로채지 않고
-         즉시 sync_pending_buy_order_plugin() 을 선행 호출하여 정식 체결 알림 · 자투리 누적 · 60초 타임쉴드를 완수한다!
-       - sell_order_id 가 남아 있을 때 역시 SKIP_RECONCILE_BOT_ORDER_PENDING 을 반환하여
-         직후 실행되는 매도 게이트(sync_pending_sell_order_plugin)가 정식 익절 정산을 수행하도록 보장한다!
-    1) 🛡️ [Case 68 핵심 방어 : 원장 초기화 감지 시 백업 금고(ledger_backups/) 자가 치유 복원]
-       - 토스 실보유 수량(h_qty > 0)이 있는데 로컬 원장 수량(ledger_qty == 0)이 비어 있을 때,
-         먼저 context.ledger.recover_from_backup_vault_sync() 를 호출하여 백업 금고에 보존된
-         2-Tier 지층·리앵커링 단가·기억저가·누적 실현수익·설정 시드머니를 최우선 복구한다!
+       - force_sync 가 아닌 일반 루프 호출 시 원장에 buy_order_id 또는 sell_order_id 가 남아 있다면,
+         거래소 즉시 체결로 실잔고(h_qty)가 먼저 변했더라도 reconcile 이 가로채지 않고
+         즉시 sync_pending_buy_order_plugin() / sync_pending_sell_order_plugin() 을 선행 호출하여
+         정식 체결 알림 · 자투리 누적 · 양방향 60초 타임쉴드 각인을 완수한다!
+    1) 🛡️ [Case 61 & Case 69 핵심 방어 : 모든 수량 불일치(h_qty != ledger_qty) 최상단 양방향 15초 그레이스 쉴드]
+       - 자동 매수 또는 자동 매도 체결 직후 15.0초 이내(is_within_auto_fill_grace_shield)라면,
+         토스 /api/v1/holdings 인덱싱 시차(0.1 ~ 0.4초) 구간이므로 어떠한 수량 불일치라도 원장을 건드리지 않고 즉시 보호한다!
+    2) 🛡️ [Case 65 핵심 방어 : 0주 싸이클 종료 시 60.0초 타임쉴드 강제 각인 및 보호]
+       - 전량 졸업 직후 60초 매도 타임쉴드가 작동 중일 때 잔고 시차로 인해 과거 백업이 복원되는 것을 차단하고,
+       - 수동 전량 매도(CLEARED_TO_ZERO_HOLDINGS)로 0주가 될 때도 60.0초 타임쉴드를 각인하여 즉각 재진입을 막는다!
+    3) 🛡️ [Case 69 핵심 방어 : h_qty < ledger_qty 화해 시 토스 이동평균 희석 원금(h_pur) 덮어쓰기 영구 금지]
+       - 부분 매도 동기화 시 토스 이동평균 단가(h_avg / h_pur)를 절대 참조하지 않고,
+         원장 고유의 순수 매수원금(old_actual_cost)과 리앵커링 크레딧만 잔여 수량 비율(scale_ratio)로 비례 축소한다!
     """
     if not isinstance(holdings, dict) or not getattr(
         context, "holdings_fetch_ok", True
@@ -106,7 +118,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
     pending_buy_oid = str(st.get("buy_order_id") or "").strip()
     pending_sell_oid = str(st.get("sell_order_id") or "").strip()
 
-    # 🚨 [Case 66 핵심 방어] 봇이 발주한 지정가 매수/매도 주문이 대기 중일 때 가로채기 금지 및 매수 선행 정산!
+    # 🚨 [Case 66 핵심 방어] 봇이 발주한 지정가 매수/매도 주문이 대기 중일 때 가로채기 금지 및 선행 정산!
     if not force_sync and (pending_buy_oid or pending_sell_oid):
         if pending_buy_oid:
             try:
@@ -118,6 +130,16 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                 )
             except Exception as exc:
                 logger.warning("Case 66 미결 매수 선행 동기화 예외: %s", exc)
+        if pending_sell_oid:
+            try:
+                await sync_pending_sell_order_plugin(
+                    context=context,
+                    holdings=holdings,
+                    prices=prices,
+                    now_est=now_est,
+                )
+            except Exception as exc:
+                logger.warning("Case 66 미결 매도 선행 동기화 예외: %s", exc)
         return {
             "status": "SKIP_RECONCILE_BOT_ORDER_PENDING",
             "buy_order_id": pending_buy_oid,
@@ -158,28 +180,47 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             "tiers": len(buckets),
         }
 
-    # [케이스 2] 토스 실보유 0주인데 로컬 원장에 지층이 남아 있는 경우
+    # 🚨 [Case 61 & Case 69 최상단 양방향 15.0초 인덱싱 그레이스 쉴드]
+    # 매수 체결 직후뿐만 아니라 1층 익절 매도 / 0주 전량 졸업 매도 직후 15.0초 이내에는
+    # 토스 잔고 API(/api/v1/holdings) 인덱싱 시차 구간이므로 모든 수량 불일치(h_qty != ledger_qty)에서 원장을 절대 건드리지 않는다!
+    if is_within_auto_fill_grace_shield(context, TARGET_SYMBOL):
+        logger.info(
+            "🛡️ [Case 61/69 양방향 인덱싱 그레이스 쉴드 작동] 최근 자동 체결 직후 잔고 API 시차 감지(토스 %d주 vs 원장 %d주) -> 원장 무결성 안전 보호",
+            h_qty,
+            ledger_qty,
+        )
+        return {
+            "status": "PROTECTED_BY_AUTO_FILL_GRACE_SHIELD",
+            "held_shares": ledger_qty,
+            "broker_shares": h_qty,
+        }
+
+    open_orders = await context.api.get_open_orders(symbol=TARGET_SYMBOL)
+    if open_orders:
+        return {
+            "status": "WAIT_OPEN_ORDER_SETTLEMENT",
+            "open_count": len(open_orders),
+        }
+
+    # [케이스 2] 토스 실보유 0주인데 로컬 원장에 지층이 남아 있는 경우 (수동 전량 청산 -> 0주 싸이클 종료)
     if h_qty == 0 and ledger_qty > 0:
-        # 🚨 Case 61: 방금 자동 매수가 체결된 직후(15.0초 이내)라면 토스 잔고 API 인덱싱 시차이므로 절대 지우지 않고 보호!
-        if is_within_auto_fill_grace_shield(context, TARGET_SYMBOL):
-            logger.info(
-                "🛡️ [Case 61 인덱싱 그레이스 쉴드 작동] 매수 체결 직후 토스 잔고 API 시차 감지 -> 원장 %d주 안전 보호",
-                ledger_qty,
-            )
-            return {
-                "status": "PROTECTED_BY_AUTO_FILL_GRACE_SHIELD",
-                "held_shares": ledger_qty,
-            }
-
-        open_orders = await context.api.get_open_orders(symbol=TARGET_SYMBOL)
-        if open_orders:
-            return {"status": "WAIT_OPEN_ORDER_SETTLEMENT"}
-
-        # 🚨 Case 60: 수동 전량 청산으로 0주가 되었으므로 cycle_min_buy_price = 0.0 으로 리셋!
+        # 🚨 Case 60 & Case 65: 0주 싸이클 종료가 확정되었으므로 기억된 최저가 및 리앵커링 크레딧을 0.0 으로 리셋하고,
+        # 지금 이 순간부터 다음 첫 진입까지 무조건 60.0초 타임쉴드(mark_post_sell_time_shield)를 강제 각인한다!
+        now_zero_ts = time.time()
+        mark_post_sell_time_shield(
+            context=context,
+            symbol=TARGET_SYMBOL,
+            fill_price=live_p,
+            sold_qty=ledger_qty,
+            is_cycle_end=True,
+        )
         await context.ledger.update_state(
             TARGET_SYMBOL,
             buckets=[],
             cycle_min_buy_price=0.0,
+            cycle_reanchor_credit_usd=0.0,
+            last_sell_fill_ts=now_zero_ts,
+            last_cycle_end_ts=now_zero_ts,
             buy_order_id="",
             sell_order_id="",
             ordered_qty=0,
@@ -188,13 +229,29 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             pending_lot_type="",
         )
         logger.info(
-            "🧹 [SOXL 실잔고 0주 동기화 완료] 수동 전량 청산 감지 -> 지층 큐 및 기억된 최저가(cycle_min_buy_price=0) 초기화 완료 (이전 장부 %d주)",
+            "🧹 [SOXL 실잔고 0주 싸이클 종료 동기화] 수동 전량 청산 감지 -> 지층 초기화 및 🛡️60초 첫 진입 타임쉴드 각인 완료 (이전 장부 %d주)",
             ledger_qty,
         )
         return {"status": "CLEARED_TO_ZERO_HOLDINGS", "prev_qty": ledger_qty}
 
     # [케이스 3] 토스 실보유 수량(h_qty > 0)이 존재하는데 로컬 원장이 비어 있는 경우 (Case 68 백업 금고 우선 복원 또는 초기 기동 복원)
     if h_qty > 0 and ledger_qty == 0:
+        # 🚨 Case 65 & Case 69: 방금 전량 졸업(0주)하여 매도 후 60초 타임쉴드가 작동 중일 때(force_sync 가 아닌 일반 루프),
+        # 토스 잔고 API 지연으로 h_qty > 0 이 뒤늦게 내려왔다면 과거 백업을 복원하지 않고 0주 상태와 60초 타임쉴드를 사수한다!
+        in_sell_sh, rem_sell_s = is_within_post_sell_time_shield(
+            context, st, TARGET_SYMBOL
+        )
+        if not force_sync and in_sell_sh:
+            logger.info(
+                "🛡️ [Case 65/69 0주 졸업 타임쉴드 사수] 매도 후 60초 타임쉴드 가동 중(잔여 %.1f초) -> 잔고 시차(h_qty=%d) 무시 및 0주 유지",
+                rem_sell_s,
+                h_qty,
+            )
+            return {
+                "status": "PROTECTED_BY_POST_SELL_ZERO_SHIELD",
+                "remain_shield_sec": rem_sell_s,
+            }
+
         # 🛡️ [Case 68 자가 치유 1단계] 백업 금고(ledger_backups/)에 보존된 지층 데이터가 있는지 먼저 확인!
         vault_st: Optional[Dict[str, Any]] = None
         recover_fn = getattr(
@@ -232,7 +289,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                     "tiers": len(vault_buckets),
                 }
 
-        # 백업 금고에 일치하는 지층이 없는 경우: 토스 실계좌 평균단가 기반으로 1층 복원 (단, 백업 시드/누적수익이 있으면 승계)
+        # 백업 금고에 일치하는 지층이 없는 경우: 토스 실계좌 평균단가 기반으로 1층 복원 (리앵커링 할인 0.0 시작)
         ref_p = h_avg if h_avg > 0.0 else (live_p if live_p > 0.0 else 100.0)
         cost_u = h_pur if h_pur > 0.0 else round(float(h_qty) * ref_p, 4)
         init_seed = _resolve_valid_seed_from_state(st)
@@ -257,6 +314,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             "anchor_price": ref_p,
             "cycle_min_buy_price": ref_p,
             "ratchet_anchor_price": ref_p,
+            "cycle_reanchor_credit_usd": 0.0,
             "buy_order_id": "",
             "sell_order_id": "",
             "ordered_qty": 0,
@@ -299,16 +357,11 @@ async def reconcile_stratum_with_broker_holdings_plugin(
 
     # [케이스 4] 토스 실보유 수량(h_qty > 0)과 로컬 원장 수량(ledger_qty > 0)이 부분 불일치하는 경우 (수동 추매 / 수동 부분매도)
     if h_qty > ledger_qty:
+        # 4-1) 수동 추가 매수 동기화: 기존 지층의 actual_cost_usd 는 절대 건드리지 않고 추가된 delta_q 주만 병합!
         delta_q = h_qty - ledger_qty
-        old_cost = sum(b.actual_cost_usd for b in buckets)
-        delta_cost = max(0.0, h_pur - old_cost)
-        est_buy_p = (
-            round(delta_cost / float(delta_q), 4)
-            if delta_cost > 0.0
-            else (live_p if live_p > 0.0 else h_avg)
-        )
+        est_buy_p = live_p if live_p > 0.0 else h_avg
         if est_buy_p <= 0.0:
-            est_buy_p = h_avg if h_avg > 0.0 else 50.0
+            est_buy_p = buckets[0].actual_avg_price if buckets else 50.0
         merged_buckets = vrev_add_quota_lot_and_merge_2tier(
             queue=buckets,
             buy_qty=delta_q,
@@ -344,25 +397,46 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         }
 
     # 4-2) h_qty < ledger_qty (수동 부분 매도 또는 체결 후 잔여 수량 조정):
-    # 🚨 Case 63: 기존 지층에 쌓여 있던 리앵커링 크레딧(old_actual_cost - old_book_inv)을 보존한다!
-    ref_p = h_avg if h_avg > 0.0 else buckets[0].actual_avg_price
-    cost_u = h_pur if h_pur > 0.0 else round(float(h_qty) * ref_p, 4)
-
+    # 🚨 [Case 69 핵심 방어 : 토스 이동평균 희석 원금(h_pur / h_avg) 덮어쓰기 영구 금지!]
+    # 토스 계좌는 전체 주식을 이동평균법으로 계산하므로 1층 익절 시 이동평균 손실만큼 잔여 주식의 h_pur 가 낮아져 있다.
+    # 따라서 h_pur 로 actual_cost_usd 를 덮어쓰지 않고, 오직 원장 고유의 순수 매수원금(old_actual_cost)과
+    # 사이클 내 실수확 리앵커링 크레딧(allowed_credit)에 잔여 수량 비율(scale_ratio)만 곱하여 비례 축소한다!
     old_actual_cost = sum(b.actual_cost_usd for b in buckets)
     old_book_inv = sum(b.book_invested_usd for b in buckets)
-    existing_reanchor_credit = max(0.0, old_actual_cost - old_book_inv)
     scale_ratio = (
         min(1.0, float(h_qty) / float(ledger_qty))
         if ledger_qty > 0
         else 1.0
     )
-    preserved_credit = round(existing_reanchor_credit * scale_ratio, 4)
 
+    new_actual_cost = round(
+        max(0.01 * float(h_qty), old_actual_cost * scale_ratio), 4
+    )
+    pure_avg_p = round(new_actual_cost / float(h_qty), 4)
+
+    existing_reanchor_credit = max(0.0, old_actual_cost - old_book_inv)
+    raw_cycle_credit = safe_float(st.get("cycle_reanchor_credit_usd"), -1.0)
+    if raw_cycle_credit >= 0.0:
+        allowed_credit = min(existing_reanchor_credit, raw_cycle_credit)
+    else:
+        cum_net_u = max(
+            0.0, safe_float(st.get("cumulative_realized_net_usd"), 0.0)
+        )
+        allowed_credit = (
+            min(
+                existing_reanchor_credit,
+                round(cum_net_u * REANCHOR_NET_BUFFER_MULT, 4),
+            )
+            if cum_net_u > 0.0
+            else existing_reanchor_credit
+        )
+
+    preserved_credit = round(max(0.0, allowed_credit * scale_ratio), 4)
     new_book_inv = round(
-        max(0.01 * float(h_qty), cost_u - preserved_credit), 4
+        max(0.01 * float(h_qty), new_actual_cost - preserved_credit), 4
     )
     new_book_p = round(
-        min(ref_p, max(0.01, new_book_inv / float(h_qty))), 4
+        min(pure_avg_p, max(0.01, new_book_inv / float(h_qty))), 4
     )
 
     init_seed = _resolve_valid_seed_from_state(st)
@@ -370,7 +444,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         1,
         min(
             sum(b.lot_count for b in buckets),
-            int(round(cost_u / max(1.0, init_seed * 0.08))),
+            int(round(new_actual_cost / max(1.0, init_seed * 0.08))),
         ),
     )
     preserved_lot_type = (
@@ -382,24 +456,27 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         qty=h_qty,
         book_price=new_book_p,
         book_invested_usd=round(new_book_p * float(h_qty), 4),
-        actual_cost_usd=cost_u,
+        actual_cost_usd=new_actual_cost,
         lot_count=adj_lots,
         lot_type=preserved_lot_type,
     )
     await context.ledger.update_state(
         TARGET_SYMBOL,
         buckets=buckets_to_dicts([adjusted_bucket]),
+        cycle_reanchor_credit_usd=preserved_credit,
     )
     logger.info(
-        "➖ [SOXL 수동 부분매도 지층 동기화] %d주 -> %d주 조정 완료 (실평단 $%.2f / 리앵커링 장부단가 $%.2f 보존)",
+        "➖ [Case 69 SOXL 부분매도 비례원가 동기화] %d주 -> %d주 조정 완료 (원장 순수평단 $%.2f / 리앵커링 장부단가 $%.2f 보존 · 토스 이동평균 $%.2f 오염 차단)",
         ledger_qty,
         h_qty,
-        ref_p,
+        pure_avg_p,
         new_book_p,
+        h_avg,
     )
     return {
         "status": "SYNCED_MANUAL_PARTIAL_REDUCTION",
         "held_shares": h_qty,
+        "actual_avg_price": pure_avg_p,
         "book_price": new_book_p,
     }
 

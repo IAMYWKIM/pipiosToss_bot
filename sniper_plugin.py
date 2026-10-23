@@ -1,26 +1,30 @@
 # -*- coding: utf-8 -*-
 """
 # MODIFIED: sniper_plugin.py
-순수 롱(SOXL) 전용 '04:07 ~ 16:00 EST 매도 체결 후 60초 강제 타임쉴드(POST_SELL_TO_BUY_SHIELD_SEC = 60.0) &
+순수 롱(SOXL) 전용 '04:07 ~ 16:00 EST 매도(및 0주 싸이클 종료) 후 60초 강제 타임쉴드(POST_SELL_TO_BUY_SHIELD_SEC = 60.0) &
 직전 매수 후 60초 타임쉴드 · 60초 경과 후 실시간 현재가 직접 조회 및 순수 현재가 지정가(LIMIT) 매수 발주 ·
 매도 1호가(Ask 1) 참조 및 10초 후 상향 추격 정정 100% 영구 소각(Case 65) ·
-전술 A 챔피언(🛡️ 05_AF_WIDE_10_01) : 0주 상태 현재가 지정가 실물 1층(REENTRY_1FL) 산입 ·
+전술 A 챔피언(🛡️ 05_AF_WIDE_10_01) : 0주 상태 60초 타임쉴드 경과 후 현재가 지정가 실물 1층(REENTRY_1FL) 산입 ·
 2층(MERGED_UPPER) 단독 잔존 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 실물 1층(REENTRY_1FL) 재장전 ·
 상승 돌파 매수 시 1회분(8%) 예산 초과 원천 차단을 위한 min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67) ·
 기억된 사이클 최저 매수가(cycle_min_buy_price) 잠금 기반 10분 고정 4단 와이드 활주로 시드보호 매수 게이트(WIDE_RUNWAY :
-1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%) 및 체결 시 2-Tier 병합·자투리 시드 귀속' 코어 플러그인 (Step 03 / 05)
-- MODIFIED (Case 65 핵심 1): 매도 체결 후 60.0초(is_within_post_sell_time_shield) 및 직전 매수 체결 후 60.0초
-  (is_within_post_buy_time_shield) 타임쉴드가 경과하기 전에는 일체의 매수 주문 발사를 원천 차단!
+1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%) 및 체결 시 2-Tier 병합·자투리 시드 귀속·양방향 인덱싱 보호(Case 69)' 코어 플러그인 (Step 02 / 05)
+- MODIFIED (Case 65 핵심 1): 매도 체결(1층 익절 및 0주 싸이클 종료 전량 졸업 포함) 후 60.0초(is_within_post_sell_time_shield)
+  및 직전 매수 체결 후 60.0초(is_within_post_buy_time_shield) 타임쉴드가 경과하기 전에는
+  0주 첫 진입(is_zero_shares)과 10분 게이트 추매를 포함한 일체의 매수 주문 발사를 100% 원천 차단!
   (10분 게이트 도래 시 60초 타임쉴드 중이면 버킷을 소모하지 않고 대기했다가 60초 경과 직후 현재가를 조회해 즉시 판정!)
 - MODIFIED (Case 65 핵심 2): 60.0초 타임쉴드 경과 후 매수 조건 판정 및 주문 발주 시 토스 API(/api/v1/prices)로
   실시간 현재가(fresh_live_p)를 직접 조회하여, 매도 1호가(ask1_p) 참조 없이 오직 '현재가 지정가(LIMIT)'로만 매수 발주!
 - MODIFIED (Case 65 핵심 3): 미체결 매수 주문을 10초 뒤 매도 1호가(ask1_p)로 상향 추격 정정하던 루틴을 100% 영구 소각하고,
   60.0초(BUY_ORDER_MAX_WAIT_SEC = 60.0) 미체결 시 안전하게 주문 취소(cancel_order) 후 복귀!
-- MODIFIED (Case 67 핵심 4): 정액제를 기반으로 한 정량제에서 상승 돌파 매수(exec_order_p > anchor_price) 시
-  고정된 주수로 인해 1회분(8%) 시드 예산(portion_budget)을 초과하는 현상을 원천 차단하기 위해
-  compute_golden8_quota_qty(..., exec_price=exec_order_p) 및 resolve_affordable_buy_qty(..., max_portion_budget_usd=portion_budget)로
-  min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑을 전 구간 강제!
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 67 완벽 준수
+- MODIFIED (Case 67 핵심 4): 상승 돌파 매수(exec_order_p > anchor_price) 시 고정된 주수로 인해 1회분(8%) 시드 예산(portion_budget)을
+  초과하는 현상을 원천 차단하기 위해 target_qty = min(budget_cap_qty, anchor_quota_qty) 이중 캡핑을 전 구간 강제!
+- NEW (Case 61 & Case 69 핵심 5):
+  1) mark_auto_fill_grace_shield() 에서 매수 전용 단조 시계(last_buy_fill_mono)와 양방향 인덱싱 보호 시계(last_auto_fill_ts)를
+     명확히 기록하고, is_within_auto_fill_grace_shield() 가 매수·매도 양방향 체결 직후 15.0초 동안 작동하도록 확장하여
+     잔고 API 인덱싱 시차로 인한 유령 추매/유령 부분매도 및 이동평균 원가 오염을 100% 원천 차단!
+  2) 0주 상태(was_empty)에서 새 싸이클 첫 진입 체결 시 cycle_reanchor_credit_usd = 0.0 으로 원자적 리셋!
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 69 완벽 준수
 """
 
 from __future__ import annotations
@@ -68,12 +72,12 @@ logger = logging.getLogger("toss_sniper.sniper_plugin")
 # 순수 현재가 지정가 매수 주문 발주 후 미체결 최대 대기 시간(초) — 상향 추격 정정 없이 60초 미체결 시 안전 취소
 BUY_ORDER_MAX_WAIT_SEC: float = 60.0
 
-# Case 61: 매수 FILLED 직후 토스 잔고 API(/api/v1/holdings) 인덱싱 시차(0.1 ~ 0.4초) 보호 그레이스 쉴드(초)
+# Case 61 & Case 69: 매수 또는 매도 FILLED 직후 토스 잔고 API(/api/v1/holdings) 인덱싱 시차(0.1 ~ 0.4초) 보호 그레이스 쉴드(초)
 AUTO_FILL_GRACE_SHIELD_SEC: float = 15.0
 
 
 # ---------------------------------------------------------------------------
-# 내부 헬퍼 : 매수 체결 직후 잔고 인덱싱 시차 보호 그레이스 쉴드 & 60초 타임쉴드 각인 (Case 61, 65)
+# 내부 헬퍼 : 매수·매도 체결 직후 잔고 인덱싱 시차 보호 그레이스 쉴드 & 60초 타임쉴드 각인 (Case 61, 65, 69)
 # ---------------------------------------------------------------------------
 def mark_auto_fill_grace_shield(
     context: Any,
@@ -83,28 +87,31 @@ def mark_auto_fill_grace_shield(
     filled_qty: int = 0,
 ) -> None:
     """
-    🚨 Case 61 & Case 65:
-    1) 매수 주문이 거래소에서 FILLED 된 직후 토스 잔고 API(/api/v1/holdings) 인덱싱 시차(0.1 ~ 0.4초) 동안
-       잔고 동기화 모듈이 방금 산 1층을 수동 매도(0주)로 오판하지 않도록 15.0초 그레이스 쉴드를 각인한다.
-    2) 동시에 last_auto_fill_ts(단조 시계)와 last_buy_fill_ts(Epoch)를 기록하여,
-       매수 체결 후 60.0초(POST_BUY_TO_SELL_SHIELD_SEC) 동안 매도 및 중복 매수가 발사되지 않도록 타임쉴드를 건다!
+    🚨 Case 61, Case 65 & Case 69:
+    1) 매수(또는 매도) 주문이 거래소에서 FILLED 된 직후 토스 잔고 API(/api/v1/holdings) 인덱싱 시차(0.1 ~ 0.4초) 동안
+       잔고 동기화 모듈(reconcile)이 시차를 수동 매매로 오판하지 않도록 15.0초 그레이스 쉴드(last_auto_fill_ts)를 각인한다.
+    2) 매수 체결 시에는 last_buy_fill_mono(단조 시계)와 last_buy_fill_ts(Epoch)를 전용 키로 각인하여,
+       매수 체결 후 정확히 60.0초(POST_BUY_TO_SELL_SHIELD_SEC) 동안 매도 및 중복 매수가 발사되지 않도록 타임쉴드를 건다!
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
     now_mono = time.monotonic()
     now_epoch = time.time()
+    tag = str(lot_type or "QUOTA_L1").upper().strip()
+
     guard_map = getattr(context, "indexing_grace_cache", None)
     if isinstance(guard_map, dict):
         prev = guard_map.get(sym) if isinstance(guard_map.get(sym), dict) else {}
         updated = dict(prev)
-        updated.update(
-            {
-                "last_auto_fill_ts": now_mono,
-                "last_buy_fill_ts": now_epoch,
-                "lot_type": str(lot_type or "QUOTA_L1"),
-                "fill_price": safe_float(fill_price, 0.0),
-                "filled_qty": safe_int(filled_qty, 0),
-            }
-        )
+        updated["last_auto_fill_ts"] = now_mono
+        updated["lot_type"] = tag
+        updated["fill_price"] = safe_float(fill_price, 0.0)
+        updated["filled_qty"] = safe_int(filled_qty, 0)
+        if tag != "SELL_FILL":
+            updated["last_buy_fill_mono"] = now_mono
+            updated["last_buy_fill_ts"] = now_epoch
+        else:
+            updated["last_sell_fill_mono"] = now_mono
+            updated["last_sell_fill_ts"] = now_epoch
         guard_map[sym] = updated
 
 
@@ -112,19 +119,61 @@ def is_within_auto_fill_grace_shield(
     context: Any, symbol: str = TARGET_SYMBOL
 ) -> bool:
     """
-    Case 61: 최근 15.0초 이내에 SOXL 매수 주문 체결 이력이 있으면 True 를 반환한다 (잔고 화해 보호용).
+    🚨 Case 61 & Case 69 [양방향 15.0초 잔고 인덱싱 시차 보호 그레이스 쉴드]:
+    최근 15.0초(AUTO_FILL_GRACE_SHIELD_SEC) 이내에 자동 매수 체결 또는 자동 매도 체결(1층 익절 / 0주 졸업)
+    이력이 존재하면 True 를 반환하여, defense_plugin.py 의 reconcile 모듈이 잔고 API 인덱싱 시차로 인해
+    유령 추매(h_qty > ledger_qty)나 유령 부분매도(h_qty < ledger_qty) 또는 백업 덮어쓰기를 수행하는 것을 100% 차단한다!
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
+    now_mono = time.monotonic()
+
     guard_map = getattr(context, "indexing_grace_cache", None)
-    if not isinstance(guard_map, dict):
-        return False
-    info = guard_map.get(sym)
-    if not isinstance(info, dict):
-        return False
-    last_ts = safe_float(info.get("last_auto_fill_ts"), 0.0)
-    if last_ts <= 0.0:
-        return False
-    return (time.monotonic() - last_ts) <= AUTO_FILL_GRACE_SHIELD_SEC
+    if isinstance(guard_map, dict):
+        info = guard_map.get(sym)
+        if isinstance(info, dict):
+            last_mono = max(
+                safe_float(info.get("last_auto_fill_ts"), 0.0),
+                safe_float(info.get("last_buy_fill_mono"), 0.0),
+                safe_float(info.get("last_sell_fill_mono"), 0.0),
+                safe_float(info.get("last_cycle_end_mono"), 0.0),
+            )
+            if (
+                last_mono > 0.0
+                and 0.0 <= (now_mono - last_mono) <= AUTO_FILL_GRACE_SHIELD_SEC
+            ):
+                return True
+
+    snap_map = getattr(context, "exit_snapshot_cache", None)
+    if isinstance(snap_map, dict):
+        s_info = snap_map.get(sym)
+        if isinstance(s_info, dict):
+            last_s_mono = max(
+                safe_float(s_info.get("last_sell_fill_mono"), 0.0),
+                safe_float(s_info.get("last_cycle_end_mono"), 0.0),
+            )
+            if (
+                last_s_mono > 0.0
+                and 0.0 <= (now_mono - last_s_mono) <= AUTO_FILL_GRACE_SHIELD_SEC
+            ):
+                return True
+
+    if hasattr(context, "ledger"):
+        try:
+            st = context.ledger.get_state(sym)
+            last_epoch = max(
+                safe_float(st.get("last_buy_fill_ts"), 0.0),
+                safe_float(st.get("last_sell_fill_ts"), 0.0),
+                safe_float(st.get("last_cycle_end_ts"), 0.0),
+            )
+            if (
+                last_epoch > 0.0
+                and 0.0 <= (time.time() - last_epoch) <= AUTO_FILL_GRACE_SHIELD_SEC
+            ):
+                return True
+        except Exception:
+            pass
+
+    return False
 
 
 def _get_live_soxl_price(
@@ -178,7 +227,7 @@ async def _fetch_fresh_current_soxl_price(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1] 매수 체결(FILLED) 커밋 · 2-Tier 배치 · 기억된 저가 잠금 · 매수 후 60초 타임쉴드 각인
+# [핵심 1] 매수 체결(FILLED) 커밋 · 2-Tier 배치 · 기억된 저가 잠금 · 매수 후 60초 타임쉴드 각인 (Case 69)
 # ---------------------------------------------------------------------------
 async def _commit_filled_buy_to_stratum_ledger(
     context: Any,
@@ -188,7 +237,7 @@ async def _commit_filled_buy_to_stratum_ledger(
     lot_type: str,
 ) -> Dict[str, Any]:
     """
-    🎯 1 & 🎯 3 & 🎯 4 & Case 25, 46, 53, 59, 60, 61, 65, 67:
+    🎯 1 & 🎯 3 & 🎯 4 & Case 25, 46, 53, 59, 60, 61, 65, 67, 69:
     매수 주문 체결(FILLED)이 확인된 즉시:
     1) 실제 소요 원금(actual_spent = filled_qty * avg_fill_price)과
        1회분 정액 예산 대비 절약된 자투리 금액(saved_from_portion = max(0, portion_budget - actual_spent))을 산출한다.
@@ -198,8 +247,10 @@ async def _commit_filled_buy_to_stratum_ledger(
     3) 🚨 Case 60: 기억된 사이클 최저 매수가(cycle_min_buy_price)는 0주에서 첫 진입(was_empty)이거나
        기존 최저가보다 더 낮게 산 경우에만 갱신(min(old_min_p, fill_p))하며,
        REENTRY_1FL 재장전 매수가로 절대 상향 덮어쓰지 않고 기존 최저가를 철벽 잠금 유지한다!
-    4) 🚨 Case 65: mark_auto_fill_grace_shield() 및 원장 last_buy_fill_ts / entry_ts 를 각인하여,
-       매수 체결 직후 60.0초 동안 매도가 나가지 않고 60초 후에 현재가를 조회하여 매도하도록 타임쉴드를 가동한다!
+    4) 🚨 Case 65 & Case 69:
+       - 0주 상태(was_empty)에서 새 싸이클 첫 진입 체결 시 cycle_reanchor_credit_usd = 0.0 으로 초기화한다.
+       - mark_auto_fill_grace_shield() 및 원장 last_buy_fill_ts / entry_ts 를 각인하여,
+         매수 체결 직후 15.0초 잔고 인덱싱 보호 및 60.0초 동안 매도/중복매수 차단 타임쉴드를 가동한다!
     """
     st = context.ledger.get_state(TARGET_SYMBOL)
     old_buckets = buckets_from_dicts(st.get("buckets", []))
@@ -234,6 +285,13 @@ async def _commit_filled_buy_to_stratum_ledger(
         new_cycle_min_p = fill_p
     else:
         new_cycle_min_p = min(old_min_p, fill_p)
+
+    # 🚨 Case 69: 0주에서 새 싸이클 첫 진입 시 cycle_reanchor_credit_usd = 0.0 리셋, 기존 싸이클 중에는 보존
+    next_cycle_credit = (
+        0.0
+        if was_empty
+        else round(max(0.0, safe_float(st.get("cycle_reanchor_credit_usd"), 0.0)), 4)
+    )
 
     new_held_lots = sum(b.lot_count for b in new_buckets)
     new_held_shares = sum(b.qty for b in new_buckets)
@@ -270,6 +328,7 @@ async def _commit_filled_buy_to_stratum_ledger(
         anchor_price=fill_p,
         cycle_min_buy_price=round(new_cycle_min_p, 4),
         ratchet_anchor_price=fill_p,
+        cycle_reanchor_credit_usd=next_cycle_credit,
         buy_order_id="",
         ordered_qty=0,
         buy_price=0.0,
@@ -470,7 +529,7 @@ async def sync_pending_buy_order_plugin(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 전술 A (05_AF_WIDE_10_01) : 매도 후 60초 타임쉴드 & 현재가 지정가 매수 게이트 (Case 67 탑재)
+# [핵심 2] 전술 A (05_AF_WIDE_10_01) : 매도(및 0주 싸이클 종료) 후 60초 타임쉴드 & 현재가 지정가 매수 게이트
 # ---------------------------------------------------------------------------
 async def execute_seed_protected_buy_gate_plugin(
     context: Any,
@@ -479,26 +538,27 @@ async def execute_seed_protected_buy_gate_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 1, 🎯 2, 🎯 4 & Case 25 ~ 67 (전술 A 챔피언 : 🛡️ 05_AF_WIDE_10_01 + 60초 타임쉴드 & 현재가 지정가 & Case 67 이중 캡핑):
+    🎯 1, 🎯 2, 🎯 4 & Case 25 ~ 69 (전술 A 챔피언 : 🛡️ 05_AF_WIDE_10_01 + 양방향 60초 타임쉴드 & 현재가 지정가 & Case 67 이중 캡핑):
     04:07:00 ~ 16:00:00 EST 운용 구간에서:
     1) 미체결 매수/매도 주문이 대기 중이면 중복 매수 발사를 차단한다.
-    2) 🛡️ [Case 65 : 매도 후 60.0초 타임쉴드 & 직전 매수 후 60.0초 타임쉴드 강제 검문]
-       - 직전 매도 체결로부터 60.0초(POST_SELL_TO_BUY_SHIELD_SEC) 또는 직전 매수 체결로부터 60.0초
-         (POST_BUY_TO_SELL_SHIELD_SEC)가 경과하지 않았으면, 0주 진입 및 10분 게이트 매수를 포함한
-         모든 매수를 즉시 보류(HOLD_POST_SELL_60S_TIME_SHIELD / HOLD_POST_BUY_60S_TIME_SHIELD)한다!
+    2) 🛡️ [Case 65 : 매도(1층 익절 및 0주 싸이클 종료) 후 60.0초 타임쉴드 & 직전 매수 후 60.0초 타임쉴드 강제 검문]
+       - 직전 매도 체결 또는 0주 싸이클 종료 시각(last_sell_fill_ts / last_cycle_end_ts)으로부터
+         60.0초(POST_SELL_TO_BUY_SHIELD_SEC)가 경과하지 않았거나, 직전 매수 체결로부터
+         60.0초(POST_BUY_TO_SELL_SHIELD_SEC)가 경과하지 않았으면,
+         0주 첫 진입(is_zero_shares) 및 10분 게이트 매수를 포함한 모든 매수를 즉시 보류
+         (HOLD_POST_SELL_60S_TIME_SHIELD / HOLD_POST_BUY_60S_TIME_SHIELD)한다!
        - 타임쉴드 중에는 10분 버킷(last_evaluated_buy_bucket_id)을 소모하지 않으므로,
          60.0초가 경과하는 즉시 최신 현재가를 조회하여 매수 판정을 수행한다!
-    3) 🔥 [분기 A : 보유 잔고 0주 상태 (is_zero_shares) — 60초 타임쉴드 경과 후 현재가 조회 및 현재가 지정가 실물 1층 산입]
-       - 60초 경과 후 _fetch_fresh_current_soxl_price() 로 실시간 현재가(fresh_live_p)를 직접 조회하여,
+    3) 🔥 [분기 A : 보유 잔고 0주 상태 (is_zero_shares) — 0주 싸이클 종료 후 60초 타임쉴드 경과 뒤에 현재가 조회 및 첫 진입]
+       - 60초 타임쉴드 경과 후 _fetch_fresh_current_soxl_price() 로 실시간 현재가(fresh_live_p)를 직접 조회하여,
          매도 1호가(Ask 1) 참조 없이 오직 '현재가(fresh_live_p)를 지정가(LIMIT)'로 8% 정량(min(1회분 예산 상한 주수, 기준가 정량))을 매수 발주한다!
     4) 🛡️ [분기 B : 지층 보유 상태 (len(buckets) > 0) — 10분 고정 시드보호 매수 게이트 검문 (Case 36, 64, 65, 67)]
        - 60초 타임쉴드가 경과한 상태에서 10분 게이트 오픈 시 _fetch_fresh_current_soxl_price() 로
          실시간 현재가(fresh_live_p)를 새로 조회한다.
        - ♻️ [하위 분기 B-1 : 2층(MERGED_UPPER) 단독 보유 상태 (Case 59 & Case 67)]
          * 조회된 현재가(fresh_live_p)가 직전 익절가 대비 -1.00% 이하 눌림목 OR +1.00% 이상 상승돌파 시에만
-           매도 1호가 참조 없이 '현재가(fresh_live_p)를 지정가(LIMIT)'로 REENTRY_1FL 독립 1층 주문을 발주한다!
-         * 이때 상승돌파로 단가가 올라가 1회분(8%) 예산을 초과하는 것을 막기 위해 반드시
-           target_qty = min(budget_cap_qty, anchor_quota_qty) (Case 67) 이중 캡핑을 적용한다!
+           target_qty = min(budget_cap_qty, anchor_quota_qty) (Case 67) 이중 캡핑을 적용해
+           '현재가(fresh_live_p)를 지정가(LIMIT)'로 REENTRY_1FL 독립 1층 주문을 발주한다!
        - 📐 [하위 분기 B-2 : 실물 1층 보유 중 — 기억된 최저가 기준 4단 와이드 활주로 추매 (WIDE_RUNWAY, Case 60 & Case 67)]
          * 조회된 현재가(fresh_live_p)가 기억된 최저가 대비 4단 와이드 단차(-1.0% / -2.0% / -3.5% / -5.5%) 이하
            신저가에 도달했을 때만 '현재가(fresh_live_p)를 지정가(LIMIT)'로 DIP_1FL 추매 주문을 발주한다!
@@ -527,8 +587,9 @@ async def execute_seed_protected_buy_gate_plugin(
     if str(st.get("sell_order_id") or "").strip():
         return {"status": "SELL_ORDER_IN_PROGRESS"}
 
-    # 🛡️ 3) [Case 65] 매도 체결 후 60.0초 타임쉴드 & 직전 매수 체결 후 60.0초 타임쉴드 강제 검문!
-    # 60초가 지나기 전에는 10분 게이트 버킷을 소모하지 않고 대기했다가, 60초가 지난 직후 현재가를 조회해 매수한다!
+    # 🛡️ 3) [Case 65 핵심] 매도(및 0주 싸이클 종료) 후 60.0초 타임쉴드 & 직전 매수 후 60.0초 타임쉴드 최우선 강제 검문!
+    # 0주 싸이클이 끝나는 시간(last_sell_fill_ts / last_cycle_end_ts)과 다음 첫 진입하는 시간 사이에
+    # 정확히 60.0초 타임쉴드가 경과하기 전에는 절대 진입하지 않는다!
     in_sell_shield, remain_sell_sec = is_within_post_sell_time_shield(
         context, st, TARGET_SYMBOL
     )
@@ -565,6 +626,8 @@ async def execute_seed_protected_buy_gate_plugin(
     threshold_mode = str(st.get("threshold_mode") or "08_VREV_PROG").upper()
     buy_interval_min = LOCKED_BUY_INTERVAL_MIN
 
+    # 🚨 Case 69: 원장이 0주(len(buckets) == 0)이고 토스 잔고가 0주(또는 매도 직후 인덱싱 시차 중)일 때
+    # 이미 위에서 60.0초 매도 후 타임쉴드(in_sell_shield)가 완전히 경과했음을 통과했으므로 안전하게 0주 진입 판정
     is_zero_shares = bool(len(buckets) == 0 and h_qty == 0)
     is_l2_only_vacant_l1 = bool(
         len(buckets) == 1
@@ -573,7 +636,7 @@ async def execute_seed_protected_buy_gate_plugin(
 
     # -----------------------------------------------------------------------
     # [분기 A : 보유 잔고 0주 상태 (is_zero_shares)]
-    # -> 60초 타임쉴드 경과 확인 완료 후 실시간 현재가를 직접 조회하여 '현재가 지정가(LIMIT)'로 1층 산입!
+    # -> 0주 싸이클 종료 후 60.0초 타임쉴드 경과 확인 완료 뒤 실시간 현재가를 직접 조회하여 '현재가 지정가(LIMIT)'로 1층 산입!
     # -----------------------------------------------------------------------
     if is_zero_shares:
         async with context.in_memory_ordering_lock:
@@ -588,17 +651,26 @@ async def execute_seed_protected_buy_gate_plugin(
                 if len(now_buckets) > 0:
                     return {"status": "L1_ALREADY_FILLED_IN_MUTEX"}
 
-                # 60초 타임쉴드 재검증 (뮤텍스 내부)
-                in_s_sh, _ = is_within_post_sell_time_shield(
+                # 🛡️ 뮤텍스 내부 60.0초 양방향 타임쉴드 재검증 (0주 싸이클 종료 시각과 첫 진입 시각 간 60.0초 보장!)
+                in_s_sh, rem_s = is_within_post_sell_time_shield(
                     context, st_now, TARGET_SYMBOL
                 )
-                in_b_sh, _ = is_within_post_buy_time_shield(
-                    context, st_now, TARGET_SYMBOL
-                )
-                if in_s_sh or in_b_sh:
-                    return {"status": "HOLD_60S_TIME_SHIELD_IN_MUTEX"}
+                if in_s_sh:
+                    return {
+                        "status": "HOLD_POST_SELL_60S_TIME_SHIELD_IN_MUTEX",
+                        "remain_shield_sec": rem_s,
+                    }
 
-                # 🔍 60초 경과 후 실시간 현재가(fresh_live_p) 직접 조회 (매도 1호가 ask1_p 참조 없음!)
+                in_b_sh, rem_b = is_within_post_buy_time_shield(
+                    context, st_now, TARGET_SYMBOL
+                )
+                if in_b_sh:
+                    return {
+                        "status": "HOLD_POST_BUY_60S_TIME_SHIELD_IN_MUTEX",
+                        "remain_shield_sec": rem_b,
+                    }
+
+                # 🔍 60초 타임쉴드 경과 후 실시간 현재가(fresh_live_p) 직접 조회 (매도 1호가 ask1_p 참조 없음!)
                 fresh_live_p = await _fetch_fresh_current_soxl_price(
                     context, fallback_price=live_p
                 )
@@ -689,7 +761,7 @@ async def execute_seed_protected_buy_gate_plugin(
                 )
                 context.wakeup_event.set()
                 logger.info(
-                    "🔵 [SOXL 0주 현재가 지정가 1층 매수 발주] %d주 @ 지정가 $%.2f (1회예산 $%.2f · orderId=%s)",
+                    "🔵 [SOXL 0주 60초 타임쉴드 완료 후 현재가 지정가 1층 매수 발주] %d주 @ 지정가 $%.2f (1회예산 $%.2f · orderId=%s)",
                     buy_qty,
                     exec_order_p,
                     portion_budget,
@@ -768,6 +840,15 @@ async def execute_seed_protected_buy_gate_plugin(
                     st_now.get("sell_order_id") or ""
                 ).strip():
                     return {"status": "ALREADY_ORDERING_IN_MUTEX"}
+
+                in_s_sh, _ = is_within_post_sell_time_shield(
+                    context, st_now, TARGET_SYMBOL
+                )
+                in_b_sh, _ = is_within_post_buy_time_shield(
+                    context, st_now, TARGET_SYMBOL
+                )
+                if in_s_sh or in_b_sh:
+                    return {"status": "HOLD_60S_TIME_SHIELD_IN_MUTEX"}
 
                 # 매도 1호가(ask1_p) 참조 없이 오직 조회된 실시간 현재가(fresh_live_p)를 지정가로 사용!
                 exec_order_p = max(
@@ -919,6 +1000,15 @@ async def execute_seed_protected_buy_gate_plugin(
             st_now = context.ledger.get_state(TARGET_SYMBOL)
             if str(st_now.get("buy_order_id") or "").strip():
                 return {"status": "ALREADY_ORDERING_IN_MUTEX"}
+
+            in_s_sh, _ = is_within_post_sell_time_shield(
+                context, st_now, TARGET_SYMBOL
+            )
+            in_b_sh, _ = is_within_post_buy_time_shield(
+                context, st_now, TARGET_SYMBOL
+            )
+            if in_s_sh or in_b_sh:
+                return {"status": "HOLD_60S_TIME_SHIELD_IN_MUTEX"}
 
             max_trigger_p = (
                 math.floor(

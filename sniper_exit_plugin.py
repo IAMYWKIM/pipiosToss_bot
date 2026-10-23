@@ -5,15 +5,24 @@
 60초 경과 후 실시간 현재가 직접 조회 및 현재가 >= 목표가(1층 +1.50% / 2층 +1.00%)일 때만 현재가 지정가(LIMIT) 매도 발주 ·
 매수 1호가(Bid 1) 참조 및 하향 추격 정정 100% 영구 소각(Case 65) ·
 단일 지층 실물 수익금 리앵커링(vrev_reanchor_single_tier_quota · 0.994 버퍼) ·
-매도 체결 즉시 매도 후 60초 타임쉴드(last_sell_fill_ts) 각인 및 분리 회계 복리 정산' 코어 플러그인 (Step 02 / 03)
+매도 체결(1층 익절 및 0주 전량 졸업) 즉시 60초 매도타임쉴드(last_sell_fill_ts / last_cycle_end_ts) &
+15초 잔고 인덱싱 그레이스 쉴드(last_auto_fill_ts) 동시 각인 ·
+리앵커링 이중 차감 방지 진성 손익분기점 하한선(True Break-Even Floor · Case 69) 및 분리 회계 복리 정산' 코어 플러그인 (Step 01 / 05)
 - MODIFIED (Case 65 핵심 1): 매수 체결 후 60.0초 동안은 일체의 매도 판정을 물리적으로 차단하는
   is_within_post_buy_time_shield() 타임쉴드를 장착하여 매수 직후 휩소 매도를 100% 원천 차단!
 - MODIFIED (Case 65 핵심 2): 60.0초 타임쉴드 경과 후 매도 조건 도달 시 실시간 현재가(get_current_prices_batch)를
   직접 재조회하여 현재가가 목표가(min_target_p) 이상일 때만 '현재가 지정가(LIMIT)'로 매도 주문을 발주!
   (매수 1호가 bid1_p 참조 및 3초 후 매수 1호가 하향 추격 정정 루틴을 100% 영구 소각하여 손절 체결을 0원으로 봉쇄!)
-- MODIFIED (Case 65 핵심 3): 매도 체결 완료 시 원장(last_sell_fill_ts) 및 인메모리 캐시에 매도 시각을 각인하여
-  sniper_plugin.py 가 매도 후 60.0초 타임쉴드 경과 뒤에 현재가를 조회하고 매수하도록 양방향 결속!
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 65 완벽 준수
+- MODIFIED (Case 65 핵심 3): 매도 체결 완료(1층 단독 매도 및 0주 싸이클 종료 전량 졸업 모두 포함) 시
+  원장(last_sell_fill_ts, last_cycle_end_ts) 및 인메모리 캐시에 매도/싸이클 종료 시각을 각인하여
+  sniper_plugin.py 가 0주 종료 또는 1층 매도 후 반드시 60.0초 타임쉴드 경과 뒤에 현재가를 조회하고 매수하도록 양방향 결속!
+- NEW (Case 61 & Case 69 핵심 4):
+  1) 매도 체결 직후 mark_post_sell_time_shield() 에서 indexing_grace_cache[sym]["last_auto_fill_ts"] 를
+     동시 각인하여, 매도 직후 토스 잔고 API 인덱싱 시차(0.1 ~ 0.4초)로 인한 유령 추매/부분매도 및 백업 덮어쓰기 핑퐁 오염을 100% 원천 차단!
+  2) 현재 사이클에서 실제 1층 익절로 수확된 리앵커링 크레딧(cycle_reanchor_credit_usd)을 정밀 추적(0주 졸업 시 0.0 리셋)하고,
+     2층 졸업 타점 판정 시 book_invested_usd 가 [actual_cost_usd - cycle_reanchor_credit_usd] 밑으로 내려가지 못하도록
+     진성 손익분기점 하한선(_resolve_safe_l2_book_price)을 강제하여 이동평균 희석 착시 조기 손절 졸업을 영구 봉쇄!
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 69 완벽 준수
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from quant_engine import (
+    REANCHOR_NET_BUFFER_MULT,
     StratumBucket,
     buckets_from_dicts,
     buckets_to_dicts,
@@ -48,7 +58,7 @@ from toss_api import (
 
 logger = logging.getLogger("toss_sniper.sniper_exit_plugin")
 
-# NEW (Case 65): 매수 체결 후 60.0초 동안 매도 금지 타임쉴드 & 매도 체결 후 60.0초 동안 매수 금지 타임쉴드 상수
+# Case 65: 매수 체결 후 60.0초 동안 매도 금지 타임쉴드 & 매도(또는 0주 싸이클 종료) 후 60.0초 동안 매수 금지 타임쉴드 상수
 POST_BUY_TO_SELL_SHIELD_SEC: float = 60.0
 POST_SELL_TO_BUY_SHIELD_SEC: float = 60.0
 
@@ -57,7 +67,7 @@ SELL_ORDER_MAX_WAIT_SEC: float = 60.0
 
 
 # ---------------------------------------------------------------------------
-# 내부 헬퍼 : 실시간 SOXL 현재가 조회 · 60초 양방향 타임쉴드 판별 · 스냅샷 백업
+# 내부 헬퍼 : 실시간 SOXL 현재가 조회 · 60초 양방향 타임쉴드 판별 · Case 69 진성 단가 하한선
 # ---------------------------------------------------------------------------
 def _get_live_soxl_price(
     context: Any,
@@ -106,6 +116,53 @@ async def _fetch_fresh_current_soxl_price(
     return safe_float(fallback_price, 0.0)
 
 
+def _resolve_safe_l2_book_price(
+    bucket: StratumBucket,
+    st: Dict[str, Any],
+) -> float:
+    """
+    🚨 NEW [Case 69 진성 손익분기점 하한선(True Break-Even Floor) 가드]:
+    2층(MERGED_UPPER)의 장부 투자원금(book_invested_usd)은 어떠한 경우에도
+    [실제 매수원금(actual_cost_usd) - 현재 사이클 내 실수확 리앵커링 크레딧 상한] 밑으로 내려갈 수 없다.
+    이를 통해 토스 이동평균 희석 단가 덮어쓰기 및 이중 차감으로 인한 조기 손절 졸업을 물리적으로 차단한다.
+    """
+    if bucket.qty <= 0:
+        return max(0.01, bucket.book_price)
+
+    raw_cycle_credit = safe_float(st.get("cycle_reanchor_credit_usd"), -1.0)
+    cum_drop_usd = max(
+        0.0, safe_float(st.get("cumulative_reanchor_drop_usd"), 0.0)
+    )
+    cum_net_usd = max(
+        0.0, safe_float(st.get("cumulative_realized_net_usd"), 0.0)
+    )
+
+    if raw_cycle_credit >= 0.0:
+        max_allowed_discount = raw_cycle_credit
+    else:
+        existing_disc = max(
+            0.0, bucket.actual_cost_usd - bucket.book_invested_usd
+        )
+        if cum_net_usd > 0.0:
+            max_allowed_discount = min(
+                existing_disc, round(cum_net_usd * REANCHOR_NET_BUFFER_MULT, 4)
+            )
+        elif cum_drop_usd <= 0.0:
+            max_allowed_discount = 0.0
+        else:
+            max_allowed_discount = existing_disc
+
+    min_floor_book_inv = max(
+        0.01 * float(bucket.qty),
+        round(bucket.actual_cost_usd - max(0.0, max_allowed_discount), 4),
+    )
+    min_floor_book_p = round(min_floor_book_inv / float(bucket.qty), 4)
+    return round(
+        min(bucket.actual_avg_price, max(bucket.book_price, min_floor_book_p)),
+        4,
+    )
+
+
 def is_within_post_buy_time_shield(
     context: Any,
     st: Optional[Dict[str, Any]] = None,
@@ -113,17 +170,24 @@ def is_within_post_buy_time_shield(
 ) -> Tuple[bool, float]:
     """
     🚨 Case 65 [매수 체결 후 60.0초 강제 타임쉴드]:
-    매수가 체결된 시점(last_auto_fill_ts 단조 시계 및 원장 last_buy_fill_ts / entry_ts)으로부터
-    60.0초가 경과하기 전에는 True 와 남은 초(remain_sec)를 반환하여 일체의 매도 시도를 차단한다.
+    매수가 체결된 시점(last_buy_fill_mono 단조 시계 및 원장 last_buy_fill_ts / entry_ts)으로부터
+    60.0초가 경과하기 전에는 True 와 남은 초(remain_sec)를 반환하여 일체의 매도(및 중복 매수) 시도를 차단한다.
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
+    now_mono = time.monotonic()
+
     guard_map = getattr(context, "indexing_grace_cache", None)
     if isinstance(guard_map, dict):
         info = guard_map.get(sym)
         if isinstance(info, dict):
-            last_buy_mono = safe_float(info.get("last_auto_fill_ts"), 0.0)
+            last_buy_mono = safe_float(info.get("last_buy_fill_mono"), 0.0)
+            if (
+                last_buy_mono <= 0.0
+                and str(info.get("lot_type") or "") != "SELL_FILL"
+            ):
+                last_buy_mono = safe_float(info.get("last_auto_fill_ts"), 0.0)
             if last_buy_mono > 0.0:
-                elapsed_mono = time.monotonic() - last_buy_mono
+                elapsed_mono = now_mono - last_buy_mono
                 if 0.0 <= elapsed_mono < POST_BUY_TO_SELL_SHIELD_SEC:
                     return True, round(
                         POST_BUY_TO_SELL_SHIELD_SEC - elapsed_mono, 1
@@ -155,11 +219,16 @@ def mark_post_sell_time_shield(
     symbol: str = TARGET_SYMBOL,
     fill_price: float = 0.0,
     sold_qty: int = 0,
+    is_cycle_end: bool = False,
 ) -> None:
     """
-    🚨 Case 65 [매도 체결 후 60.0초 강제 타임쉴드 각인]:
-    매도가 체결된 즉시 인메모리 캐시(exit_snapshot_cache 및 indexing_grace_cache)에
-    last_sell_fill_mono 와 last_sell_fill_ts 를 기록하여 60.0초 동안 재매수를 차단한다.
+    🚨 Case 61, Case 65 & Case 69 [매도 체결 및 0주 싸이클 종료 후 60.0초 타임쉴드 & 15.0초 잔고 인덱싱 그레이스 쉴드 동시 각인]:
+    1) 매도가 체결된 즉시(또는 0주 싸이클이 종료된 즉시) 인메모리 캐시(exit_snapshot_cache 및 indexing_grace_cache)에
+       last_sell_fill_mono 와 last_sell_fill_ts 를 기록하고, 0주 졸업(is_cycle_end=True) 시에는
+       last_cycle_end_mono 와 last_cycle_end_ts 도 함께 기록하여 60.0초 동안 다음 첫 진입 및 재매수를 원천 차단한다.
+    2) 동시에 indexing_grace_cache[sym]["last_auto_fill_ts"] = now_mono 를 각인하여,
+       매도 체결 직후 토스 잔고 API(/api/v1/holdings) 인덱싱 시차(0.1 ~ 0.4초) 동안
+       reconcile 모듈이 유령 추매/부분매도나 과거 백업 원장 복원을 수행하지 못하도록 15.0초 그레이스 쉴드를 작동시킨다!
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
     now_mono = time.monotonic()
@@ -170,6 +239,9 @@ def mark_post_sell_time_shield(
         entry = snap_map.get(sym) if isinstance(snap_map.get(sym), dict) else {}
         entry["last_sell_fill_mono"] = now_mono
         entry["last_sell_fill_ts"] = now_epoch
+        if is_cycle_end:
+            entry["last_cycle_end_mono"] = now_mono
+            entry["last_cycle_end_ts"] = now_epoch
         entry["last_sell_price"] = safe_float(fill_price, 0.0)
         entry["last_sold_qty"] = safe_int(sold_qty, 0)
         snap_map[sym] = entry
@@ -179,8 +251,23 @@ def mark_post_sell_time_shield(
         g_entry = (
             guard_map.get(sym) if isinstance(guard_map.get(sym), dict) else {}
         )
+        prev_lot_type = str(g_entry.get("lot_type") or "")
+        if (
+            prev_lot_type != "SELL_FILL"
+            and safe_float(g_entry.get("last_auto_fill_ts"), 0.0) > 0.0
+        ):
+            g_entry["last_buy_fill_mono"] = safe_float(
+                g_entry.get("last_auto_fill_ts"), 0.0
+            )
+        g_entry["last_auto_fill_ts"] = now_mono
         g_entry["last_sell_fill_mono"] = now_mono
         g_entry["last_sell_fill_ts"] = now_epoch
+        if is_cycle_end:
+            g_entry["last_cycle_end_mono"] = now_mono
+            g_entry["last_cycle_end_ts"] = now_epoch
+        g_entry["lot_type"] = "SELL_FILL"
+        g_entry["fill_price"] = safe_float(fill_price, 0.0)
+        g_entry["filled_qty"] = safe_int(sold_qty, 0)
         guard_map[sym] = g_entry
 
 
@@ -190,20 +277,42 @@ def is_within_post_sell_time_shield(
     symbol: str = TARGET_SYMBOL,
 ) -> Tuple[bool, float]:
     """
-    🚨 Case 65 [매도 체결 후 60.0초 강제 타임쉴드 판별]:
-    매도가 체결된 시점으로부터 60.0초가 경과하기 전에는 True 와 남은 초(remain_sec)를 반환한다.
+    🚨 Case 65 [매도 체결 및 0주 싸이클 종료 후 60.0초 강제 타임쉴드 판별]:
+    직전 매도 체결 시각(last_sell_fill_mono / last_sell_fill_ts) 또는
+    0주 싸이클 종료 시각(last_cycle_end_mono / last_cycle_end_ts)으로부터
+    60.0초(POST_SELL_TO_BUY_SHIELD_SEC)가 경과하기 전에는 True 와 남은 초(remain_sec)를 반환한다.
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
+    now_mono = time.monotonic()
+
     snap_map = getattr(context, "exit_snapshot_cache", None)
     if isinstance(snap_map, dict):
         entry = snap_map.get(sym)
         if isinstance(entry, dict):
-            last_sell_mono = safe_float(entry.get("last_sell_fill_mono"), 0.0)
+            last_sell_mono = max(
+                safe_float(entry.get("last_sell_fill_mono"), 0.0),
+                safe_float(entry.get("last_cycle_end_mono"), 0.0),
+            )
             if last_sell_mono > 0.0:
-                elapsed_mono = time.monotonic() - last_sell_mono
+                elapsed_mono = now_mono - last_sell_mono
                 if 0.0 <= elapsed_mono < POST_SELL_TO_BUY_SHIELD_SEC:
                     return True, round(
                         POST_SELL_TO_BUY_SHIELD_SEC - elapsed_mono, 1
+                    )
+
+    guard_map = getattr(context, "indexing_grace_cache", None)
+    if isinstance(guard_map, dict):
+        g_entry = guard_map.get(sym)
+        if isinstance(g_entry, dict):
+            g_sell_mono = max(
+                safe_float(g_entry.get("last_sell_fill_mono"), 0.0),
+                safe_float(g_entry.get("last_cycle_end_mono"), 0.0),
+            )
+            if g_sell_mono > 0.0:
+                elapsed_g = now_mono - g_sell_mono
+                if 0.0 <= elapsed_g < POST_SELL_TO_BUY_SHIELD_SEC:
+                    return True, round(
+                        POST_SELL_TO_BUY_SHIELD_SEC - elapsed_g, 1
                     )
 
     state_obj = (
@@ -215,7 +324,10 @@ def is_within_post_sell_time_shield(
             else {}
         )
     )
-    last_sell_epoch = safe_float(state_obj.get("last_sell_fill_ts"), 0.0)
+    last_sell_epoch = max(
+        safe_float(state_obj.get("last_sell_fill_ts"), 0.0),
+        safe_float(state_obj.get("last_cycle_end_ts"), 0.0),
+    )
     if last_sell_epoch > 0.0:
         elapsed_epoch = time.time() - last_sell_epoch
         if 0.0 <= elapsed_epoch < POST_SELL_TO_BUY_SHIELD_SEC:
@@ -233,7 +345,7 @@ def update_exit_snapshot_on_hold(
 ) -> Dict[str, Any]:
     """
     Case 19: 보유 중 매 틱마다 exit_snapshot_cache["SOXL"] 에 실보유 수량과 평단가,
-    현재가를 백업하되 기존의 last_sell_fill_mono / last_sell_fill_ts 타임쉴드 시각을 보존한다.
+    현재가를 백업하되 기존의 last_sell_fill_mono / last_sell_fill_ts / last_cycle_end_mono 타임쉴드 시각을 보존한다.
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
     snap_map: Dict[str, Dict[str, Any]] = getattr(
@@ -394,7 +506,7 @@ async def execute_bulletproof_sell_sweep(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 실물 매도 FILLED 정산 · 세후 순익 복리 산입 · 2층 리앵커링 · 매도 후 60초 타임쉴드 각인
+# [핵심 2] 실물 매도 FILLED 정산 · 세후 순익 복리 산입 · 2층 리앵커링 · 양방향 쉴드 각인 (Case 69)
 # ---------------------------------------------------------------------------
 async def _commit_filled_sell_and_reanchor_ledger(
     context: Any,
@@ -403,15 +515,18 @@ async def _commit_filled_sell_and_reanchor_ledger(
     sell_mode: str,
 ) -> Dict[str, Any]:
     """
-    🎯 1 & 🎯 3 & 🎯 4 & Case 19, 47, 59, 60, 65:
+    🎯 1 & 🎯 3 & 🎯 4 & Case 19, 47, 59, 60, 61, 65, 69:
     스나이퍼 실물 매도 주문이 체결(FILLED)되었을 때:
     1) 매도된 지층의 실제 매수 원금(sold_actual_cost_usd)과 실제 매도 체결가(avg_fill_price)로
        왕복 수수료(0.14%) 차감 후 세후 실물 실현 순수익금(net_pnl_usd)을 산출한다.
     2) 1층만 팔리고 2층(단일 지층)이 남은 경우(len(rem_buckets) == 1 and net_pnl_usd > 0),
-       vrev_reanchor_single_tier_quota() 를 호출하여 net_pnl_usd * 0.994 만큼 2층 장부 단가를 강제 인하한다!
-    3) 🚨 [Case 65 매도 후 60.0초 타임쉴드 각인]:
-       mark_post_sell_time_shield() 및 원장 last_sell_fill_ts = time.time() 을 각인하여,
-       매도 체결 직후 60.0초 동안은 일체의 재매수를 차단하고 60초 경과 후 현재가를 조회해 매수하도록 강제한다!
+       vrev_reanchor_single_tier_quota() 를 호출하여 net_pnl_usd * 0.994 만큼 2층 장부 단가를 강제 인하하되,
+       현재 사이클 내 실수확 리앵커링 크레딧(cycle_reanchor_credit_usd)을 정밀 누적 기록한다 (Case 69).
+    3) 🚨 [Case 61, Case 65 & Case 69 매도/0주 싸이클 종료 후 60.0초 타임쉴드 & 15.0초 잔고 인덱싱 그레이스 쉴드 동시 각인]:
+       mark_post_sell_time_shield(is_cycle_end=(len(rem_buckets) == 0)) 및 원장 last_sell_fill_ts,
+       last_cycle_end_ts(0주 졸업 시)를 동시에 각인하여,
+       0주 싸이클 종료 시각(또는 1층 매도 시각)부터 정확히 60.0초가 경과하기 전에는
+       다음 첫 진입이나 추매가 절대 발사되지 않도록 물리적으로 잠근다!
     """
     st = context.ledger.get_state(TARGET_SYMBOL)
     buckets = buckets_from_dicts(st.get("buckets", []))
@@ -422,8 +537,18 @@ async def _commit_filled_sell_and_reanchor_ledger(
     ).upper()
 
     if not buckets:
+        now_empty_epoch = time.time()
+        mark_post_sell_time_shield(
+            context=context,
+            symbol=TARGET_SYMBOL,
+            fill_price=fill_p,
+            sold_qty=q_filled,
+            is_cycle_end=True,
+        )
         await context.ledger.update_state(
             TARGET_SYMBOL,
+            last_sell_fill_ts=now_empty_epoch,
+            last_cycle_end_ts=now_empty_epoch,
             sell_order_id="",
             ordered_qty=0,
             target_sell_price=0.0,
@@ -523,9 +648,28 @@ async def _commit_filled_sell_and_reanchor_ledger(
     new_l2_book_p = 0.0
     reanchor_inc = 0
 
-    # ♻️ [Case 59 단일 지층 마법 : 1층 실물 익절 후 2층 단독 잔존 시 실물 세후 순익으로 2층 장부단가 즉시 리앵커링!]
+    # 🚨 Case 69: 사이클 내 실수확된 리앵커링 크레딧 누적 추적
+    prev_cycle_credit = safe_float(st.get("cycle_reanchor_credit_usd"), -1.0)
+    if prev_cycle_credit < 0.0:
+        if len(rem_buckets) == 1:
+            prev_cycle_credit = round(
+                max(
+                    0.0,
+                    rem_buckets[0].actual_cost_usd
+                    - rem_buckets[0].book_invested_usd,
+                ),
+                4,
+            )
+        else:
+            prev_cycle_credit = 0.0
+
+    is_graduated_zero = bool(len(rem_buckets) == 0)
+
+    # ♻️ [Case 59 & Case 69 단일 지층 마법 : 1층 실물 익절 후 2층 단독 잔존 시 실물 세후 순익으로 2층 장부단가 즉시 리앵커링!]
     if len(rem_buckets) == 1 and net_pnl > 0.0:
         old_l2_book_p = rem_buckets[0].book_price
+        added_credit = round(max(0.0, net_pnl * REANCHOR_NET_BUFFER_MULT), 4)
+        next_cycle_credit = round(prev_cycle_credit + added_credit, 4)
         rem_buckets, reanchor_drop_amt = vrev_reanchor_single_tier_quota(
             queue=rem_buckets,
             net_realized_cash_profit=net_pnl,
@@ -533,12 +677,17 @@ async def _commit_filled_sell_and_reanchor_ledger(
         new_l2_book_p = rem_buckets[0].book_price
         if reanchor_drop_amt > 0.0:
             reanchor_inc = 1
+    elif is_graduated_zero:
+        # 전량 졸업(0주) 시 사이클 리앵커링 크레딧도 0.0 으로 원자적 리셋!
+        next_cycle_credit = 0.0
+    else:
+        next_cycle_credit = round(max(0.0, prev_cycle_credit), 4)
 
     # 🚨 Case 60: 2층이 남아 있으면 기억된 최저 매수가(cycle_min_buy_price)를 보존하고,
     # 전량 졸업(len(rem_buckets) == 0) 시에만 0.0 으로 리셋한다!
     old_cycle_min_p = safe_float(st.get("cycle_min_buy_price"), 0.0)
     next_cycle_min_p = (
-        round(old_cycle_min_p, 4) if len(rem_buckets) > 0 else 0.0
+        round(old_cycle_min_p, 4) if not is_graduated_zero else 0.0
     )
 
     tot_sell_ev = safe_int(st.get("total_sell_events"), 0) + 1
@@ -569,37 +718,44 @@ async def _commit_filled_sell_and_reanchor_ledger(
         safe_float(st.get("daily_realized_net_usd"), 0.0) + net_pnl, 4
     )
 
-    # 🚨 Case 65: 매도 체결 직후 60.0초 매수 금지 타임쉴드 각인!
+    # 🚨 Case 61, Case 65 & Case 69: 매도 체결(및 0주 싸이클 종료) 직후 60.0초 매수 금지 타임쉴드 & 15.0초 인덱싱 그레이스 쉴드 동시 각인!
     now_sell_epoch = time.time()
     mark_post_sell_time_shield(
         context=context,
         symbol=TARGET_SYMBOL,
         fill_price=fill_p,
         sold_qty=sold_q,
+        is_cycle_end=is_graduated_zero,
     )
 
+    update_kwargs: Dict[str, Any] = {
+        "buckets": buckets_to_dicts(rem_buckets),
+        "anchor_price": fill_p,
+        "cycle_min_buy_price": next_cycle_min_p,
+        "ratchet_anchor_price": fill_p,
+        "cycle_reanchor_credit_usd": next_cycle_credit,
+        "last_sell_fill_ts": now_sell_epoch,
+        "sell_order_id": "",
+        "ordered_qty": 0,
+        "target_sell_price": 0.0,
+        "pending_sell_mode": "",
+        "total_sell_events": tot_sell_ev,
+        "total_sold_shares": tot_sold_sh,
+        "win_sell_events": win_ev,
+        "daily_sell_events": day_sell_ev,
+        "reanchor_cnt": reanchor_cnt,
+        "daily_reanchor_cnt": day_reanchor_cnt,
+        "cumulative_reanchor_drop_usd": cum_reanchor_drop,
+        "cumulative_realized_gross_usd": cum_gross,
+        "cumulative_realized_fee_usd": cum_fee,
+        "cumulative_realized_net_usd": cum_net,
+        "daily_realized_net_usd": day_net,
+    }
+    if is_graduated_zero:
+        update_kwargs["last_cycle_end_ts"] = now_sell_epoch
+
     updated_st = await context.ledger.update_state(
-        TARGET_SYMBOL,
-        buckets=buckets_to_dicts(rem_buckets),
-        anchor_price=fill_p,
-        cycle_min_buy_price=next_cycle_min_p,
-        ratchet_anchor_price=fill_p,
-        last_sell_fill_ts=now_sell_epoch,
-        sell_order_id="",
-        ordered_qty=0,
-        target_sell_price=0.0,
-        pending_sell_mode="",
-        total_sell_events=tot_sell_ev,
-        total_sold_shares=tot_sold_sh,
-        win_sell_events=win_ev,
-        daily_sell_events=day_sell_ev,
-        reanchor_cnt=reanchor_cnt,
-        daily_reanchor_cnt=day_reanchor_cnt,
-        cumulative_reanchor_drop_usd=cum_reanchor_drop,
-        cumulative_realized_gross_usd=cum_gross,
-        cumulative_realized_fee_usd=cum_fee,
-        cumulative_realized_net_usd=cum_net,
-        daily_realized_net_usd=day_net,
+        TARGET_SYMBOL, **update_kwargs
     )
 
     context.wakeup_event.set()
@@ -608,8 +764,8 @@ async def _commit_filled_sell_and_reanchor_ledger(
     if hasattr(context, "send_slim_alert"):
         sign = "+" if net_pnl >= 0.0 else "-"
         r_sign = "+" if net_rate >= 0.0 else ""
-        if len(rem_buckets) == 0:
-            note_str = "🎓 전량 졸업 완료(0주 ➔ 🛡️60초 타임쉴드 후 현재가 조회 및 1층 재산입!)"
+        if is_graduated_zero:
+            note_str = "🎓 전량 졸업 완료(0주 싸이클 종료 ➔ 🛡️60초 타임쉴드 경과 후 현재가 조회 및 첫 진입!)"
         elif reanchor_drop_amt > 0.0:
             note_str = (
                 f"♻️ 2층({rem_buckets[0].qty}주) 실물수익 리앵커링: "
@@ -649,7 +805,7 @@ async def sync_pending_sell_order_plugin(
     🚨 Case 19, Case 24 & Case 65:
     장부에 대기 중인 미체결 매도 주문(sell_order_id)이 존재할 때:
     1) GET /api/v1/orders/{orderId} 로 FILLED 여부를 조회하여 체결 완료 시
-       즉시 _commit_filled_sell_and_reanchor_ledger() 로 복리 정산 및 60초 타임쉴드 각인을 수행한다.
+       즉시 _commit_filled_sell_and_reanchor_ledger() 로 복리 정산 및 60초 타임쉴드/15초 그레이스 쉴드 각인을 수행한다.
     2) [핵심 수술] 3초 후 매수 1호가(Bid 1)로 주문 단가를 낮추어 강제 손절시키던 추격 정정 로직을 100% 영구 폐기!
        현재가 지정가로 발주된 매도 주문이 60.0초(SELL_ORDER_MAX_WAIT_SEC) 동안 체결되지 않으면,
        가격을 낮추지 않고 미체결 주문을 안전하게 취소(cancel_order)한 뒤 지층 보유 감시 상태로 복귀한다.
@@ -703,7 +859,10 @@ async def sync_pending_sell_order_plugin(
     # 🚨 Case 65: 매수 1호가(Bid 1) 하향 정정 추격 완전 소각!
     # 60.0초 이상 미체결 시 안전하게 취소하고 다음 목표가 도달을 재감시한다.
     last_mod = safe_float(st.get("last_modify_mono"), 0.0)
-    if last_mod > 0.0 and (time.monotonic() - last_mod) >= SELL_ORDER_MAX_WAIT_SEC:
+    if (
+        last_mod > 0.0
+        and (time.monotonic() - last_mod) >= SELL_ORDER_MAX_WAIT_SEC
+    ):
         try:
             await context.api.cancel_order(sell_oid)
         except Exception:
@@ -752,7 +911,7 @@ async def sync_pending_sell_order_plugin(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 3] 04:07 ~ 16:00 EST 매수 후 60초 타임쉴드 & 현재가 지정가 스나이퍼 매도 게이트
+# [핵심 3] 04:07 ~ 16:00 EST 매수 후 60초 타임쉴드 & 현재가 지정가 스나이퍼 매도 게이트 (Case 69 탑재)
 # ---------------------------------------------------------------------------
 async def execute_1m_sniper_sell_and_reanchor_plugin(
     context: Any,
@@ -761,14 +920,14 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 2 [Step 2] & 🎯 3 & 🎯 4 & Case 24, 44, 46 ~ 65:
+    🎯 2 [Step 2] & 🎯 3 & 🎯 4 & Case 24, 44, 46 ~ 69:
     04:07:00 ~ 16:00:00 EST 전 구간에서 작동하는 순수 현재가 지정가 스나이퍼 매도(오팔) 엔진:
     1) 대기 중인 미체결 매도 주문(sell_order_id)이 있으면 먼저 체결 확인을 수행한다.
     2) 🛡️ [Case 65 매수 후 60.0초 강제 타임쉴드 검문]:
        직전 매수 체결로부터 60.0초(POST_BUY_TO_SELL_SHIELD_SEC)가 지나지 않았으면
        일체의 매도 판정을 보류(HOLD_POST_BUY_60S_TIME_SHIELD)하여 휩소를 원천 차단한다!
-    3) 🔍 [60.0초 경과 후 실시간 현재가 재조회 & 현재가 >= 목표가일 때만 현재가 지정가 매도]:
-       60초 타임쉴드 경과 후 현재가가 1층(+1.50%) 또는 2층(+1.00%) 목표가 이상으로 감지되면,
+    3) 🔍 [60.0초 경과 후 실시간 현재가 재조회 & Case 69 진성 손익분기점 하한선 검증 후 현재가 지정가 매도]:
+       60초 타임쉴드 경과 후 현재가가 1층(+1.50%) 또는 2층(+1.00%, _resolve_safe_l2_book_price 적용) 목표가 이상으로 감지되면,
        즉시 _fetch_fresh_current_soxl_price() 로 실시간 현재가를 다시 조회하여
        재조회된 현재가(fresh_live_p)가 목표가(min_target_p) 이상일 때만
        매수 1호가(Bid 1) 참조 없이 오직 '현재가(fresh_live_p)를 지정가(LIMIT)'로 매도 주문을 발주한다!
@@ -835,14 +994,15 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
     )
 
     # -----------------------------------------------------------------------
-    # [분기 A : 2층(MERGED_UPPER) 단독 보유 상태 — 2층 졸업(+1.00%) 감시]
+    # [분기 A : 2층(MERGED_UPPER) 단독 보유 상태 — 2층 졸업(+1.00% · Case 69 진성 단가 하한선 적용) 감시]
     # -----------------------------------------------------------------------
     if len(buckets) == 1 and str(buckets[0].lot_type).upper() == "MERGED_UPPER":
         upper_b = buckets[0]
+        eff_l2_book_p = _resolve_safe_l2_book_price(upper_b, st)
         min_l2_target_p = (
             math.ceil(
                 (
-                    upper_b.book_price * (1.0 + rise_sell_l2_pct / 100.0)
+                    eff_l2_book_p * (1.0 + rise_sell_l2_pct / 100.0)
                     - 1e-9
                 )
                 * 100.0
@@ -878,8 +1038,8 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
                 }
 
         upper_gain_pct = (
-            ((live_p - upper_b.book_price) / upper_b.book_price) * 100.0
-            if upper_b.book_price > 0.0
+            ((live_p - eff_l2_book_p) / eff_l2_book_p) * 100.0
+            if eff_l2_book_p > 0.0
             else 0.0
         )
         return {
@@ -889,7 +1049,7 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         }
 
     # -----------------------------------------------------------------------
-    # [분기 B : 실물 1층(buckets[0]) 보유 상태 — 1층(+1.50%) 익절 및 2층(+1.00%) 동시 졸업 판정]
+    # [분기 B : 실물 1층(buckets[0]) 보유 상태 — 1층(+1.50%) 익절 및 2층(+1.00% · Case 69 하한선) 동시 졸업 판정]
     # -----------------------------------------------------------------------
     floor1_b = buckets[0]
     min_l1_target_p = (
@@ -900,11 +1060,15 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         / 100.0
     )
 
-    # B-1) 2층이 존재할 때 리앵커링된 2층 목표가(+1.00%)에 도달했고 1층도 본전 이상이면 전량 동시 졸업!
+    # B-1) 2층이 존재할 때 리앵커링된 2층 목표가(+1.00%, Case 69 하한선 적용)에 도달했고 1층도 본전 이상이면 전량 동시 졸업!
     if len(buckets) >= 2 and live_p >= floor1_b.book_price:
         min_l2_target_p = max(
             math.ceil(
-                (b_up.book_price * (1.0 + rise_sell_l2_pct / 100.0) - 1e-9)
+                (
+                    _resolve_safe_l2_book_price(b_up, st)
+                    * (1.0 + rise_sell_l2_pct / 100.0)
+                    - 1e-9
+                )
                 * 100.0
             )
             / 100.0
@@ -946,10 +1110,11 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         if fresh_live_p >= min_l1_target_p:
             sell_all_grad = True
             for b_up in buckets[1:]:
+                eff_up_book_p = _resolve_safe_l2_book_price(b_up, st)
                 up_target_p = (
                     math.ceil(
                         (
-                            b_up.book_price * (1.0 + rise_sell_l2_pct / 100.0)
+                            eff_up_book_p * (1.0 + rise_sell_l2_pct / 100.0)
                             - 1e-9
                         )
                         * 100.0

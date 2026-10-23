@@ -2,10 +2,10 @@
 """
 # MODIFIED: toss_api.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 토스증권 Open API (v1.2.14) 방탄 통신 통제소 &
-SOXL 단일 롱 2-Tier 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 02 / 06)
+SOXL 단일 롱 2-Tier 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 05 / 05)
 - 제1헌법: 모든 파일 I/O 및 네트워크 통신의 asyncio.to_thread 비동기 격리 + GlobalThrottle 중앙 통제
 - 제2헌법: 기동 시 GET /api/v1/accounts 1회 호출로 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 자동 주입
-- 제3헌법 ~ 제6헌법 및 Case 01 ~ 68 전수 락온:
+- 제3헌법 ~ 제6헌법 및 Case 01 ~ 69 전수 락온:
   1) REAL_ALLOWED_SYMBOLS = ("SOXL",) 단일 롱 화이트리스트 물리적 강제 (인버스 숏 SOXS 원천 차단)
   2) get_holdings_map_with_status, get_candles_1m, get_candles_1d, get_current_prices_batch,
      get_orderbook, get_buying_power_usd, get_sellable_quantity, create_order, modify_order,
@@ -17,6 +17,11 @@ SOXL 단일 롱 2-Tier 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 �
      - 폴더명(folder_slug) 기반 ① 고유 원장(soxl_stratum_ledger_<폴더명>.json), ② 호환 원장(soxl_stratum_ledger.json),
        ③ 실시간 백업 금고(ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json) 3중 원자적 동기화 및 기존 데이터 무손실 자동 이관
      - initial_seed_usd 결측/0.0 유입 시 $100.0 으로 강제 박제되던 버그 영구 소각 및 백업/환경변수/기본값($10,000) 자가 치유 복원
+  5) 🚨 [NEW · Case 65 & Case 69 0주 싸이클 종료 60초 타임쉴드 시각(last_cycle_end_ts) 영속화 및
+     리앵커링 이중 차감 방지 진성 손익분기점 하한선(True Break-Even Floor) 원장 레벨 강제]
+     - _default_symbol_state 및 _sanitize_and_enforce_identity 에 last_cycle_end_ts 와 cycle_reanchor_credit_usd 정식 탑재
+     - 보유 지층의 리앵커링 할인 총액(actual_cost_usd - book_invested_usd)이 현재 사이클 내 실제 수확된 리앵커링 크레딧
+       상한을 절대 초과할 수 없도록 원장 저장/로드 시마다 물리적으로 검증 및 복구하여 조기 손절 졸업을 영구 봉쇄!
 """
 
 from __future__ import annotations
@@ -138,7 +143,7 @@ class _NonRetryableApiError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# [NEW · Case 68] 폴더 위치(base_dir) 기반 자동 식별기 및 격리 환경변수 로더
+# [Case 68] 폴더 위치(base_dir) 기반 자동 식별기 및 격리 환경변수 로더
 # ("/home/pipiosToss" 고정 경로 하드코딩 100% 영구 소각)
 # ---------------------------------------------------------------------------
 def get_bot_base_dir(explicit_dir: Optional[str] = None) -> str:
@@ -337,17 +342,19 @@ class GlobalThrottle:
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] SOXL 단일 롱 2-Tier 폴더별 3중 안전 지층 원장 (SoxlStratumLedger)
+# [핵심 2] SOXL 단일 롱 2-Tier 폴더별 3중 안전 지층 원장 (SoxlStratumLedger — Case 68 & Case 69)
 # ---------------------------------------------------------------------------
 class SoxlStratumLedger:
     """
-    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 68:
+    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 69:
     현재 봇이 위치한 폴더(`base_dir`)를 기준으로:
     ① 폴더 고유 원장(`soxl_stratum_ledger_<folder_slug>.json` — Git 덮어쓰기 100% 면역)
     ② 표준 호환 원장(`soxl_stratum_ledger.json` — 기존 코드 및 외부 도구 호환 미러)
     ③ 실시간 백업 금고(`ledger_backups/soxl_stratum_ledger_<folder_slug>.bak.json`)
     3곳에 SOXL 2-Tier 지층(buckets), 가용 현금 시드(free_cash_usd), 기억된 사이클 최저 매수가(cycle_min_buy_price),
-    양방향 60초 타임쉴드 시각, 누적 세후 실현수익금 및 자투리 절약금을 원자적(.tmp -> os.replace)으로 동시 영속화한다.
+    양방향 60초 타임쉴드 시각(last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts),
+    사이클 내 실수확 리앵커링 크레딧(cycle_reanchor_credit_usd), 누적 세후 실현수익금 및 자투리 절약금을
+    원자적(.tmp -> os.replace)으로 동시 영속화한다.
     """
 
     ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
@@ -404,9 +411,6 @@ class SoxlStratumLedger:
     ) -> float:
         """
         🚨 Case 68 [시드머니 $100 강제 변조 버그 영구 소각]:
-        기존 코드의 `max(100.0, safe_float(st.get("initial_seed_usd"), 10000.0))` 는
-        `initial_seed_usd` 에 0 또는 0.0 이 들어왔을 때 $10,000 이 아닌 $100.0 으로 시드를 고정시켜 버렸다.
-        이를 방지하기 위해:
         1) raw_seed > 100.0 이면 사용자 설정 시드로 정상 인정한다.
         2) raw_seed == 100.0 인 경우, 명시적 플래그(`seed_explicitly_set_100 == True`)가 없으면
            초기화 오류로 발생한 $100 변조로 판정하여 직전 정상 시드(fallback_seed) 또는 환경변수/기본값($10,000)으로 복구한다!
@@ -465,6 +469,7 @@ class SoxlStratumLedger:
             "anchor_price": 0.0,
             "cycle_min_buy_price": 0.0,
             "ratchet_anchor_price": 0.0,
+            "cycle_reanchor_credit_usd": 0.0,
             "buy_order_id": "",
             "sell_order_id": "",
             "client_order_id": "",
@@ -478,6 +483,7 @@ class SoxlStratumLedger:
             "entry_ts": 0.0,
             "last_buy_fill_ts": 0.0,
             "last_sell_fill_ts": 0.0,
+            "last_cycle_end_ts": 0.0,
             "last_evaluated_buy_bucket_id": -1,
             "last_evaluated_date": today_est,
             "logical_date": today_est,
@@ -509,13 +515,21 @@ class SoxlStratumLedger:
         self, raw_st: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        🚨 Case 63, Case 64 & Case 68:
+        🚨 Case 63, Case 64, Case 68 & Case 69:
         1) buy_interval_min = 10, sell_interval_min = 1, portion_mode = "COMP_08PCT",
            threshold_mode = "WIDE_RUNWAY" 를 강제 동기화한다.
         2) 시드머니 결측 또는 0.0 유입 시 $100.0 으로 변조되지 않도록 _resolve_safe_initial_seed() 를 적용한다.
-        3) 회계 항등식(free_cash_usd = max(0.0, initial_seed_usd + cumulative_realized_net_usd - actual_invested))을
+        3) 🛡️ [Case 69 진성 손익분기점 하한선(True Break-Even Floor) 하드 가드]:
+           - 보유 지층이 비어 있으면(0주) cycle_reanchor_credit_usd = 0.0 으로 강제 초기화한다.
+           - 보유 지층이 존재할 때 리앵커링 할인 총액(actual_cost_usd - book_invested_usd)이
+             현재 사이클 내 실수확된 리앵커링 크레딧 상한(cycle_reanchor_credit_usd)을 절대 초과하지 못하도록
+             book_invested_usd 와 book_price 의 하한선을 물리적으로 강제하여 이중 차감 조기 졸업을 봉쇄한다!
+        4) 회계 항등식(free_cash_usd = max(0.0, initial_seed_usd + cumulative_realized_net_usd - actual_invested))을
            항상 정밀 유지한다.
         """
+        has_explicit_cycle_credit = bool(
+            isinstance(raw_st, dict) and "cycle_reanchor_credit_usd" in raw_st
+        )
         st = self._default_symbol_state(
             folder_slug=self.folder_slug,
             initial_seed=self._last_known_valid_seed,
@@ -538,8 +552,13 @@ class SoxlStratumLedger:
         if init_seed > 100.0:
             self._last_known_valid_seed = round(init_seed, 4)
 
+        cum_net = round(
+            safe_float(st.get("cumulative_realized_net_usd"), 0.0), 4
+        )
+        st["cumulative_realized_net_usd"] = cum_net
+
         raw_buckets = st.get("buckets")
-        clean_buckets: List[Dict[str, Any]] = []
+        temp_buckets: List[Dict[str, Any]] = []
         if isinstance(raw_buckets, list):
             for b in raw_buckets:
                 if isinstance(b, dict) and safe_int(b.get("qty"), 0) > 0:
@@ -563,7 +582,7 @@ class SoxlStratumLedger:
                     )
                     lc = max(1, safe_int(b.get("lot_count"), 1))
                     lt = str(b.get("lot_type") or "QUOTA_L1").upper().strip()
-                    clean_buckets.append(
+                    temp_buckets.append(
                         {
                             "qty": q,
                             "book_price": bp,
@@ -573,17 +592,70 @@ class SoxlStratumLedger:
                             "lot_type": lt,
                         }
                     )
+
+        # 🚨 Case 69: 사이클 내 실수확 리앵커링 크레딧 결정 및 진성 손익분기점 하한선 강제
+        if not temp_buckets:
+            eff_cycle_credit = 0.0
+        elif has_explicit_cycle_credit:
+            eff_cycle_credit = round(
+                max(0.0, safe_float(st.get("cycle_reanchor_credit_usd"), 0.0)),
+                4,
+            )
+        else:
+            # 구버전 원장 최초 마이그레이션 시: 현재 지층 할인액과 누적 세후수익 버퍼 중 작은 값으로 상한 설정
+            raw_disc_sum = sum(
+                max(0.0, b["actual_cost_usd"] - b["book_invested_usd"])
+                for b in temp_buckets
+            )
+            max_from_cum = (
+                round(cum_net * REANCHOR_NET_BUFFER_MULT, 4)
+                if cum_net > 0.0
+                else 0.0
+            )
+            eff_cycle_credit = round(min(raw_disc_sum, max_from_cum), 4)
+
+        rem_credit = eff_cycle_credit
+        clean_buckets: List[Dict[str, Any]] = []
+        for idx, b in enumerate(temp_buckets):
+            q = b["qty"]
+            ac = b["actual_cost_usd"]
+            bi = b["book_invested_usd"]
+            lt = b["lot_type"]
+            lc = b["lot_count"]
+            pure_avg_p = round(ac / float(q), 4)
+
+            cur_disc = max(0.0, ac - bi)
+            if len(temp_buckets) >= 2 and idx == 0 and lt != "MERGED_UPPER":
+                allowed_disc = 0.0
+            else:
+                allowed_disc = min(cur_disc, rem_credit)
+                rem_credit = max(0.0, rem_credit - allowed_disc)
+
+            min_floor_bi = max(
+                0.01 * float(q), round(ac - allowed_disc, 4)
+            )
+            safe_bi = max(bi, min_floor_bi)
+            safe_bp = round(
+                min(pure_avg_p, max(0.01, safe_bi / float(q))), 4
+            )
+            clean_buckets.append(
+                {
+                    "qty": q,
+                    "book_price": safe_bp,
+                    "book_invested_usd": round(safe_bp * float(q), 4),
+                    "actual_cost_usd": round(ac, 4),
+                    "lot_count": lc,
+                    "lot_type": lt,
+                }
+            )
+
         st["buckets"] = clean_buckets
+        st["cycle_reanchor_credit_usd"] = round(eff_cycle_credit, 4)
 
         actual_inv = round(
             sum(safe_float(b["actual_cost_usd"], 0.0) for b in clean_buckets),
             4,
         )
-        cum_net = round(
-            safe_float(st.get("cumulative_realized_net_usd"), 0.0), 4
-        )
-        st["cumulative_realized_net_usd"] = cum_net
-
         realized_equity = max(0.0, init_seed + cum_net)
         st["free_cash_usd"] = round(max(0.0, realized_equity - actual_inv), 4)
         st["updated_at"] = datetime.now(EST_TZ).isoformat()
@@ -600,18 +672,17 @@ class SoxlStratumLedger:
         return None
 
     @staticmethod
-    def _score_ledger_state(st: Dict[str, Any]) -> Tuple[int, int, int, float, str]:
+    def _score_ledger_state(
+        st: Dict[str, Any],
+    ) -> Tuple[int, int, int, float, str]:
         """
         🚨 Case 68 [다중 원장 상태 비교 자가 치유 스코어링]:
         폴더 내 3개 원장 후보(고유 원장 · 실시간 백업 금고 · 호환 원장) 중
-        실수로 초기화된 빈 파일 대신 실제 매매 데이터를 보유한 최적 원장을 선택하기 위한 우선순위 튜플:
-        1) has_active_position : 보유 지층 수량(sum(qty) > 0) 또는 미결 주문 존재 여부 (1 or 0)
-        2) has_trade_history   : 누적 매수/매도 횟수 + 리앵커링 횟수 + 시드보호 패스 횟수 합계
-        3) has_valid_seed      : initial_seed_usd > 100.0 여부 (1 or 0, $100 변조본 배제)
-        4) abs_realized_metric : abs(cumulative_realized_net_usd) + cumulative_leftover_saved_usd
-        5) updated_at_str      : ISO 타임스탬프 문자열
+        실수로 초기화된 빈 파일 대신 실제 매매 데이터를 보유한 최적 원장을 선택하기 위한 우선순위 튜플.
         """
-        buckets = st.get("buckets") if isinstance(st.get("buckets"), list) else []
+        buckets = (
+            st.get("buckets") if isinstance(st.get("buckets"), list) else []
+        )
         total_qty = sum(
             safe_int(b.get("qty"), 0) for b in buckets if isinstance(b, dict)
         )
@@ -662,8 +733,8 @@ class SoxlStratumLedger:
         1) primary_filepath (`soxl_stratum_ledger_<폴더명>.json`)
         2) backup_filepath  (`ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json`)
         3) legacy_filepath  (`soxl_stratum_ledger.json`)
-        3개 파일을 모두 검사하여 가장 풍부하고 유효한 상태(보유 지층, 누적 수익, 정상 시드 보유)를
-        가진 원장을 채택한 뒤, 즉시 3개 경로 모두에 원자적으로 동기화 저장한다.
+        3개 파일을 모두 검사하여 가장 풍부하고 유효한 상태를 가진 원장을 채택한 뒤,
+        즉시 3개 경로 모두에 원자적으로 동기화 저장한다.
         """
         with GlobalThrottle.get_file_lock(self.primary_filepath):
             with GlobalThrottle.get_file_lock(self.legacy_filepath):
@@ -678,7 +749,6 @@ class SoxlStratumLedger:
                         if isinstance(raw_d, dict):
                             candidates.append((label, raw_d))
 
-                    # 어떤 후보 파일에서도 > $100 시드가 발견되면 먼저 _last_known_valid_seed 에 기억
                     for _, cand_d in candidates:
                         c_seed = safe_float(cand_d.get("initial_seed_usd"), 0.0)
                         if c_seed > 100.0:
@@ -688,7 +758,6 @@ class SoxlStratumLedger:
                     best_raw: Dict[str, Any] = {}
                     best_label: str = "DEFAULT_INIT"
                     if candidates:
-                        # 스코어가 가장 높은 원장 채택 (동점일 경우 PRIMARY > BACKUP_VAULT > LEGACY_MIRROR 순)
                         priority_map = {
                             "PRIMARY": 3,
                             "BACKUP_VAULT": 2,
@@ -713,7 +782,7 @@ class SoxlStratumLedger:
                         for b in sanitized.get("buckets", [])
                     )
                     logger.info(
-                        "📂 [Case 68 폴더별 3중 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주 · 고유원장=%s",
+                        "📂 [Case 68/69 폴더별 3중 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주 · 고유원장=%s",
                         self.folder_slug,
                         best_label,
                         safe_float(sanitized.get("initial_seed_usd"), 10000.0),
@@ -751,9 +820,7 @@ class SoxlStratumLedger:
         1) 폴더 고유 원장 (`soxl_stratum_ledger_<folder_slug>.json`)
         2) 호환 미러 원장 (`soxl_stratum_ledger.json`)
         3) 실시간 백업 금고 (`ledger_backups/soxl_stratum_ledger_<folder_slug>.bak.json`)
-        — 단, 현재 상태가 지층 0주이면서 동시에 백업 금고에 유효 지층(buckets > 0)이 있고
-          수동 초기화/정식 매도가 아닌 비정상 빈 덮어쓰기라면 백업 금고를 보호하고,
-          정상적인 운영 업데이트 시에는 3곳 모두 원자적(.tmp -> os.replace)으로 동시 기록한다.
+        3곳 모두 원자적(.tmp -> os.replace)으로 동시 기록한다.
         """
         payload = {TARGET_SYMBOL: self._data[TARGET_SYMBOL]}
         self._atomic_write_json_sync(self.primary_filepath, payload)
@@ -767,7 +834,7 @@ class SoxlStratumLedger:
         self, logical_date: Optional[str] = None, keep_days: int = 14
     ) -> str:
         """
-        NEW [Case 68 일일 날짜별 스냅샷 금고 보관]:
+        Case 68 [일일 날짜별 스냅샷 금고 보관]:
         17:00 EST 일일 GC 또는 장 마감 결산 시 `ledger_backups/soxl_stratum_ledger_<folder_slug>_YYYY-MM-DD.json`
         파일을 생성하고 오래된 스냅샷(최근 14개 초과분)을 자동 정리한다.
         """
@@ -808,7 +875,7 @@ class SoxlStratumLedger:
 
     def recover_from_backup_vault_sync(self) -> Optional[Dict[str, Any]]:
         """
-        NEW [Case 68]:
+        Case 68:
         백업 금고(`backup_filepath` 또는 최신 일일 스냅샷)에서 유효한 지층(`buckets`)이나
         시드/수익 데이터가 존재하면 읽어와 반환한다.
         """
@@ -866,7 +933,9 @@ class SoxlStratumLedger:
                         )
                     )
                     if "initial_seed_usd" in kwargs:
-                        req_seed = safe_float(kwargs.get("initial_seed_usd"), 0.0)
+                        req_seed = safe_float(
+                            kwargs.get("initial_seed_usd"), 0.0
+                        )
                         cur["seed_explicitly_set_100"] = bool(
                             abs(req_seed - 100.0) < 1e-6
                         )
@@ -890,9 +959,9 @@ class SoxlStratumLedger:
         preserve_realized_profit: bool = True,
     ) -> Dict[str, Any]:
         """
-        🚨 Case 02:
-        /reset 또는 /reset_seed 명령 시 지층 큐(buckets), 기준가, 기억된 최저가, 미체결 주문 ID를
-        원자적으로 0점 초기화한다.
+        🚨 Case 02, Case 65 & Case 69:
+        /reset 또는 /reset_seed 명령 시 지층 큐(buckets), 기준가, 기억된 최저가, 리앵커링 크레딧, 미체결 주문 ID를
+        원자적으로 0점 초기화하고, 0주 싸이클 종료 타임쉴드(last_sell_fill_ts, last_cycle_end_ts)를 각인한다.
         """
         sym = self._assert_allowed_symbol(symbol)
         st = self.get_state(sym)
@@ -907,6 +976,7 @@ class SoxlStratumLedger:
             if preserve_realized_profit
             else 0.0
         )
+        now_reset_ts = time.time()
         return await self.update_state(
             sym,
             initial_seed_usd=round(init_seed, 4),
@@ -915,6 +985,9 @@ class SoxlStratumLedger:
             anchor_price=0.0,
             cycle_min_buy_price=0.0,
             ratchet_anchor_price=0.0,
+            cycle_reanchor_credit_usd=0.0,
+            last_sell_fill_ts=now_reset_ts,
+            last_cycle_end_ts=now_reset_ts,
             buy_order_id="",
             sell_order_id="",
             client_order_id="",
@@ -1225,7 +1298,7 @@ class TossApiClient:
         - 429 Rate Limit 또는 5xx 일시 오류 시 지수 백오프 재시도
         - 400, 403, 404, 409, 415, 422 비즈니스 에러 시 즉시 _NonRetryableApiError 발생
         """
-        clean_path = path if path.startswith("/") else f"/{path}"
+        clean_path = path if path.startswith("/") else f"{'/'}{path}"
         url = f"{self.base_url}{clean_path}"
         if params:
             filtered_params = {
@@ -1712,7 +1785,6 @@ class TossApiClient:
                         else pl_obj.get("rate"),
                         0.0,
                     )
-                    # API.txt 명세: rate는 소수비율(0.1333 = 13.33%)로 반환됨
                     profit_rate_pct = round(raw_rate * 100.0, 2)
 
                     out_map[sym] = {
