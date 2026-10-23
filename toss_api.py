@@ -2,10 +2,10 @@
 """
 # MODIFIED: toss_api.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 토스증권 Open API (v1.2.14) 방탄 통신 통제소 &
-SOXL 단일 롱 2-Tier 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Hotfix Step 01 / 01)
+SOXL 단일 롱 12-Tier 순수 멀티 그리드 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 01 / 07)
 - 제1헌법: 모든 파일 I/O 및 네트워크 통신의 asyncio.to_thread 비동기 격리 + GlobalThrottle 중앙 통제
 - 제2헌법: 기동 시 GET /api/v1/accounts 1회 호출로 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 자동 주입
-- 제3헌법 ~ 제6헌법 및 Case 01 ~ 70 전수 락온:
+- 제3헌법 ~ 제6헌법 및 Case 01 ~ 71 전수 락온:
   1) REAL_ALLOWED_SYMBOLS = ("SOXL",) 단일 롱 화이트리스트 물리적 강제 (인버스 숏 SOXS 원천 차단)
   2) get_holdings_map_with_status, get_candles_1m, get_candles_1d, get_current_prices_batch,
      get_orderbook, get_buying_power_usd, get_sellable_quantity, create_order, modify_order,
@@ -16,15 +16,12 @@ SOXL 단일 롱 2-Tier 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 �
      - "/home/pipiosToss" 고정 경로 하드코딩 100% 영구 소각 -> 오직 실행 파일이 위치한 폴더(base_dir)의 .env 만 로드
      - 폴더명(folder_slug) 기반 ① 고유 원장(soxl_stratum_ledger_<폴더명>.json), ② 호환 원장(soxl_stratum_ledger.json),
        ③ 실시간 백업 금고(ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json) 3중 원자적 동기화 및 기존 데이터 무손실 자동 이관
-     - resolve_folder_isolated_ledger_paths() 내 backup_path f-string 구문 무결성 100% 교정 완료
-  5) 🚨 [Case 65 & Case 69 0주 싸이클 종료 60초 타임쉴드 시각(last_cycle_end_ts) 영속화 및
-     리앵커링 이중 차감 방지 진성 손익분기점 하한선(True Break-Even Floor) 원장 레벨 강제]
-     - _default_symbol_state 및 _sanitize_and_enforce_identity 에 last_cycle_end_ts 와 cycle_reanchor_credit_usd 정식 탑재
-     - 보유 지층의 리앵커링 할인 총액(actual_cost_usd - book_invested_usd)이 현재 사이클 내 실제 수확된 리앵커링 크레딧
-       상한을 절대 초과할 수 없도록 원장 저장/로드 시마다 물리적으로 검증 및 복구하여 조기 손절 졸업을 영구 봉쇄!
-  6) 🚨 [NEW · Case 70 보유 중 매 60.0초 타임쉴드 주기 매도 모니터 검문 시각(last_sell_gate_eval_ts) 원장 영속화]
-     - 매수 후 최초 60.0초뿐만 아니라 보유 중 매 60.0초 타임쉴드 주기로만 매도 모니터가 작동하도록
-       last_sell_gate_eval_ts 필드를 원장 기본 상태 및 정규화/리셋 루틴에 완벽 결속!
+  5) 🚨 [Case 65, Case 69 & Case 70 양방향·주기 60초 타임쉴드 시각 영속화 및 순수 원가 무결성 강제]
+     - last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts 원장 영속화
+  6) 🚨 [NEW · Case 71 신규 챔피언 🔥 03_12G_PURE_10_01 : 1층 ~ 12층 순수 원가 멀티 그리드(MAX_GRID_TIERS_12 = 12) &
+     3중 다중 익절 인덱스(pending_sell_indices) 영속화 및 리앵커링 원가 차감 영구 폐기]
+     - 모든 보유 지층(1층 ~ 12층)의 book_price == actual_avg_price 및 book_invested_usd == actual_cost_usd 순수 실물 원가 100% 보존!
+     - 다중 그리드 동시 매도 체결 정산을 위한 pending_sell_indices 및 2~12층 개별/이동평균 익절 통계 필드 정식 탑재!
 """
 
 from __future__ import annotations
@@ -49,7 +46,7 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger("toss_sniper.toss_api")
 
 # ---------------------------------------------------------------------------
-# [핵심 상수] 제4헌법 EST 단일 타임존 & 전술 A (🛡️ 05_AF_WIDE_10_01) 전역 상수
+# [핵심 상수] 제4헌법 EST 단일 타임존 & 신규 챔피언 (🔥 03_12G_PURE_10_01) 전역 상수
 # ---------------------------------------------------------------------------
 EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
@@ -61,6 +58,8 @@ ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
 DEFAULT_INITIAL_SEED_USD: float = 10000.0
 PORTION_RATIO_LOCKED: float = 0.08
 BASE_MAX_LOTS_8PCT: int = 12
+# NEW [Case 71]: 1층 ~ 12층 멀티 그리드 최대 층수 상수
+MAX_GRID_TIERS_12: int = 12
 LOCKED_BUY_INTERVAL_MIN: int = 10
 LOCKED_SELL_INTERVAL_MIN: int = 1
 ROUND_TRIP_FEE_RATE: float = 0.0014
@@ -203,7 +202,6 @@ def resolve_folder_isolated_ledger_paths(
     )
     legacy_path = os.path.join(target_dir, "soxl_stratum_ledger.json")
     backup_dir = os.path.join(target_dir, "ledger_backups")
-    # MODIFIED: f-string 닫는 중괄호(}) 구문 무결성 교정 완료
     backup_path = os.path.join(
         backup_dir, f"soxl_stratum_ledger_{folder_slug}.bak.json"
     )
@@ -346,18 +344,19 @@ class GlobalThrottle:
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] SOXL 단일 롱 2-Tier 폴더별 3중 안전 지층 원장 (SoxlStratumLedger — Case 68, 69, 70)
+# [핵심 2] SOXL 단일 롱 12-Tier 순수 멀티 그리드 폴더별 3중 안전 지층 원장 (SoxlStratumLedger — Case 68, 69, 70, 71)
 # ---------------------------------------------------------------------------
 class SoxlStratumLedger:
     """
-    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 70:
+    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 71:
     현재 봇이 위치한 폴더(`base_dir`)를 기준으로:
     ① 폴더 고유 원장(`soxl_stratum_ledger_<folder_slug>.json` — Git 덮어쓰기 100% 면역)
     ② 표준 호환 원장(`soxl_stratum_ledger.json` — 기존 코드 및 외부 도구 호환 미러)
     ③ 실시간 백업 금고(`ledger_backups/soxl_stratum_ledger_<folder_slug>.bak.json`)
-    3곳에 SOXL 2-Tier 지층(buckets), 가용 현금 시드(free_cash_usd), 기억된 사이클 최저 매수가(cycle_min_buy_price),
-    양방향 60초 타임쉴드 시각(last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts),
-    사이클 내 실수확 리앵커링 크레딧(cycle_reanchor_credit_usd), 누적 세후 실현수익금 및 자투리 절약금을
+    3곳에 SOXL 1~12층 순수 멀티 그리드 지층(buckets), 가용 현금 시드(free_cash_usd),
+    기억된 사이클 최저 매수가(cycle_min_buy_price), 양방향·주기 60초 타임쉴드 시각
+    (last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts),
+    다중 그리드 매도 대기 인덱스(pending_sell_indices), 누적 세후 실현수익금 및 자투리 절약금을
     원자적(.tmp -> os.replace)으로 동시 영속화한다.
     """
 
@@ -469,6 +468,7 @@ class SoxlStratumLedger:
             "reentry_mode": "HYBRID_PULL_OR_BRK",
             "buy_interval_min": LOCKED_BUY_INTERVAL_MIN,
             "sell_interval_min": LOCKED_SELL_INTERVAL_MIN,
+            "max_grid_tiers": MAX_GRID_TIERS_12,
             "buckets": [],
             "anchor_price": 0.0,
             "cycle_min_buy_price": 0.0,
@@ -483,12 +483,14 @@ class SoxlStratumLedger:
             "pending_portion_budget": 0.0,
             "pending_lot_type": "",
             "pending_sell_mode": "",
+            # NEW [Case 71]: 3중 다중 익절 시 매도 대상 그리드 인덱스 리스트 영속화 필드
+            "pending_sell_indices": [],
             "last_modify_mono": 0.0,
             "entry_ts": 0.0,
             "last_buy_fill_ts": 0.0,
             "last_sell_fill_ts": 0.0,
             "last_cycle_end_ts": 0.0,
-            # NEW [Case 70]: 보유 중 매 60.0초 타임쉴드 주기 매도 모니터 검문 시각 영속화 필드
+            # Case 70: 보유 중 매 60.0초 타임쉴드 주기 매도 모니터 검문 시각 영속화 필드
             "last_sell_gate_eval_ts": 0.0,
             "last_evaluated_buy_bucket_id": -1,
             "last_evaluated_date": today_est,
@@ -507,6 +509,11 @@ class SoxlStratumLedger:
             "total_sold_shares": 0,
             "win_sell_events": 0,
             "daily_sell_events": 0,
+            # NEW [Case 71]: 2~12층 개별 그리드 익절 및 2~12층 통합 이동평균 일괄 익절 카운터
+            "indiv_grid_sell_cnt": 0,
+            "daily_indiv_grid_sell_cnt": 0,
+            "wma_grad_sell_cnt": 0,
+            "daily_wma_grad_sell_cnt": 0,
             "reanchor_cnt": 0,
             "daily_reanchor_cnt": 0,
             "cumulative_reanchor_drop_usd": 0.0,
@@ -521,21 +528,18 @@ class SoxlStratumLedger:
         self, raw_st: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        🚨 Case 63, Case 64, Case 68, Case 69 & Case 70:
-        1) buy_interval_min = 10, sell_interval_min = 1, portion_mode = "COMP_08PCT",
-           threshold_mode = "WIDE_RUNWAY" 를 강제 동기화한다.
+        🚨 Case 63, Case 64, Case 68, Case 69, Case 70 & Case 71:
+        1) buy_interval_min = 10, sell_interval_min = 1, max_grid_tiers = 12,
+           portion_mode = "COMP_08PCT", threshold_mode = "WIDE_RUNWAY" 를 강제 동기화한다.
         2) 시드머니 결측 또는 0.0 유입 시 $100.0 으로 변조되지 않도록 _resolve_safe_initial_seed() 를 적용한다.
-        3) 🛡️ [Case 69 & Case 70 진성 손익분기점 하한선 및 0주 시 매도모니터 타임쉴드 리셋]:
-           - 보유 지층이 비어 있으면(0주) cycle_reanchor_credit_usd = 0.0 및 last_sell_gate_eval_ts = 0.0 으로 강제 초기화한다.
-           - 보유 지층이 존재할 때 리앵커링 할인 총액(actual_cost_usd - book_invested_usd)이
-             현재 사이클 내 실수확된 리앵커링 크레딧 상한(cycle_reanchor_credit_usd)을 절대 초과하지 못하도록
-             book_invested_usd 와 book_price 의 하한선을 물리적으로 강제하여 이중 차감 조기 졸업을 봉쇄한다!
+        3) 🛡️ [Case 69 & Case 71 순수 실물 원가 100% 보존 강제 (리앵커링 원가 차감 영구 폐기)]:
+           - 모든 보유 지층(1층 ~ 12층)의 장부 단가(book_price)와 장부 투자금(book_invested_usd)을
+             순수 실물 매수 원가(actual_avg_price = ac / q, actual_cost_usd = ac)와 100% 일치시켜,
+             리앵커링 차감이나 이동평균 희석으로 인한 조기 손절 착시를 물리적으로 원천 봉쇄한다!
+           - cycle_reanchor_credit_usd = 0.0 으로 항상 고정한다.
         4) 회계 항등식(free_cash_usd = max(0.0, initial_seed_usd + cumulative_realized_net_usd - actual_invested))을
            항상 정밀 유지한다.
         """
-        has_explicit_cycle_credit = bool(
-            isinstance(raw_st, dict) and "cycle_reanchor_credit_usd" in raw_st
-        )
         st = self._default_symbol_state(
             folder_slug=self.folder_slug,
             initial_seed=self._last_known_valid_seed,
@@ -547,6 +551,7 @@ class SoxlStratumLedger:
         st["folder_slug"] = self.folder_slug
         st["buy_interval_min"] = LOCKED_BUY_INTERVAL_MIN
         st["sell_interval_min"] = LOCKED_SELL_INTERVAL_MIN
+        st["max_grid_tiers"] = MAX_GRID_TIERS_12
         st["portion_mode"] = "COMP_08PCT"
         st["threshold_mode"] = "WIDE_RUNWAY"
         st["reentry_mode"] = "HYBRID_PULL_OR_BRK"
@@ -564,106 +569,65 @@ class SoxlStratumLedger:
         st["cumulative_realized_net_usd"] = cum_net
 
         raw_buckets = st.get("buckets")
-        temp_buckets: List[Dict[str, Any]] = []
+        clean_buckets: List[Dict[str, Any]] = []
         if isinstance(raw_buckets, list):
             for b in raw_buckets:
                 if isinstance(b, dict) and safe_int(b.get("qty"), 0) > 0:
                     q = max(1, safe_int(b.get("qty"), 1))
-                    bp = round(
+                    bp_raw = round(
                         max(0.01, safe_float(b.get("book_price"), 0.01)), 4
                     )
-                    bi = round(
+                    bi_raw = round(
                         max(
                             0.01 * q,
-                            safe_float(b.get("book_invested_usd"), q * bp),
+                            safe_float(b.get("book_invested_usd"), q * bp_raw),
                         ),
                         4,
                     )
                     ac = round(
                         max(
                             0.01 * q,
-                            safe_float(b.get("actual_cost_usd"), bi),
+                            safe_float(b.get("actual_cost_usd"), bi_raw),
                         ),
                         4,
                     )
                     lc = max(1, safe_int(b.get("lot_count"), 1))
                     lt = str(b.get("lot_type") or "QUOTA_L1").upper().strip()
-                    temp_buckets.append(
+                    # 🚨 Case 69 & Case 71: 모든 층의 book_price 와 book_invested_usd 를 순수 매수 원가(ac)와 100% 일치!
+                    pure_avg_p = round(max(0.01, ac / float(q)), 4)
+                    clean_buckets.append(
                         {
                             "qty": q,
-                            "book_price": bp,
-                            "book_invested_usd": bi,
-                            "actual_cost_usd": ac,
+                            "book_price": pure_avg_p,
+                            "book_invested_usd": round(ac, 4),
+                            "actual_cost_usd": round(ac, 4),
                             "lot_count": lc,
                             "lot_type": lt,
                         }
                     )
 
-        # 🚨 Case 69 & Case 70: 사이클 내 실수확 리앵커링 크레딧 결정 및 0주 시 매도 모니터 타임쉴드 리셋
-        if not temp_buckets:
-            eff_cycle_credit = 0.0
-            st["last_sell_gate_eval_ts"] = 0.0
-        elif has_explicit_cycle_credit:
-            eff_cycle_credit = round(
-                max(0.0, safe_float(st.get("cycle_reanchor_credit_usd"), 0.0)),
-                4,
-            )
-            st["last_sell_gate_eval_ts"] = round(
-                max(0.0, safe_float(st.get("last_sell_gate_eval_ts"), 0.0)), 4
-            )
-        else:
-            # 구버전 원장 최초 마이그레이션 시: 현재 지층 할인액과 누적 세후수익 버퍼 중 작은 값으로 상한 설정
-            raw_disc_sum = sum(
-                max(0.0, b["actual_cost_usd"] - b["book_invested_usd"])
-                for b in temp_buckets
-            )
-            max_from_cum = (
-                round(cum_net * REANCHOR_NET_BUFFER_MULT, 4)
-                if cum_net > 0.0
-                else 0.0
-            )
-            eff_cycle_credit = round(min(raw_disc_sum, max_from_cum), 4)
-            st["last_sell_gate_eval_ts"] = round(
-                max(0.0, safe_float(st.get("last_sell_gate_eval_ts"), 0.0)), 4
-            )
-
-        rem_credit = eff_cycle_credit
-        clean_buckets: List[Dict[str, Any]] = []
-        for idx, b in enumerate(temp_buckets):
-            q = b["qty"]
-            ac = b["actual_cost_usd"]
-            bi = b["book_invested_usd"]
-            lt = b["lot_type"]
-            lc = b["lot_count"]
-            pure_avg_p = round(ac / float(q), 4)
-
-            cur_disc = max(0.0, ac - bi)
-            if len(temp_buckets) >= 2 and idx == 0 and lt != "MERGED_UPPER":
-                allowed_disc = 0.0
-            else:
-                allowed_disc = min(cur_disc, rem_credit)
-                rem_credit = max(0.0, rem_credit - allowed_disc)
-
-            min_floor_bi = max(
-                0.01 * float(q), round(ac - allowed_disc, 4)
-            )
-            safe_bi = max(bi, min_floor_bi)
-            safe_bp = round(
-                min(pure_avg_p, max(0.01, safe_bi / float(q))), 4
-            )
-            clean_buckets.append(
-                {
-                    "qty": q,
-                    "book_price": safe_bp,
-                    "book_invested_usd": round(safe_bp * float(q), 4),
-                    "actual_cost_usd": round(ac, 4),
-                    "lot_count": lc,
-                    "lot_type": lt,
-                }
-            )
-
         st["buckets"] = clean_buckets
-        st["cycle_reanchor_credit_usd"] = round(eff_cycle_credit, 4)
+        st["cycle_reanchor_credit_usd"] = 0.0
+
+        if not clean_buckets:
+            st["last_sell_gate_eval_ts"] = 0.0
+            st["pending_sell_indices"] = []
+        else:
+            st["last_sell_gate_eval_ts"] = round(
+                max(0.0, safe_float(st.get("last_sell_gate_eval_ts"), 0.0)), 4
+            )
+            raw_p_idx = st.get("pending_sell_indices")
+            if isinstance(raw_p_idx, list):
+                valid_idx = sorted(
+                    {
+                        safe_int(x, -1)
+                        for x in raw_p_idx
+                        if 0 <= safe_int(x, -1) < len(clean_buckets)
+                    }
+                )
+                st["pending_sell_indices"] = valid_idx
+            else:
+                st["pending_sell_indices"] = []
 
         actual_inv = round(
             sum(safe_float(b["actual_cost_usd"], 0.0) for b in clean_buckets),
@@ -795,11 +759,12 @@ class SoxlStratumLedger:
                         for b in sanitized.get("buckets", [])
                     )
                     logger.info(
-                        "📂 [Case 68/69/70 폴더별 3중 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주 · 고유원장=%s",
+                        "📂 [Case 68~71 폴더별 3중 12층 그리드 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주(%d개층) · 고유원장=%s",
                         self.folder_slug,
                         best_label,
                         safe_float(sanitized.get("initial_seed_usd"), 10000.0),
                         held_q,
+                        len(sanitized.get("buckets", [])),
                         os.path.basename(self.primary_filepath),
                     )
 
@@ -972,10 +937,10 @@ class SoxlStratumLedger:
         preserve_realized_profit: bool = True,
     ) -> Dict[str, Any]:
         """
-        🚨 Case 02, Case 65, Case 69 & Case 70:
+        🚨 Case 02, Case 65, Case 69, Case 70 & Case 71:
         /reset 또는 /reset_seed 명령 시 지층 큐(buckets), 기준가, 기억된 최저가, 리앵커링 크레딧,
-        매도 모니터 검문 시각(last_sell_gate_eval_ts), 미체결 주문 ID를 원자적으로 0점 초기화하고,
-        0주 싸이클 종료 타임쉴드(last_sell_fill_ts, last_cycle_end_ts)를 각인한다.
+        다중 그리드 매도 대기 인덱스(pending_sell_indices), 매도 모니터 검문 시각(last_sell_gate_eval_ts),
+        미체결 주문 ID를 원자적으로 0점 초기화하고, 0주 싸이클 종료 타임쉴드(last_sell_fill_ts, last_cycle_end_ts)를 각인한다.
         """
         sym = self._assert_allowed_symbol(symbol)
         st = self.get_state(sym)
@@ -1012,6 +977,7 @@ class SoxlStratumLedger:
             pending_portion_budget=0.0,
             pending_lot_type="",
             pending_sell_mode="",
+            pending_sell_indices=[],
             last_evaluated_buy_bucket_id=-1,
         )
 
@@ -1052,6 +1018,8 @@ class SoxlStratumLedger:
             logical_date=str(logical_date),
             daily_buy_events=0,
             daily_sell_events=0,
+            daily_indiv_grid_sell_cnt=0,
+            daily_wma_grad_sell_cnt=0,
             daily_seed_protect_pass_cnt=0,
             daily_reanchor_cnt=0,
             daily_leftover_saved_usd=0.0,
