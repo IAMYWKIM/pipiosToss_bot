@@ -2,7 +2,7 @@
 """
 # MODIFIED: quant_engine.py
 순수 롱(SOXL) 전용 '8%(12.5분할) 황금비율 정액제 기반 정량 산출기(min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑 Case 67 탑재) ·
-자투리 절약금 및 세후 실물 수익금 실시간 시드 풀 복리 산입 ·
+자투리 절약금 및 세후 실물 수익금 실시간 시드 풀 무리셋 연속 복리 산입 ·
 최종 확정 챔피언(🔥 03_7G_PURE_10_01 / 01_7L_STATIC_CYCLE_MIN) 보유 회차별 4단 와이드 점진 활주로
 (1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 및 1층 +1.50% / 2~7층 +1.00%) ·
 상단 그리드(2층 ~ 7층) 보유 중 1층 공석 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 1층(REENTRY_1FL) 재장전 판정기 ·
@@ -10,7 +10,7 @@
 REENTRY_1FL 독립 1층 배치 vs DIP_1FL 2~6층 개별 승격 및 8회차 이상 최상단 6층+7층 통합 7층 병합 · Case 53 하드 캡핑 · Case 71, Case 72) ·
 2층 ~ 7층 통합 이동평균(wma_2_to_7) 산출 및 3중 다중 익절 판정(① 1층 +1.50% / ② 2~6층 개별 및 통합 7층 +1.00% / ③ 2~7층 통합 이동평균 +1.00% · Case 71, Case 72) ·
 순수 실물 원가 무결성(book_price == actual_avg_price · 리앵커링 원가 차감 영구 폐기 · Case 69, Case 71) ·
-정적 기억 최저 매수가(cycle_min_buy_price) 잠금 요약 및 TDD 검증' 코어 모듈 (Step 03 / 06)
+정적 기억 최저 매수가(cycle_min_buy_price) 잠금 및 당일 프리장~정규장 시드보호 패스(daily_seed_protect_pass_cnt) 요약 · TDD 검증' 코어 모듈 (Step 01 / 02)
 - 제1헌법 ~ 제6헌법 및 Case 01 ~ 72 완벽 준수
 """
 
@@ -916,7 +916,7 @@ def summarize_stratum_portfolio(
     - 상단 2층 ~ 7층 중 최저 단가 개별 층(min_indiv_upper_price) 및 +1.00% 개별 익절 목표가(min_indiv_upper_target_price)
     - 상단 그리드 단독 보유(1층 공석, is_l2_only_anti_bloat) 시 직전 익절가 대비 눌림(-1.0%)/돌파(+1.0%) 타점
     - 활성 1층 보유 중 정적 기억 사이클 최저 매수가(cycle_min_buy_price) 기준 4단 와이드 신저가 매수 트리거 가격
-    - Case 67 min(budget_cap_qty, anchor_quota_qty) 캡핑 정량 및 회계 항등식 기반 자산 요약을 반환한다.
+    - Case 67 min(budget_cap_qty, anchor_quota_qty) 캡핑 정량 및 회계 항등식 기반 무리셋 연속 복리 자산 요약을 반환한다.
     """
     st = state_dict if isinstance(state_dict, dict) else {}
     raw_buckets = buckets_from_dicts(st.get("buckets", []))
@@ -1120,7 +1120,16 @@ def summarize_stratum_portfolio(
     )
     indiv_grid_sell_cnt = safe_int(st.get("indiv_grid_sell_cnt"), 0)
     wma_grad_sell_cnt = safe_int(st.get("wma_grad_sell_cnt"), 0)
-    seed_protect_pass_cnt = safe_int(st.get("seed_protect_pass_cnt"), 0)
+
+    # MODIFIED: 🛡️ 시드보호 패스는 당일 프리장 ~ 정규장(04:07 ~ 16:00 EST) 일일 주기 카운터(daily_seed_protect_pass_cnt)로 바인딩!
+    daily_seed_protect_pass_cnt = safe_int(
+        st.get("daily_seed_protect_pass_cnt"), 0
+    )
+    total_seed_protect_pass_cnt = safe_int(
+        st.get("seed_protect_pass_cnt"), 0
+    )
+    seed_protect_pass_cnt = daily_seed_protect_pass_cnt
+
     extra_13plus_buy_events = safe_int(st.get("extra_13plus_buy_events"), 0)
     cum_leftover_saved = round(
         safe_float(st.get("cumulative_leftover_saved_usd"), 0.0), 4
@@ -1187,6 +1196,8 @@ def summarize_stratum_portfolio(
         "reanchor_cnt": reanchor_cnt,
         "cumulative_reanchor_drop_usd": cum_reanchor_drop,
         "seed_protect_pass_cnt": seed_protect_pass_cnt,
+        "daily_seed_protect_pass_cnt": daily_seed_protect_pass_cnt,
+        "total_seed_protect_pass_cnt": total_seed_protect_pass_cnt,
         "extra_13plus_buy_events": extra_13plus_buy_events,
         "cumulative_leftover_saved_usd": cum_leftover_saved,
     }
@@ -1201,7 +1212,8 @@ def run_quant_engine_tdd() -> bool:
     4단 와이드 활주로(-1.0% / -2.0% / -3.5% / -5.5%),
     1층 ~ 6층 개별 완충층 보존 및 8회차 최상단(6층+7층 ➔ 통합 7층 GRID_L7) 병합(Case 72),
     1층(+1.50%) / 2~7층 개별(+1.00%) / 2~7층 통합 이동평균(+1.00%) 3중 다중 익절 판정(Case 71, 72),
-    상단 그리드 단독 보유(1층 공석) 시 눌림/돌파 독립 1층 재장전(Case 59) 및 정적 기억저가 잠금(Case 60, 72)을 전수 검증한다.
+    상단 그리드 단독 보유(1층 공석) 시 눌림/돌파 독립 1층 재장전(Case 59), 정적 기억저가 잠금(Case 60, 72) 및
+    당일 시드보호 패스(daily_seed_protect_pass_cnt) 바인딩을 전수 검증한다.
     """
     # 1) 8% 황금정량 및 Case 67 min(budget_cap_qty, anchor_quota_qty) 캡핑 검증
     q_dip, bud_c67 = compute_golden8_quota_qty(
@@ -1293,13 +1305,15 @@ def run_quant_engine_tdd() -> bool:
         and res_grad["hit_wma_grad"]
     ), f"TDD 실패(Case 71/72 2~7층 이동평균 일괄졸업): {res_grad}"
 
-    # 5) Case 60 & Case 72 정적 기억 최저가($80.00) 잠금 및 포트폴리오 요약 검증
+    # 5) Case 60 & Case 72 정적 기억 최저가($80.00) 잠금 및 당일 시드보호 패스 바인딩 검증
     mock_st = {
         "buckets": buckets_to_dicts(reloaded_grid),
         "initial_seed_usd": 10000.0,
         "anchor_price": 80.50,
         "cycle_min_buy_price": 80.00,
         "cumulative_realized_net_usd": 25.0,
+        "seed_protect_pass_cnt": 120,
+        "daily_seed_protect_pass_cnt": 7,
     }
     sum_info = summarize_stratum_portfolio(mock_st, live_price=81.00)
     assert abs(sum_info["active_buy_anchor"] - 80.00) < 1e-4, (
@@ -1309,7 +1323,8 @@ def run_quant_engine_tdd() -> bool:
         sum_info["held_tiers"] == 3
         and sum_info["upper_tier_count"] == 2
         and abs(sum_info["upper_wma_price"] - 87.50) < 1e-4
-    ), "TDD 실패(Case 72): 상단 2~7층 이동평균 요약 오류"
+        and sum_info["seed_protect_pass_cnt"] == 7
+    ), "TDD 실패(Case 72): 상단 2~7층 이동평균 또는 당일 시드패스 요약 오류"
 
     logger.info(
         "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 🔥 03_7G_PURE_10_01 (1~6층 개별 완충층 + 통합 7층 본대 · 2~7층 통합이평 3중 익절 · 정적 저가 잠금 Case 59~72) 검증 완료"
