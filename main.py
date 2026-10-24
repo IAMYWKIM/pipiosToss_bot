@@ -2,7 +2,7 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 7층 골디락스 멀티 그리드 지층관리 스나이퍼
-메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 06 / 06)
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 사용자 중심 초슬림 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 02 / 02)
 - 최종 확정 챔피언 (🔥 03_7G_PURE_10_01 / 01_7L_STATIC_CYCLE_MIN · Case 71 & Case 72) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67) &
      자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
@@ -17,7 +17,7 @@
       ③ 2~7층 통합 이동평균 단가 대비 +1.00% 이상 일괄 졸업을 동시 판정하며, 목표 미달 시 즉시 다음 60.0초 매도 타임쉴드 재장전!)
   6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
-  7) 📡 [Case 11 & Case 62 부팅 중 SIGTERM 0.1초 고속 종료 가드 & 텔레그램 적체 큐 무조건부 일괄 소각]
+  7) 📡 [Case 11, Case 15, Case 16 & Case 62 부팅 중 SIGTERM 0.1초 고속 종료 가드 · 텔레그램 적체 큐 소각 · 사용자 중심 초슬림 UI 동기화]
   8) 🚨 [Case 68, Case 69, Case 71 & Case 72 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 순수 원가 100% 보존]
 - 제1헌법 ~ 제6헌법 및 Case 01 ~ 72 전수 락온
 """
@@ -1767,31 +1767,17 @@ class _AdaptiveTelegramBridge:
         return False
 
     async def send_startup_alive_banner(self) -> None:
-        st = self.context.ledger.get_state(TARGET_SYMBOL)
-        init_seed = _resolve_display_seed(st)
-        free_cash = safe_float(st.get("free_cash_usd"), init_seed)
-        buckets_raw = st.get("buckets", [])
-        held_sh = sum(safe_int(b.get("qty"), 0) for b in buckets_raw)
-        held_tiers = len(buckets_raw)
-        folder_slug, primary_ledger_name = _resolve_folder_identity_badge(
-            self.context, st
-        )
-        text = (
-            "<b>✅ 서버가 정상 작동 중입니다.</b>\n"
-            f"🔸 폴더격리: 📂 <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code> · 3중 백업금고 ON)\n"
-            "🔸 🐂 [인피니트 스노우볼 v3.0 · 🔥 03_7G_PURE_10_01] 1~6층 개별 &amp; 통합 7층 본대 · 2~7층 통합이평 3중 익절 · 정적 저가 잠금 &amp; 양방향·주기 60초 타임쉴드(Case 65~72) 가동 완료\n"
-            f"🔸 기준시드: <b>${init_seed:,.2f}</b> · 가용현금: <b>${free_cash:,.2f}</b> · 보유: <b>{held_sh}주({held_tiers}개층)</b>"
-        )
+        """
+        # MODIFIED: 기동 완료 후 "✅ 서버가 정상 작동 중입니다." 단일 라인 생존 신호 타전 (Case 16)
+        """
+        text = "<b>✅ 서버가 정상 작동 중입니다.</b>"
         sent = await self.send_message(
             text=text, reply_markup=_build_main_reply_keyboard()
         )
         if not sent:
             await self.send_slim_alert(
                 title="✅ 서버가 정상 작동 중입니다.",
-                body=(
-                    f"📂 [{folder_slug}] ({primary_ledger_name}) · "
-                    f"기준시드 ${init_seed:,.2f} · 가용현금 ${free_cash:,.2f} · 보유 {held_sh}주({held_tiers}개층)"
-                ),
+                body="",
             )
 
     # -----------------------------------------------------------------------
@@ -1800,33 +1786,27 @@ class _AdaptiveTelegramBridge:
     def _build_start_schedule_message(
         self, st: Dict[str, Any], now_est: datetime
     ) -> str:
+        """
+        # MODIFIED: 사용자 중심 초슬림 /start 메인 메뉴 메시지 (요청된 줄바꿈·7칸 공백·빈 줄 100% 일치)
+        """
         dst_str = _get_dst_badge(now_est)
-        init_seed = _resolve_display_seed(st)
-        folder_slug, primary_ledger_name = _resolve_folder_identity_badge(
-            self.context, st
-        )
         lines = [
-            f"🐂 <b>[ SOXL 7층 골디락스 멀티그리드 스나이퍼 ({_escape_html(dst_str)}) ]</b>",
-            f"▫️ 폴더격리: 📂 <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code> · 3중 백업금고 ON)",
-            "▫️ 전략: 🔥 <b>03_7G_PURE_10_01</b> (1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대 · 2~7층 통합이평 3중 익절 · 리앵커링 없음)",
-            "▫️ 정량: 📐 min(1회분 8% 예산 상한 주수, 기준가 고정 정량) 이중 캡핑으로 돌파 시 예산 초과 차단 (Case 67)",
-            "▫️ 매수: 🛡️ 10분 고정 4단 와이드 게이트 (정적 기억저가 대비 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%)",
-            "▫️ 재장전: 🔥 0주 60초 타임쉴드 후 진입 · 상단 그리드 보유(1층 공석) 시 10분 게이트 눌림(-1.0%)/돌파(+1.0%) 독립 1층 산입",
-            "▫️ 매도: ⚡ 60초 타임쉴드 주기 3중 다중익절 (① 1층 +1.50% / ② 2~7층 개별 +1.00% / ③ 2~7층 통합이평 +1.00% · Case 70~72)",
-            "▫️ 방어: ⏱️ 양방향·주기 60초 강제 타임쉴드 &amp; 정적 저가 잠금 &amp; 순수 실물 원가 100% 보존 &amp; 3중 원장 금고 (Case 65~72)",
-            f"▫️ 기준 시드머니: <b>${init_seed:,.2f}</b> (1회 8% 정량 자동 산출)",
+            f"🐂 <b>[ 스나이퍼 ({_escape_html(dst_str)}) ]</b>",
             "──────────────",
-            "🔹 04:00 ~ 04:06: 🌅 프리장 호가 안정화 &amp; 오버나이트 7층 그리드 동기화",
-            "🔹 04:07 ~ 09:29: 🔫 프리장 7층 그리드 가동 (10분 와이드매수 · 60초 주기 3중 다중익절 모니터)",
-            "🔹 09:30 ~ 16:00: 🔥 정규장 7층 그리드 가동 (10분 와이드매수 · 60초 주기 3중 다중익절 모니터)",
-            "🔹 16:00 ~ 16:59: 🌙 정규장 마감 일일 결산 &amp; 보유 1~7층 그리드 오버나이트 보존",
-            "🔹 17:00 ~ 03:59: 🧹 일일 GC · 날짜별 금고 백업 및 장외 대기",
+            "🔹 04:00 ~ 04:06: 🌅 휩소 안정화",
+            "🔹 04:07 ~ 09:29: 🔫 프리장 ",
+            "🔹 09:30 ~ 16:00: 🔥 정규장 ",
+            "🔹 16:00 ~ 16:59: 🌙 일일 결산",
+            "🔹 17:00 ~ 03:59: 🧹 일일 GC · 장외 대기",
             "──────────────",
-            "📡 /avwap : 실시간 7층 멀티그리드 스나이퍼 레이더",
-            "📜 /sync : 토스 실잔고 동기화 &amp; 지층 지시서",
-            "⚙️ /settlement : 초슬림 전술 제어반 (작동 ON/OFF · 시드머니 설정)",
-            "🧹 /reset : 지층 원장 0점 초기화 (/reset_seed 금액)",
-            "🚀 /update : 최신 깃허브 코드 검증 업데이트 (원장 100% 보존)",
+            "📡 /avwap : 실시간 스나이퍼 레이더",
+            "📜 /sync : 지층 지시서",
+            "⚙️ /settlement : 전술 제어반",
+            "       (작동 ON/OFF · 시드머니 설정)",
+            "",
+            "🧹 /reset : 지층 원장 0점 초기화",
+            "",
+            "🚀 /update : 최신 코드 업데이트",
         ]
         return "\n".join(lines)
 
@@ -1837,6 +1817,9 @@ class _AdaptiveTelegramBridge:
         live_price: float,
         now_est: datetime,
     ) -> str:
+        """
+        # MODIFIED: 📡 /avwap 사용자 중심 초슬림 레이더 메시지 생성 (불필요한 VWAP/5MA/이평졸업 줄 제거 및 줄바꿈 분리)
+        """
         met = refresh_metrics_with_live_tick(
             metrics, live_price, now_est=now_est
         )
@@ -1854,24 +1837,6 @@ class _AdaptiveTelegramBridge:
             if getattr(self.context, "fast_shield_mode", False)
             else "⏱️60s 타임쉴드"
         )
-        folder_slug, _ = _resolve_folder_identity_badge(self.context, st)
-
-        ma5_amp = safe_float(met.get("ma5_amp_pct"), 6.50)
-        ha_badge = str(met.get("ha_badge") or "🕯️HA양봉")
-
-        pre_vwap = safe_float(met.get("premarket_vwap"), 0.0)
-        pre_l = safe_float(met.get("premarket_low"), 0.0)
-        pre_h = safe_float(met.get("premarket_high"), 0.0)
-        pre_amp = safe_float(met.get("premarket_amp_pct"), 0.0)
-        pre_el = safe_float(met.get("premarket_est_low"), 0.0)
-        pre_eh = safe_float(met.get("premarket_est_high"), 0.0)
-
-        reg_vwap = safe_float(met.get("regular_vwap"), 0.0)
-        reg_l = safe_float(met.get("regular_low"), 0.0)
-        reg_h = safe_float(met.get("regular_high"), 0.0)
-        reg_amp = safe_float(met.get("regular_amp_pct"), 0.0)
-        reg_el = safe_float(met.get("regular_est_low"), 0.0)
-        reg_eh = safe_float(met.get("regular_est_high"), 0.0)
 
         held_sh = safe_int(summary.get("held_shares"), 0)
         held_lots = safe_int(summary.get("held_lots"), 0)
@@ -1937,8 +1902,6 @@ class _AdaptiveTelegramBridge:
                 f"(와이드단차 {drop_req:.2f}% · 신저가 <b>${trig_p:.2f}</b> 이하)"
             )
 
-        wma_grad_cnt = safe_int(summary.get("wma_grad_sell_cnt"), 0)
-        indiv_sell_cnt = safe_int(summary.get("indiv_grid_sell_cnt"), 0)
         pass_cnt = safe_int(summary.get("seed_protect_pass_cnt"), 0)
         extra_13 = safe_int(summary.get("extra_13plus_buy_events"), 0)
         saved_u = safe_float(summary.get("cumulative_leftover_saved_usd"), 0.0)
@@ -1950,10 +1913,8 @@ class _AdaptiveTelegramBridge:
         m_sign = "+" if mark_roi >= 0.0 else ""
 
         lines = [
-            f"📡 <b>[SOXL 7층 골디락스 레이더 · 📂{_escape_html(folder_slug)}]</b> ({active_badge} · {fast_badge})",
-            f"🐂 <b>SOXL</b> [{active_badge}] 현재가 <b>${lp:.2f}</b> · 5MA {ma5_amp:.2f}% · {_escape_html(ha_badge)}",
-            f"🌅 프리장 VWAP ${pre_vwap:.2f} · 밴드 ${pre_l:.2f} ~ ${pre_h:.2f} ({pre_amp:.1f}%) · 예상 ${pre_el:.2f} ~ ${pre_eh:.2f}",
-            f"🔥 정규장 VWAP ${reg_vwap:.2f} · 밴드 ${reg_l:.2f} ~ ${reg_h:.2f} ({reg_amp:.1f}%) · 예상 ${reg_el:.2f} ~ ${reg_eh:.2f}",
+            f"📡 <b>[레이더]</b> ({active_badge} · {fast_badge})",
+            f"🐂 <b>SOXL</b> [{active_badge}] 현재가 <b>${lp:.2f}</b>",
         ]
         if shield_line:
             lines.append(shield_line)
@@ -1968,8 +1929,8 @@ class _AdaptiveTelegramBridge:
                 gate_cond_line,
                 f"▫️ 차기 8% 정량: 예산 ${next_bud:,.2f} ➔ {quota_badge_str}",
                 "──────────────",
-                f"🎯 2~7층 이평졸업: {wma_grad_cnt}회 · 2~7층 개별익절: {indiv_sell_cnt}회 (순수원가 100% 보존)",
-                f"🛡️ 시드보호 패스: {pass_cnt:,}회 · 🔥 13회차+ 확장매수: {extra_13}회",
+                f"🛡️ 시드보호 패스: {pass_cnt:,}회",
+                f"🔥 13회차+ 확장매수: {extra_13}회",
                 f"💰 자투리절약 누적: +${saved_u:,.2f} · 세후실현익: {n_sign}${abs(cum_net):,.2f}",
                 f"💵 가용현금: <b>${free_cash:,.2f}</b> · 총자산: <b>${mark_eq:,.2f}</b> ({m_sign}{mark_roi:.2f}%)",
                 f"🕒 갱신: {now_est.strftime('%m-%d %H:%M:%S EST')}",
@@ -1986,6 +1947,9 @@ class _AdaptiveTelegramBridge:
         fx_rate: float,
         now_est: datetime,
     ) -> str:
+        """
+        # MODIFIED: 📜 /sync 사용자 중심 초슬림 지층 지시서 메시지 생성 (7칸 공백 들여쓰기 및 줄바꿈 적용)
+        """
         h_info = (holdings or {}).get(TARGET_SYMBOL, {})
         lp = safe_float(
             live_price,
@@ -1995,23 +1959,10 @@ class _AdaptiveTelegramBridge:
             ),
         )
         summary = summarize_stratum_portfolio(st, live_price=lp)
-        eff_fx = fx_rate if fx_rate > 100.0 else KRW_PER_USD_DEFAULT
-        folder_slug, primary_ledger_name = _resolve_folder_identity_badge(
-            self.context, st
-        )
 
         init_seed = safe_float(summary.get("initial_seed_usd"), 10000.0)
         free_cash = safe_float(summary.get("free_cash_usd"), 0.0)
         actual_inv = safe_float(summary.get("actual_invested_usd"), 0.0)
-        cum_net = safe_float(summary.get("cumulative_realized_net_usd"), 0.0)
-        cum_roi = safe_float(summary.get("realized_roi_pct"), 0.0)
-        unreal_pnl = safe_float(summary.get("unrealized_pnl_usd"), 0.0)
-        mark_eq = safe_float(summary.get("mark_equity_usd"), 0.0)
-        mark_roi = safe_float(summary.get("mark_roi_pct"), 0.0)
-
-        total_net_usd = cum_net + unreal_pnl
-        total_net_krw = total_net_usd * eff_fx
-        cum_net_krw = cum_net * eff_fx
 
         held_sh = safe_int(summary.get("held_shares"), 0)
         held_tiers = safe_int(summary.get("held_tiers"), 0)
@@ -2020,21 +1971,14 @@ class _AdaptiveTelegramBridge:
         upper_wma = safe_float(summary.get("upper_wma_price"), 0.0)
         locked_min_p = safe_float(summary.get("cycle_min_buy_price"), 0.0)
 
-        c_sign = "+" if cum_net >= 0.0 else "-"
-        u_sign = "+" if unreal_pnl >= 0.0 else "-"
-        t_sign = "+" if total_net_usd >= 0.0 else "-"
-
         lines = [
-            "📜 <b>[SOXL 7층 골디락스 스나이퍼 지시서 (실잔고 동기화)]</b>",
-            f"📂 운용 폴더: <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code>)",
-            f"💵 설정 기준시드: <b>${init_seed:,.2f}</b> (환율 {eff_fx:,.1f}원/$)",
-            f"🏦 스나이퍼 가용현금: <b>${free_cash:,.2f}</b> (토스 실주문가능: ${broker_bp_usd:,.2f})",
+            "📜 <b>[스나이퍼 지시서]</b>",
+            f"💵 설정 기준시드: <b>${init_seed:,.2f}</b>",
+            f"🏦 스나이퍼 가용현금: <b>${free_cash:,.2f}</b>",
+            f"       토스 실주문가능: ${broker_bp_usd:,.2f}",
             f"📦 보유 그리드 합계: <b>{held_sh}주</b> ({held_tiers}개층 · {held_lots}회차 · 순수매수원금 ${actual_inv:,.2f})",
             f"📐 전체 순수평단: <b>${actual_avg:.2f}</b> · 2~7층 통합이평: <b>${upper_wma:.2f}</b> (기억저가 ${locked_min_p:.2f})",
             "──────────────",
-            f"💰 누적 세후실현익(보유원금 미차감): <b>{c_sign}${abs(cum_net):,.2f}</b> ({c_sign}{abs(cum_roi):.2f}% · {c_sign}{abs(cum_net_krw):,.0f}원)",
-            f"📊 현재 그리드 평가손익: <b>{u_sign}${abs(unreal_pnl):,.2f}</b> (현재가 ${lp:.2f})",
-            f"👑 시가평가 총자산: <b>${mark_eq:,.2f}</b> ({t_sign}{abs(mark_roi):.2f}% · 총순익 {t_sign}{abs(total_net_krw):,.0f}원)",
             f"🕒 동기화 시각: {now_est.strftime('%Y-%m-%d %H:%M:%S EST')}",
         ]
         return "\n".join(lines)
@@ -2042,11 +1986,11 @@ class _AdaptiveTelegramBridge:
     def _build_settlement_control_message(
         self, st: Dict[str, Any], live_price: float, now_est: datetime
     ) -> str:
+        """
+        # MODIFIED: ⚙️ /settlement 사용자 중심 초슬림 전술 제어반 메시지 생성 (0️⃣ ~ 3️⃣ 넘버링 및 10000 예시 적용)
+        """
         lp = safe_float(live_price, safe_float(st.get("anchor_price"), 100.0))
         summary = summarize_stratum_portfolio(st, live_price=lp)
-        folder_slug, primary_ledger_name = _resolve_folder_identity_badge(
-            self.context, st
-        )
 
         is_active = bool(st.get("is_active", True))
         power_str = "🟢 가동 중 (ON)" if is_active else "🔴 일시정지 (OFF)"
@@ -2062,15 +2006,13 @@ class _AdaptiveTelegramBridge:
         held_lots = safe_int(summary.get("held_lots"), 0)
 
         lines = [
-            "⚙️ <b>[SOXL 인피니트 스노우볼 v3.0 전술 제어반]</b>",
-            f"0️⃣ 격리 폴더: 📂 <b>{_escape_html(folder_slug)}</b> (<code>{_escape_html(primary_ledger_name)}</code>)",
-            f"1️⃣ 마스터 전원: <b>{power_str}</b>",
-            f"2️⃣ 기준 시드머니: <b>${init_seed:,.2f}</b> (실현기준 총자산 ${real_eq:,.2f})",
-            "3️⃣ 운용 엔진: 🔥 <b>03_7G_PURE_10_01 (1~6층 개별 + 통합 7층 본대 · 2~7층 통합이평 3중 익절 · 정적 저가 잠금 · Case 72)</b> (고정)",
-            f"4️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str} (가용현금 ${free_cash:,.2f})",
-            f"5️⃣ 현재 보유 지층: <b>{held_sh}주</b> ({held_tiers}개층 · {held_lots}회차)",
+            "⚙️ <b>[전술 제어반]</b>",
+            f"0️⃣ 마스터 전원: <b>{power_str}</b>",
+            f"1️⃣ 기준 시드머니: <b>${init_seed:,.2f}</b> (실현기준 총자산 ${real_eq:,.2f})",
+            f"2️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str} (가용현금 ${free_cash:,.2f})",
+            f"3️⃣ 현재 보유 지층: <b>{held_sh}주</b> ({held_tiers}개층 · {held_lots}회차)",
             "──────────────",
-            "💡 시드머니를 변경하시려면 아래 <b>[💵 기준 시드머니($) 설정]</b> 버튼을 누른 뒤 숫자(예: <code>19000</code>)를 입력하거나, <code>/seed 19000</code> 명령어를 입력하세요.",
+            "💡 시드머니를 변경하시려면 아래 <b>[💵 기준 시드머니($) 설정]</b> 버튼을 누른 뒤 숫자(예: <code>10000</code>)를 입력하거나, <code>/seed 10000</code> 명령어를 입력하세요.",
             f"🕒 기준 시각: {now_est.strftime('%m-%d %H:%M:%S EST')}",
         ]
         return "\n".join(lines)
@@ -2201,7 +2143,7 @@ class _AdaptiveTelegramBridge:
         if val < 100.0 or val > 10000000.0:
             await self.send_message(
                 chat_id=chat_id,
-                text="⚠️ 시드머니는 <b>$100 ~ $10,000,000</b> 사이의 숫자로 입력해 주세요. (예: <code>19000</code>)",
+                text="⚠️ 시드머니는 <b>$100 ~ $10,000,000</b> 사이의 숫자로 입력해 주세요. (예: <code>10000</code>)",
             )
             return
 
@@ -2220,13 +2162,10 @@ class _AdaptiveTelegramBridge:
         live_p, _ = await self._refresh_live_price_and_metrics()
         summary = summarize_stratum_portfolio(updated_st, live_price=live_p)
         quota_badge_str = _format_case67_quota_badge(summary)
-        folder_slug, _ = _resolve_folder_identity_badge(
-            self.context, updated_st
-        )
         await self.send_message(
             chat_id=chat_id,
             text=(
-                f"✅ <b>[기준 시드머니 설정 완료 · 📂{_escape_html(folder_slug)}]</b>\n"
+                "✅ <b>[기준 시드머니 설정 완료]</b>\n"
                 f"🔸 새 기준 시드머니: <b>${val:,.2f}</b>\n"
                 f"🔸 가용 현금시드: <b>${safe_float(summary.get('free_cash_usd'), 0.0):,.2f}</b>\n"
                 f"🔸 차기 1회(8%) 예산: <b>${safe_float(summary.get('next_portion_budget'), 0.0):,.2f}</b> "
@@ -2238,13 +2177,14 @@ class _AdaptiveTelegramBridge:
         )
 
     async def _execute_manual_update_command(self, chat_id: str) -> None:
+        """
+        # MODIFIED: 사용자 중심 초슬림 시스템 업데이트 개시 및 검증 통과 메시지 타전
+        """
         await self._ack_telegram_offset(self._last_update_id)
-        folder_slug, _ = _resolve_folder_identity_badge(self.context)
         await self.send_message(
             chat_id=chat_id,
             text=(
-                f"⏳ <b>[시스템 업데이트 개시 · 📂{_escape_html(folder_slug)}]</b>\n"
-                "🔸 로컬 3중 원장 및 .env 보호 스냅샷 잠금 완료\n"
+                "⏳ <b>[시스템 업데이트 개시]</b>\n"
                 "🔸 GitHub 최신 코드 동기화 및 9대 코어 모듈 프리플라이트 검증 중..."
             ),
         )
@@ -2289,8 +2229,7 @@ class _AdaptiveTelegramBridge:
             await self.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"✅ <b>[최신 버전 검증 완료 · 무중단 가동 유지]</b>\n"
-                    f"🔸 {_escape_html(msg)}\n"
+                    "✅ <b>[최신 버전 검증 완료 · 무중단 가동 유지]</b>\n"
                     "🔸 원격 변경사항이 없으므로 재기동 없이 현재 스나이퍼 엔진과 원장을 계속 유지합니다."
                 ),
             )
@@ -2299,8 +2238,7 @@ class _AdaptiveTelegramBridge:
         await self.send_message(
             chat_id=chat_id,
             text=(
-                f"🚀 <b>[신규 업데이트 검증 통과 · 📂{_escape_html(folder_slug)}]</b>\n"
-                f"🔸 {_escape_html(msg)}\n"
+                "🚀 <b>[신규 업데이트 검증 통과]</b>\n"
                 "🔸 원장 데이터 100% 보존 상태로 잠시 후 스나이퍼 데몬을 재기동합니다..."
             ),
         )
@@ -2540,11 +2478,10 @@ class _AdaptiveTelegramBridge:
             )
         elif data == "prompt_seed_input":
             self._awaiting_seed_input_chats[chat_id] = time.monotonic()
-            folder_slug, _ = _resolve_folder_identity_badge(self.context)
             await self.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"💵 <b>[기준 시드머니($) 입력 안내 · 📂{_escape_html(folder_slug)}]</b>\n"
+                    "💵 <b>[기준 시드머니($) 입력 안내]</b>\n"
                     "🔸 지금부터 <b>5분 이내</b>에 운용할 기준 달러 시드머니 금액을 숫자만 채팅창에 입력해 주세요.\n"
                     "🔸 예시: <code>10000</code> 또는 <code>19000</code>"
                 ),
