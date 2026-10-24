@@ -2,14 +2,15 @@
 """
 # MODIFIED: toss_api.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 토스증권 Open API (v1.2.14) 방탄 통신 통제소 &
-SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대) 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 02 / 06)
+SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대) 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 01 / 05)
 - 제1헌법: 모든 파일 I/O 및 네트워크 통신의 asyncio.to_thread 비동기 격리 + GlobalThrottle 중앙 통제
 - 제2헌법: 기동 시 GET /api/v1/accounts 1회 호출로 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 자동 주입
 - 제3헌법 ~ 제6헌법 및 Case 01 ~ 72 전수 락온:
   1) REAL_ALLOWED_SYMBOLS = ("SOXL",) 단일 롱 화이트리스트 물리적 강제 (인버스 숏 SOXS 원천 차단)
   2) get_holdings_map_with_status, get_candles_1m, get_candles_1d, get_current_prices_batch,
      get_orderbook, get_buying_power_usd, get_sellable_quantity, create_order, modify_order,
-     cancel_order, get_order_detail, get_open_orders, get_usd_krw_rate 등 전 메서드 100% 정식 구현!
+     cancel_order, get_order_detail, get_open_orders, get_closed_orders, probe_latest_manual_fill_price,
+     get_usd_krw_rate 등 전 메서드 100% 정식 구현!
   3) 미국 주식 주문 정정(/modify) 시 quantity 필드 원천 배제(400 us-modify-quantity-not-supported 차단) 및
      주문 취소(/cancel) 시 빈 JSON 객체 {} 전송 강제(HTTP 415 차단)
   4) 🚨 [Case 68 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 시드 $100 변조 방어]
@@ -18,10 +19,8 @@ SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2~6층 개별 �
        ③ 실시간 백업 금고(ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json) 3중 원자적 동기화 및 기존 데이터 무손실 자동 이관
   5) 🚨 [Case 65, Case 69 & Case 70 양방향·주기 60초 타임쉴드 시각 영속화 및 순수 원가 무결성 강제]
      - last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts 원장 영속화
-  6) 🚨 [NEW · Case 71 & Case 72 최종 확정 챔피언 🔥 03_7G_PURE_10_01 : 1층 ~ 7층 순수 원가 골디락스 멀티 그리드
-     (MAX_GRID_TIERS_7 = 7 : 1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대) & 정적 싸이클 최저가 잠금(STATIC_CYCLE_MIN)]
-     - 모든 보유 지층(1층 ~ 7층)의 book_price == actual_avg_price 및 book_invested_usd == actual_cost_usd 순수 실물 원가 100% 보존!
-     - AST 심볼 하위 호환을 위해 MAX_GRID_TIERS_12 = 7 별칭을 동시 제공하며, 다중 그리드 동시 매도 인덱스(pending_sell_indices) 탑재!
+  6) 🚨 [NEW · Case 63, Case 71 & Case 72 : 최종 확정 챔피언 🔥 03_7G_PURE_10_01 7-Layer 순수 원가 보존 및
+     토스 CLOSED 주문 원장 역추적(probe_latest_manual_fill_price) & 기정산 주문 링버퍼(last_settled_order_ids) 탑재]
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("toss_sniper.toss_api")
@@ -59,7 +58,7 @@ DEFAULT_INITIAL_SEED_USD: float = 10000.0
 PORTION_RATIO_LOCKED: float = 0.08
 BASE_MAX_LOTS_8PCT: int = 12
 
-# NEW [Case 72]: 골디락스 7-Layer (1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대) 상수 락온
+# NEW [Case 72]: 골디락스 7-Layer (1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대) 상수 락온
 # (타 모듈 AST 임포트 무결성 100% 호환을 위해 MAX_GRID_TIERS_12 도 7 로 동시 매핑)
 MAX_GRID_TIERS_7: int = 7
 MAX_GRID_TIERS: int = 7
@@ -358,11 +357,11 @@ class SoxlStratumLedger:
     ① 폴더 고유 원장(`soxl_stratum_ledger_<folder_slug>.json` — Git 덮어쓰기 100% 면역)
     ② 표준 호환 원장(`soxl_stratum_ledger.json` — 기존 코드 및 외부 도구 호환 미러)
     ③ 실시간 백업 금고(`ledger_backups/soxl_stratum_ledger_<folder_slug>.bak.json`)
-    3곳에 SOXL 1~7층 순수 멀티 그리드 지층(1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대),
+    3곳에 SOXL 1 ~ 7층 순수 멀티 그리드 지층(1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대),
     가용 현금 시드(free_cash_usd), 정적 잠금 사이클 최저 매수가(cycle_min_buy_price),
     양방향·주기 60초 타임쉴드 시각(last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts),
-    다중 그리드 매도 대기 인덱스(pending_sell_indices), 누적 세후 실현수익금 및 자투리 절약금을
-    원자적(.tmp -> os.replace)으로 동시 영속화한다.
+    다중 그리드 매도 대기 인덱스(pending_sell_indices), 기정산 주문 ID 링버퍼(last_settled_order_ids),
+    누적 세후 실현수익금 및 자투리 절약금을 원자적(.tmp -> os.replace)으로 동시 영속화한다.
     """
 
     ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
@@ -472,7 +471,7 @@ class SoxlStratumLedger:
             "reentry_mode": "HYBRID_PULL_OR_BRK",
             "buy_interval_min": LOCKED_BUY_INTERVAL_MIN,
             "sell_interval_min": LOCKED_SELL_INTERVAL_MIN,
-            # MODIFIED [Case 72]: 7-Layer (1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대) 기본값 락온
+            # MODIFIED [Case 72]: 7-Layer (1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대) 기본값 락온
             "max_grid_tiers": MAX_GRID_TIERS_7,
             "buckets": [],
             "anchor_price": 0.0,
@@ -489,6 +488,8 @@ class SoxlStratumLedger:
             "pending_lot_type": "",
             "pending_sell_mode": "",
             "pending_sell_indices": [],
+            # NEW: 봇 자동 정산 완료된 orderId 링버퍼(최근 50개) — 수동 체결 역추적 시 중복 정산 방지
+            "last_settled_order_ids": [],
             "last_modify_mono": 0.0,
             "entry_ts": 0.0,
             "last_buy_fill_ts": 0.0,
@@ -542,7 +543,7 @@ class SoxlStratumLedger:
         """
         # NEW [Case 72]:
         구 12-Layer 등에서 이관된 원장에 7개 층 초과 버킷이 존재할 경우,
-        활성 1층과 2~6층(5개 개별 완충층)은 그대로 보존하고 7층 이상 초과분만
+        활성 1층과 2 ~ 6층(5개 개별 완충층)은 그대로 보존하고 7층 이상 초과분만
         '통합 7층 본대(GRID_L7)'로 무손실 가중평균 병합하여 7-Layer 규격을 100% 보장한다.
         """
         if not clean_buckets:
@@ -672,6 +673,18 @@ class SoxlStratumLedger:
         clean_buckets = self._enforce_7tier_cap_on_dict_buckets(clean_buckets)
         st["buckets"] = clean_buckets
         st["cycle_reanchor_credit_usd"] = 0.0
+
+        # NEW: 기정산 주문 ID 링버퍼(최근 50개) 정규화
+        raw_settled_ids = st.get("last_settled_order_ids")
+        if isinstance(raw_settled_ids, list):
+            clean_oids: List[str] = []
+            for x in raw_settled_ids:
+                sx = str(x or "").strip()
+                if sx and sx not in clean_oids:
+                    clean_oids.append(sx)
+            st["last_settled_order_ids"] = clean_oids[-50:]
+        else:
+            st["last_settled_order_ids"] = []
 
         if not clean_buckets:
             st["last_sell_gate_eval_ts"] = 0.0
@@ -1921,7 +1934,7 @@ class TossApiClient:
         return 0
 
     # -----------------------------------------------------------------------
-    # [Order & Order History 그룹] 주문 생성 · 정정 · 취소 · 상세/목록 조회
+    # [Order & Order History 그룹] 주문 생성 · 정정 · 취소 · 상세/목록 조회 · 수동체결 역추적
     # -----------------------------------------------------------------------
     @staticmethod
     def _format_us_limit_price(price: float) -> str:
@@ -2086,6 +2099,102 @@ class TossApiClient:
         except Exception as exc:
             logger.debug("미체결 주문 목록 조회 예외: %s", exc)
         return []
+
+    async def get_closed_orders(
+        self, symbol: str = TARGET_SYMBOL, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        # NEW (API.txt v1.2.14 준수):
+        GET /api/v1/orders?status=CLOSED&symbol=SOXL&limit=20
+        종료된 주문(FILLED, CANCELED, REJECTED, REPLACED 등) 목록을 최신순으로 조회한다.
+        """
+        params: Dict[str, Any] = {
+            "status": "CLOSED",
+            "limit": max(1, min(100, safe_int(limit, 20))),
+        }
+        if symbol:
+            params["symbol"] = str(symbol).upper().strip()
+        try:
+            res = await self._request(
+                method="GET",
+                path="/api/v1/orders",
+                params=params,
+                require_account=True,
+                rate_group="ORDER_HISTORY",
+            )
+            r_obj = res.get("result") if isinstance(res, dict) else {}
+            if isinstance(r_obj, dict) and isinstance(
+                r_obj.get("orders"), list
+            ):
+                return [
+                    o for o in r_obj["orders"] if isinstance(o, dict)
+                ]
+        except Exception as exc:
+            logger.debug("종료 주문 목록 조회(/api/v1/orders?status=CLOSED) 예외: %s", exc)
+        return []
+
+    async def probe_latest_manual_fill_price(
+        self,
+        side: str,
+        target_qty: int,
+        settled_order_ids: Iterable[str] = (),
+        fallback_price: float = 0.0,
+        symbol: str = TARGET_SYMBOL,
+    ) -> Tuple[float, List[str]]:
+        """
+        # NEW [Case 19 & Case 63 수동 매수·매도 실체결가 역추적기]:
+        GET /api/v1/orders?status=CLOSED&symbol=SOXL 응답에서 봇이 이미 정산한 settled_order_ids 를 제외하고,
+        요청된 방향(side="BUY" 또는 "SELL")의 최신 체결 완료 건(execution.filledQuantity > 0 & averageFilledPrice > 0)들을
+        target_qty 수량만큼 역추적하여 수량 가중평균 체결단가와 매칭된 orderId 리스트를 반환한다.
+        """
+        target_side = str(side or "SELL").upper().strip()
+        need_q = max(1, safe_int(target_qty, 1))
+        settled_set: Set[str] = {
+            str(x).strip() for x in (settled_order_ids or ()) if str(x).strip()
+        }
+        fb_p = round(max(0.0, safe_float(fallback_price, 0.0)), 4)
+
+        closed_list = await self.get_closed_orders(symbol=symbol, limit=30)
+        if not closed_list:
+            return fb_p, []
+
+        acc_qty = 0
+        acc_val = 0.0
+        matched_ids: List[str] = []
+
+        for ord_item in closed_list:
+            if not isinstance(ord_item, dict):
+                continue
+            oid = str(ord_item.get("orderId") or "").strip()
+            if not oid or oid in settled_set:
+                continue
+            o_side = str(ord_item.get("side") or "").upper().strip()
+            if o_side != target_side:
+                continue
+
+            # Case 19: 오직 실제 체결 데이터(execution.filledQuantity & averageFilledPrice)만 인정!
+            exec_obj = (
+                ord_item.get("execution")
+                if isinstance(ord_item.get("execution"), dict)
+                else {}
+            )
+            f_qty = safe_int(exec_obj.get("filledQuantity"), 0)
+            f_avg = safe_float(exec_obj.get("averageFilledPrice"), 0.0)
+            if f_qty <= 0 or f_avg <= 0.0:
+                continue
+
+            take_q = min(need_q - acc_qty, f_qty)
+            if take_q <= 0:
+                break
+            acc_qty += take_q
+            acc_val += float(take_q) * f_avg
+            matched_ids.append(oid)
+            if acc_qty >= need_q:
+                break
+
+        if acc_qty > 0 and acc_val > 0.0:
+            return round(acc_val / float(acc_qty), 4), matched_ids
+        return fb_p, []
 
     async def find_latest_open_order_id(
         self, symbol: str = TARGET_SYMBOL, side: Optional[str] = None

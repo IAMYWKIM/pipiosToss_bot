@@ -2,15 +2,15 @@
 """
 # MODIFIED: sniper_exit_plugin.py
 순수 롱(SOXL) 전용 '04:07 ~ 16:00 EST 매수 체결 후 60초 강제 타임쉴드(POST_BUY_TO_SELL_SHIELD_SEC = 60.0) &
-보유 중 매 60초 타임쉴드 주기 3중 다중 익절 매도 모니터(SELL_MONITOR_TIME_SHIELD_SEC = 60.0 · Case 70, Case 71) ·
-60초 타임쉴드 경과 시점에만 실시간 현재가 직접 조회 및 3중 다중 익절 조건(① 1층 +1.50% 이상 / ② 2~12층 개별 그리드 +1.00% 이상 /
-③ 2~12층 통합 이동평균 +1.00% 이상) 동시 스캔 후 그 높아진 현재가 지정가(LIMIT) 매도 발주(목표 미달 시 즉시 다음 60초 매도 타임쉴드 자동 재장전) ·
+보유 중 매 60초 타임쉴드 주기 3중 다중 익절 매도 모니터(SELL_MONITOR_TIME_SHIELD_SEC = 60.0 · Case 70, Case 71, Case 72) ·
+60초 타임쉴드 경과 시점에만 실시간 현재가 직접 조회 및 3중 다중 익절 조건(① 1층 +1.50% 이상 / ② 2~6층 개별 완충층 및 통합 7층 +1.00% 이상 /
+③ 2~7층 통합 이동평균 +1.00% 이상) 동시 스캔 후 그 높아진 현재가 지정가(LIMIT) 매도 발주(목표 미달 시 즉시 다음 60초 매도 타임쉴드 자동 재장전) ·
 매수 1호가(Bid 1) 참조 및 하향 추격 정정 100% 영구 소각(Case 65) ·
-리앵커링 원가 차감 영구 폐기 및 순수 실물 원가(book_price == actual_avg_price) 100% 보존(Case 69, Case 71) ·
-1층 익절 후 상단 2~12층 잔존 시 1층 공석(GRID_L2 ~ GRID_L12) 보존 및 싸이클 최저가(cycle_min_buy_price) 잠금 유지(Case 59, Case 60, Case 71) ·
-매도 체결(부분 익절 및 0주 전량 졸업) 즉시 60초 매도타임쉴드(last_sell_fill_ts / last_cycle_end_ts) &
-15초 잔고 인덱싱 그레이스 쉴드(last_auto_fill_ts) 동시 각인' 코어 플러그인 (Step 03 / 07)
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 71 완벽 준수
+리앵커링 원가 차감 영구 폐기 및 순수 실물 원가(book_price == actual_avg_price) 100% 보존(Case 69, Case 71, Case 72) ·
+1층 익절 후 상단 2~7층 잔존 시 1층 공석(GRID_L2 ~ GRID_L7) 보존 및 싸이클 최저가(cycle_min_buy_price) 잠금 유지(Case 59, Case 60, Case 71, Case 72) ·
+매도 체결(부분 익절 및 0주 전량 졸업) 즉시 기정산 주문 ID(last_settled_order_ids) 등록 및
+60초 매도타임쉴드(last_sell_fill_ts / last_cycle_end_ts) & 15초 잔고 인덱싱 그레이스 쉴드(last_auto_fill_ts) 동시 각인' 코어 플러그인 (Step 03 / 05)
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 72 완벽 준수
 """
 
 from __future__ import annotations
@@ -23,11 +23,14 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from quant_engine import (
+    MAX_GRID_TIERS_7,
+    MAX_GRID_TIERS_12,
     REANCHOR_NET_BUFFER_MULT,
     StratumBucket,
     buckets_from_dicts,
     buckets_to_dicts,
     calc_sell_realized_pnl,
+    compute_upper_2_to_7_moving_avg,
     compute_upper_2_to_12_moving_avg,
     evaluate_multi_grid_sell_targets,
     get_golden8_prog_thresholds,
@@ -41,7 +44,6 @@ from quant_indicators_plugin import (
 )
 from toss_api import (
     EST_TZ,
-    MAX_GRID_TIERS_12,
     TARGET_SYMBOL,
     _NonRetryableApiError,
     generate_client_order_id,
@@ -61,7 +63,7 @@ SELL_ORDER_MAX_WAIT_SEC: float = 60.0
 
 
 # ---------------------------------------------------------------------------
-# 내부 헬퍼 : 실시간 SOXL 현재가 조회 · 60초 양방향/주기 타임쉴드 판별 · Case 69/71 순수 원가 하한선
+# 내부 헬퍼 : 실시간 SOXL 현재가 조회 · 60초 양방향/주기 타임쉴드 판별 · Case 69/71/72 순수 원가 하한선
 # ---------------------------------------------------------------------------
 def _get_live_soxl_price(
     context: Any,
@@ -117,8 +119,8 @@ def _resolve_safe_l2_book_price(
     st: Optional[Dict[str, Any]] = None,
 ) -> float:
     """
-    🚨 MODIFIED [Case 69 & Case 71 진성 손익분기점(순수 매수 원가) 하한선 가드]:
-    신규 챔피언(🔥 03_12G_PURE_10_01)에서는 인위적 리앵커링 차감을 수행하지 않으므로,
+    🚨 MODIFIED [Case 69, Case 71 & Case 72 진성 손익분기점(순수 매수 원가) 하한선 가드]:
+    최종 확정 챔피언(🔥 03_7G_PURE_10_01)에서는 인위적 리앵커링 차감을 수행하지 않으므로,
     모든 그리드 지층의 기준 단가는 언제나 순수 실물 매수 평단가(actual_avg_price) 이상으로 강제된다.
     """
     if bucket.qty <= 0:
@@ -185,7 +187,7 @@ def mark_sell_monitor_60s_cycle_shield(
 ) -> float:
     """
     🚨 Case 70 [보유 중 매 60.0초 타임쉴드 주기 매도 모니터 재장전기]:
-    - 60.0초 매도 모니터 검문 시 현재가가 3중 다중 익절 조건(1층 +1.50% / 2~12층 개별 +1.00% / 2~12층 이동평균 +1.00%)에
+    - 60.0초 매도 모니터 검문 시 현재가가 3중 다중 익절 조건(1층 +1.50% / 2~7층 개별 +1.00% / 2~7층 이동평균 +1.00%)에
       모두 미달하거나, 발주된 매도 주문이 60.0초 미체결로 안전 취소된 직후, 또는 부분 익절 후 상단 지층이 남았을 때 호출되어
       인메모리 캐시(exit_snapshot_cache 및 indexing_grace_cache)에 last_sell_gate_eval_mono 와
       last_sell_gate_eval_ts 를 기록하고 현재 Epoch 시각을 반환한다.
@@ -458,7 +460,7 @@ def update_exit_snapshot_on_hold(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1] Case 24, Case 65, Case 70 & Case 71 : 순수 현재가 지정가(LIMIT) 다중 그리드 스나이퍼 매도 발주
+# [핵심 1] Case 24, Case 65, Case 70, Case 71 & Case 72 : 순수 현재가 지정가(LIMIT) 다중 그리드 스나이퍼 매도 발주
 # ---------------------------------------------------------------------------
 async def execute_bulletproof_sell_sweep(
     context: Any,
@@ -470,7 +472,7 @@ async def execute_bulletproof_sell_sweep(
     pending_sell_indices: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     """
-    🚨 Case 24, Case 65, Case 70 & Case 71:
+    🚨 Case 24, Case 65, Case 70, Case 71 & Case 72:
     60초 타임쉴드 주기 3중 다중 익절 스나이퍼 매도 발사 시:
     - 오직 목표 익절 지정가(min_floor_price) 이상인 '그 시점의 실시간 현재가 지정가(sweep_price)'로만 LIMIT 매도 주문을 발주한다!
     - 매도 대상 그리드 인덱스 리스트(pending_sell_indices)를 원장에 기록하여 체결 시 정확히 해당 층들만 정산한다.
@@ -487,7 +489,11 @@ async def execute_bulletproof_sell_sweep(
     )
     sp = max(floor_p, raw_sp)
     clean_indices = sorted(
-        {safe_int(x, -1) for x in (pending_sell_indices or []) if safe_int(x, -1) >= 0}
+        {
+            safe_int(x, -1)
+            for x in (pending_sell_indices or [])
+            if safe_int(x, -1) >= 0
+        }
     )
 
     snap_map: Dict[str, Dict[str, Any]] = getattr(
@@ -602,27 +608,30 @@ async def execute_bulletproof_sell_sweep(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 실물 매도 FILLED 정산 · 세후 순익 복리 산입 · 1~12층 순수 원가 보존 · 양방향 쉴드 각인 (Case 69, 70, 71)
+# [핵심 2] 실물 매도 FILLED 정산 · 세후 순익 복리 산입 · 1~7층 순수 원가 보존 · 양방향 쉴드 각인 (Case 69 ~ 72)
 # ---------------------------------------------------------------------------
 async def _commit_filled_sell_and_reanchor_ledger(
     context: Any,
     filled_qty: int,
     avg_fill_price: float,
     sell_mode: str,
+    settled_order_id: str = "",
 ) -> Dict[str, Any]:
     """
-    🎯 1 ~ 🎯 4 & Case 19, 59, 60, 61, 65, 69, 70, 71:
-    12층 멀티 그리드 스나이퍼 매도 주문이 체결(FILLED)되었을 때:
+    🎯 1 ~ 🎯 4 & Case 19, 59, 60, 61, 65, 69, 70, 71, 72:
+    7층 골디락스 멀티 그리드 스나이퍼 매도 주문이 체결(FILLED)되었을 때:
     1) pending_sell_indices (또는 sell_mode)에 해당하는 매도 지층들의 순수 매수 원금(sold_actual_cost_usd)과
        실제 매도 체결가(avg_fill_price)로 왕복 수수료(0.14%) 차감 후 세후 실현 순수익금(net_pnl_usd)을 산출한다.
-    2) 🚨 [Case 71 리앵커링 원가 차감 영구 폐기 및 1층 공석 보존]:
+    2) 🚨 [Case 71 & Case 72 리앵커링 원가 차감 영구 폐기 및 1층 공석 보존]:
        - 남은 지층들의 원가를 인위적으로 차감하지 않고 순수 매수 원가(book_price == actual_avg_price)를 100% 보존한다.
-       - 1층이 팔리고 상단 그리드(2층 ~ 12층)만 남은 경우, 상단 2층을 1층으로 승격시키지 않고
-         relabel_upper_grid_tiers() 를 통해 GRID_L2, GRID_L3, ... (1층 공석 상태)로 보존하여
+       - 1층이 팔리고 상단 그리드(2층 ~ 7층)만 남은 경우, 상단 2층을 1층으로 승격시키지 않고
+         relabel_upper_grid_tiers() 를 통해 GRID_L2 ~ GRID_L7 (1층 공석 상태)로 보존하여
          반등 고점 재매수로 인한 현금 고갈을 원천 차단하고, 싸이클 최저가(cycle_min_buy_price) 잠금을 유지한다!
        - 만약 1층은 팔리지 않고 상단 개별 그리드만 팔린 경우, buckets[0] 은 활성 1층으로 유지하고
-         나머지 상단 지층들만 GRID_L2, GRID_L3, ... 로 정렬한다.
-    3) 🚨 [Case 61, Case 65, Case 69 & Case 70 매도/0주 싸이클 종료 후 60.0초 타임쉴드 & 15.0초 그레이스 쉴드 동시 각인]
+         나머지 상단 지층들만 GRID_L2 ~ GRID_L7 로 정렬한다.
+    3) 🚨 [NEW : 기정산 주문 ID(last_settled_order_ids) 등록]
+       - 봇 자동 매도 주문 ID를 last_settled_order_ids 에 등록하여 수동 매도 역추적 시 이중 정산을 방지한다.
+    4) 🚨 [Case 61, Case 65, Case 69 & Case 70 매도/0주 싸이클 종료 후 60.0초 타임쉴드 & 15.0초 그레이스 쉴드 동시 각인]
     """
     st = context.ledger.get_state(TARGET_SYMBOL)
     buckets = buckets_from_dicts(st.get("buckets", []))
@@ -631,6 +640,12 @@ async def _commit_filled_sell_and_reanchor_ledger(
     mode = str(
         sell_mode or st.get("pending_sell_mode") or "SELL_L1_ONLY"
     ).upper()
+    eff_oid = str(settled_order_id or st.get("sell_order_id") or "").strip()
+
+    settled_oids: List[str] = list(st.get("last_settled_order_ids") or [])
+    if eff_oid and eff_oid not in settled_oids:
+        settled_oids.append(eff_oid)
+    settled_oids = settled_oids[-50:]
 
     if not buckets:
         now_empty_epoch = time.time()
@@ -651,6 +666,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
             target_sell_price=0.0,
             pending_sell_mode="",
             pending_sell_indices=[],
+            last_settled_order_ids=settled_oids,
         )
         return {"status": "NO_BUCKETS_TO_SETTLE"}
 
@@ -723,17 +739,17 @@ async def _commit_filled_sell_and_reanchor_ledger(
             if idx == 0 and was_active_l1:
                 sold_l1_flag = False
 
-    # 🚨 Case 71: 남은 그리드 지층 라벨 정규화 (1층이 팔렸으면 남은 층들은 GRID_L2 ~ GRID_L12 로 1층 공석 유지!)
+    # 🚨 Case 71 & Case 72: 남은 그리드 지층 라벨 정규화 (1층이 팔렸으면 남은 층들은 GRID_L2 ~ GRID_L7 로 1층 공석 유지!)
     if rem_buckets:
         if was_active_l1 and not sold_l1_flag:
             active_b1 = rem_buckets[0]
             re_uppers = relabel_upper_grid_tiers(
-                rem_buckets[1:], max_tiers=MAX_GRID_TIERS_12
+                rem_buckets[1:], max_tiers=MAX_GRID_TIERS_7
             )
             rem_buckets = [active_b1] + re_uppers
         else:
             rem_buckets = relabel_upper_grid_tiers(
-                rem_buckets, max_tiers=MAX_GRID_TIERS_12
+                rem_buckets, max_tiers=MAX_GRID_TIERS_7
             )
 
     sold_q = sum(b.qty for b in sold_buckets)
@@ -819,6 +835,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
         "target_sell_price": 0.0,
         "pending_sell_mode": "",
         "pending_sell_indices": [],
+        "last_settled_order_ids": settled_oids,
         "total_sell_events": tot_sell_ev,
         "total_sold_shares": tot_sold_sh,
         "win_sell_events": win_ev,
@@ -848,7 +865,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
         if is_graduated_zero:
             note_str = "🎓 전 지층 흑자 졸업 완료(0주 싸이클 종료 ➔ 🛡️60초 타임쉴드 경과 후 현재가 조회 및 첫 1층 진입!)"
         else:
-            wma_info = compute_upper_2_to_12_moving_avg(rem_buckets)
+            wma_info = compute_upper_2_to_7_moving_avg(rem_buckets)
             u_cnt = safe_int(wma_info.get("upper_tier_count"), len(rem_buckets))
             u_qty = safe_int(
                 wma_info.get("upper_qty"), sum(b.qty for b in rem_buckets)
@@ -887,7 +904,7 @@ async def sync_pending_sell_order_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🚨 Case 19, Case 24, Case 65, Case 70 & Case 71:
+    🚨 Case 19, Case 24, Case 65, Case 70, Case 71 & Case 72:
     장부에 대기 중인 미체결 매도 주문(sell_order_id)이 존재할 때:
     1) GET /api/v1/orders/{orderId} 로 FILLED 여부를 조회하여 체결 완료 시
        즉시 _commit_filled_sell_and_reanchor_ledger() 로 복리 정산 및 60초 타임쉴드/15초 그레이스 쉴드 각인을 수행한다.
@@ -926,6 +943,7 @@ async def sync_pending_sell_order_plugin(
                 filled_qty=eff_q,
                 avg_fill_price=eff_p,
                 sell_mode=sell_mode,
+                settled_order_id=sell_oid,
             )
 
         if ord_status in ("CANCELED", "REJECTED") and filled_q == 0:
@@ -972,6 +990,7 @@ async def sync_pending_sell_order_plugin(
                     filled_qty=(f_qty if f_qty > 0 else ordered_qty),
                     avg_fill_price=(f_avg if f_avg > 0.0 else target_p),
                     sell_mode=sell_mode,
+                    settled_order_id=sell_oid,
                 )
 
         eval_epoch = mark_sell_monitor_60s_cycle_shield(
@@ -1003,7 +1022,7 @@ async def sync_pending_sell_order_plugin(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 3] 04:07 ~ 16:00 EST 매수 후 60초 & 보유 중 매 60초 타임쉴드 주기 3중 다중 익절 매도 모니터 (Case 69, 70, 71)
+# [핵심 3] 04:07 ~ 16:00 EST 매수 후 60초 & 보유 중 매 60초 타임쉴드 주기 3중 다중 익절 매도 모니터 (Case 69 ~ 72)
 # ---------------------------------------------------------------------------
 async def execute_1m_sniper_sell_and_reanchor_plugin(
     context: Any,
@@ -1012,7 +1031,7 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 2 [Step 2] & 🎯 3 & 🎯 4 & Case 24, 44, 46 ~ 71:
+    🎯 2 [Step 2] & 🎯 3 & 🎯 4 & Case 24, 44, 46 ~ 72:
     04:07:00 ~ 16:00:00 EST 전 구간에서 매 60.0초 타임쉴드 주기로 작동하는 3중 다중 익절 스나이퍼 매도(오팔) 모니터:
     1) 대기 중인 미체결 매도 주문(sell_order_id)이 있으면 먼저 체결 확인을 수행한다.
     2) 🛡️ [Case 65 매수 후 최초 60.0초 강제 타임쉴드 검문]:
@@ -1022,12 +1041,12 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
        직전 매도 모니터 검문 시각(last_sell_gate_eval_mono / last_sell_gate_eval_ts)으로부터
        60.0초(SELL_MONITOR_TIME_SHIELD_SEC)가 지나지 않았으면 일체의 매도 판정을 보류(HOLD_SELL_MONITOR_60S_TIME_SHIELD)하여
        1.5초 / 0.4초 상시 감시로 인한 +1.50% / +1.00% 턱걸이 조기 매도를 100% 원천 차단한다!
-    4) 🔍 [Case 71 : 60.0초 타임쉴드 해제 시점 실시간 현재가 직접 조회 & 3중 다중 익절 동시 판정]:
+    4) 🔍 [Case 71 & Case 72 : 60.0초 타임쉴드 해제 시점 실시간 현재가 직접 조회 & 3중 다중 익절 동시 판정]:
        60.0초 타임쉴드가 경과하여 매도 모니터가 깨어난 순간 _fetch_fresh_current_soxl_price() 로 실시간 현재가를 새로 조회한 뒤,
        evaluate_multi_grid_sell_targets() 를 호출하여:
        - ① 활성 1층(buckets[0]) 단가 대비 +1.50% 이상 도래
-       - ② 상단 2층 ~ 12층 개별 그리드 단가 대비 +1.00% 이상 도래
-       - ③ 상단 2층 ~ 12층 통합 이동평균 단가(wma_2_to_12) 대비 +1.00% 이상 도래 (1층 본전 이상 시 전량 졸업)
+       - ② 상단 2층 ~ 6층 개별 완충층 및 통합 7층 본대 단가 대비 +1.00% 이상 도래
+       - ③ 상단 2층 ~ 7층 통합 이동평균 단가(wma_2_to_7) 대비 +1.00% 이상 도래 (1층 본전 이상 시 전량 졸업)
        조건이 충족된 모든 지층(sold_indices)을 그 높아진 실시간 현재가 지정가(LIMIT)로 즉시 매도 발주한다!
        - 만약 3대 조건 모두 미달이면 즉시 mark_sell_monitor_60s_cycle_shield() 로 다음 60.0초 매도 타임쉴드를 재장전한다!
     """
@@ -1086,7 +1105,7 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
             "remain_shield_sec": remain_mon_sec,
         }
 
-    # 🔍 4) [Case 65, Case 70 & Case 71] 60.0초 타임쉴드가 해제된 시점 -> 최신 실시간 현재가 직접 조회!
+    # 🔍 4) [Case 65, Case 70, Case 71 & Case 72] 60.0초 타임쉴드가 해제된 시점 -> 최신 실시간 현재가 직접 조회!
     fallback_p = _get_live_soxl_price(context, prices, holdings, dt_now)
     fresh_live_p = await _fetch_fresh_current_soxl_price(
         context, fallback_price=fallback_p
@@ -1107,7 +1126,7 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         held_lots=held_lots, threshold_mode=threshold_mode
     )
 
-    # 🎯 5) [Case 71] 1층(+1.50%) · 2~12층 개별(+1.00%) · 2~12층 통합 이동평균(+1.00%) 3중 다중 익절 판정!
+    # 🎯 5) [Case 71 & Case 72] 1층(+1.50%) · 2~6층 개별 및 통합 7층(+1.00%) · 2~7층 통합 이동평균(+1.00%) 3중 다중 익절 판정!
     sell_eval = evaluate_multi_grid_sell_targets(
         buckets=buckets,
         live_price=fresh_live_p,

@@ -4,12 +4,14 @@
 순수 롱(SOXL) 전용 '04:07 ~ 16:00 EST 매도(및 0주 싸이클 종료) 후 60초 강제 타임쉴드(POST_SELL_TO_BUY_SHIELD_SEC = 60.0) &
 직전 매수 후 60초 타임쉴드 · 60초 경과 후 실시간 현재가 직접 조회 및 순수 현재가 지정가(LIMIT) 매수 발주 ·
 매도 1호가(Ask 1) 참조 및 10초 후 상향 추격 정정 100% 영구 소각(Case 65) ·
-신규 챔피언(🔥 03_12G_PURE_10_01 · Case 71) : 0주 상태 60초 타임쉴드 경과 후 현재가 지정가 실물 1층(REENTRY_1FL) 산입 ·
-상단 2층 ~ 12층(GRID_L2 ~ GRID_L12) 보유 중 1층 공석 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 실물 1층(REENTRY_1FL) 재장전 ·
+최종 확정 챔피언(🔥 03_7G_PURE_10_01 / 01_7L_STATIC_CYCLE_MIN · Case 71, Case 72) :
+0주 상태 60초 타임쉴드 경과 후 현재가 지정가 실물 1층(REENTRY_1FL) 산입 ·
+상단 2층 ~ 7층(GRID_L2 ~ GRID_L7) 보유 중 1층 공석 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 실물 1층(REENTRY_1FL) 재장전 ·
 상승 돌파 매수 시 1회분(8%) 예산 초과 원천 차단을 위한 min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67) ·
-기억된 사이클 최저 매수가(cycle_min_buy_price) 잠금 기반 10분 고정 4단 와이드 활주로 시드보호 매수 게이트(WIDE_RUNWAY :
-1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%) 및 체결 시 1~12층 순수 멀티 그리드 승격·자투리 시드 귀속·양방향 인덱싱 보호(Case 69, Case 71)' 코어 플러그인 (Step 04 / 07)
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 71 완벽 준수
+정적 기억 사이클 최저 매수가(cycle_min_buy_price) 잠금 기반 10분 고정 4단 와이드 활주로 시드보호 매수 게이트(WIDE_RUNWAY :
+1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5%) 및 체결 시 1~7층 순수 멀티 그리드 승격·자투리 시드 귀속·
+기정산 주문 ID(last_settled_order_ids) 각인·양방향 인덱싱 보호(Case 69, Case 71, Case 72)' 코어 플러그인 (Step 04 / 05)
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 72 완벽 준수
 """
 
 from __future__ import annotations
@@ -18,14 +20,16 @@ import logging
 import math
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from quant_engine import (
     BASE_MAX_LOTS_8PCT,
+    MAX_GRID_TIERS_7,
     MAX_GRID_TIERS_12,
     buckets_from_dicts,
     buckets_to_dicts,
     compute_golden8_quota_qty,
+    compute_upper_2_to_7_moving_avg,
     compute_upper_2_to_12_moving_avg,
     evaluate_l2_only_hybrid_reentry_signal,
     get_golden8_prog_thresholds,
@@ -215,7 +219,7 @@ async def _fetch_fresh_current_soxl_price(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1] 매수 체결(FILLED) 커밋 · 1~12층 순수 그리드 배치 · 기억저가 잠금 · 매수 후 60초 타임쉴드 각인 (Case 69, 71)
+# [핵심 1] 매수 체결(FILLED) 커밋 · 1~7층 순수 그리드 배치 · 기억저가 잠금 · 매수 후 60초 타임쉴드 각인 (Case 69 ~ 72)
 # ---------------------------------------------------------------------------
 async def _commit_filled_buy_to_stratum_ledger(
     context: Any,
@@ -223,21 +227,24 @@ async def _commit_filled_buy_to_stratum_ledger(
     avg_fill_price: float,
     portion_budget: float,
     lot_type: str,
+    settled_order_id: str = "",
 ) -> Dict[str, Any]:
     """
-    🎯 1, 🎯 3, 🎯 4 & Case 25, 46, 53, 59, 60, 61, 65, 67, 69, 71:
+    🎯 1, 🎯 3, 🎯 4 & Case 25, 46, 53, 59, 60, 61, 65, 67, 69, 71, 72:
     매수 주문 체결(FILLED)이 확인된 즉시:
     1) 실제 소요 원금(actual_spent = filled_qty * avg_fill_price)과
        1회분 정액 예산 대비 절약된 자투리 금액(saved_from_portion = max(0, portion_budget - actual_spent))을 산출한다.
     2) vrev_add_quota_lot_and_merge_2tier() 를 호출하여:
-       - 상단 그리드(2층 ~ 12층)만 보유 중(1층 공석) REENTRY_1FL 체결 시에는 상단 지층을 병합하지 않고
-         [new_l1(REENTRY_1FL), GRID_L2, ..., GRID_Lk] 로 독립 배치(Case 59 & Case 71)하고,
+       - 상단 그리드(2층 ~ 7층)만 보유 중(1층 공석) REENTRY_1FL 체결 시에는 상단 지층을 병합하지 않고
+         [new_l1(REENTRY_1FL), GRID_L2, ..., GRID_Lk] 로 독립 배치(Case 59, Case 71 & Case 72)하고,
        - 활성 1층 보유 중 4단 와이드 신저가 추매(DIP_1FL / QUOTA_L1) 체결 시에는 신규 매수분을 1층에 두고
-         기존 지층들을 2층 ~ 12층(GRID_L2 ~ GRID_L12)으로 한 칸씩 승격(12층 초과 시 최상단 11층+12층만 병합)한다.
-    3) 🚨 Case 60: 기억된 사이클 최저 매수가(cycle_min_buy_price)는 0주에서 첫 진입(was_empty)이거나
+         기존 지층들을 2층 ~ 6층(GRID_L2 ~ GRID_L6) 개별 완충층으로 한 칸씩 승격(7층 초과 시 최상단 6층+7층만 통합 7층 GRID_L7 합병)한다.
+    3) 🚨 Case 60 & Case 72: 기억된 사이클 최저 매수가(cycle_min_buy_price)는 0주에서 첫 진입(was_empty)이거나
        기존 최저가보다 더 낮게 산 경우에만 갱신(min(old_min_p, fill_p))하며,
        REENTRY_1FL 재장전 매수가로 절대 상향 덮어쓰지 않고 기존 최저가를 철벽 잠금 유지한다!
-    4) 🚨 Case 65, Case 69 & Case 71:
+    4) 🚨 NEW: 봇 자동 매수 주문 ID(settled_order_id)를 last_settled_order_ids 에 등록하여
+       defense_plugin.py 의 수동 체결 역추적 시 중복 합산을 방지한다.
+    5) 🚨 Case 65, Case 69, Case 71 & Case 72:
        - 모든 지층은 리앵커링 차감 없이 순수 매수 원가(cycle_reanchor_credit_usd = 0.0)를 보존한다.
        - mark_auto_fill_grace_shield() 및 원장 last_buy_fill_ts / entry_ts 를 각인하여,
          매수 체결 직후 15.0초 잔고 인덱싱 보호 및 60.0초 동안 매도/중복매수 차단 타임쉴드를 가동한다!
@@ -249,6 +256,12 @@ async def _commit_filled_buy_to_stratum_ledger(
     fill_p = round(max(0.01, safe_float(avg_fill_price, 0.01)), 4)
     actual_spent = round(float(q_int) * fill_p, 4)
     tag = str(lot_type or "QUOTA_L1").upper().strip()
+    eff_oid = str(settled_order_id or st.get("buy_order_id") or "").strip()
+
+    settled_oids: List[str] = list(st.get("last_settled_order_ids") or [])
+    if eff_oid and eff_oid not in settled_oids:
+        settled_oids.append(eff_oid)
+    settled_oids = settled_oids[-50:]
 
     eff_portion_budget = safe_float(portion_budget, 0.0)
     if eff_portion_budget <= 0.0:
@@ -266,10 +279,10 @@ async def _commit_filled_buy_to_stratum_ledger(
         buy_price=fill_p,
         actual_spent_usd=actual_spent,
         lot_type=tag,
-        max_tiers=MAX_GRID_TIERS_12,
+        max_tiers=MAX_GRID_TIERS_7,
     )
 
-    # 🚨 Case 60: 기억된 최저 매수가(cycle_min_buy_price) 잠금!
+    # 🚨 Case 60 & Case 72: 기억된 최저 매수가(cycle_min_buy_price) 정적 잠금!
     old_min_p = safe_float(st.get("cycle_min_buy_price"), 0.0)
     if was_empty or old_min_p <= 0.0:
         new_cycle_min_p = fill_p
@@ -318,6 +331,7 @@ async def _commit_filled_buy_to_stratum_ledger(
         buy_price=0.0,
         pending_portion_budget=0.0,
         pending_lot_type="",
+        last_settled_order_ids=settled_oids,
         total_buy_events=tot_buy_ev,
         total_buy_shares=tot_buy_sh,
         daily_buy_events=day_buy_ev,
@@ -390,11 +404,11 @@ async def sync_pending_buy_order_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 1 & 🎯 5 & Case 19, 24, 59, 60, 61, 65, 71:
+    🎯 1 & 🎯 5 & Case 19, 24, 59, 60, 61, 65, 71, 72:
     장부에 대기 중인 미체결 매수 주문(buy_order_id)이 존재할 때:
     1) GET /api/v1/orders/{orderId} 로 실제 체결 상태(FILLED / PARTIAL_FILLED / PENDING / CANCELED)를 조회한다.
     2) FILLED 확인 즉시 실제 평균 체결가(execution.averageFilledPrice)와 체결 수량(filledQuantity)으로
-       1~12층 멀티 그리드 배치/승격, 자투리 시드 귀속 및 매수 후 60초 타임쉴드 각인을 완료한다.
+       1~7층 멀티 그리드 배치/승격, 자투리 시드 귀속, 기정산 주문 ID 등록 및 매수 후 60초 타임쉴드 각인을 완료한다.
     3) 🚨 [Case 65]: 현재가 지정가로 발주된 매수 주문이 60.0초(BUY_ORDER_MAX_WAIT_SEC) 동안 체결되지 않으면,
        가격을 올리지 않고 미체결 주문을 안전하게 취소(cancel_order)한 뒤 관망 복귀한다.
     """
@@ -433,6 +447,7 @@ async def sync_pending_buy_order_plugin(
                 avg_fill_price=eff_p,
                 portion_budget=portion_budget,
                 lot_type=lot_type,
+                settled_order_id=buy_oid,
             )
 
         # 2) 부분 체결(PARTIAL_FILLED) 진행 중인 경우
@@ -452,6 +467,7 @@ async def sync_pending_buy_order_plugin(
                     avg_fill_price=eff_p,
                     portion_budget=portion_budget,
                     lot_type=lot_type,
+                    settled_order_id=buy_oid,
                 )
             return {
                 "status": "BUY_PARTIAL_FILLED_WAITING",
@@ -496,6 +512,7 @@ async def sync_pending_buy_order_plugin(
                     avg_fill_price=(f_avg if f_avg > 0.0 else ord_price),
                     portion_budget=portion_budget,
                     lot_type=lot_type,
+                    settled_order_id=buy_oid,
                 )
 
         await context.ledger.update_state(
@@ -516,7 +533,7 @@ async def sync_pending_buy_order_plugin(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 챔피언 (🔥 03_12G_PURE_10_01) : 매도/0주 종료 후 60초 타임쉴드 & 현재가 지정가 매수 게이트
+# [핵심 2] 챔피언 (🔥 03_7G_PURE_10_01) : 매도/0주 종료 후 60초 타임쉴드 & 현재가 지정가 매수 게이트
 # ---------------------------------------------------------------------------
 async def execute_seed_protected_buy_gate_plugin(
     context: Any,
@@ -525,19 +542,19 @@ async def execute_seed_protected_buy_gate_plugin(
     now_est: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
-    🎯 1, 🎯 2, 🎯 4 & Case 25 ~ 71 (챔피언 : 🔥 03_12G_PURE_10_01 + 양방향 60초 타임쉴드 & 현재가 지정가 & Case 67 이중 캡핑):
+    🎯 1, 🎯 2, 🎯 4 & Case 25 ~ 72 (챔피언 : 🔥 03_7G_PURE_10_01 + 양방향 60초 타임쉴드 & 현재가 지정가 & Case 67 이중 캡핑):
     04:07:00 ~ 16:00:00 EST 운용 구간에서:
     1) 미체결 매수/매도 주문이 대기 중이면 중복 매수 발사를 차단한다.
     2) 🛡️ [Case 65 : 매도(부분 익절 및 0주 싸이클 종료) 후 60.0초 타임쉴드 & 직전 매수 후 60.0초 타임쉴드 강제 검문]
        - 타임쉴드 중에는 10분 버킷(last_evaluated_buy_bucket_id)을 소모하지 않고 대기했다가 60초 경과 직후 판정한다.
     3) 🔥 [분기 A : 보유 잔고 0주 상태 (is_zero_shares) — 0주 싸이클 종료 후 60초 타임쉴드 경과 뒤에 현재가 조회 및 첫 진입]
-    4) 🛡️ [분기 B : 지층 보유 상태 (len(buckets) > 0) — 10분 고정 시드보호 매수 게이트 검문 (Case 36, 64, 65, 67, 71)]
-       - ♻️ [하위 분기 B-1 : 상단 그리드(2층 ~ 12층)만 보유 중 (1층 공석, not has_active_l1_bucket(buckets) · Case 59, 67, 71)]
+    4) 🛡️ [분기 B : 지층 보유 상태 (len(buckets) > 0) — 10분 고정 시드보호 매수 게이트 검문 (Case 36, 64, 65, 67, 71, 72)]
+       - ♻️ [하위 분기 B-1 : 상단 그리드(2층 ~ 7층)만 보유 중 (1층 공석, not has_active_l1_bucket(buckets) · Case 59, 67, 71, 72)]
          * 조회된 현재가(fresh_live_p)가 직전 익절가 대비 -1.00% 이하 눌림목 OR +1.00% 이상 상승돌파 시에만
            target_qty = min(budget_cap_qty, anchor_quota_qty) 이중 캡핑을 적용해
-           상단 2층 ~ 12층 비병합 독립 1층(REENTRY_1FL) 주문을 발주한다!
-       - 📐 [하위 분기 B-2 : 활성 1층 보유 중 — 기억된 최저가 기준 4단 와이드 활주로 추매 (WIDE_RUNWAY, Case 60, 67, 71)]
-         * 조회된 현재가(fresh_live_p)가 기억된 최저가 대비 4단 와이드 단차(-1.0% / -2.0% / -3.5% / -5.5%) 이하
+           상단 2층 ~ 7층 비병합 독립 1층(REENTRY_1FL) 주문을 발주한다!
+       - 📐 [하위 분기 B-2 : 활성 1층 보유 중 — 정적 기억 최저가 기준 4단 와이드 활주로 추매 (WIDE_RUNWAY, Case 60, 67, 71, 72)]
+         * 조회된 현재가(fresh_live_p)가 정적 기억 최저가 대비 4단 와이드 단차(-1.0% / -2.0% / -3.5% / -5.5%) 이하
            신저가에 도달했을 때만 현재가 지정가(LIMIT)로 DIP_1FL 추매 주문을 발주한다!
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
@@ -602,7 +619,7 @@ async def execute_seed_protected_buy_gate_plugin(
     buy_interval_min = LOCKED_BUY_INTERVAL_MIN
 
     is_zero_shares = bool(len(buckets) == 0 and h_qty == 0)
-    # 🚨 Case 71: 상단에 2층 ~ 12층 그리드(GRID_L2 ~ GRID_L12)가 남아 있고 1층이 익절되어 공석인 상태!
+    # 🚨 Case 71 & Case 72: 상단에 2층 ~ 7층 그리드(GRID_L2 ~ GRID_L7)가 남아 있고 1층이 익절되어 공석인 상태!
     is_l2_only_vacant_l1 = bool(
         len(buckets) > 0 and not has_active_l1_bucket(buckets)
     )
@@ -773,10 +790,10 @@ async def execute_seed_protected_buy_gate_plugin(
         return {"status": "NO_FRESH_LIVE_PRICE"}
 
     # -----------------------------------------------------------------------
-    # [하위 분기 B-1 : 상단 그리드(2층 ~ 12층)만 보유 중 (1층 공석) — 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 재장전 (Case 59, 65, 67, 71)]
+    # [하위 분기 B-1 : 상단 그리드(2층 ~ 7층)만 보유 중 (1층 공석) — 눌림(-1.0%) OR 돌파(+1.0%) 독립 1층 재장전 (Case 59, 65, 67, 71, 72)]
     # -----------------------------------------------------------------------
     if is_l2_only_vacant_l1:
-        wma_info = compute_upper_2_to_12_moving_avg(buckets)
+        wma_info = compute_upper_2_to_7_moving_avg(buckets)
         upper_wma_p = safe_float(
             wma_info.get("upper_wma_price"), buckets[0].book_price
         )
@@ -804,7 +821,7 @@ async def execute_seed_protected_buy_gate_plugin(
                 "status": "L2_ONLY_REENTRY_HOLD_PASSED",
                 "ref_anchor": reentry_sig.get("ref_anchor"),
                 "chg_from_exit_pct": reentry_sig.get("chg_from_exit_pct"),
-                "seed_protect_pass_cnt": new_pass_cnt,
+                "seed_protect_pass_cnt": new_day_pass,
             }
 
         async with context.in_memory_ordering_lock:
@@ -925,7 +942,7 @@ async def execute_seed_protected_buy_gate_plugin(
                 }
 
     # -----------------------------------------------------------------------
-    # [하위 분기 B-2 : 활성 1층 보유 중 — 기억된 최저가 기준 4단 와이드 신저가 추매 (WIDE_RUNWAY, Case 60, 65, 67, 71)]
+    # [하위 분기 B-2 : 활성 1층 보유 중 — 정적 기억 최저가 기준 4단 와이드 신저가 추매 (WIDE_RUNWAY, Case 60, 65, 67, 71, 72)]
     # -----------------------------------------------------------------------
     held_lots = sum(b.lot_count for b in buckets)
     drop_buy_pct, _, _ = get_golden8_prog_thresholds(
@@ -935,7 +952,7 @@ async def execute_seed_protected_buy_gate_plugin(
     anchor_p = safe_float(st.get("anchor_price"), buckets[0].book_price)
     cycle_min_p = safe_float(st.get("cycle_min_buy_price"), anchor_p)
 
-    # 🚨 Case 60: 추가 매수(그리드 층수 증가) 판정 기준가는 반드시 기억된 사이클 최저 매수가로 잠금!
+    # 🚨 Case 60 & Case 72: 추가 매수(그리드 층수 증가) 판정 기준가는 반드시 정적 기억 사이클 최저 매수가로 잠금!
     valid_refs = [
         p for p in (buckets[0].book_price, anchor_p, cycle_min_p) if p > 0.0
     ]
@@ -964,7 +981,7 @@ async def execute_seed_protected_buy_gate_plugin(
             "ref_buy_anchor": round(ref_buy_anchor, 4),
             "chg_pct": round(chg_for_buy_pct, 2),
             "required_drop_pct": drop_buy_pct,
-            "seed_protect_pass_cnt": new_pass_cnt,
+            "seed_protect_pass_cnt": new_day_pass,
         }
 
     # 🎯 [4단 와이드 신저가 하락 조건 충족] 기억된 최저가(ref_buy_anchor)로 8% 목표 정량(target_qty)을 확정한 뒤

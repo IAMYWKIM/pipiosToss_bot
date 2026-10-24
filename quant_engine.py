@@ -7,10 +7,11 @@
 (1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 및 1층 +1.50% / 2~7층 +1.00%) ·
 상단 그리드(2층 ~ 7층) 보유 중 1층 공석 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 1층(REENTRY_1FL) 재장전 판정기 ·
 1층 ~ 7층 순수 원가 골디락스 멀티 그리드 관리(MAX_GRID_TIERS_7 = 7 : 1층 공격수 + 2~6층 개별 완충층[5개] + 통합 7층 본대[GRID_L7] ·
-REENTRY_1FL 독립 1층 배치 vs DIP_1FL 2~6층 개별 승격 및 8회차 이상 최상단 6층+7층 통합 7층 병합 · Case 53 하드 캡핑 · Case 71, Case 72) ·
+REENTRY_1FL 독립 1층 배치 vs DIP_1FL 2~6층 개별 승격 및 8회차 이상 최상단 6층+7층 통합 7층 병합 ·
+수동 매수 시 단가 비교 오름차순 층간 스마트 편입 & 수동 매도 시 층별 순수원가 1:1 매칭 정산기 탑재 · Case 53 하드 캡핑 · Case 63, Case 69, Case 71, Case 72) ·
 2층 ~ 7층 통합 이동평균(wma_2_to_7) 산출 및 3중 다중 익절 판정(① 1층 +1.50% / ② 2~6층 개별 및 통합 7층 +1.00% / ③ 2~7층 통합 이동평균 +1.00% · Case 71, Case 72) ·
 순수 실물 원가 무결성(book_price == actual_avg_price · 리앵커링 원가 차감 영구 폐기 · Case 69, Case 71) ·
-정적 기억 최저 매수가(cycle_min_buy_price) 잠금 및 당일 프리장~정규장 시드보호 패스(daily_seed_protect_pass_cnt) 요약 · TDD 검증' 코어 모듈 (Step 01 / 02)
+정적 기억 최저 매수가(cycle_min_buy_price) 잠금 및 당일 프리장~정규장 시드보호 패스(daily_seed_protect_pass_cnt) 요약 · TDD 검증' 코어 모듈 (Step 02 / 05)
 - 제1헌법 ~ 제6헌법 및 Case 01 ~ 72 완벽 준수
 """
 
@@ -232,10 +233,14 @@ def relabel_upper_grid_tiers(
         tot_q = sum(b.qty for b in overflow)
         tot_cost = round(sum(b.actual_cost_usd for b in overflow), 4)
         tot_lots = sum(max(1, b.lot_count) for b in overflow)
-        avg_p = round(max(0.01, tot_cost / float(tot_q)), 4)
+        overall_book_avg = (
+            sum(float(b.qty) * b.book_price for b in overflow) / float(tot_q)
+        )
+        raw_avg_p = max(0.01, tot_cost / float(tot_q))
+        capped_avg_p = round(min(raw_avg_p, overall_book_avg), 4)
         merged_top = StratumBucket(
             qty=tot_q,
-            book_price=avg_p,
+            book_price=capped_avg_p,
             book_invested_usd=tot_cost,
             actual_cost_usd=tot_cost,
             lot_count=tot_lots,
@@ -499,7 +504,7 @@ def evaluate_l2_only_hybrid_reentry_signal(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 4 · MODIFIED Case 71 & Case 72] 1층 ~ 7층 골디락스 순수 멀티 그리드 배치 & 2~7층 통합 이동평균 · 3중 다중 익절 엔진
+# [핵심 4 · MODIFIED Case 63, Case 71 & Case 72] 1층 ~ 7층 골디락스 순수 멀티 그리드 배치(단가 비교 층간 편입 포함) & 매도 층 원가 매칭 정산기
 # ---------------------------------------------------------------------------
 def vrev_add_quota_lot_and_merge_2tier(
     queue: Sequence[StratumBucket],
@@ -519,11 +524,12 @@ def vrev_add_quota_lot_and_merge_2tier(
        10분 게이트 눌림(-1.0%)/돌파(+1.0%)로 재장전한 실물 1층(lot_type == "REENTRY_1FL")이 체결되면:
        기존 상단 2층 ~ 7층(GRID_L2 ~ GRID_L7)을 전혀 병합하거나 이동시키지 않고 그대로 유지한 채,
        맨 앞(index 0)에 신규 1층(new_l1)을 독립 배치하여 [new_l1(REENTRY_1FL), GRID_L2, ..., GRID_Lk] 를 반환한다!
-    3) 🚨 Case 71 & Case 72 (활성 1층 보유 상태에서 4단 와이드 신저가 추매 DIP_1FL / QUOTA_L1 체결 시 2~6층 개별 승격 & 7층 통합 합병):
-       - 신규 매수분은 1층(index 0, DIP_1FL)에 순수 단가로 배치한다.
-       - 기존 지층들(기존 1층 + 기존 2층 ~ k층)은 2층(GRID_L2) ~ 6층(GRID_L6)까지는 병합 없이 한 층씩 위로 개별 승격시킨다!
-       - 기존 지층 수가 이미 7개 이상이어서 총 층수가 7개(max_tiers = 7)를 초과할 때는
-         새 2층 ~ 6층(5개 개별 완충층)은 그대로 보존하고 최상단 6층+7층을 '통합 7층 본대(GRID_L7)'로 가중평균 병합(Case 53 하드 캡핑 적용)한다!
+    3) 🚨 NEW [Case 63 & Case 72 : 매수 가격 비교 기반 1층 ~ 7층 사이 오름차순 층간 스마트 편입]:
+       - 신저가 추매(DIP_1FL / QUOTA_L1)로 신규 매수가(pure_p)가 기존 1층 단가 이하일 때는
+         신규 매수분을 1층(index 0)에 배치하고 기존 지층들을 2층 ~ 6층 개별 승격(7층 초과분은 통합 7층 합병)한다.
+       - 수동 추가 매수(MANUAL_SYNC_L1) 등으로 신규 매수가(pure_p)가 기존 1층보다 높고 상단 지층들 사이의 가격일 때는
+         1층 ~ 7층 단가(book_price)와 대소를 비교하여 크거나 작은 층 사이(저가 1층 ➔ 고가 7층 오름차순)에 정확히 중간 편입시키고,
+         가장 단가가 낮은 최하단 층을 1층 공격수로 유지하며 7층 초과 시 최상단 고가 층(6층+7층)만 통합 7층(GRID_L7)으로 합병한다!
     """
     q_int = max(1, safe_int(buy_qty, 1))
     p_val = round(max(0.0001, safe_float(buy_price, 0.01)), 4)
@@ -565,7 +571,7 @@ def vrev_add_quota_lot_and_merge_2tier(
         )
         return [new_l1] + preserved_uppers
 
-    # 활성 1층 보유 중 신저가 추매(DIP_1FL 등) 유입 시: 기존 1층 ~ k층을 2층 ~ 6층 개별 승격 & 7층 통합 합병
+    # 2-Layer 레거시 모드 호환 분기
     if eff_max_tiers <= 2:
         old_total_qty = sum(b.qty for b in existing)
         old_actual_cost = round(sum(b.actual_cost_usd for b in existing), 4)
@@ -586,10 +592,172 @@ def vrev_add_quota_lot_and_merge_2tier(
         )
         return [new_l1, merged_l2]
 
+    # 🚨 NEW [Case 63 & Case 72 : 단가 비교 오름차순(저가 1층 ➔ 고가 7층) 층간 중간 편입]
+    # 신규 매수 단가(pure_p)가 기존 최저가 층(existing[0].book_price)보다 높은 경우(예: 수동 추매 등),
+    # 기존 1층 ~ 7층 단가와 비교하여 자기 가격에 맞는 층 사이에 정확히 편입시킨다!
+    if pure_p > existing[0].book_price + 1e-6:
+        combined = list(existing) + [new_l1]
+        combined.sort(key=lambda b: round(b.book_price, 4))
+        lowest_b = combined[0]
+        if is_upper_grid_tier(lowest_b.lot_type):
+            lowest_b = StratumBucket(
+                qty=lowest_b.qty,
+                book_price=lowest_b.book_price,
+                book_invested_usd=lowest_b.book_invested_usd,
+                actual_cost_usd=lowest_b.actual_cost_usd,
+                lot_count=max(1, lowest_b.lot_count),
+                lot_type=tag,
+            )
+        sorted_uppers = relabel_upper_grid_tiers(
+            combined[1:], max_tiers=eff_max_tiers
+        )
+        return [lowest_b] + sorted_uppers
+
     shifted_uppers = relabel_upper_grid_tiers(
         existing, max_tiers=eff_max_tiers
     )
     return [new_l1] + shifted_uppers
+
+
+def match_and_remove_sold_buckets_7tier(
+    buckets: Sequence[StratumBucket],
+    delta_remove_qty: int,
+    sell_exec_price: float = 0.0,
+    max_tiers: int = MAX_GRID_TIERS_7,
+) -> Dict[str, Any]:
+    """
+    # NEW [Case 63, Case 69, Case 71 & Case 72 : 매도 수량 층 판별 및 층별 순수 원가 1:1 매칭 정산기]:
+    수동 매도(전량 또는 부분 매도)로 보유 수량이 delta_remove_qty 만큼 줄었을 때:
+    1) 1층 ~ 7층 레이어 중 어느 층의 물량이 매도되었는지 판별(하단 최저단가 층부터 순차 차감하되,
+       활성 1층이 전량 소진되면 남은 상단 층들은 GRID_L2 ~ GRID_L7 [1층 공석] 상태로 보존)한다.
+    2) 토스 계좌의 이동평균 희석 평단을 절대 사용하지 않고, 실제로 차감된 바로 그 층(들)의
+       고유 순수 매수 단가(book_price == actual_avg_price)와 순수 매수 원금(sold_actual_cost_usd)만 적용하여
+       calc_sell_realized_pnl() 로 세후 실현수익(net_pnl_usd)을 정밀 산출한다.
+    """
+    valid = [
+        b
+        for b in (buckets or [])
+        if isinstance(b, StratumBucket) and b.qty > 0
+    ]
+    rem_to_cut = max(0, safe_int(delta_remove_qty, 0))
+    exec_p = round(max(0.0, safe_float(sell_exec_price, 0.0)), 4)
+
+    if not valid or rem_to_cut <= 0:
+        return {
+            "rem_buckets": valid,
+            "sold_buckets": [],
+            "sold_qty": 0,
+            "sold_actual_cost_usd": 0.0,
+            "sold_avg_cost_price": 0.0,
+            "sold_tier_desc": "없음",
+            "sold_l1_completely": False,
+            "sold_upper_tier": False,
+            "pnl_info": calc_sell_realized_pnl(0, exec_p, 0.0),
+        }
+
+    was_active_l1 = has_active_l1_bucket(valid)
+    rem_buckets: List[StratumBucket] = []
+    sold_buckets: List[StratumBucket] = []
+    sold_tier_parts: List[str] = []
+    removed_first_tier_completely = False
+    sold_upper_tier = False
+
+    for idx, b in enumerate(valid):
+        tier_label = (
+            "1층"
+            if (idx == 0 and was_active_l1)
+            else f"{idx + 1 if was_active_l1 else idx + 2}층"
+        )
+        if rem_to_cut <= 0:
+            rem_buckets.append(b)
+            continue
+
+        if rem_to_cut >= b.qty:
+            sold_buckets.append(b)
+            sold_tier_parts.append(f"{tier_label}({b.qty}주@${b.book_price:.2f})")
+            rem_to_cut -= b.qty
+            if idx == 0 and was_active_l1:
+                removed_first_tier_completely = True
+            else:
+                sold_upper_tier = True
+        else:
+            sold_q_part = rem_to_cut
+            keep_q = b.qty - rem_to_cut
+            rem_to_cut = 0
+
+            pure_unit_p = b.actual_avg_price
+            sold_cost_part = round(float(sold_q_part) * pure_unit_p, 4)
+            keep_cost_part = round(
+                max(0.01 * float(keep_q), b.actual_cost_usd - sold_cost_part),
+                4,
+            )
+
+            sold_buckets.append(
+                StratumBucket(
+                    qty=sold_q_part,
+                    book_price=round(sold_cost_part / float(sold_q_part), 4),
+                    book_invested_usd=sold_cost_part,
+                    actual_cost_usd=sold_cost_part,
+                    lot_count=1,
+                    lot_type=b.lot_type,
+                )
+            )
+            rem_buckets.append(
+                StratumBucket(
+                    qty=keep_q,
+                    book_price=round(keep_cost_part / float(keep_q), 4),
+                    book_invested_usd=keep_cost_part,
+                    actual_cost_usd=keep_cost_part,
+                    lot_count=max(1, b.lot_count),
+                    lot_type=b.lot_type,
+                )
+            )
+            sold_tier_parts.append(
+                f"{tier_label}부분({sold_q_part}주@${pure_unit_p:.2f})"
+            )
+            if not (idx == 0 and was_active_l1):
+                sold_upper_tier = True
+
+    eff_max_t = max(2, safe_int(max_tiers, MAX_GRID_TIERS_7))
+    if rem_buckets:
+        if was_active_l1 and not removed_first_tier_completely:
+            active_b1 = rem_buckets[0]
+            re_uppers = relabel_upper_grid_tiers(
+                rem_buckets[1:], max_tiers=eff_max_t
+            )
+            rem_buckets = [active_b1] + re_uppers
+        else:
+            rem_buckets = relabel_upper_grid_tiers(
+                rem_buckets, max_tiers=eff_max_t
+            )
+
+    sold_qty_total = sum(b.qty for b in sold_buckets)
+    sold_cost_total = round(sum(b.actual_cost_usd for b in sold_buckets), 4)
+    sold_avg_cost_p = (
+        round(sold_cost_total / float(sold_qty_total), 4)
+        if sold_qty_total > 0
+        else 0.0
+    )
+    eff_sell_p = exec_p if exec_p > 0.0 else sold_avg_cost_p
+    pnl_info = calc_sell_realized_pnl(
+        sold_qty=sold_qty_total,
+        sell_exec_price=eff_sell_p,
+        sold_actual_cost_usd=sold_cost_total,
+    )
+
+    return {
+        "rem_buckets": rem_buckets,
+        "sold_buckets": sold_buckets,
+        "sold_qty": sold_qty_total,
+        "sold_actual_cost_usd": sold_cost_total,
+        "sold_avg_cost_price": sold_avg_cost_p,
+        "sold_tier_desc": (
+            " + ".join(sold_tier_parts) if sold_tier_parts else "없음"
+        ),
+        "sold_l1_completely": removed_first_tier_completely,
+        "sold_upper_tier": sold_upper_tier,
+        "pnl_info": pnl_info,
+    }
 
 
 def compute_upper_2_to_12_moving_avg(
@@ -1212,8 +1380,8 @@ def run_quant_engine_tdd() -> bool:
     4단 와이드 활주로(-1.0% / -2.0% / -3.5% / -5.5%),
     1층 ~ 6층 개별 완충층 보존 및 8회차 최상단(6층+7층 ➔ 통합 7층 GRID_L7) 병합(Case 72),
     1층(+1.50%) / 2~7층 개별(+1.00%) / 2~7층 통합 이동평균(+1.00%) 3중 다중 익절 판정(Case 71, 72),
-    상단 그리드 단독 보유(1층 공석) 시 눌림/돌파 독립 1층 재장전(Case 59), 정적 기억저가 잠금(Case 60, 72) 및
-    당일 시드보호 패스(daily_seed_protect_pass_cnt) 바인딩을 전수 검증한다.
+    상단 그리드 단독 보유(1층 공석) 시 눌림/돌파 독립 1층 재장전(Case 59), 정적 기억저가 잠금(Case 60, 72),
+    단가 비교 기반 층간 스마트 편입 및 매도 층 원가 매칭 정산(match_and_remove_sold_buckets_7tier)을 전수 검증한다.
     """
     # 1) 8% 황금정량 및 Case 67 min(budget_cap_qty, anchor_quota_qty) 캡핑 검증
     q_dip, bud_c67 = compute_golden8_quota_qty(
@@ -1326,7 +1494,32 @@ def run_quant_engine_tdd() -> bool:
         and sum_info["seed_protect_pass_cnt"] == 7
     ), "TDD 실패(Case 72): 상단 2~7층 이동평균 또는 당일 시드패스 요약 오류"
 
+    # 6) NEW: 단가 비교 층간 스마트 중간 편입($80.50 < $84.50 < $85.00 < $90.00) & 매도 층 원가 매칭 정산 검증
+    mid_inserted = vrev_add_quota_lot_and_merge_2tier(
+        reloaded_grid, 10, 84.50, 845.0, "MANUAL_SYNC_L1"
+    )
+    assert (
+        len(mid_inserted) == 4
+        and mid_inserted[0].book_price == 80.50
+        and mid_inserted[1].book_price == 84.50
+        and mid_inserted[1].lot_type == "GRID_L2"
+        and mid_inserted[2].book_price == 85.00
+        and mid_inserted[2].lot_type == "GRID_L3"
+    ), f"TDD 실패(단가 비교 층간 편입): {mid_inserted}"
+
+    match_res = match_and_remove_sold_buckets_7tier(
+        mid_inserted, delta_remove_qty=10, sell_exec_price=82.50
+    )
+    assert (
+        match_res["sold_qty"] == 10
+        and abs(match_res["sold_actual_cost_usd"] - 805.0) < 1e-4
+        and match_res["sold_l1_completely"] is True
+        and len(match_res["rem_buckets"]) == 3
+        and not has_active_l1_bucket(match_res["rem_buckets"])
+        and match_res["pnl_info"]["net_pnl_usd"] > 0.0
+    ), f"TDD 실패(수동 매도 층별 원가 매칭 정산): {match_res}"
+
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 🔥 03_7G_PURE_10_01 (1~6층 개별 완충층 + 통합 7층 본대 · 2~7층 통합이평 3중 익절 · 정적 저가 잠금 Case 59~72) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 🔥 03_7G_PURE_10_01 (1~6층 개별 완충층 + 통합 7층 본대 · 층간 비교 편입 & 원가 매칭 정산 Case 59~72) 검증 완료"
     )
     return True
