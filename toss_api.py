@@ -2,10 +2,10 @@
 """
 # MODIFIED: toss_api.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 토스증권 Open API (v1.2.14) 방탄 통신 통제소 &
-SOXL 단일 롱 12-Tier 순수 멀티 그리드 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 01 / 07)
+SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대) 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 02 / 06)
 - 제1헌법: 모든 파일 I/O 및 네트워크 통신의 asyncio.to_thread 비동기 격리 + GlobalThrottle 중앙 통제
 - 제2헌법: 기동 시 GET /api/v1/accounts 1회 호출로 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 자동 주입
-- 제3헌법 ~ 제6헌법 및 Case 01 ~ 71 전수 락온:
+- 제3헌법 ~ 제6헌법 및 Case 01 ~ 72 전수 락온:
   1) REAL_ALLOWED_SYMBOLS = ("SOXL",) 단일 롱 화이트리스트 물리적 강제 (인버스 숏 SOXS 원천 차단)
   2) get_holdings_map_with_status, get_candles_1m, get_candles_1d, get_current_prices_batch,
      get_orderbook, get_buying_power_usd, get_sellable_quantity, create_order, modify_order,
@@ -18,10 +18,10 @@ SOXL 단일 롱 12-Tier 순수 멀티 그리드 폴더별 3중 지층 원장(Sox
        ③ 실시간 백업 금고(ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json) 3중 원자적 동기화 및 기존 데이터 무손실 자동 이관
   5) 🚨 [Case 65, Case 69 & Case 70 양방향·주기 60초 타임쉴드 시각 영속화 및 순수 원가 무결성 강제]
      - last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts 원장 영속화
-  6) 🚨 [NEW · Case 71 신규 챔피언 🔥 03_12G_PURE_10_01 : 1층 ~ 12층 순수 원가 멀티 그리드(MAX_GRID_TIERS_12 = 12) &
-     3중 다중 익절 인덱스(pending_sell_indices) 영속화 및 리앵커링 원가 차감 영구 폐기]
-     - 모든 보유 지층(1층 ~ 12층)의 book_price == actual_avg_price 및 book_invested_usd == actual_cost_usd 순수 실물 원가 100% 보존!
-     - 다중 그리드 동시 매도 체결 정산을 위한 pending_sell_indices 및 2~12층 개별/이동평균 익절 통계 필드 정식 탑재!
+  6) 🚨 [NEW · Case 71 & Case 72 최종 확정 챔피언 🔥 03_7G_PURE_10_01 : 1층 ~ 7층 순수 원가 골디락스 멀티 그리드
+     (MAX_GRID_TIERS_7 = 7 : 1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대) & 정적 싸이클 최저가 잠금(STATIC_CYCLE_MIN)]
+     - 모든 보유 지층(1층 ~ 7층)의 book_price == actual_avg_price 및 book_invested_usd == actual_cost_usd 순수 실물 원가 100% 보존!
+     - AST 심볼 하위 호환을 위해 MAX_GRID_TIERS_12 = 7 별칭을 동시 제공하며, 다중 그리드 동시 매도 인덱스(pending_sell_indices) 탑재!
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger("toss_sniper.toss_api")
 
 # ---------------------------------------------------------------------------
-# [핵심 상수] 제4헌법 EST 단일 타임존 & 신규 챔피언 (🔥 03_12G_PURE_10_01) 전역 상수
+# [핵심 상수] 제4헌법 EST 단일 타임존 & 최종 확정 챔피언 (🔥 03_7G_PURE_10_01 · Case 72) 전역 상수
 # ---------------------------------------------------------------------------
 EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
@@ -58,8 +58,13 @@ ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
 DEFAULT_INITIAL_SEED_USD: float = 10000.0
 PORTION_RATIO_LOCKED: float = 0.08
 BASE_MAX_LOTS_8PCT: int = 12
-# NEW [Case 71]: 1층 ~ 12층 멀티 그리드 최대 층수 상수
-MAX_GRID_TIERS_12: int = 12
+
+# NEW [Case 72]: 골디락스 7-Layer (1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대) 상수 락온
+# (타 모듈 AST 임포트 무결성 100% 호환을 위해 MAX_GRID_TIERS_12 도 7 로 동시 매핑)
+MAX_GRID_TIERS_7: int = 7
+MAX_GRID_TIERS: int = 7
+MAX_GRID_TIERS_12: int = 7
+
 LOCKED_BUY_INTERVAL_MIN: int = 10
 LOCKED_SELL_INTERVAL_MIN: int = 1
 ROUND_TRIP_FEE_RATE: float = 0.0014
@@ -344,18 +349,18 @@ class GlobalThrottle:
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] SOXL 단일 롱 12-Tier 순수 멀티 그리드 폴더별 3중 안전 지층 원장 (SoxlStratumLedger — Case 68, 69, 70, 71)
+# [핵심 2] SOXL 단일 롱 7-Tier 순수 멀티 그리드 폴더별 3중 안전 지층 원장 (SoxlStratumLedger — Case 68 ~ 72)
 # ---------------------------------------------------------------------------
 class SoxlStratumLedger:
     """
-    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 71:
+    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 72:
     현재 봇이 위치한 폴더(`base_dir`)를 기준으로:
     ① 폴더 고유 원장(`soxl_stratum_ledger_<folder_slug>.json` — Git 덮어쓰기 100% 면역)
     ② 표준 호환 원장(`soxl_stratum_ledger.json` — 기존 코드 및 외부 도구 호환 미러)
     ③ 실시간 백업 금고(`ledger_backups/soxl_stratum_ledger_<folder_slug>.bak.json`)
-    3곳에 SOXL 1~12층 순수 멀티 그리드 지층(buckets), 가용 현금 시드(free_cash_usd),
-    기억된 사이클 최저 매수가(cycle_min_buy_price), 양방향·주기 60초 타임쉴드 시각
-    (last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts),
+    3곳에 SOXL 1~7층 순수 멀티 그리드 지층(1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대),
+    가용 현금 시드(free_cash_usd), 정적 잠금 사이클 최저 매수가(cycle_min_buy_price),
+    양방향·주기 60초 타임쉴드 시각(last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts),
     다중 그리드 매도 대기 인덱스(pending_sell_indices), 누적 세후 실현수익금 및 자투리 절약금을
     원자적(.tmp -> os.replace)으로 동시 영속화한다.
     """
@@ -384,7 +389,6 @@ class SoxlStratumLedger:
             base_dir=self.base_dir,
             explicit_filepath=filepath,
         )
-        # 하위 호환성 유지: 외부에서 ledger.filepath 접근 시 legacy_filepath 반환
         self.filepath: str = self.legacy_filepath
         self.backup_dir: str = os.path.dirname(self.backup_filepath)
 
@@ -468,7 +472,8 @@ class SoxlStratumLedger:
             "reentry_mode": "HYBRID_PULL_OR_BRK",
             "buy_interval_min": LOCKED_BUY_INTERVAL_MIN,
             "sell_interval_min": LOCKED_SELL_INTERVAL_MIN,
-            "max_grid_tiers": MAX_GRID_TIERS_12,
+            # MODIFIED [Case 72]: 7-Layer (1층 공격수 + 2~6층 개별 완충층 + 통합 7층 본대) 기본값 락온
+            "max_grid_tiers": MAX_GRID_TIERS_7,
             "buckets": [],
             "anchor_price": 0.0,
             "cycle_min_buy_price": 0.0,
@@ -483,14 +488,12 @@ class SoxlStratumLedger:
             "pending_portion_budget": 0.0,
             "pending_lot_type": "",
             "pending_sell_mode": "",
-            # NEW [Case 71]: 3중 다중 익절 시 매도 대상 그리드 인덱스 리스트 영속화 필드
             "pending_sell_indices": [],
             "last_modify_mono": 0.0,
             "entry_ts": 0.0,
             "last_buy_fill_ts": 0.0,
             "last_sell_fill_ts": 0.0,
             "last_cycle_end_ts": 0.0,
-            # Case 70: 보유 중 매 60.0초 타임쉴드 주기 매도 모니터 검문 시각 영속화 필드
             "last_sell_gate_eval_ts": 0.0,
             "last_evaluated_buy_bucket_id": -1,
             "last_evaluated_date": today_est,
@@ -509,7 +512,6 @@ class SoxlStratumLedger:
             "total_sold_shares": 0,
             "win_sell_events": 0,
             "daily_sell_events": 0,
-            # NEW [Case 71]: 2~12층 개별 그리드 익절 및 2~12층 통합 이동평균 일괄 익절 카운터
             "indiv_grid_sell_cnt": 0,
             "daily_indiv_grid_sell_cnt": 0,
             "wma_grad_sell_cnt": 0,
@@ -524,16 +526,78 @@ class SoxlStratumLedger:
             "updated_at": datetime.now(EST_TZ).isoformat(),
         }
 
+    @staticmethod
+    def _is_upper_grid_tag(lot_type_str: str) -> bool:
+        tag = str(lot_type_str or "").upper().strip()
+        if tag == "MERGED_UPPER":
+            return True
+        if tag.startswith("GRID_L") and tag != "GRID_L1":
+            return True
+        return False
+
+    @classmethod
+    def _enforce_7tier_cap_on_dict_buckets(
+        cls, clean_buckets: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        # NEW [Case 72]:
+        구 12-Layer 등에서 이관된 원장에 7개 층 초과 버킷이 존재할 경우,
+        활성 1층과 2~6층(5개 개별 완충층)은 그대로 보존하고 7층 이상 초과분만
+        '통합 7층 본대(GRID_L7)'로 무손실 가중평균 병합하여 7-Layer 규격을 100% 보장한다.
+        """
+        if not clean_buckets:
+            return []
+
+        has_active_l1 = not cls._is_upper_grid_tag(
+            str(clean_buckets[0].get("lot_type") or "")
+        )
+        if has_active_l1:
+            l1_list = [clean_buckets[0]]
+            uppers = list(clean_buckets[1:])
+        else:
+            l1_list = []
+            uppers = list(clean_buckets[:])
+
+        max_upper_cnt = MAX_GRID_TIERS_7 - 1  # 6개 (GRID_L2 ~ GRID_L7)
+        if len(uppers) > max_upper_cnt:
+            kept = uppers[: max_upper_cnt - 1]
+            overflow = uppers[max_upper_cnt - 1 :]
+            tot_q = sum(safe_int(b.get("qty"), 0) for b in overflow)
+            tot_ac = round(
+                sum(safe_float(b.get("actual_cost_usd"), 0.0) for b in overflow),
+                4,
+            )
+            tot_lc = sum(max(1, safe_int(b.get("lot_count"), 1)) for b in overflow)
+            pure_p = round(max(0.01, tot_ac / float(max(1, tot_q))), 4)
+            merged_top = {
+                "qty": max(1, tot_q),
+                "book_price": pure_p,
+                "book_invested_usd": tot_ac,
+                "actual_cost_usd": tot_ac,
+                "lot_count": max(1, tot_lc),
+                "lot_type": f"GRID_L{MAX_GRID_TIERS_7}",
+            }
+            uppers = kept + [merged_top]
+
+        relabeled_uppers: List[Dict[str, Any]] = []
+        for idx, b in enumerate(uppers):
+            tier_no = min(MAX_GRID_TIERS_7, idx + 2)
+            b_copy = dict(b)
+            b_copy["lot_type"] = f"GRID_L{tier_no}"
+            relabeled_uppers.append(b_copy)
+
+        return l1_list + relabeled_uppers
+
     def _sanitize_and_enforce_identity(
         self, raw_st: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        🚨 Case 63, Case 64, Case 68, Case 69, Case 70 & Case 71:
-        1) buy_interval_min = 10, sell_interval_min = 1, max_grid_tiers = 12,
+        🚨 Case 63, Case 64, Case 68, Case 69, Case 70, Case 71 & Case 72:
+        1) buy_interval_min = 10, sell_interval_min = 1, max_grid_tiers = 7 (MAX_GRID_TIERS_7),
            portion_mode = "COMP_08PCT", threshold_mode = "WIDE_RUNWAY" 를 강제 동기화한다.
         2) 시드머니 결측 또는 0.0 유입 시 $100.0 으로 변조되지 않도록 _resolve_safe_initial_seed() 를 적용한다.
-        3) 🛡️ [Case 69 & Case 71 순수 실물 원가 100% 보존 강제 (리앵커링 원가 차감 영구 폐기)]:
-           - 모든 보유 지층(1층 ~ 12층)의 장부 단가(book_price)와 장부 투자금(book_invested_usd)을
+        3) 🛡️ [Case 69, Case 71 & Case 72 순수 실물 원가 100% 보존 강제 (리앵커링 원가 차감 영구 폐기)]:
+           - 모든 보유 지층(1층 ~ 7층)의 장부 단가(book_price)와 장부 투자금(book_invested_usd)을
              순수 실물 매수 원가(actual_avg_price = ac / q, actual_cost_usd = ac)와 100% 일치시켜,
              리앵커링 차감이나 이동평균 희석으로 인한 조기 손절 착시를 물리적으로 원천 봉쇄한다!
            - cycle_reanchor_credit_usd = 0.0 으로 항상 고정한다.
@@ -551,7 +615,7 @@ class SoxlStratumLedger:
         st["folder_slug"] = self.folder_slug
         st["buy_interval_min"] = LOCKED_BUY_INTERVAL_MIN
         st["sell_interval_min"] = LOCKED_SELL_INTERVAL_MIN
-        st["max_grid_tiers"] = MAX_GRID_TIERS_12
+        st["max_grid_tiers"] = MAX_GRID_TIERS_7
         st["portion_mode"] = "COMP_08PCT"
         st["threshold_mode"] = "WIDE_RUNWAY"
         st["reentry_mode"] = "HYBRID_PULL_OR_BRK"
@@ -593,7 +657,6 @@ class SoxlStratumLedger:
                     )
                     lc = max(1, safe_int(b.get("lot_count"), 1))
                     lt = str(b.get("lot_type") or "QUOTA_L1").upper().strip()
-                    # 🚨 Case 69 & Case 71: 모든 층의 book_price 와 book_invested_usd 를 순수 매수 원가(ac)와 100% 일치!
                     pure_avg_p = round(max(0.01, ac / float(q)), 4)
                     clean_buckets.append(
                         {
@@ -606,6 +669,7 @@ class SoxlStratumLedger:
                         }
                     )
 
+        clean_buckets = self._enforce_7tier_cap_on_dict_buckets(clean_buckets)
         st["buckets"] = clean_buckets
         st["cycle_reanchor_credit_usd"] = 0.0
 
@@ -759,7 +823,7 @@ class SoxlStratumLedger:
                         for b in sanitized.get("buckets", [])
                     )
                     logger.info(
-                        "📂 [Case 68~71 폴더별 3중 12층 그리드 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주(%d개층) · 고유원장=%s",
+                        "📂 [Case 68~72 폴더별 3중 7층 골디락스 그리드 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주(%d개층) · 고유원장=%s",
                         self.folder_slug,
                         best_label,
                         safe_float(sanitized.get("initial_seed_usd"), 10000.0),
@@ -937,7 +1001,7 @@ class SoxlStratumLedger:
         preserve_realized_profit: bool = True,
     ) -> Dict[str, Any]:
         """
-        🚨 Case 02, Case 65, Case 69, Case 70 & Case 71:
+        🚨 Case 02, Case 65, Case 69, Case 70, Case 71 & Case 72:
         /reset 또는 /reset_seed 명령 시 지층 큐(buckets), 기준가, 기억된 최저가, 리앵커링 크레딧,
         다중 그리드 매도 대기 인덱스(pending_sell_indices), 매도 모니터 검문 시각(last_sell_gate_eval_ts),
         미체결 주문 ID를 원자적으로 0점 초기화하고, 0주 싸이클 종료 타임쉴드(last_sell_fill_ts, last_cycle_end_ts)를 각인한다.
@@ -1277,9 +1341,6 @@ class TossApiClient:
         """
         🚨 제1헌법, 제2헌법 & Case 20, 21:
         모든 토스 Open API 요청을 처리하는 중앙 비동기 디스패처.
-        - 401 응답 시 토큰 1회 강제 재발급 후 자동 재시도
-        - 429 Rate Limit 또는 5xx 일시 오류 시 지수 백오프 재시도
-        - 400, 403, 404, 409, 415, 422 비즈니스 에러 시 즉시 _NonRetryableApiError 발생
         """
         clean_path = path if path.startswith("/") else f"/{path}"
         url = f"{self.base_url}{clean_path}"
@@ -1681,8 +1742,6 @@ class TossApiClient:
         """
         🚨 Case 03:
         GET /api/v1/holdings 를 호출하여 (holdings_map, fetch_ok) 튜플을 반환한다.
-        - krw / usd 분리 객체의 null 결측치를 안전하게 방어하며,
-        - profitLoss.rate 소수비율(예: 0.1333)을 퍼센트(13.33%)로 정규화한다.
         """
         out_map: Dict[str, Dict[str, Any]] = {
             TARGET_SYMBOL: self._empty_holding_dict(TARGET_SYMBOL)
