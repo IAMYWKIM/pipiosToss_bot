@@ -7,10 +7,11 @@
 ③ 2~7층 통합 이동평균 +1.00% 이상) 동시 스캔 후 그 높아진 현재가 지정가(LIMIT) 매도 발주(목표 미달 시 즉시 다음 60초 매도 타임쉴드 자동 재장전) ·
 매수 1호가(Bid 1) 참조 및 하향 추격 정정 100% 영구 소각(Case 65) ·
 리앵커링 원가 차감 영구 폐기 및 순수 실물 원가(book_price == actual_avg_price) 100% 보존(Case 69, Case 71, Case 72) ·
-1층 익절 후 상단 2~7층 잔존 시 1층 공석(GRID_L2 ~ GRID_L7) 보존 및 싸이클 최저가(cycle_min_buy_price) 잠금 유지(Case 59, Case 60, Case 71, Case 72) ·
+1층 익절 후 상단 2~7층 잔존 시 1층 공석(GRID_L2 ~ GRID_L7) 보존 및 싸이클 최저가(cycle_min_buy_price) 잠금 유지(Case 59, Case 60, Case 71, Case 72, Case 73) ·
 매도 체결(부분 익절 및 0주 전량 졸업) 즉시 기정산 주문 ID(last_settled_order_ids) 등록 및
-60초 매도타임쉴드(last_sell_fill_ts / last_cycle_end_ts) & 15초 잔고 인덱싱 그레이스 쉴드(last_auto_fill_ts) 동시 각인' 코어 플러그인 (Step 03 / 05)
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 72 완벽 준수
+60초 매도타임쉴드(last_sell_fill_ts / last_cycle_end_ts) & 1층 공석 재장전 타임쉴드 클리어(last_reentry_eval_ts = 0.0) &
+15초 잔고 인덱싱 그레이스 쉴드(last_auto_fill_ts) 동시 각인' 코어 플러그인 (Step 02 / 04)
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 74 완벽 준수
 """
 
 from __future__ import annotations
@@ -291,13 +292,15 @@ def mark_post_sell_time_shield(
     is_cycle_end: bool = False,
 ) -> None:
     """
-    🚨 Case 61, Case 65, Case 69 & Case 70 [매도 체결 및 0주 싸이클 종료 후 60.0초 타임쉴드 & 15.0초 잔고 인덱싱 그레이스 쉴드 동시 각인]:
+    🚨 Case 61, Case 65, Case 69, Case 70 & Case 73 [매도 체결 및 0주 싸이클 종료 후 60.0초 타임쉴드 & 1층 공석 재장전 타임쉴드 클리어 & 15.0초 잔고 인덱싱 그레이스 쉴드 동시 각인]:
     1) 매도가 체결된 즉시(또는 0주 싸이클이 종료된 즉시) 인메모리 캐시(exit_snapshot_cache 및 indexing_grace_cache)에
        last_sell_fill_mono 와 last_sell_fill_ts 를 기록하고, 0주 졸업(is_cycle_end=True) 시에는
        last_cycle_end_mono 와 last_cycle_end_ts 도 함께 기록하여 60.0초 동안 다음 첫 진입 및 재매수를 원천 차단한다.
     2) 부분 익절 후 상단 그리드가 남아 있는 경우(is_cycle_end=False)에는 다음 매도 모니터도 60.0초 타임쉴드 뒤에 작동하도록
        last_sell_gate_eval_mono / last_sell_gate_eval_ts 를 동시 재장전하고, 0주 졸업(is_cycle_end=True) 시에는 0.0 으로 리셋한다.
-    3) 동시에 indexing_grace_cache[sym]["last_auto_fill_ts"] = now_mono 를 각인하여,
+    3) MODIFIED [Case 73]: 매도 직후 last_reentry_eval_mono = 0.0 및 last_reentry_eval_ts = 0.0 으로 클리어하여,
+       매도 후 60.0초 타임쉴드(POST_SELL_TO_BUY_SHIELD_SEC)가 끝나는 즉시 첫 번째 1층 공석 재장전 검문이 지연 없이 실행되도록 보장한다!
+    4) 동시에 indexing_grace_cache[sym]["last_auto_fill_ts"] = now_mono 를 각인하여,
        매도 체결 직후 토스 잔고 API(/api/v1/holdings) 인덱싱 시차(0.1 ~ 0.4초) 동안
        reconcile 모듈이 유령 추매/부분매도나 과거 백업 원장 복원을 수행하지 못하도록 15.0초 그레이스 쉴드를 작동시킨다!
     """
@@ -310,6 +313,8 @@ def mark_post_sell_time_shield(
         entry = snap_map.get(sym) if isinstance(snap_map.get(sym), dict) else {}
         entry["last_sell_fill_mono"] = now_mono
         entry["last_sell_fill_ts"] = now_epoch
+        entry["last_reentry_eval_mono"] = 0.0
+        entry["last_reentry_eval_ts"] = 0.0
         if is_cycle_end:
             entry["last_cycle_end_mono"] = now_mono
             entry["last_cycle_end_ts"] = now_epoch
@@ -338,6 +343,8 @@ def mark_post_sell_time_shield(
         g_entry["last_auto_fill_ts"] = now_mono
         g_entry["last_sell_fill_mono"] = now_mono
         g_entry["last_sell_fill_ts"] = now_epoch
+        g_entry["last_reentry_eval_mono"] = 0.0
+        g_entry["last_reentry_eval_ts"] = 0.0
         if is_cycle_end:
             g_entry["last_cycle_end_mono"] = now_mono
             g_entry["last_cycle_end_ts"] = now_epoch
@@ -608,7 +615,7 @@ async def execute_bulletproof_sell_sweep(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 실물 매도 FILLED 정산 · 세후 순익 복리 산입 · 1~7층 순수 원가 보존 · 양방향 쉴드 각인 (Case 69 ~ 72)
+# [핵심 2] 실물 매도 FILLED 정산 · 세후 순익 복리 산입 · 1~7층 순수 원가 보존 · 양방향 쉴드 각인 (Case 69 ~ 73)
 # ---------------------------------------------------------------------------
 async def _commit_filled_sell_and_reanchor_ledger(
     context: Any,
@@ -618,7 +625,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
     settled_order_id: str = "",
 ) -> Dict[str, Any]:
     """
-    🎯 1 ~ 🎯 4 & Case 19, 59, 60, 61, 65, 69, 70, 71, 72:
+    🎯 1 ~ 🎯 4 & Case 19, 59, 60, 61, 65, 69, 70, 71, 72, 73:
     7층 골디락스 멀티 그리드 스나이퍼 매도 주문이 체결(FILLED)되었을 때:
     1) pending_sell_indices (또는 sell_mode)에 해당하는 매도 지층들의 순수 매수 원금(sold_actual_cost_usd)과
        실제 매도 체결가(avg_fill_price)로 왕복 수수료(0.14%) 차감 후 세후 실현 순수익금(net_pnl_usd)을 산출한다.
@@ -631,7 +638,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
          나머지 상단 지층들만 GRID_L2 ~ GRID_L7 로 정렬한다.
     3) 🚨 [NEW : 기정산 주문 ID(last_settled_order_ids) 등록]
        - 봇 자동 매도 주문 ID를 last_settled_order_ids 에 등록하여 수동 매도 역추적 시 이중 정산을 방지한다.
-    4) 🚨 [Case 61, Case 65, Case 69 & Case 70 매도/0주 싸이클 종료 후 60.0초 타임쉴드 & 15.0초 그레이스 쉴드 동시 각인]
+    4) 🚨 [Case 61, Case 65, Case 69, Case 70 & Case 73 매도/0주 싸이클 종료 후 60.0초 타임쉴드 · 1층 공석 재장전 타임쉴드 클리어 · 15.0초 그레이스 쉴드 동시 각인]
     """
     st = context.ledger.get_state(TARGET_SYMBOL)
     buckets = buckets_from_dicts(st.get("buckets", []))
@@ -661,6 +668,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
             last_sell_fill_ts=now_empty_epoch,
             last_cycle_end_ts=now_empty_epoch,
             last_sell_gate_eval_ts=0.0,
+            last_reentry_eval_ts=0.0,
             sell_order_id="",
             ordered_qty=0,
             target_sell_price=0.0,
@@ -830,6 +838,8 @@ async def _commit_filled_sell_and_reanchor_ledger(
         "last_sell_gate_eval_ts": (
             0.0 if is_graduated_zero else now_sell_epoch
         ),
+        # MODIFIED [Case 73]: 매도 체결 직후 1층 공석 재장전 타임쉴드 시각을 0.0 으로 리셋하여 60초 매도타임쉴드 종료 즉시 재장전 검문 개시
+        "last_reentry_eval_ts": 0.0,
         "sell_order_id": "",
         "ordered_qty": 0,
         "target_sell_price": 0.0,
@@ -872,10 +882,21 @@ async def _commit_filled_sell_and_reanchor_ledger(
             )
             u_wma_p = safe_float(wma_info.get("upper_wma_price"), 0.0)
             u_wma_t = safe_float(wma_info.get("upper_wma_target_price"), 0.0)
-            note_str = (
-                f"📦 잔여 2~{u_cnt + 1}층({u_cnt}개층·{u_qty}주) 순수이평 ${u_wma_p:.2f}(목표 ${u_wma_t:.2f}) 보존 "
-                f"· 🛡️60초 타임쉴드 & 10분게이트 대기(기억저가 ${next_cycle_min_p:.2f} 잠금)"
-            )
+            rem_has_active_l1 = has_active_l1_bucket(rem_buckets)
+            if not rem_has_active_l1:
+                l2_cap_p = safe_float(
+                    wma_info.get("min_indiv_upper_price"),
+                    rem_buckets[0].book_price,
+                )
+                note_str = (
+                    f"📦 잔여 2~{u_cnt + 1}층({u_cnt}개층·{u_qty}주) 순수이평 ${u_wma_p:.2f}(목표 ${u_wma_t:.2f}) 보존 "
+                    f"· 🛡️60초 타임쉴드 후 1분 주기 1층재장전(2층상한 ${l2_cap_p:.2f} 이하) & 매도감시(기억저가 ${next_cycle_min_p:.2f} 잠금)"
+                )
+            else:
+                note_str = (
+                    f"📦 잔여 1층+상단({len(rem_buckets)}개층) 순수이평 ${u_wma_p:.2f}(목표 ${u_wma_t:.2f}) 보존 "
+                    f"· 🛡️60초 타임쉴드 & 10분게이트 대기(기억저가 ${next_cycle_min_p:.2f} 잠금)"
+                )
 
         await context.send_slim_alert(
             title=f"🔴 [SOXL 현재가 지정가 익절 체결 ({mode})] {sold_q}주 @ ${fill_p:.2f} ({r_sign}{net_rate:.2f}%)",

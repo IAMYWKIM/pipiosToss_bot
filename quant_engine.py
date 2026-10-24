@@ -5,14 +5,15 @@
 자투리 절약금 및 세후 실물 수익금 실시간 시드 풀 무리셋 연속 복리 산입 ·
 최종 확정 챔피언(🔥 03_7G_PURE_10_01 / 01_7L_STATIC_CYCLE_MIN) 보유 회차별 4단 와이드 점진 활주로
 (1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 및 1층 +1.50% / 2~7층 +1.00%) ·
-상단 그리드(2층 ~ 7층) 보유 중 1층 공석 시 10분 게이트 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 1층(REENTRY_1FL) 재장전 판정기 ·
+상단 그리드(2층 ~ 7층) 보유 중 1층 공석 시 60초(1분) 타임쉴드 주기 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 1층(REENTRY_1FL) 재장전 판정기 &
+현재가 > 2층 단가(min_upper_tier_price) 시 1층 > 2층 단가 역전 원천 차단(HOLD_PREVENT_INVERSION · Case 73) 가드 ·
 1층 ~ 7층 순수 원가 골디락스 멀티 그리드 관리(MAX_GRID_TIERS_7 = 7 : 1층 공격수 + 2~6층 개별 완충층[5개] + 통합 7층 본대[GRID_L7] ·
 REENTRY_1FL 독립 1층 배치 vs DIP_1FL 2~6층 개별 승격 및 8회차 이상 최상단 6층+7층 통합 7층 병합 ·
-수동 매수 시 단가 비교 오름차순 층간 스마트 편입 & 수동 매도 시 층별 순수원가 1:1 매칭 정산기 탑재 · Case 53 하드 캡핑 · Case 63, Case 69, Case 71, Case 72) ·
+수동 매수 시 단가 비교 오름차순 층간 스마트 편입 & 수동 매도 시 층별 순수원가 1:1 매칭 정산기 탑재 · Case 53 하드 캡핑 · Case 63, Case 69, Case 71, Case 72, Case 73) ·
 2층 ~ 7층 통합 이동평균(wma_2_to_7) 산출 및 3중 다중 익절 판정(① 1층 +1.50% / ② 2~6층 개별 및 통합 7층 +1.00% / ③ 2~7층 통합 이동평균 +1.00% · Case 71, Case 72) ·
 순수 실물 원가 무결성(book_price == actual_avg_price · 리앵커링 원가 차감 영구 폐기 · Case 69, Case 71) ·
-정적 기억 최저 매수가(cycle_min_buy_price) 잠금 및 당일 프리장~정규장 시드보호 패스(daily_seed_protect_pass_cnt) 요약 · TDD 검증' 코어 모듈 (Step 02 / 05)
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 72 완벽 준수
+정적 기억 최저 매수가(cycle_min_buy_price) 잠금 및 당일 프리장~정규장 시드보호 패스(daily_seed_protect_pass_cnt · Case 74) 요약 · TDD 검증' 코어 모듈 (Step 01 / 05)
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 74 완벽 준수
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ MAX_GRID_TIERS: int = MAX_GRID_TIERS_7
 # 타 모듈 AST 심볼 임포트 호환을 위해 MAX_GRID_TIERS_12 별칭을 7 로 동시 유지
 MAX_GRID_TIERS_12: int = MAX_GRID_TIERS_7
 
-# 🎯 4 & Case 59, Case 71, Case 72: 상단 그리드(2~7층) 보유 중 1층 공석 시 10분 게이트 눌림목/상승돌파 임계치(%)
+# 🎯 4 & Case 59, Case 71, Case 72, Case 73: 상단 그리드(2~7층) 보유 중 1층 공석 시 60초 주기 눌림목/상승돌파 임계치(%)
 REENTRY_PULLBACK_DROP_PCT: float = -1.00
 REENTRY_BREAKOUT_RISE_PCT: float = 1.00
 
@@ -59,7 +60,7 @@ REENTRY_BREAKOUT_RISE_PCT: float = 1.00
 @dataclass
 class StratumBucket:
     """
-    🎯 3 & Case 46 ~ 72:
+    🎯 3 & Case 46 ~ 74:
     SOXL 1층 ~ 7층 골디락스 멀티 그리드(1층 공격수 L1 / 2층 ~ 6층 개별 완충층 GRID_L2 ~ GRID_L6 / 통합 7층 본대 GRID_L7) 데이터 구조체.
     - qty              : 보유 정수 주식 수 (주)
     - book_price       : 목표 탈출 기준 단가 ($, 순수 원가 모드에서는 actual_avg_price 와 100% 동일)
@@ -393,7 +394,7 @@ def resolve_affordable_buy_qty(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 3] 보유 회차별 4단 와이드 점진 단차 & 하이브리드 1층 재장전 판정기 (🎯 2, 🎯 4 & Case 36 ~ 72)
+# [핵심 3] 보유 회차별 4단 와이드 점진 단차 & 하이브리드 1층 재장전 판정기 (🎯 2, 🎯 4 & Case 36 ~ 74)
 # ---------------------------------------------------------------------------
 def get_golden8_prog_thresholds(
     held_lots: int,
@@ -432,19 +433,34 @@ def evaluate_l2_only_hybrid_reentry_signal(
     live_price: float,
     anchor_price: float,
     l2_book_price: float = 0.0,
+    min_upper_tier_price: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    🎯 4 & Case 59, Case 67, Case 71, Case 72:
+    # MODIFIED [🎯 4 & Case 59, Case 67, Case 71, Case 72, Case 73]:
     1층이 실물 익절되어 장부에 상단 그리드(2층 ~ 7층)만 남아 1층이 공석일 때,
-    반등 고점에서의 이중 현금 소진을 막기 위해 회수 현금을 보유하다가 10분 매수 게이트에서:
-    - 조건 A (눌림목 재장전 : chg_from_exit <= -1.00%)
-    - 조건 B (상승돌파 재장전 : chg_from_exit >= +1.00%)
-    충족 시에만 상단 2층 ~ 7층 비병합 독립 실물 1층(REENTRY_1FL) 재장전을 승인한다.
+    매도 후 60.0초 타임쉴드 및 매 60.0초(1분) 타임쉴드 주기마다 호출되는 하이브리드 독립 1층 재장전 판정기:
+    1) 🛡️ [Case 73 단가 역전 원천 차단 가드 (HOLD_PREVENT_INVERSION · 후자)]:
+       실시간 현재가(lp)가 상단 최하단 층인 2층 단가(ceil_p = min_upper_tier_price)보다 높으면
+       (lp > ceil_p + 1e-6), 새로 매수할 1층 공격수 단가가 2층 단가보다 비싸지는 단가 역전(1층 > 2층) 및
+       고점 중복 매수를 막기 위해 즉시 매수를 패스(should_buy = False, signal_type = "HOLD_PREVENT_INVERSION")하고
+       60초 매도 모니터가 수익권에 들어선 2층(+1.00%)을 익절하도록 위임한다!
+    2) 🎯 [현재가 <= 2층 단가 안전 영역 내 눌림목(-1.00%) OR 상승돌파(+1.00%) 타점 판정]:
+       - 조건 A (눌림목 재장전 : chg_from_exit <= -1.00% & lp <= ceil_p) -> PULLBACK_RELOAD
+       - 조건 B (상승돌파 재장전 : chg_from_exit >= +1.00% & lp <= ceil_p) -> BREAKOUT_RELOAD
+       충족 시에만 상단 2층 ~ 7층 비병합 독립 실물 1층(REENTRY_1FL) 재장전을 승인한다.
     """
     lp = safe_float(live_price, 0.0)
     anc = safe_float(anchor_price, 0.0)
     b2_p = safe_float(l2_book_price, 0.0)
-    ref_anchor = anc if anc > 0.0 else (b2_p if b2_p > 0.0 else lp)
+    ceil_p = safe_float(min_upper_tier_price, 0.0)
+    if ceil_p <= 0.0 and b2_p > 0.0:
+        ceil_p = b2_p
+
+    ref_anchor = (
+        anc
+        if anc > 0.0
+        else (ceil_p if ceil_p > 0.0 else (b2_p if b2_p > 0.0 else lp))
+    )
 
     pullback_target_p = (
         round(ref_anchor * (1.0 + REENTRY_PULLBACK_DROP_PCT / 100.0), 2)
@@ -466,9 +482,23 @@ def evaluate_l2_only_hybrid_reentry_signal(
             "chg_from_exit_pct": 0.0,
             "pullback_target_price": pullback_target_p,
             "breakout_target_price": breakout_target_p,
+            "l2_ceiling_price": round(ceil_p, 4),
         }
 
     chg_from_exit_pct = ((lp - ref_anchor) / ref_anchor) * 100.0
+
+    # 🚨 [Case 73 핵심 방어 : 현재가 > 2층 단가(ceil_p) 시 1층 > 2층 단가 역전 원천 차단 (후자)]
+    if ceil_p > 0.0 and lp > (ceil_p + 1e-6):
+        return {
+            "should_buy": False,
+            "signal_type": "HOLD_PREVENT_INVERSION",
+            "ref_anchor": round(ref_anchor, 4),
+            "quota_ref_price": round(ref_anchor, 4),
+            "chg_from_exit_pct": round(chg_from_exit_pct, 2),
+            "pullback_target_price": pullback_target_p,
+            "breakout_target_price": breakout_target_p,
+            "l2_ceiling_price": round(ceil_p, 4),
+        }
 
     if chg_from_exit_pct <= REENTRY_PULLBACK_DROP_PCT:
         return {
@@ -479,6 +509,7 @@ def evaluate_l2_only_hybrid_reentry_signal(
             "chg_from_exit_pct": round(chg_from_exit_pct, 2),
             "pullback_target_price": pullback_target_p,
             "breakout_target_price": breakout_target_p,
+            "l2_ceiling_price": round(ceil_p, 4),
         }
 
     if chg_from_exit_pct >= REENTRY_BREAKOUT_RISE_PCT:
@@ -490,6 +521,7 @@ def evaluate_l2_only_hybrid_reentry_signal(
             "chg_from_exit_pct": round(chg_from_exit_pct, 2),
             "pullback_target_price": pullback_target_p,
             "breakout_target_price": breakout_target_p,
+            "l2_ceiling_price": round(ceil_p, 4),
         }
 
     return {
@@ -500,11 +532,12 @@ def evaluate_l2_only_hybrid_reentry_signal(
         "chg_from_exit_pct": round(chg_from_exit_pct, 2),
         "pullback_target_price": pullback_target_p,
         "breakout_target_price": breakout_target_p,
+        "l2_ceiling_price": round(ceil_p, 4),
     }
 
 
 # ---------------------------------------------------------------------------
-# [핵심 4 · MODIFIED Case 63, Case 71 & Case 72] 1층 ~ 7층 골디락스 순수 멀티 그리드 배치(단가 비교 층간 편입 포함) & 매도 층 원가 매칭 정산기
+# [핵심 4 · MODIFIED Case 63, Case 71 ~ 73] 1층 ~ 7층 골디락스 순수 멀티 그리드 배치(단가 비교 층간 편입 포함) & 매도 층 원가 매칭 정산기
 # ---------------------------------------------------------------------------
 def vrev_add_quota_lot_and_merge_2tier(
     queue: Sequence[StratumBucket],
@@ -515,19 +548,20 @@ def vrev_add_quota_lot_and_merge_2tier(
     max_tiers: int = MAX_GRID_TIERS_7,
 ) -> List[StratumBucket]:
     """
-    🎯 3 & 🎯 4 & Case 46 ~ 72 (함수명은 타 모듈 AST 호환을 위해 유지하되 내부는 1~7층 골디락스 멀티 그리드로 작동):
+    🎯 3 & 🎯 4 & Case 46 ~ 74 (함수명은 타 모듈 AST 호환을 위해 유지하되 내부는 1~7층 골디락스 멀티 그리드로 작동):
     신규 정량 매수 체결 시 최대 7개 지층(1층 공격수 + 2~6층 개별 완충층[5개] + 통합 7층 본대[GRID_L7])을 관리하는 핵심 함수:
     1) 기존 보유 지층이 없을 때(len(existing) == 0):
        신규 매수분을 단일 1층([new_l1])으로 생성한다.
-    2) 🚨 Case 59, Case 71 & Case 72 (상단 2층 ~ 7층 보유 중 1층 공석 상태에서 REENTRY_1FL 독립 1층 재장전):
+    2) 🚨 Case 59, Case 71, Case 72 & Case 73 (상단 2층 ~ 7층 보유 중 1층 공석 상태에서 REENTRY_1FL 독립 1층 재장전):
        1층이 익절되어 장부에 상단 그리드(not has_active_l1_bucket(existing))만 남아 있을 때,
-       10분 게이트 눌림(-1.0%)/돌파(+1.0%)로 재장전한 실물 1층(lot_type == "REENTRY_1FL")이 체결되면:
+       60초(1분) 주기 재장전 모니터(현재가 <= 2층 단가 상한 보장)에서 눌림(-1.0%)/돌파(+1.0%)로 재장전한
+       실물 1층(lot_type == "REENTRY_1FL")이 체결되면:
        기존 상단 2층 ~ 7층(GRID_L2 ~ GRID_L7)을 전혀 병합하거나 이동시키지 않고 그대로 유지한 채,
        맨 앞(index 0)에 신규 1층(new_l1)을 독립 배치하여 [new_l1(REENTRY_1FL), GRID_L2, ..., GRID_Lk] 를 반환한다!
-    3) 🚨 NEW [Case 63 & Case 72 : 매수 가격 비교 기반 1층 ~ 7층 사이 오름차순 층간 스마트 편입]:
+    3) 🚨 [Case 63 & Case 72 : 매수 가격 비교 기반 1층 ~ 7층 사이 오름차순 층간 스마트 편입]:
        - 신저가 추매(DIP_1FL / QUOTA_L1)로 신규 매수가(pure_p)가 기존 1층 단가 이하일 때는
          신규 매수분을 1층(index 0)에 배치하고 기존 지층들을 2층 ~ 6층 개별 승격(7층 초과분은 통합 7층 합병)한다.
-       - 수동 추가 매수(MANUAL_SYNC_L1) 등으로 신규 매수가(pure_p)가 기존 1층보다 높고 상단 지층들 사이의 가격일 때는
+       - 수동 추가 매수(MANUAL_SYNC_L1) 등으로 신규 매수가(pure_p)가 기존 최저단가 층보다 높고 상단 지층들 사이의 가격일 때는
          1층 ~ 7층 단가(book_price)와 대소를 비교하여 크거나 작은 층 사이(저가 1층 ➔ 고가 7층 오름차순)에 정확히 중간 편입시키고,
          가장 단가가 낮은 최하단 층을 1층 공격수로 유지하며 7층 초과 시 최상단 고가 층(6층+7층)만 통합 7층(GRID_L7)으로 합병한다!
     """
@@ -564,7 +598,7 @@ def vrev_add_quota_lot_and_merge_2tier(
 
     eff_max_tiers = max(2, safe_int(max_tiers, MAX_GRID_TIERS_7))
 
-    # 🚨 Case 59, Case 71 & Case 72: 상단 그리드(2층 ~ 7층)만 보유 중(1층 공석) REENTRY_1FL 유입 시 상단 비병합 독립 1층 배치!
+    # 🚨 Case 59, Case 71, Case 72 & Case 73: 상단 그리드(2층 ~ 7층)만 보유 중(1층 공석) REENTRY_1FL 유입 시 상단 비병합 독립 1층 배치!
     if not has_active_l1_bucket(existing) and tag == "REENTRY_1FL":
         preserved_uppers = relabel_upper_grid_tiers(
             existing, max_tiers=eff_max_tiers
@@ -592,8 +626,8 @@ def vrev_add_quota_lot_and_merge_2tier(
         )
         return [new_l1, merged_l2]
 
-    # 🚨 NEW [Case 63 & Case 72 : 단가 비교 오름차순(저가 1층 ➔ 고가 7층) 층간 중간 편입]
-    # 신규 매수 단가(pure_p)가 기존 최저가 층(existing[0].book_price)보다 높은 경우(예: 수동 추매 등),
+    # 🚨 [Case 63 & Case 72 : 단가 비교 오름차순(저가 1층 ➔ 고가 7층) 층간 중간 편입]
+    # 신규 매수 단가(pure_p)가 기존 최저가 층(existing[0].book_price)보다 높은 경우(수동 추매 등),
     # 기존 1층 ~ 7층 단가와 비교하여 자기 가격에 맞는 층 사이에 정확히 편입시킨다!
     if pure_p > existing[0].book_price + 1e-6:
         combined = list(existing) + [new_l1]
@@ -674,7 +708,9 @@ def match_and_remove_sold_buckets_7tier(
 
         if rem_to_cut >= b.qty:
             sold_buckets.append(b)
-            sold_tier_parts.append(f"{tier_label}({b.qty}주@${b.book_price:.2f})")
+            sold_tier_parts.append(
+                f"{tier_label}({b.qty}주@${b.book_price:.2f})"
+            )
             rem_to_cut -= b.qty
             if idx == 0 and was_active_l1:
                 removed_first_tier_completely = True
@@ -770,8 +806,8 @@ def compute_upper_2_to_12_moving_avg(
     - 활성 1층(has_active_l1_bucket == True)이 존재하면 buckets[1:] (2층 ~ 7층)을 상단 그리드로 집계하고,
     - 1층이 익절되어 공석(has_active_l1_bucket == False)이면 buckets[0:] 전체를 상단 그리드(2층 ~ 7층)로 집계한다.
     - 상단 2층 ~ 7층의 통합 이동평균 단가(upper_wma_price = sum(actual_cost_usd) / sum(qty))와
-      +1.00% 일괄 익절 목표가(upper_wma_target_price), 그리고 상단 개별 층 중 가장 낮은 단가 층의
-      +1.00% 개별 익절 목표가(min_indiv_upper_target_price)를 함께 산출하여 반환한다.
+      +1.00% 일괄 익절 목표가(upper_wma_target_price), 그리고 상단 개별 층 중 가장 낮은 단가 층(2층)의
+      단가(min_indiv_upper_price)와 +1.00% 개별 익절 목표가(min_indiv_upper_target_price)를 함께 산출하여 반환한다.
     """
     valid = [
         b
@@ -1077,12 +1113,13 @@ def summarize_stratum_portfolio(
     live_price: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    🎯 1 ~ 🎯 5 & Case 59, 60, 67, 69, 71, 72:
+    🎯 1 ~ 🎯 5 & Case 59, 60, 67, 69, 71, 72, 73, 74:
     원장 상태(state_dict)와 현재가(live_price)를 받아:
     - 1층(활성 공격수) 및 상단 2층 ~ 6층 개별 완충층 · 통합 7층 본대(GRID_L2 ~ GRID_L7) 현황
     - 상단 2층 ~ 7층 통합 이동평균 단가(upper_wma_price) 및 +1.00% 일괄 익절 목표가(l2_target_price / upper_wma_target_price)
-    - 상단 2층 ~ 7층 중 최저 단가 개별 층(min_indiv_upper_price) 및 +1.00% 개별 익절 목표가(min_indiv_upper_target_price)
-    - 상단 그리드 단독 보유(1층 공석, is_l2_only_anti_bloat) 시 직전 익절가 대비 눌림(-1.0%)/돌파(+1.0%) 타점
+    - 상단 2층 ~ 7층 중 최저 단가 개별 층(2층, min_indiv_upper_price) 및 +1.00% 개별 익절 목표가(min_indiv_upper_target_price)
+    - 상단 그리드 단독 보유(1층 공석, is_l2_only_anti_bloat) 시 60초(1분) 주기 직전 익절가 대비 눌림(-1.0%)/돌파(+1.0%) 타점 및
+      2층 단가 상한선(l2_ceiling_price = min_indiv_upper_price · Case 73 역전 차단 가드)
     - 활성 1층 보유 중 정적 기억 사이클 최저 매수가(cycle_min_buy_price) 기준 4단 와이드 신저가 매수 트리거 가격
     - Case 67 min(budget_cap_qty, anchor_quota_qty) 캡핑 정량 및 회계 항등식 기반 무리셋 연속 복리 자산 요약을 반환한다.
     """
@@ -1185,10 +1222,16 @@ def summarize_stratum_portfolio(
     cycle_min_p = safe_float(st.get("cycle_min_buy_price"), 0.0)
     ratchet_p = safe_float(st.get("ratchet_anchor_price"), anchor_p)
 
+    # 🚨 Case 73: 1층 공석 시 상단 최하단 층(2층, min_indiv_upper_price)을 상한 가드로 전달!
     reentry_sig = evaluate_l2_only_hybrid_reentry_signal(
         live_price=lp,
         anchor_price=anchor_p,
-        l2_book_price=upper_wma_price,
+        l2_book_price=(
+            min_indiv_upper_price
+            if min_indiv_upper_price > 0.0
+            else upper_wma_price
+        ),
+        min_upper_tier_price=min_indiv_upper_price,
     )
     reentry_ref_anchor = safe_float(reentry_sig.get("ref_anchor"), anchor_p)
     reentry_pullback_price = safe_float(
@@ -1200,8 +1243,16 @@ def summarize_stratum_portfolio(
     chg_from_reentry_anchor_pct = safe_float(
         reentry_sig.get("chg_from_exit_pct"), 0.0
     )
+    l2_ceiling_price = safe_float(
+        reentry_sig.get("l2_ceiling_price"), min_indiv_upper_price
+    )
+    reentry_signal_type = str(
+        reentry_sig.get("signal_type") or "HOLD_WAIT_GATE"
+    )
 
-    # 🚨 Case 60 & Case 72: 활성 1층 보유 중 추가 매수(DIP_1FL) 기준가는 반드시 정적 기억 최저 매수가(cycle_min_buy_price)!
+    # 🚨 Case 60, Case 67 & Case 72:
+    # - 보유 지층이 존재할 때 추가 매수(DIP_1FL) 기준가는 정적 기억 최저 매수가(cycle_min_buy_price)!
+    # - 0주 상태(not buckets)일 때는 sniper_plugin.py 의 0주 진입 로직과 동일하게 직전 anchor_p 가 존재하면 이를 우선 참조한다!
     if buckets:
         candidates = [
             p
@@ -1212,7 +1263,10 @@ def summarize_stratum_portfolio(
             min(candidates) if candidates else buckets[0].book_price
         )
     else:
-        active_buy_anchor = lp if lp > 0.0 else max(anchor_p, 1.0)
+        # MODIFIED [Case 67]: 0주 상태에서 직전 anchor_p 존재 시 우선 참조하여 실전 주문 정량과 100% 일치
+        active_buy_anchor = (
+            anchor_p if anchor_p > 0.0 else (lp if lp > 0.0 else 1.0)
+        )
 
     trigger_buy_price = (
         round(active_buy_anchor * (1.0 + drop_buy_pct / 100.0), 2)
@@ -1237,7 +1291,10 @@ def summarize_stratum_portfolio(
 
     cost_equity = free_cash + actual_invested
     if len(buckets) == 0:
-        ref_for_quota = lp if lp > 0.0 else max(anchor_p, 1.0)
+        # MODIFIED [Case 67]: 0주 첫 진입 시 sniper_plugin.py 와 동일하게 anchor_p 우선 참조
+        ref_for_quota = (
+            anchor_p if anchor_p > 0.0 else (lp if lp > 0.0 else 1.0)
+        )
     elif is_l2_only:
         ref_for_quota = (
             reentry_ref_anchor
@@ -1289,7 +1346,7 @@ def summarize_stratum_portfolio(
     indiv_grid_sell_cnt = safe_int(st.get("indiv_grid_sell_cnt"), 0)
     wma_grad_sell_cnt = safe_int(st.get("wma_grad_sell_cnt"), 0)
 
-    # MODIFIED: 🛡️ 시드보호 패스는 당일 프리장 ~ 정규장(04:07 ~ 16:00 EST) 일일 주기 카운터(daily_seed_protect_pass_cnt)로 바인딩!
+    # MODIFIED [Case 74]: 🛡️ 시드보호 패스는 당일 프리장 ~ 정규장(04:07 ~ 16:00 EST) 일일 주기 카운터(daily_seed_protect_pass_cnt)로 바인딩!
     daily_seed_protect_pass_cnt = safe_int(
         st.get("daily_seed_protect_pass_cnt"), 0
     )
@@ -1355,6 +1412,8 @@ def summarize_stratum_portfolio(
         "reentry_pullback_price": reentry_pullback_price,
         "reentry_breakout_price": reentry_breakout_price,
         "chg_from_reentry_anchor_pct": chg_from_reentry_anchor_pct,
+        "l2_ceiling_price": round(l2_ceiling_price, 4),
+        "reentry_signal_type": reentry_signal_type,
         "next_target_qty": next_target_qty,
         "anchor_quota_qty": anchor_quota_qty,
         "budget_cap_qty": budget_cap_qty,
@@ -1372,7 +1431,7 @@ def summarize_stratum_portfolio(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 72 & 1~7층 순수 멀티 그리드 전수 검증)
+# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 74 & 1~7층 순수 멀티 그리드 전수 검증)
 # ---------------------------------------------------------------------------
 def run_quant_engine_tdd() -> bool:
     """
@@ -1380,7 +1439,8 @@ def run_quant_engine_tdd() -> bool:
     4단 와이드 활주로(-1.0% / -2.0% / -3.5% / -5.5%),
     1층 ~ 6층 개별 완충층 보존 및 8회차 최상단(6층+7층 ➔ 통합 7층 GRID_L7) 병합(Case 72),
     1층(+1.50%) / 2~7층 개별(+1.00%) / 2~7층 통합 이동평균(+1.00%) 3중 다중 익절 판정(Case 71, 72),
-    상단 그리드 단독 보유(1층 공석) 시 눌림/돌파 독립 1층 재장전(Case 59), 정적 기억저가 잠금(Case 60, 72),
+    상단 그리드 단독 보유(1층 공석) 시 2층 단가 상한 역전 차단(HOLD_PREVENT_INVERSION · Case 73) 및
+    눌림/돌파 독립 1층 재장전(Case 59, 73), 정적 기억저가 잠금(Case 60, 72), 당일 시드패스 바인딩(Case 74),
     단가 비교 기반 층간 스마트 편입 및 매도 층 원가 매칭 정산(match_and_remove_sold_buckets_7tier)을 전수 검증한다.
     """
     # 1) 8% 황금정량 및 Case 67 min(budget_cap_qty, anchor_quota_qty) 캡핑 검증
@@ -1393,6 +1453,23 @@ def run_quant_engine_tdd() -> bool:
     assert q_dip == 18 and q_brk == 17 and (q_brk * 86.00) <= bud_c67, (
         f"TDD 실패(Case 67): q_dip={q_dip}, q_brk={q_brk}"
     )
+
+    # NEW [Case 67]: 0주 상태에서 직전 anchor_price($85.00)가 존재하고 현재가($80.00)가 낮을 때 정량 일치 검증
+    mock_zero_st = {
+        "buckets": [],
+        "initial_seed_usd": 10000.0,
+        "anchor_price": 85.00,
+        "cumulative_realized_net_usd": 0.0,
+    }
+    zero_sum = summarize_stratum_portfolio(mock_zero_st, live_price=80.00)
+    q_zero_order, _ = compute_golden8_quota_qty(
+        85.00, 10000.0, 10000.0, "COMP_08PCT", exec_price=80.00
+    )
+    assert (
+        zero_sum["anchor_quota_qty"] == 9
+        and zero_sum["budget_cap_qty"] == 10
+        and zero_sum["next_target_qty"] == q_zero_order == 9
+    ), f"TDD 실패(Case 67 0주 정량 일치): {zero_sum}"
 
     # 2) 4단 와이드 활주로 단차 검증
     d1, s1, s2 = get_golden8_prog_thresholds(1, "WIDE_RUNWAY")
@@ -1451,6 +1528,41 @@ def run_quant_engine_tdd() -> bool:
         "TDD 실패(Case 71/72): 1층 익절 후 1층 공석(상단 그리드만 보유) 상태 판별 오류"
     )
 
+    # 5) 🚨 Case 73: 1층 공석 상태에서 현재가 > 2층 단가($85.00)일 때 HOLD_PREVENT_INVERSION 단가 역전 차단 검증
+    sig_inv = evaluate_l2_only_hybrid_reentry_signal(
+        live_price=85.50,
+        anchor_price=83.41,
+        l2_book_price=85.00,
+        min_upper_tier_price=85.00,
+    )
+    assert (
+        sig_inv["should_buy"] is False
+        and sig_inv["signal_type"] == "HOLD_PREVENT_INVERSION"
+        and abs(sig_inv["l2_ceiling_price"] - 85.00) < 1e-4
+    ), f"TDD 실패(Case 73 단가 역전 차단): {sig_inv}"
+
+    sig_brk_ok = evaluate_l2_only_hybrid_reentry_signal(
+        live_price=84.30,
+        anchor_price=83.41,
+        l2_book_price=85.00,
+        min_upper_tier_price=85.00,
+    )
+    assert (
+        sig_brk_ok["should_buy"] is True
+        and sig_brk_ok["signal_type"] == "BREAKOUT_RELOAD"
+    ), f"TDD 실패(Case 73 2층 이하 안전 돌파 승인): {sig_brk_ok}"
+
+    sig_pull_ok = evaluate_l2_only_hybrid_reentry_signal(
+        live_price=82.50,
+        anchor_price=83.41,
+        l2_book_price=85.00,
+        min_upper_tier_price=85.00,
+    )
+    assert (
+        sig_pull_ok["should_buy"] is True
+        and sig_pull_ok["signal_type"] == "PULLBACK_RELOAD"
+    ), f"TDD 실패(Case 73 눌림목 재장전 승인): {sig_pull_ok}"
+
     # 1층 공석 상태에서 눌림목($80.50)으로 REENTRY_1FL 재장전 시 상단 [GRID_L2, GRID_L3] 비병합 독립 1층 배치!
     reloaded_grid = vrev_add_quota_lot_and_merge_2tier(
         rem_uppers, 10, 80.50, 805.0, "REENTRY_1FL"
@@ -1473,7 +1585,7 @@ def run_quant_engine_tdd() -> bool:
         and res_grad["hit_wma_grad"]
     ), f"TDD 실패(Case 71/72 2~7층 이동평균 일괄졸업): {res_grad}"
 
-    # 5) Case 60 & Case 72 정적 기억 최저가($80.00) 잠금 및 당일 시드보호 패스 바인딩 검증
+    # 6) Case 60 & Case 72 정적 기억 최저가($80.00) 잠금 및 Case 74 당일 시드보호 패스 바인딩 검증
     mock_st = {
         "buckets": buckets_to_dicts(reloaded_grid),
         "initial_seed_usd": 10000.0,
@@ -1491,10 +1603,11 @@ def run_quant_engine_tdd() -> bool:
         sum_info["held_tiers"] == 3
         and sum_info["upper_tier_count"] == 2
         and abs(sum_info["upper_wma_price"] - 87.50) < 1e-4
+        and abs(sum_info["l2_ceiling_price"] - 85.00) < 1e-4
         and sum_info["seed_protect_pass_cnt"] == 7
-    ), "TDD 실패(Case 72): 상단 2~7층 이동평균 또는 당일 시드패스 요약 오류"
+    ), "TDD 실패(Case 72/73/74): 상단 2~7층 이동평균 또는 당일 시드패스 요약 오류"
 
-    # 6) NEW: 단가 비교 층간 스마트 중간 편입($80.50 < $84.50 < $85.00 < $90.00) & 매도 층 원가 매칭 정산 검증
+    # 7) 단가 비교 층간 스마트 중간 편입($80.50 < $84.50 < $85.00 < $90.00) & 매도 층 원가 매칭 정산 검증
     mid_inserted = vrev_add_quota_lot_and_merge_2tier(
         reloaded_grid, 10, 84.50, 845.0, "MANUAL_SYNC_L1"
     )
@@ -1520,6 +1633,6 @@ def run_quant_engine_tdd() -> bool:
     ), f"TDD 실패(수동 매도 층별 원가 매칭 정산): {match_res}"
 
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 🔥 03_7G_PURE_10_01 (1~6층 개별 완충층 + 통합 7층 본대 · 층간 비교 편입 & 원가 매칭 정산 Case 59~72) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 🔥 03_7G_PURE_10_01 (1~6층 개별 완충층 + 통합 7층 본대 · 1층 공석 2층 상한 역전 차단 Case 59~74) 검증 완료"
     )
     return True

@@ -3,7 +3,7 @@
 # MODIFIED: plugin_updater.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
 9대 코어 모듈 프리플라이트 컴파일 · AST 심볼 교차 검증 · 4배수 선제 스냅 치유기 · 텔레그램 잔류 큐 소각 ·
-폴더별 원장/환경변수 스냅샷 철벽 보존 및 무인 Git 업데이트 코어 모듈 (Step 03 / 06)
+폴더별 원장/환경변수 스냅샷 철벽 보존 및 무인 Git 업데이트 코어 모듈 (Step 03 / 05)
 - 제1헌법: 모든 파일 I/O 및 git/python 서브프로세스 실행을 asyncio.to_thread 로 비동기 격리 및 타임아웃 적용
 - 제3헌법: 구버전 폐기 파일(daymarket_sim_plugin.py, whipsaw_plugin.py, state_SOXS.json 등) 디스크 영구 소각
 - Case 07: 평일 04:00 ~ 16:05 EST 장중 백그라운드 무인 업데이트 재기동 전면 차단 및 systemd ExecStartPre 장중 락다운 지원
@@ -18,7 +18,8 @@
 - 🚨 [NEW · Case 68 폴더 위치(base_dir) 기반 격리 & git reset --hard 원장/환경변수 증발 100% 차단 쉴드]:
   1) "/home/pipiosToss" 고정 경로 하드코딩 100% 영구 제거 -> 오직 현재 실행 폴더(base_dir)의 .env 와 원장만 참조
   2) git reset --hard 실행 직전 해당 폴더 내 모든 원장(*ledger*.json, ledger_backups/*.json)과 환경설정(.env*, *config*.json)을
-     메모리 및 백업 금고에 스냅샷 보존하고, git reset --hard 직후 0.001초 내에 즉시 원자적 원상 복원하여
+     메모리 및 백업 금고에 스냅샷 보존하고, git reset --hard 직후 0.001초 내에 즉시 원자적 원상 복원
+     (git rm --cached --ignore-unmatch soxl_stratum_ledger.json 병행)하여
      장외 자동 업데이트로 인한 어제 기록 초기화 및 타 폴더 원장 덮어쓰기 사고를 물리적으로 영구 봉쇄!
 """
 
@@ -655,7 +656,21 @@ def _execute_git_pull_and_preflight_sync(
             _restore_protected_local_files_sync(
                 target_dir, protected_snapshots
             )
-            # Git 인덱스가 로컬 원장 변경을 추적하지 않도록 assume-unchanged 설정 (실패해도 무해)
+            # MODIFIED [Case 68 ③번]: git rm --cached --ignore-unmatch 및 assume-unchanged 병행으로 Git 인덱스 원장 추적 영구 해제!
+            try:
+                _run_cmd_sync(
+                    [
+                        "git",
+                        "rm",
+                        "--cached",
+                        "--ignore-unmatch",
+                        "soxl_stratum_ledger.json",
+                    ],
+                    cwd=target_dir,
+                    timeout_sec=5.0,
+                )
+            except Exception:
+                pass
             try:
                 _run_cmd_sync(
                     [
