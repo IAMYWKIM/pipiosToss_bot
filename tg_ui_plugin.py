@@ -11,16 +11,14 @@
   2) 기동 직후 _flush_stale_updates_on_startup() 에서 조건 없이 큐의 마지막 update_id 까지 일괄 소각(Ack)
   3) /update 실행 시 오프셋 선행 확정 후 신규 커밋(changed == True)이 있을 때만 재기동(os._exit(0))하고,
      이미 최신 코드(changed == False)일 때는 재기동 없이 무중단 가동 유지!
-- Case 15 & Case 16: 사용자 중심 초슬림 모바일 가독성 최적화(불필요한 내부 시스템 메타데이터 제거,
-  요청된 줄바꿈 및 7칸 들여쓰기 엄격 준수), html.escape 전역 적용, 기동 완료 시 "✅ 서버가 정상 작동 중입니다." 단일 라인 타전
-- Case 64: 전술 제어반(/settlement) 내 30분 옵션 완전 제거 -> 오직 [작동 ON/OFF 버튼]과 [시드머니 설정 버튼] 2가지 옵션만 유지
-- Case 65, Case 66, Case 70, Case 71 & Case 72:
-  1) /avwap 레이더 내 양방향 60초 타임쉴드 및 보유 중 매 60초 주기 매도 모니터 타임쉴드 잔여 시간과 4단 와이드 활주로 실시간 표출!
-  2) 최종 확정 챔피언 🔥 03_7G_PURE_10_01 의 1층(공격수) + 2층 ~ 6층(개별 완충층) + 통합 7층(본대)
-     순수 원가 그리드 현황, 2층 ~ 7층 통합 이동평균 단가(upper_wma_price) 및 +1.00% 일괄 졸업 목표가, 개별 층 +1.00% 익절 목표가 실시간 표출!
-- Case 67: /avwap 레이더 및 /settlement 전술 제어반에서 차기 8% 정량 표출 시
-  min(1회분 예산 상한 주수 budget_cap_qty, 기준가 고정 정량 anchor_quota_qty) 캡핑 상태를 실시간 반영!
-- Case 68: 폴더 위치(base_dir) 기반 격리 동작 유지 & 평시 숫자 오입력 시드 변조 잠금
+- Case 15 & Case 16: 사용자 중심 초슬림 모바일 가독성 최적화, 문단 하단 2중 중복 인라인 네비게이션 버튼 전면 제거
+  (하단 고정 키보드 단일 유지), 기동 완료 시 "✅ 서버가 정상 작동 중입니다." 단일 라인 타전
+- Case 02 & Case 64:
+  1) 전술 제어반(/settlement) 내 30분 옵션 및 중복 네비게이션 버튼 완전 제거 -> 오직 [작동 ON/OFF 버튼]과 [시드머니 설정 버튼] 2가지 옵션만 유지
+  2) 보유 지층(buckets)을 날려버리는 /reset 기능을 사용자 메뉴 및 명령어에서 전면 차단하고,
+     보유 주식 지층(1~7층 단가·수량·정적 기억저가)과 기준 시드머니는 100% 보존한 채 누적 실현수익만 0점으로 초기화하여
+     설정된 기준 시드머니(예: $10,000 또는 $19,000)의 8% 정량 투입으로 복귀시키는 `/reset_profit` 전용 기능으로 대체!
+- Case 65 ~ Case 72 완벽 준수
 """
 
 from __future__ import annotations
@@ -152,7 +150,7 @@ def _format_case67_quota_badge(summary: Dict[str, Any]) -> str:
 
 def _build_main_reply_keyboard() -> Dict[str, Any]:
     """
-    텔레그램 하단 고정 퀵 메뉴 키보드
+    텔레그램 하단 고정 퀵 메뉴 키보드 (is_persistent=True)
     """
     return {
         "keyboard": [
@@ -172,27 +170,21 @@ def _build_main_reply_keyboard() -> Dict[str, Any]:
     }
 
 
-def _build_radar_inline_keyboard() -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🔄 레이더 갱신", "callback_data": "cmd_avwap"},
-                {"text": "📜 지층 지시서", "callback_data": "cmd_sync"},
-            ],
-            [
-                {"text": "⚙️ 전술 제어반", "callback_data": "cmd_settlement"},
-                {"text": "⬅️ 메인 메뉴", "callback_data": "cmd_start"},
-            ],
-        ]
-    }
+def _build_radar_inline_keyboard() -> Optional[Dict[str, Any]]:
+    """
+    # MODIFIED: 하단 고정 메뉴(_build_main_reply_keyboard)와 2중으로 중복 출력되던
+    문단 아래 인라인 네비게이션 버튼을 전면 비활성화(None 반환)한다.
+    """
+    return None
 
 
 def _build_settlement_inline_keyboard(is_active: bool) -> Dict[str, Any]:
     """
-    🚨 Case 64:
-    전술 제어반(/settlement)에는 30분 옵션 없이 오직:
+    # MODIFIED [Case 64 엄수 & 하단 중복 메뉴 제거]:
+    전술 제어반(/settlement)에는 하단 고정 메뉴와 중복되는 [스나이퍼 레이더 / 지층 지시서] 버튼을 제거하고,
+    오직:
     1) [작동 ON / OFF 전환 버튼]
-    2) [시드머니 설정 버튼]
+    2) [기준 시드머니($) 설정 버튼]
     2가지 핵심 조작 옵션만 표출한다!
     """
     power_label = (
@@ -211,10 +203,6 @@ def _build_settlement_inline_keyboard(is_active: bool) -> Dict[str, Any]:
                     "callback_data": "prompt_seed_input",
                 },
             ],
-            [
-                {"text": "🔫 스나이퍼 레이더", "callback_data": "cmd_avwap"},
-                {"text": "📜 지층 지시서", "callback_data": "cmd_sync"},
-            ],
         ]
     }
 
@@ -228,7 +216,7 @@ def build_start_schedule_message(
     context: Optional[Any] = None,
 ) -> str:
     """
-    # MODIFIED: 사용자 중심 초슬림 /start 메인 메뉴 메시지 (요청된 줄바꿈·7칸 공백·빈 줄 100% 일치)
+    # MODIFIED: /reset 을 메뉴에서 완전 삭제하고 그 자리에 /reset_profit 만 배치
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     dst_str = _get_dst_badge(dt_now)
@@ -247,7 +235,7 @@ def build_start_schedule_message(
         "⚙️ /settlement : 전술 제어반",
         "       (작동 ON/OFF · 시드머니 설정)",
         "",
-        "🧹 /reset : 지층 원장 0점 초기화",
+        "🧹 /reset_profit : 실현수익 0점 초기화",
         "",
         "🚀 /update : 최신 코드 업데이트",
     ]
@@ -345,7 +333,7 @@ def build_avwap_radar_message(
     now_est: Optional[datetime] = None,
 ) -> str:
     """
-    # MODIFIED: 📡 /avwap 사용자 중심 초슬림 레이더 메시지 생성 (불필요한 VWAP/5MA/이평졸업 줄 제거 및 줄바꿈 분리)
+    # MODIFIED: 📡 /avwap 사용자 중심 초슬림 레이더 메시지 생성
     """
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     met = refresh_metrics_with_live_tick(metrics, live_price, now_est=dt_now)
@@ -767,7 +755,7 @@ class TelegramCommandController:
         )
 
     # -----------------------------------------------------------------------
-    # 실시간 시세/잔고 최신화 후 각 관제 보드 렌더링
+    # 실시간 시세/잔고 최신화 후 각 관제 보드 렌더링 (문단 하단 중복 인라인 키보드 제거)
     # -----------------------------------------------------------------------
     async def _refresh_live_price_and_metrics(
         self,
@@ -799,6 +787,9 @@ class TelegramCommandController:
     async def _render_and_send_avwap(
         self, chat_id: str, edit_msg_id: Optional[int] = None
     ) -> None:
+        """
+        # MODIFIED: 하단 고정 메뉴와 중복되는 문단 아래 인라인 버튼 부착 제거(reply_markup=None)
+        """
         live_p, met = await self._refresh_live_price_and_metrics()
         st = self.context.ledger.get_state(TARGET_SYMBOL)
         msg = build_avwap_radar_message(
@@ -812,12 +803,15 @@ class TelegramCommandController:
             chat_id=chat_id,
             message_id=edit_msg_id,
             text=msg,
-            reply_markup=_build_radar_inline_keyboard(),
+            reply_markup=None,
         )
 
     async def _render_and_send_sync(
         self, chat_id: str, edit_msg_id: Optional[int] = None
     ) -> None:
+        """
+        # MODIFIED: 하단 고정 메뉴와 중복되는 문단 아래 인라인 버튼 부착 제거(reply_markup=None)
+        """
         now_est = datetime.now(EST_TZ)
         live_p, _ = await self._refresh_live_price_and_metrics()
         holdings_map, fetch_ok = (
@@ -855,7 +849,7 @@ class TelegramCommandController:
             chat_id=chat_id,
             message_id=edit_msg_id,
             text=msg,
-            reply_markup=_build_radar_inline_keyboard(),
+            reply_markup=None,
         )
 
     async def _render_and_send_settlement(
@@ -920,6 +914,70 @@ class TelegramCommandController:
         )
         return True
 
+    async def _reset_realized_profit_only(self, chat_id: str) -> None:
+        """
+        # NEW: 보유 중인 주식 지층(buckets · 1~7층 개별 단가 · 정적 기억저가 cycle_min_buy_price)과
+        설정된 기준 시드머니(initial_seed_usd)는 100% 보존하고, 오직 누적/당일 세후 실현수익금 및
+        자투리 절약금·카운터 통계만 0점으로 초기화하여 설정된 기준 시드머니의 8% 정량 투입으로 복귀시킨다.
+        """
+        st_reset = await self.context.ledger.update_state(
+            TARGET_SYMBOL,
+            cumulative_realized_gross_usd=0.0,
+            cumulative_realized_fee_usd=0.0,
+            cumulative_realized_net_usd=0.0,
+            daily_realized_net_usd=0.0,
+            cumulative_leftover_saved_usd=0.0,
+            daily_leftover_saved_usd=0.0,
+            seed_protect_pass_cnt=0,
+            daily_seed_protect_pass_cnt=0,
+            extra_13plus_buy_events=0,
+            total_buy_events=0,
+            daily_buy_events=0,
+            total_sell_events=0,
+            total_sold_shares=0,
+            win_sell_events=0,
+            daily_sell_events=0,
+            indiv_grid_sell_cnt=0,
+            daily_indiv_grid_sell_cnt=0,
+            wma_grad_sell_cnt=0,
+            daily_wma_grad_sell_cnt=0,
+            reanchor_cnt=0,
+            daily_reanchor_cnt=0,
+            cumulative_reanchor_drop_usd=0.0,
+        )
+        snap_fn = getattr(
+            self.context.ledger, "create_daily_backup_snapshot", None
+        )
+        if callable(snap_fn):
+            try:
+                await snap_fn()
+            except Exception:
+                pass
+
+        self.context.wakeup_event.set()
+        live_p, _ = await self._refresh_live_price_and_metrics()
+        summary = summarize_stratum_portfolio(st_reset, live_price=live_p)
+        init_seed = safe_float(summary.get("initial_seed_usd"), 10000.0)
+        free_cash = safe_float(summary.get("free_cash_usd"), 0.0)
+        next_bud = safe_float(
+            summary.get("next_portion_budget"), init_seed * 0.08
+        )
+        quota_badge_str = _format_case67_quota_badge(summary)
+        held_sh = safe_int(summary.get("held_shares"), 0)
+        held_tiers = safe_int(summary.get("held_tiers"), 0)
+        held_lots = safe_int(summary.get("held_lots"), 0)
+
+        await self.send_message(
+            chat_id=chat_id,
+            text=(
+                "🧹 <b>[실현수익 0점 초기화 완료]</b>\n"
+                "🔸 누적 세후실현익: <b>$0.00</b> (자투리절약 <b>$0.00</b>)\n"
+                f"🔸 복귀 기준시드: <b>${init_seed:,.2f}</b> (가용현금 <b>${free_cash:,.2f}</b>)\n"
+                f"🔸 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str}\n"
+                f"🔸 보유 지층 보존: <b>{held_sh}주</b> ({held_tiers}개층 · {held_lots}회차 유지)"
+            ),
+        )
+
     async def _execute_manual_update_command(self, chat_id: str) -> None:
         """
         # MODIFIED: 사용자 중심 초슬림 시스템 업데이트 개시 및 검증 통과 메시지 타전
@@ -982,7 +1040,7 @@ class TelegramCommandController:
         os._exit(0)
 
     # -----------------------------------------------------------------------
-    # 메시지 및 콜백 디스패처
+    # 메시지 및 콜백 디스패처 (/reset 차단 및 /reset_profit 전용 대체)
     # -----------------------------------------------------------------------
     async def _handle_command_or_text(
         self, chat_id: str, raw_text: str
@@ -1018,12 +1076,12 @@ class TelegramCommandController:
                 )
             return
 
-        low = text.lower()
+        first_token = text.split()[0].lower()
+        if "@" in first_token:
+            first_token = first_token.split("@", 1)[0]
 
         if (
-            low.startswith("/start")
-            or low.startswith("/menu")
-            or low.startswith("/help")
+            first_token in ("/start", "/menu", "/help")
             or text == "⬅️ 메인 메뉴"
         ):
             st = self.context.ledger.get_state(TARGET_SYMBOL)
@@ -1038,15 +1096,13 @@ class TelegramCommandController:
             return
 
         if (
-            low.startswith("/avwap")
-            or low.startswith("/status")
-            or low.startswith("/radar")
+            first_token in ("/avwap", "/status", "/radar")
             or text == "🔫 스나이퍼 레이더"
         ):
             await self._render_and_send_avwap(chat_id=chat_id)
             return
 
-        if low.startswith("/sync") or text in (
+        if first_token == "/sync" or text in (
             "📜 지층 지시서",
             "🔄 잔고 동기화",
         ):
@@ -1054,14 +1110,13 @@ class TelegramCommandController:
             return
 
         if (
-            low.startswith("/settlement")
-            or low.startswith("/config")
+            first_token in ("/settlement", "/config")
             or text == "⚙️ 전술 제어반"
         ):
             await self._render_and_send_settlement(chat_id=chat_id)
             return
 
-        if low.startswith("/seed"):
+        if first_token == "/seed":
             parts = text.split(maxsplit=1)
             if len(parts) >= 2:
                 self._awaiting_seed_input_chats.pop(chat_id, None)
@@ -1071,54 +1126,24 @@ class TelegramCommandController:
                 await self._render_and_send_settlement(chat_id=chat_id)
             return
 
-        if low.startswith("/reset_seed"):
-            parts = text.split(maxsplit=1)
-            new_seed: Optional[float] = None
-            if len(parts) >= 2:
-                s_val = safe_float(parts[1], 0.0)
-                if s_val >= 100.0:
-                    new_seed = s_val
-            await self.context.api.cancel_all_open_orders(symbol=TARGET_SYMBOL)
-            st_reset = await self.context.ledger.reset_stratum_only(
-                symbol=TARGET_SYMBOL,
-                new_seed_usd=new_seed,
-                preserve_realized_profit=(new_seed is None),
-            )
-            self.context.indexing_grace_cache.pop(TARGET_SYMBOL, None)
-            self.context.exit_snapshot_cache.pop(TARGET_SYMBOL, None)
-            self.context.wakeup_event.set()
+        # MODIFIED: 오직 /reset_profit 만 허용하여 보유 지층(buckets)은 100% 보존하고 실현수익만 0점 초기화!
+        if first_token == "/reset_profit":
+            await self._reset_realized_profit_only(chat_id=chat_id)
+            return
+
+        # MODIFIED: 사용자가 실수로 /reset 또는 /reset_seed 를 입력하더라도 보유 지층을 절대 초기화하지 못하도록 원천 차단!
+        if first_token in ("/reset", "/reset_seed"):
             await self.send_message(
                 chat_id=chat_id,
                 text=(
-                    "🧹 <b>[SOXL 7층 그리드 및 시드 원자적 초기화 완료]</b>\n"
-                    f"🔸 기준 시드머니: <b>${safe_float(st_reset.get('initial_seed_usd'), 10000.0):,.2f}</b>\n"
-                    f"🔸 가용 현금시드: <b>${safe_float(st_reset.get('free_cash_usd'), 10000.0):,.2f}</b>\n"
-                    "🔸 보유 그리드 큐 및 정적 기억저가(cycle_min_buy_price) 0점 소각 완료 (🛡️60초 첫 진입 타임쉴드 작동)"
+                    "🔒 <b>[지층 리셋 영구 차단 안내]</b>\n"
+                    "🔸 보유 중인 주식 지층 보호를 위해 지층 초기화 기능은 비활성화되었습니다.\n"
+                    "🔸 보유 주식을 유지한 채 실현수익만 초기화하여 설정된 기준 시드로 복귀하시려면 <code>/reset_profit</code> 명령어를 입력해 주세요."
                 ),
             )
             return
 
-        if low.startswith("/reset"):
-            await self.context.api.cancel_all_open_orders(symbol=TARGET_SYMBOL)
-            st_reset = await self.context.ledger.reset_stratum_only(
-                symbol=TARGET_SYMBOL,
-                new_seed_usd=None,
-                preserve_realized_profit=True,
-            )
-            self.context.indexing_grace_cache.pop(TARGET_SYMBOL, None)
-            self.context.exit_snapshot_cache.pop(TARGET_SYMBOL, None)
-            self.context.wakeup_event.set()
-            await self.send_message(
-                chat_id=chat_id,
-                text=(
-                    "🧹 <b>[SOXL 7층 그리드 원장 0점 소각 완료]</b>\n"
-                    "🔸 미체결 주문 취소 및 그리드 큐·기억저가 초기화 완료 (🛡️60초 첫 진입 타임쉴드 작동)\n"
-                    f"🔸 보존된 가용 현금시드: <b>${safe_float(st_reset.get('free_cash_usd'), 10000.0):,.2f}</b>"
-                ),
-            )
-            return
-
-        if low.startswith("/update") or text == "🚀 시스템 업데이트":
+        if first_token == "/update" or text == "🚀 시스템 업데이트":
             await self._execute_manual_update_command(chat_id=chat_id)
             return
 
@@ -1165,7 +1190,7 @@ class TelegramCommandController:
                 chat_id=chat_id,
                 message_id=msg_id,
                 text=msg,
-                reply_markup=_build_radar_inline_keyboard(),
+                reply_markup=None,
             )
         elif data == "toggle_bot_active":
             updated_st = await self.context.ledger.toggle_bot_active()
@@ -1188,6 +1213,8 @@ class TelegramCommandController:
                     "🔸 예시: <code>10000</code> 또는 <code>19000</code>"
                 ),
             )
+        elif data == "reset_profit_only":
+            await self._reset_realized_profit_only(chat_id=chat_id)
 
     async def run_polling_loop(self) -> None:
         """
