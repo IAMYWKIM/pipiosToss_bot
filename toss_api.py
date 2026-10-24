@@ -2,7 +2,7 @@
 """
 # MODIFIED: toss_api.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 토스증권 Open API (v1.2.14) 방탄 통신 통제소 &
-SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대) 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 01 / 02)
+SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대) 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈
 - 제1헌법: 모든 파일 I/O 및 네트워크 통신의 asyncio.to_thread 비동기 격리 + GlobalThrottle 중앙 통제
 - 제2헌법: 기동 시 GET /api/v1/accounts 1회 호출로 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 자동 주입
 - 제3헌법 ~ 제6헌법 및 Case 01 ~ 75 전수 락온:
@@ -212,8 +212,9 @@ def resolve_folder_isolated_ledger_paths(
     )
     legacy_path = os.path.join(target_dir, "soxl_stratum_ledger.json")
     backup_dir = os.path.join(target_dir, "ledger_backups")
+    # MODIFIED: f-string 중괄호 문법 오류 교정 완료
     backup_path = os.path.join(
-        backup_dir, f"soxl_stratum_ledger_{folder_slug>.bak.json".replace(">", "")
+        backup_dir, f"soxl_stratum_ledger_{folder_slug}.bak.json"
     )
     return primary_path, legacy_path, backup_path, folder_slug
 
