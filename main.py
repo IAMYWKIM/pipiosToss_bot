@@ -2,8 +2,8 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 7층 골디락스 멀티 그리드 지층관리 스나이퍼
-메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 사용자 중심 초슬림 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 05 / 05)
-- 최종 확정 챔피언 (🔥 03_7G_PURE_10_01 / 01_7L_STATIC_CYCLE_MIN · Case 71 ~ Case 74) 100% 결속:
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 사용자 중심 초슬림 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 03 / 04)
+- 최종 확정 챔피언 (🔥 03_7G_PURE_10_01 / 01_7L_STATIC_CYCLE_MIN · Case 70 ~ Case 75) 100% 결속:
   1) 8%(12.5분할) 황금비율 정액 기반 정량제 & min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67) &
      자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
@@ -13,15 +13,15 @@
   4) 활성 1층 보유 중 정적 기억 사이클 최저 매수가(cycle_min_buy_price) 잠금 기반 10분 고정 4단 와이드 활주로 시드보호 매수 게이트
      (WIDE_RUNWAY : 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 신저가 도달 시에만 현재가 지정가 추매 및
       2~6층 개별 승격 · 8회차 이상 최상단 6층+7층을 통합 7층 본대[GRID_L7]로 가중평균 합병 · Case 72)
-  5) 🛡️ [Case 65, Case 70, Case 71 & Case 72] 매수 후 최초 60초 타임쉴드 및 보유 중 매 60.0초 타임쉴드 주기 3중 다중 익절 스나이퍼 매도 모니터
-     (60.0초 타임쉴드가 해제된 시점에만 현재가를 조회하여 ① 1층 +1.50% 이상 개별 익절 / ② 2~6층 개별 및 통합 7층 +1.00% 이상 개별 익절 /
-      ③ 2~7층 통합 이동평균 단가 대비 +1.00% 이상 일괄 졸업을 동시 판정하며, 목표 미달 시 즉시 다음 60.0초 매도 타임쉴드 재장전!)
+  5) ⚡ [MODIFIED · Case 65, Case 70, Case 71 & Case 72] 매수 직후 최초 60.0초 타임쉴드 유지 & 이후 보유 중 매 1.5초 실시간 3중 다중 익절 스나이퍼 매도 모니터
+     (매수 후 60.0초 경과 시점부터 60초 블라인드 대기 락 없이 매 1.5초 루프마다 현재가를 상시 대조하여 ① 1층 +1.50% 이상 개별 익절 /
+      ② 2~6층 개별 및 통합 7층 +1.00% 이상 개별 익절 / ③ 2~7층 통합 이동평균 단가 대비 +1.00% 이상 일괄 졸업을 동시 판정해 도래 즉시 현재가 지정가 매도!)
   6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
   7) 📡 [Case 11, Case 15, Case 16, Case 62, Case 64 & Case 74 문단 하단 2중 중복 인라인 메뉴 전면 제거 · /reset 차단 및 /reset_profit 전용 대체 ·
      04:00 EST 및 17:00 EST 당일 시드보호 패스 카운터 0회 리셋 보장]
-  8) 🚨 [Case 68, Case 69, Case 71 ~ Case 74 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 순수 원가 100% 보존]
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 74 전수 락온
+  8) 🚨 [Case 68, Case 69, Case 71 ~ Case 75 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 순수 원가 100% 보존]
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 75 전수 락온
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("toss_sniper.main")
 
-# 메인 루프 주기 상수 (평시 1.5초 / 미체결 주문 체결 확인 부스터 0.4초)
+# 메인 루프 주기 상수 (평시 1.5초 실시간 타점 감시 / 미체결 주문 체결 확인 부스터 0.4초)
 NORMAL_LOOP_INTERVAL_SEC: float = 1.50
 FAST_SHIELD_LOOP_INTERVAL_SEC: float = 0.40
 KRW_PER_USD_DEFAULT: float = 1380.0
@@ -1530,7 +1530,7 @@ class _AdaptiveTelegramBridge:
     """
     외부 tg_ui_plugin 의 폴링 루프 구조에 구애받지 않고
     자체 내장 getUpdates 롱폴링 + /start, /avwap, /sync, /settlement, /reset_profit, /update +
-    인라인 버튼 콜백 + 시드 숫자 입력을 100% 직접 수행하는 완결형 텔레그램 컨트롤러 (Case 62 ~ 74).
+    인라인 버튼 콜백 + 시드 숫자 입력을 100% 직접 수행하는 완결형 텔레그램 컨트롤러 (Case 62 ~ 75).
     """
 
     def __init__(self, context: Any) -> None:
@@ -1818,6 +1818,9 @@ class _AdaptiveTelegramBridge:
         """
         # MODIFIED [Case 65, Case 70, Case 71, Case 72, Case 73 & Case 74]:
         📡 /avwap 사용자 중심 초슬림 레이더 메시지 생성:
+        - 상단 배지를 ⚡1.5s 실시간타점 (미체결 체결 감시 중일 때는 ⚡0.4s 체결감시)으로 표출한다.
+        - 매수 직후 최초 60.0초 타임쉴드(in_b) 가동 중일 때만 잔여 초를 표출하고,
+          경과 후에는 보유 중 불필요한 60초 매도 대기 문구 없이 상시 1.5초 실시간 익절 감시 상태를 표출한다.
         - 0주(held_sh <= 0)일 때는 0주 싸이클 종료 후 60초 타임쉴드 및 현재가 지정가 첫 1층 진입 모니터를 표출한다.
         - 1층 공석(is_l2_only_anti_bloat == True)일 때는 60초(1분) 주기 재장전 타임쉴드 잔여 시간 및
           2층 단가 상한선(l2_ceiling_price 이하 / HOLD_PREVENT_INVERSION 역전차단 배지)을 실시간 표출한다.
@@ -1838,7 +1841,7 @@ class _AdaptiveTelegramBridge:
         fast_badge = (
             "⚡0.4s 체결감시"
             if getattr(self.context, "fast_shield_mode", False)
-            else "⏱️60s 타임쉴드"
+            else "⚡1.5s 실시간타점"
         )
 
         held_sh = safe_int(summary.get("held_shares"), 0)
@@ -1846,11 +1849,8 @@ class _AdaptiveTelegramBridge:
         held_tiers = safe_int(summary.get("held_tiers"), 0)
         is_l2_only = bool(summary.get("is_l2_only_anti_bloat"))
 
-        # 🛡️ Case 65, Case 70 & Case 73: 매수 직후 60초 / 보유 중 매 60초 주기 매도 모니터 / 1층 공석 60초 재장전 모니터 / 매도 후 60초 타임쉴드 확인
+        # 🛡️ Case 65, Case 70 & Case 73: 매수 직후 최초 60초 / 1층 공석 60초 재장전 모니터 / 매도 후 60초 타임쉴드 확인
         in_b, rem_b = is_within_post_buy_time_shield(
-            self.context, st, TARGET_SYMBOL
-        )
-        in_m, rem_m = is_within_sell_monitor_time_shield(
             self.context, st, TARGET_SYMBOL
         )
         in_s, rem_s = is_within_post_sell_time_shield(
@@ -1864,22 +1864,12 @@ class _AdaptiveTelegramBridge:
         if in_b:
             shield_line = (
                 f"🛡️ <b>[매수 직후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_b:.1f}초</b> 후 "
-                "실시간 현재가 조회 &amp; 3중 다중익절 검문"
-            )
-        elif held_sh > 0 and in_m:
-            re_sub = (
-                f" · 1층재장전 잔여 <b>{rem_re:.1f}초</b>"
-                if (is_l2_only and in_re)
-                else ""
-            )
-            shield_line = (
-                f"🛡️ <b>[60초 매도 모니터 타임쉴드 가동 중]</b> 잔여 <b>{rem_m:.1f}초</b>{re_sub} 후 "
-                "현재가 조회 &amp; 3중 다중익절(1층+1.5% / 2~7층개별·이평+1.0%) 검문"
+                "⚡1.5초 실시간 3중 다중익절 감시 개시"
             )
         elif is_l2_only and in_re:
             shield_line = (
                 f"🛡️ <b>[60초 1층 공석 재장전 타임쉴드 가동 중]</b> 잔여 <b>{rem_re:.1f}초</b> 후 "
-                "현재가 조회 &amp; 1층 재장전(2층 단가 이하 눌림/돌파) 검문"
+                "1층 재장전(2층 단가 이하 눌림/돌파) 검문 · 상단 익절 ⚡1.5초 상시감시 중"
             )
         elif in_s:
             shield_line = (
@@ -2333,11 +2323,11 @@ class _AdaptiveTelegramBridge:
                 msg = (
                     " · ".join(str_parts)
                     if str_parts
-                    else "✅ 9대 코어 모듈 py_compile 및 AST 심볼 정합성 100% 통과 · 원장 보존"
+                    else "✅ 9대 코어 모듈 인메모리 컴파일 및 AST 심볼 정합성 100% 통과 · 원장 보존"
                 )
             else:
                 ok = bool(upd_res)
-                msg = "✅ 9대 코어 모듈 py_compile 및 AST 심볼 정합성 100% 통과 · 원장 보존"
+                msg = "✅ 9대 코어 모듈 인메모리 컴파일 및 AST 심볼 정합성 100% 통과 · 원장 보존"
         else:
             ok, msg = verify_all_modules_compile(self.context.base_dir)
 
@@ -2819,11 +2809,10 @@ def _evaluate_fast_shield_mode(
     live_p: float,
 ) -> bool:
     """
-    🚨 Case 70 : 목표가 근접 시 0.4초 턱걸이 매도 가속 조건 영구 소각:
-    - 매도 모니터는 매수 직후 60초 및 보유 중 매 60.0초 타임쉴드 주기로만 작동하므로,
-      현재가가 목표가에 근접했다고 0.4초 부스터를 켜서 턱걸이 매도를 유발하던 조건을 완전히 제거한다.
-    - 0.4초 고속 루프는 오직 미체결 주문(buy_order_id / sell_order_id) 체결 확인 시점 및
-      10분 매수 게이트 정각 오픈 경계에서만 작동한다.
+    🚨 Case 70 :
+    - 평시 보유 중 매도 모니터는 매 1.5초(NORMAL_LOOP_INTERVAL_SEC)마다 실시간 타점 감시를 수행한다.
+    - 0.4초 고속 루프(FAST_SHIELD_LOOP_INTERVAL_SEC)는 미체결 주문(buy_order_id / sell_order_id) 체결 확인 시점 및
+      10분 매수 게이트 정각 오픈 경계에서 작동한다.
     """
     hm = now_est.hour * 100 + now_est.minute
     if not is_active_trading_window(hm):
@@ -2950,7 +2939,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     now_est=now_est,
                 )
 
-                # 3-2) 매수 후 60초 & 보유 중 매 60초 타임쉴드 주기 3중 다중 익절 스나이퍼 매도 모니터 (Case 44, 65, 69, 70, 71, 72)
+                # 3-2) 매수 후 최초 60초 타임쉴드 & 이후 보유 중 매 1.5초 실시간 3중 다중 익절 스나이퍼 매도 모니터 (Case 44, 65, 69, 70, 71, 72)
                 sell_res = await _call_plugin_adaptive(
                     execute_1m_sniper_sell_and_reanchor_plugin,
                     context=context,
@@ -3129,7 +3118,7 @@ async def async_main() -> None:
 
     run_quant_engine_tdd()
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 🔥 03_7G_PURE_10_01 (1~6층 개별 완충층 + 통합 7층 본대 · 1층 공석 60초 재장전 & 2층 역전 차단 Case 59~74) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 🔥 03_7G_PURE_10_01 (1~6층 개별 완충층 + 통합 7층 본대 · 1층 공석 60초 재장전 & 2층 역전 차단 · 1.5초 실시간 익절 감시 Case 59~75) 검증 완료"
     )
 
     context = SniperAppContext(base_dir=base_dir)
@@ -3241,7 +3230,7 @@ async def async_main() -> None:
     ]
 
     logger.info(
-        "🚀 [SOXL 7층 골디락스 멀티그리드 스나이퍼 가동 완료 · 폴더=%s] 04:07 ~ 16:00 EST · 챔피언 🔥 03_7G_PURE_10_01 · 1~6층 개별 완충층 + 통합 7층 본대 · 2~7층 통합이평 3중 익절 · 1층 공석 60초 재장전 & 2층 역전 차단 · 정적 저가 잠금 · 폴더별 3중 원장 금고(Case 65~74)",
+        "🚀 [SOXL 7층 골디락스 멀티그리드 스나이퍼 가동 완료 · 폴더=%s] 04:07 ~ 16:00 EST · 챔피언 🔥 03_7G_PURE_10_01 · 1~6층 개별 완충층 + 통합 7층 본대 · 매수후 60초 쉴드 뒤 1.5초 실시간 3중 익절 · 1층 공석 60초 재장전 & 2층 역전 차단 · 정적 저가 잠금 · 폴더별 3중 원장 금고(Case 65~75)",
         context.folder_slug,
     )
 

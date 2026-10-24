@@ -2,7 +2,7 @@
 """
 # MODIFIED: tg_ui_plugin.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 7층 골디락스 멀티 그리드 지층관리 스나이퍼
-텔레그램 관제탑 사용자 중심 초슬림 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 04 / 05)
+텔레그램 관제탑 사용자 중심 초슬림 UI 렌더러 및 명령어·콜백 비동기 컨트롤러 코어 모듈 (Step 04 / 04)
 - 제1헌법: 모든 텔레그램 HTTP API 호출을 asyncio.to_thread 로 비동기 격리 및 타임아웃 적용
 - 제4헌법: 모든 논리 시계열은 미국 동부 시간(EST/EDT) 100% 락온
 - Case 11 & Case 62:
@@ -18,10 +18,11 @@
   2) 보유 지층(buckets)을 날려버리는 /reset 기능을 사용자 메뉴 및 명령어에서 전면 차단하고,
      보유 주식 지층(1~7층 단가·수량·정적 기억저가)과 기준 시드머니는 100% 보존한 채 누적 실현수익만 0점으로 초기화하여
      설정된 기준 시드머니(예: $10,000 또는 $19,000)의 8% 정량 투입으로 복귀시키는 `/reset_profit` 전용 기능으로 대체!
-- Case 73 & Case 74:
-  1) 0주 상태(60초 타임쉴드 후 현재가 지정가 첫 1층 진입) / 상단 2층 ~ 7층 보유 중 1층 공석('60초(1분) 주기 1층 공석 재장전 모니터' 잔여 초 및
+- Case 70, Case 73 & Case 74:
+  1) 매수 직후 최초 60.0초 타임쉴드 유지 & 보유 중 60초 블라인드 대기 락 전면 해제 -> `/avwap` 레이더 상단 `⚡1.5s 실시간타점` 배지 표출
+  2) 0주 상태(60초 타임쉴드 후 현재가 지정가 첫 1층 진입) / 상단 2층 ~ 7층 보유 중 1층 공석('60초(1분) 주기 1층 공석 재장전 모니터' 잔여 초 및
      '2층 단가 상한($XX.XX 이하) / 1층>2층 단가 역전 차단(HOLD_PREVENT_INVERSION)') / 활성 1층 보유 중(10분 고정 와이드 게이트) 3대 상태 실시간 분리 표출
-  2) 레이더 하단 4대 관제 지표 생명주기 분리(🛡️시드보호 패스 당일 일일 주기 vs 나머지 3대 지표 무리셋 연속 복리 주기)
+  3) 레이더 하단 4대 관제 지표 생명주기 분리(🛡️시드보호 패스 당일 일일 주기 vs 나머지 3대 지표 무리셋 연속 복리 주기)
 """
 
 from __future__ import annotations
@@ -344,6 +345,9 @@ def build_avwap_radar_message(
     """
     # MODIFIED [Case 65, Case 70, Case 71, Case 72, Case 73 & Case 74]:
     📡 /avwap 사용자 중심 초슬림 레이더 메시지 생성:
+    - 상단 배지를 ⚡1.5s 실시간타점 (미체결 체결 감시 중일 때는 ⚡0.4s 체결감시)으로 표출한다.
+    - 매수 직후 최초 60.0초 타임쉴드(in_buy_shield) 가동 중일 때만 잔여 초를 표출하고,
+      경과 후에는 보유 중 불필요한 60초 매도 대기 문구 없이 상시 1.5초 실시간 익절 감시 상태를 표출한다.
     - 0주(held_sh == 0)일 때는 0주 싸이클 종료 후 60초 타임쉴드 및 현재가 지정가 첫 1층 진입 모니터를 표출한다.
     - 1층 공석(is_l2_only_anti_bloat == True)일 때는 60초(1분) 주기 재장전 타임쉴드 잔여 시간 및
       2층 단가 상한선(l2_ceiling_price 이하 / HOLD_PREVENT_INVERSION 역전차단 배지)을 실시간 표출한다.
@@ -364,7 +368,7 @@ def build_avwap_radar_message(
     fast_badge = (
         "⚡0.4s 체결감시"
         if getattr(context, "fast_shield_mode", False)
-        else "⏱️60s 타임쉴드"
+        else "⚡1.5s 실시간타점"
     )
 
     held_sh = safe_int(summary.get("held_shares"), 0)
@@ -372,11 +376,8 @@ def build_avwap_radar_message(
     held_tiers = safe_int(summary.get("held_tiers"), 0)
     is_l2_only = bool(summary.get("is_l2_only_anti_bloat"))
 
-    # 🛡️ Case 65, Case 70 & Case 73: 매수 직후 60초 / 보유 중 매 60초 주기 매도 모니터 / 1층 공석 60초 재장전 모니터 / 매도 후 60초 타임쉴드 확인
+    # 🛡️ Case 65, Case 70 & Case 73: 매수 직후 최초 60초 / 1층 공석 60초 재장전 모니터 / 매도 후 60초 타임쉴드 확인
     in_buy_shield, rem_buy_sec = is_within_post_buy_time_shield(
-        context, st, TARGET_SYMBOL
-    )
-    in_mon_shield, rem_mon_sec = is_within_sell_monitor_time_shield(
         context, st, TARGET_SYMBOL
     )
     in_sell_shield, rem_sell_sec = is_within_post_sell_time_shield(
@@ -390,22 +391,12 @@ def build_avwap_radar_message(
     if in_buy_shield:
         shield_line = (
             f"🛡️ <b>[매수 직후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_buy_sec:.1f}초</b> 후 "
-            "실시간 현재가 조회 &amp; 3중 다중익절 검문"
-        )
-    elif held_sh > 0 and in_mon_shield:
-        re_sub = (
-            f" · 1층재장전 잔여 <b>{rem_re_sec:.1f}초</b>"
-            if (is_l2_only and in_re_shield)
-            else ""
-        )
-        shield_line = (
-            f"🛡️ <b>[60초 매도 모니터 타임쉴드 가동 중]</b> 잔여 <b>{rem_mon_sec:.1f}초</b>{re_sub} 후 "
-            "현재가 조회 &amp; 3중 다중익절(1층+1.5% / 2~7층개별·이평+1.0%) 검문"
+            "⚡1.5초 실시간 3중 다중익절 감시 개시"
         )
     elif is_l2_only and in_re_shield:
         shield_line = (
             f"🛡️ <b>[60초 1층 공석 재장전 타임쉴드 가동 중]</b> 잔여 <b>{rem_re_sec:.1f}초</b> 후 "
-            "현재가 조회 &amp; 1층 재장전(2층 단가 이하 눌림/돌파) 검문"
+            "1층 재장전(2층 단가 이하 눌림/돌파) 검문 · 상단 익절 ⚡1.5초 상시감시 중"
         )
     elif in_sell_shield:
         shield_line = (
@@ -609,7 +600,7 @@ def build_settlement_control_message(
 # ---------------------------------------------------------------------------
 class TelegramCommandController:
     """
-    🚨 제1헌법 & Case 02, 15, 16, 62, 64, 65, 66, 67, 68, 70, 71, 72, 73, 74:
+    🚨 제1헌법 & Case 02, 15, 16, 62, 64, 65, 66, 67, 68, 70, 71, 72, 73, 74, 75:
     main.py 의 SniperAppContext 와 정식 결속되는 텔레그램 봇 컨트롤러.
     """
 
