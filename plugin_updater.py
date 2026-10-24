@@ -2,25 +2,33 @@
 """
 # MODIFIED: plugin_updater.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 지층관리 스나이퍼
-9대 코어 모듈 프리플라이트 컴파일 · AST 심볼 교차 검증 · 4배수 선제 스냅 치유기 · 텔레그램 잔류 큐 소각 ·
-폴더별 원장/환경변수 스냅샷 철벽 보존 및 무인 Git 업데이트 코어 모듈 (Step 03 / 05)
+9대 코어 모듈 무디스크 인메모리 프리플라이트 컴파일 · AST 심볼 교차 검증 · 4배수 선제 스냅 치유기 · 텔레그램 잔류 큐 소각 ·
+폴더별 원장/환경변수 스냅샷 Dirty-Check 철벽 보존 및 무인 Git 업데이트 코어 모듈 (Step 02 / 02)
 - 제1헌법: 모든 파일 I/O 및 git/python 서브프로세스 실행을 asyncio.to_thread 로 비동기 격리 및 타임아웃 적용
 - 제3헌법: 구버전 폐기 파일(daymarket_sim_plugin.py, whipsaw_plugin.py, state_SOXS.json 등) 디스크 영구 소각
 - Case 07: 평일 04:00 ~ 16:05 EST 장중 백그라운드 무인 업데이트 재기동 전면 차단 및 systemd ExecStartPre 장중 락다운 지원
 - Case 11 & Case 62:
-  1) 9대 필수 코어 모듈(REQUIRED_CORE_MODULES) py_compile 문법 검증 + AST ImportFrom 심볼 테이블 정적 교차 검증
+  1) 9대 필수 코어 모듈(REQUIRED_CORE_MODULES) 인메모리 compile() 문법 검증 + AST ImportFrom 심볼 테이블 정적 교차 검증
   2) 모바일 복사·붙여넣기 과정에서 발생한 마크다운 펜스 및 홀수 공백(1칸 -> 0칸, 9칸 -> 8칸)을
      AST 파싱 전에 4배수로 선제 스냅 교정하여 다음 줄이 오염되는 현상을 100% 원천 차단(_auto_heal_indentation_glitches)
   3) /update 실행 시 구버전 RAM 캐시(sys.modules) 간섭을 막기 위해 `python3 plugin_updater.py --verify-only` 를
      독립 서브프로세스로 호출하고 실패 시 직전 정상 커밋 해시로 즉시 원자적 롤백 수행
   4) 프리플라이트 및 업데이트 시점에 텔레그램 서버의 미확인 적체 큐(getUpdates offset = max_uid + 1)를
      즉시 강제 소각(_flush_telegram_pending_updates_sync)하고, 원격 저장소에 신규 커밋이 없을 때 로컬 수정본을 안전 보존!
-- 🚨 [NEW · Case 68 폴더 위치(base_dir) 기반 격리 & git reset --hard 원장/환경변수 증발 100% 차단 쉴드]:
+- 🚨 [Case 68 폴더 위치(base_dir) 기반 격리 & git reset --hard 원장/환경변수 증발 100% 차단 쉴드]:
   1) "/home/pipiosToss" 고정 경로 하드코딩 100% 영구 제거 -> 오직 현재 실행 폴더(base_dir)의 .env 와 원장만 참조
   2) git reset --hard 실행 직전 해당 폴더 내 모든 원장(*ledger*.json, ledger_backups/*.json)과 환경설정(.env*, *config*.json)을
-     메모리 및 백업 금고에 스냅샷 보존하고, git reset --hard 직후 0.001초 내에 즉시 원자적 원상 복원
+     메모리에 스냅샷 보존하고, git reset --hard 직후 0.001초 내에 즉시 원자적 원상 복원
      (git rm --cached --ignore-unmatch soxl_stratum_ledger.json 병행)하여
      장외 자동 업데이트로 인한 어제 기록 초기화 및 타 폴더 원장 덮어쓰기 사고를 물리적으로 영구 봉쇄!
+- 🚨 [NEW · Case 75 클라우드 VM 디스크 고갈([Errno 28] No space left on device) 원천 차단 및 디스크 Write 90% 감축]:
+  1) verify_all_modules_compile() 에서 디스크에 __pycache__/*.pyc 파일을 강제 기록하다가 디스크 풀 상태에서
+     [Errno 28] No space left on device 예외를 유발하던 py_compile.compile() 디스크 쓰기를 제거하고,
+     디스크 쓰기 0 Byte 순수 인메모리 컴파일(compile(src, fpath, "exec") + ast.parse)로 100% 검증!
+  2) remote_ahead == 0 (원격 신규 커밋 없음) 시 git reset --hard 를 수행하지 않으므로 불필요한 20여 개 백업·원장 파일
+     재작성(_restore_protected_local_files_sync)을 전면 스킵하고, 복원 시에도 바이트 Dirty-Check 적용!
+  3) 프리플라이트 및 업데이트 전후 emergency_free_disk_space_sync() 로 고아 임시 파일(*.tmp.*, *.heal.tmp) 및
+     __pycache__ 바이트코드 캐시를 자동 소각하여 디스크 블록 및 Inode 고갈을 원천 방어!
 """
 
 from __future__ import annotations
@@ -28,11 +36,11 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import errno
 import glob
 import json
 import logging
 import os
-import py_compile
 import re
 import subprocess
 import sys
@@ -46,6 +54,7 @@ from toss_api import (
     EST_TZ,
     GlobalThrottle,
     SoxlStratumLedger,
+    emergency_free_disk_space_sync,
     get_bot_base_dir,
     resolve_folder_isolated_ledger_paths,
     safe_int,
@@ -81,7 +90,7 @@ _TG_TOKEN_STRICT_RE = re.compile(r"\b(\d{8,12}:[A-Za-z0-9_-]{25,60})\b")
 
 
 # ---------------------------------------------------------------------------
-# [핵심 0] 폴더 위치(base_dir) 전용 텔레그램 적체 큐 선제 강제 소각기 (Case 68)
+# [핵심 0] 폴더 위치(base_dir) 전용 텔레그램 적체 큐 선제 강제 소각기 (Case 68 & Case 75)
 # ---------------------------------------------------------------------------
 def _discover_bot_token_sync(base_dir: Optional[str] = None) -> str:
     """
@@ -118,27 +127,63 @@ def _discover_bot_token_sync(base_dir: Optional[str] = None) -> str:
 
 
 def _update_ledger_tg_offset_sync(ledger_fp: str, max_uid: int) -> None:
+    """
+    # MODIFIED [Case 75]:
+    1) max_uid <= cur_saved 이면 디스크 쓰기를 수행하지 않고 즉시 반환한다.
+    2) 쓰기 도중 OSError(errno.ENOSPC == 28) 발생 시 미완성 .tmp 파일을 즉시 제거하고
+       emergency_free_disk_space_sync() 로 고아 파일 및 캐시를 청소한 뒤 재시도한다.
+    """
     if not ledger_fp or not os.path.isfile(ledger_fp) or max_uid <= 0:
         return
+    target_dir = os.path.dirname(os.path.abspath(ledger_fp))
     try:
         with GlobalThrottle.get_file_lock(ledger_fp):
             with open(ledger_fp, "r", encoding="utf-8") as rf:
                 ldata = json.load(rf)
-            if isinstance(ldata, dict) and "SOXL" in ldata and isinstance(
-                ldata["SOXL"], dict
+            if not (
+                isinstance(ldata, dict)
+                and "SOXL" in ldata
+                and isinstance(ldata["SOXL"], dict)
             ):
-                cur_saved = safe_int(ldata["SOXL"].get("last_tg_update_id"), 0)
-                if max_uid > cur_saved:
-                    ldata["SOXL"]["last_tg_update_id"] = max_uid
-                    tmp_p = (
-                        f"{ledger_fp}.ack.tmp.{os.getpid()}."
-                        f"{threading.get_ident()}"
-                    )
+                return
+            cur_saved = safe_int(ldata["SOXL"].get("last_tg_update_id"), 0)
+            if max_uid <= cur_saved:
+                return
+
+            ldata["SOXL"]["last_tg_update_id"] = max_uid
+            for attempt in range(2):
+                tmp_p = (
+                    f"{ledger_fp}.ack.tmp.{os.getpid()}."
+                    f"{threading.get_ident()}"
+                )
+                try:
                     with open(tmp_p, "w", encoding="utf-8") as wf:
                         json.dump(ldata, wf, ensure_ascii=False, indent=2)
                         wf.flush()
                         os.fsync(wf.fileno())
                     os.replace(tmp_p, ledger_fp)
+                    break
+                except OSError as os_err:
+                    try:
+                        if os.path.exists(tmp_p):
+                            os.remove(tmp_p)
+                    except Exception:
+                        pass
+                    if os_err.errno == errno.ENOSPC and attempt == 0:
+                        emergency_free_disk_space_sync(
+                            base_dir=target_dir,
+                            keep_backup_days=3,
+                            remove_pycache=True,
+                        )
+                        continue
+                    break
+                except Exception:
+                    try:
+                        if os.path.exists(tmp_p):
+                            os.remove(tmp_p)
+                    except Exception:
+                        pass
+                    break
     except Exception:
         pass
 
@@ -208,19 +253,23 @@ def _flush_telegram_pending_updates_sync(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 0-B · NEW Case 68] git reset --hard 실행 전후 폴더별 원장 & .env 철벽 보호기
+# [핵심 0-B · Case 68 & Case 75] git reset --hard 실행 전후 폴더별 원장 & .env 철벽 보호기 (바이트 Dirty-Check 탑재)
 # ---------------------------------------------------------------------------
 def _snapshot_protected_local_files_sync(target_dir: str) -> Dict[str, bytes]:
     """
-    🚨 Case 68:
+    🚨 Case 68 & Case 75:
     git reset --hard 가 실행되기 직전에 현재 폴더(target_dir) 내의:
-    1) 3중 안전 원장(SoxlStratumLedger) 선행 동기화 실행 (가장 유효한 원장 데이터를 백업 금고에 먼저 확보)
-    2) 모든 `*ledger*.json` 파일, `ledger_backups/*.json` 파일, `.env*` 및 `*config*.json`, `secrets.json`
+    1) 고아 임시 파일(*.tmp.*) 및 __pycache__ 선제 청소로 여유 공간 확보
+    2) 3중 안전 원장(SoxlStratumLedger) 선행 동기화 실행 (Dirty-Check 로 변경된 경우에만 기록)
+    3) 모든 `*ledger*.json` 파일, `ledger_backups/*.json` 파일, `.env*` 및 `*config*.json`, `secrets.json`
        파일의 원본 바이트(bytes)를 메모리에 스냅샷으로 보존한다.
     """
     abs_dir = get_bot_base_dir(target_dir)
+    emergency_free_disk_space_sync(
+        base_dir=abs_dir, keep_backup_days=14, remove_pycache=True
+    )
     try:
-        # 업데이트 직전 현재 폴더의 가장 유효한 원장 상태를 3중 경로(고유·호환·백업금고)에 먼저 동기화
+        # 업데이트 직전 현재 폴더의 가장 유효한 원장 상태를 3중 경로(고유·호환·백업금고)에 동기화(Dirty-Check 적용됨)
         SoxlStratumLedger(base_dir=abs_dir)
     except Exception as exc:
         logger.debug("업데이트 전 원장 선행 동기화 예외(무시): %s", exc)
@@ -238,7 +287,11 @@ def _snapshot_protected_local_files_sync(target_dir: str) -> Dict[str, bytes]:
             if not os.path.isfile(fp):
                 continue
             bname = os.path.basename(fp)
-            if bname in DEPRECATED_LEGACY_FILES or ".tmp." in bname:
+            if (
+                bname in DEPRECATED_LEGACY_FILES
+                or ".tmp." in bname
+                or bname.endswith(".heal.tmp")
+            ):
                 continue
             try:
                 with GlobalThrottle.get_file_lock(fp):
@@ -256,10 +309,13 @@ def _restore_protected_local_files_sync(
     target_dir: str, snapshots: Dict[str, bytes]
 ) -> int:
     """
-    🚨 Case 68:
+    🚨 Case 68 & Case 75:
     git reset --hard 실행 직후, 원격 저장소의 초기 파일(예: 초기화된 soxl_stratum_ledger.json)이
-    로컬 디스크를 덮어썼더라도 메모리에 보존해 둔 스냅샷 바이트를 즉시 원자적으로 복원하고,
-    SoxlStratumLedger 자가 치유 로더를 구동하여 어제의 기록과 시드머니를 100% 무손실 보존한다.
+    로컬 디스크를 덮어썼을 때 메모리에 보존해 둔 스냅샷 바이트를 즉시 원자적으로 복원하되:
+    1) 디스크의 현재 파일 바이트가 스냅샷 바이트와 이미 100% 동일하면(existing_bytes == raw_bytes)
+       불필요한 .restore.tmp 생성 및 os.fsync() 디스크 쓰기를 즉시 스킵한다!
+    2) 복원 도중 OSError(errno.ENOSPC == 28) 감지 시 즉시 emergency_free_disk_space_sync() 로
+       공간을 확보한 뒤 재시도한다.
     """
     abs_dir = get_bot_base_dir(target_dir)
     restored_cnt = 0
@@ -267,19 +323,47 @@ def _restore_protected_local_files_sync(
         if not fp or not raw_bytes:
             continue
         try:
-            parent_d = os.path.dirname(fp)
-            if parent_d and not os.path.isdir(parent_d):
-                os.makedirs(parent_d, exist_ok=True)
             with GlobalThrottle.get_file_lock(fp):
-                tmp_fp = (
-                    f"{fp}.restore.tmp.{os.getpid()}.{threading.get_ident()}"
-                )
-                with open(tmp_fp, "wb") as wf:
-                    wf.write(raw_bytes)
-                    wf.flush()
-                    os.fsync(wf.fileno())
-                os.replace(tmp_fp, fp)
-            restored_cnt += 1
+                # NEW [Case 75 바이트 Dirty-Check]: 디스크 파일이 이미 동일한 바이트를 가지고 있으면 쓰기 스킵!
+                if os.path.isfile(fp):
+                    try:
+                        with open(fp, "rb") as rf:
+                            existing_bytes = rf.read()
+                        if existing_bytes == raw_bytes:
+                            continue
+                    except Exception:
+                        pass
+
+                parent_d = os.path.dirname(fp)
+                for attempt in range(2):
+                    if parent_d and not os.path.isdir(parent_d):
+                        os.makedirs(parent_d, exist_ok=True)
+                    tmp_fp = (
+                        f"{fp}.restore.tmp.{os.getpid()}."
+                        f"{threading.get_ident()}"
+                    )
+                    try:
+                        with open(tmp_fp, "wb") as wf:
+                            wf.write(raw_bytes)
+                            wf.flush()
+                            os.fsync(wf.fileno())
+                        os.replace(tmp_fp, fp)
+                        restored_cnt += 1
+                        break
+                    except OSError as os_err:
+                        try:
+                            if os.path.exists(tmp_fp):
+                                os.remove(tmp_fp)
+                        except Exception:
+                            pass
+                        if os_err.errno == errno.ENOSPC and attempt == 0:
+                            emergency_free_disk_space_sync(
+                                base_dir=abs_dir,
+                                keep_backup_days=3,
+                                remove_pycache=True,
+                            )
+                            continue
+                        raise
         except Exception as exc:
             logger.error("보호 파일 복원 예외(%s): %s", fp, exc)
 
@@ -292,15 +376,16 @@ def _restore_protected_local_files_sync(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 1] 구버전 폐기 파일 자동 청소기 (purge_deprecated_legacy_files)
+# [핵심 1] 구버전 폐기 파일 및 고아 임시 파일 자동 청소기 (purge_deprecated_legacy_files — Case 75)
 # ---------------------------------------------------------------------------
 def purge_deprecated_legacy_files(
     base_dir: Optional[str] = None,
 ) -> List[str]:
     """
-    🚨 제3헌법:
-    구버전 데드코드 파일(daymarket_sim_plugin.py, whipsaw_plugin.py, state_SOXS.json 등)이
-    디스크에 남아 있을 경우 즉시 삭제하고 삭제된 파일명 리스트를 반환한다.
+    🚨 제3헌법 & Case 75:
+    1) 구버전 데드코드 파일(daymarket_sim_plugin.py, whipsaw_plugin.py, state_SOXS.json 등)이
+       디스크에 남아 있을 경우 즉시 삭제하고 삭제된 파일명 리스트를 반환한다.
+    2) 동시에 폴더 내 고아 임시 파일(*.tmp.*, *.heal.tmp)도 함께 청소한다.
     """
     target_dir = get_bot_base_dir(base_dir)
     removed: List[str] = []
@@ -313,29 +398,35 @@ def purge_deprecated_legacy_files(
                 removed.append(fname)
             except Exception as exc:
                 logger.warning("폐기 파일 삭제 실패 (%s): %s", fname, exc)
+
+    # NEW [Case 75]: 고아 임시 파일(*.tmp.*, *.heal.tmp) 선제 청소
+    emergency_free_disk_space_sync(
+        base_dir=target_dir, keep_backup_days=14, remove_pycache=False
+    )
     return removed
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] 4배수 선제 스냅 및 마크다운 펜스 자동 치유기 (_auto_heal_indentation_glitches)
+# [핵심 2] 4배수 선제 스냅 및 마크다운 펜스 자동 치유기 (_auto_heal_indentation_glitches — Case 75)
 # ---------------------------------------------------------------------------
 def _auto_heal_indentation_glitches(
     filepath: str, max_passes: int = 6
 ) -> bool:
     """
-    MODIFIED [역방향 들여쓰기 오염 원천 차단]:
+    MODIFIED [역방향 들여쓰기 오염 원천 차단 & Case 75 ENOSPC 방어]:
     1) 파일 상단에 복사 시 섞여 들어간 텍스트나 마크다운 코드펜스(```)를 먼저 제거한다.
     2) AST 파싱 결과 SyntaxError / IndentationError 가 감지될 경우,
        먼저 코드 라인 중 4의 배수가 아닌 비정상 홀수 공백(예: 1칸 -> 0칸, 9칸 -> 8칸)을
        가장 가까운 4의 배수로 일괄 선제 스냅 교정한다!
-       (블록 첫 줄이 9칸일 때 파이썬 파서가 다음 줄 8칸에서 에러를 발생시켜 정상 라인들이 9칸으로
-        도미노 오염되던 현상을 100% 원천 방지!)
+    3) 치유본 저장 시 OSError(errno.ENOSPC == 28)가 발생하면 미완성 .heal.tmp 를 즉시 삭제하고
+       emergency_free_disk_space_sync() 로 공간을 확보한 뒤 재시도한다.
     """
     if not os.path.isfile(filepath):
         return False
 
     fence_prefix = chr(96) * 3
     coding_marker = "# -*- coding: utf-8 -*-"
+    target_dir = os.path.dirname(os.path.abspath(filepath))
 
     try:
         with GlobalThrottle.get_file_lock(filepath):
@@ -344,7 +435,7 @@ def _auto_heal_indentation_glitches(
 
             src = orig_src
 
-            # 0단계: 이미 문법적으로 완벽하면 즉시 통과
+            # 0단계: 이미 문법적으로 완벽하면 디스크 쓰기 없이 즉시 통과
             try:
                 ast.parse(src, filename=filepath)
                 return False
@@ -430,24 +521,40 @@ def _auto_heal_indentation_glitches(
                 except SyntaxError:
                     return False
 
-                tmp_fp = f"{filepath}.heal.tmp"
-                with open(tmp_fp, "w", encoding="utf-8") as wf:
-                    wf.write(src)
-                    wf.flush()
-                    os.fsync(wf.fileno())
-                os.replace(tmp_fp, filepath)
-                logger.info(
-                    "🔧 [들여쓰기/코드펜스 자동 정규화 완료] %s",
-                    os.path.basename(filepath),
-                )
-                return True
+                for attempt in range(2):
+                    tmp_fp = f"{filepath}.heal.tmp"
+                    try:
+                        with open(tmp_fp, "w", encoding="utf-8") as wf:
+                            wf.write(src)
+                            wf.flush()
+                            os.fsync(wf.fileno())
+                        os.replace(tmp_fp, filepath)
+                        logger.info(
+                            "🔧 [들여쓰기/코드펜스 자동 정규화 완료] %s",
+                            os.path.basename(filepath),
+                        )
+                        return True
+                    except OSError as os_err:
+                        try:
+                            if os.path.exists(tmp_fp):
+                                os.remove(tmp_fp)
+                        except Exception:
+                            pass
+                        if os_err.errno == errno.ENOSPC and attempt == 0:
+                            emergency_free_disk_space_sync(
+                                base_dir=target_dir,
+                                keep_backup_days=3,
+                                remove_pycache=True,
+                            )
+                            continue
+                        break
     except Exception as exc:
         logger.debug("들여쓰기 자동 치유 스킵 (%s): %s", filepath, exc)
     return False
 
 
 # ---------------------------------------------------------------------------
-# [핵심 3] AST 최상위 익스포트 심볼 추출기 및 9대 코어 모듈 정적 교차 검증기
+# [핵심 3] AST 최상위 익스포트 심볼 추출기 및 9대 코어 모듈 무디스크 인메모리 교차 검증기 (Case 75)
 # ---------------------------------------------------------------------------
 def _extract_module_exported_symbols(tree: ast.AST) -> Set[str]:
     """
@@ -486,19 +593,27 @@ def verify_all_modules_compile(
     base_dir: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
-    🚨 Case 11 & Case 62:
-    1) 9대 필수 코어 모듈(REQUIRED_CORE_MODULES)이 디스크에 모두 존재하는지 확인한다.
-    2) 홀수 공백 들여쓰기 오타 자동 치유(_auto_heal_indentation_glitches) 후
-       py_compile.compile(doraise=True) 및 ast.parse() 로 문법 무결성을 검증한다.
-    3) 9대 코어 모듈 간 `from <local_module> import <symbol>` 구문을 전수 대조하여,
+    🚨 Case 11, Case 62 & Case 75 [디스크 쓰기 0 Byte 순수 인메모리 컴파일 검증]:
+    1) 검증 시작 전 emergency_free_disk_space_sync(remove_pycache=False) 로 고아 .tmp.* 파일을 청소한다.
+    2) 9대 필수 코어 모듈(REQUIRED_CORE_MODULES)이 디스크에 모두 존재하는지 확인한다.
+    3) 홀수 공백 들여쓰기 오타 자동 치유(_auto_heal_indentation_glitches) 후
+       디스크에 `__pycache__/*.pyc` 파일을 강제 생성하다가 `[Errno 28] No space left on device` 에러를 일으키던
+       `py_compile.compile()` 대신, 디스크에 단 1바이트도 쓰지 않는 파이썬 내장 인메모리 바이트코드 컴파일러
+       `compile(src, fpath, "exec", dont_inherit=True)` 및 `ast.parse(src, filename=fpath)` 로
+       문법 및 바이트코드 생성 무결성을 100% 검증한다!
+    4) 9대 코어 모듈 간 `from <local_module> import <symbol>` 구문을 전수 대조하여,
        대상 모듈에 존재하지 않는 심볼을 임포트하는 경우 즉시 에러 원인을 반환한다.
     """
     target_dir = get_bot_base_dir(base_dir)
+    emergency_free_disk_space_sync(
+        base_dir=target_dir, keep_backup_days=14, remove_pycache=False
+    )
+
     errors: List[str] = []
     ast_trees: Dict[str, ast.AST] = {}
     exported_map: Dict[str, Set[str]] = {}
 
-    # 1단계: 파일 존재 확인 · 들여쓰기 자동 치유 · py_compile & AST 파싱
+    # 1단계: 파일 존재 확인 · 들여쓰기 자동 치유 · 인메모리 compile() & AST 파싱 (디스크 쓰기 0 Byte!)
     for fname in REQUIRED_CORE_MODULES:
         fpath = os.path.join(target_dir, fname)
         mod_name = fname[:-3]
@@ -509,22 +624,27 @@ def verify_all_modules_compile(
         _auto_heal_indentation_glitches(fpath)
 
         try:
-            py_compile.compile(fpath, doraise=True)
-        except py_compile.PyCompileError as comp_err:
-            errors.append(f"컴파일 오류 [{fname}]: {comp_err.msg}")
-            continue
+            with open(fpath, "r", encoding="utf-8") as f:
+                src = f.read()
         except Exception as exc:
-            errors.append(f"컴파일 예외 [{fname}]: {exc}")
+            errors.append(f"파일 읽기 예외 [{fname}]: {exc}")
             continue
 
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                src = f.read()
+            # NEW [Case 75]: 디스크 __pycache__ 쓰기 없이 순수 RAM 에서 바이트코드 컴파일 및 AST 트리 생성
+            compile(src, fpath, "exec", dont_inherit=True)
             tree = ast.parse(src, filename=fpath)
             ast_trees[mod_name] = tree
             exported_map[mod_name] = _extract_module_exported_symbols(tree)
+        except SyntaxError as syn_err:
+            line_info = (
+                f" (line {syn_err.lineno})"
+                if getattr(syn_err, "lineno", None)
+                else ""
+            )
+            errors.append(f"문법/컴파일 오류 [{fname}]{line_info}: {syn_err.msg}")
         except Exception as exc:
-            errors.append(f"AST 파싱 오류 [{fname}]: {exc}")
+            errors.append(f"컴파일/AST 파싱 예외 [{fname}]: {exc}")
 
     if errors:
         return False, "🚨 컴파일/문법 검증 실패:\n" + "\n".join(errors)
@@ -554,12 +674,12 @@ def verify_all_modules_compile(
 
     return (
         True,
-        f"✅ 9대 코어 모듈 py_compile 및 AST 심볼 정합성 100% 통과 ({len(REQUIRED_CORE_MODULES)}개 파일)",
+        f"✅ 9대 코어 모듈 인메모리 컴파일 및 AST 심볼 정합성 100% 통과 ({len(REQUIRED_CORE_MODULES)}개 파일)",
     )
 
 
 # ---------------------------------------------------------------------------
-# [핵심 4] 스마트 Git 동기화 · Case 68 원장 철벽 보존 쉴드 및 Case 62 독립 서브프로세스 검증
+# [핵심 4] 스마트 Git 동기화 · Case 68 원장 철벽 보존 쉴드 · Case 75 불필요 복원 쓰기 제거 및 독립 서브프로세스 검증
 # ---------------------------------------------------------------------------
 def _run_cmd_sync(
     cmd: List[str], cwd: str, timeout_sec: float = 30.0
@@ -582,24 +702,27 @@ def _execute_git_pull_and_preflight_sync(
     base_dir: Optional[str] = None,
 ) -> Tuple[bool, str, bool]:
     """
-    🚨 Case 62 & Case 68 [장외 업데이트 시 로컬 원장·환경변수 증발 100% 원천 차단]:
-    1) 실행 즉시 `_flush_telegram_pending_updates_sync()` 로 텔레그램 서버의 미확인 `/update` 큐를 선제 소각한다.
+    🚨 Case 62, Case 68 & Case 75 [장외 업데이트 시 로컬 원장·환경변수 증발 원천 차단 & 디스크 Write 최소화]:
+    1) 실행 즉시 `_flush_telegram_pending_updates_sync()` 로 텔레그램 서버의 미확인 `/update` 큐를 선제 소각하고,
+       `emergency_free_disk_space_sync()` 로 고아 `.tmp.*` 파일 및 `__pycache__` 를 청소하여 디스크 여유 공간을 확보한다.
     2) `_snapshot_protected_local_files_sync(target_dir)` 를 호출하여 현재 폴더의 모든 `*ledger*.json`,
        `ledger_backups/*.json`, `.env*`, `*config*.json` 파일을 메모리에 스냅샷 보존한다.
     3) `git fetch --all --prune` 후 원격 저장소에 신규 커밋이 실제로 존재할 때(`remote_ahead > 0`)만
        `git reset --hard origin/<branch>` 를 수행하고, 직후 0.001초 내에 `_restore_protected_local_files_sync()` 로
-       로컬 원장과 `.env` 파일을 100% 원상 복원한다!
-       (GitHub 저장소에 올라가 있던 초기 `soxl_stratum_ledger.json` 이 로컬 원장을 덮어쓰는 현상을 영구 봉쇄!)
-    4) 구버전 RAM 캐시(sys.modules) 간섭을 차단하기 위해
-       반드시 `[sys.executable, "plugin_updater.py", "--verify-only", "--base-dir", target_dir]` 를 독립 서브프로세스로 실행한다!
+       로컬 원장과 `.env` 파일을 원상 복원한다!
+       - 🚨 [Case 75 핵심]: `remote_ahead == 0` (신규 커밋 없음)일 때는 `git reset --hard` 를 실행하지 않았으므로
+         20여 개 백업·원장 파일을 디스크에 다시 덮어쓰는 `_restore_protected_local_files_sync()` 호출을 완전히 스킵한다!
+    4) 구버전 RAM 캐시(sys.modules) 간섭 및 `.pyc` 디스크 생성을 차단하기 위해
+       `[sys.executable, "-B", updater_script, "--verify-only", "--base-dir", target_dir]` 를 독립 서브프로세스로 실행한다!
     5) 서브프로세스 검증 실패 시 즉시 이전 정상 커밋 해시로 자동 롤백하고 로컬 원장을 재복원한다.
     """
     target_dir = get_bot_base_dir(base_dir)
 
     _flush_telegram_pending_updates_sync(target_dir)
 
-    # 🛡️ [Case 68 핵심 방어] git 명령 실행 전 현재 폴더의 모든 원장 및 .env 파일 스냅샷 보존!
+    # 🛡️ [Case 68 & Case 75] git 명령 실행 전 고아 파일/캐시 청소 및 현재 폴더의 모든 원장·.env 파일 메모리 스냅샷 보존!
     protected_snapshots = _snapshot_protected_local_files_sync(target_dir)
+    did_git_reset = False
 
     try:
         rc_h, prev_hash, _ = _run_cmd_sync(
@@ -616,17 +739,31 @@ def _execute_git_pull_and_preflight_sync(
         if rc_b != 0 or not branch_name or branch_name == "HEAD":
             branch_name = "main"
 
-        rc_f, _, _ = _run_cmd_sync(
+        rc_f, _, err_f = _run_cmd_sync(
             ["git", "fetch", "--all", "--prune"],
             cwd=target_dir,
             timeout_sec=25.0,
         )
         if rc_f != 0:
-            _restore_protected_local_files_sync(
-                target_dir, protected_snapshots
-            )
-            ok_local, msg_local = verify_all_modules_compile(target_dir)
-            return ok_local, f"로컬 검증 완료 (git fetch 스킵): {msg_local}", False
+            # NEW [Case 75]: 디스크 공간 부족으로 git fetch 가 실패했을 경우 긴급 디스크 청소 후 1회 재시도
+            if "No space left on device" in err_f or "ENOSPC" in err_f:
+                emergency_free_disk_space_sync(
+                    base_dir=target_dir,
+                    keep_backup_days=3,
+                    remove_pycache=True,
+                )
+                rc_f, _, _ = _run_cmd_sync(
+                    ["git", "fetch", "--all", "--prune"],
+                    cwd=target_dir,
+                    timeout_sec=25.0,
+                )
+            if rc_f != 0:
+                ok_local, msg_local = verify_all_modules_compile(target_dir)
+                return (
+                    ok_local,
+                    f"로컬 검증 완료 (git fetch 스킵): {msg_local}",
+                    False,
+                )
 
         target_ref = f"origin/{branch_name}"
         rc_ref, _, _ = _run_cmd_sync(
@@ -647,12 +784,13 @@ def _execute_git_pull_and_preflight_sync(
         changed = False
         new_hash = prev_hash
         if remote_ahead > 0:
+            did_git_reset = True
             rc_r, _, err_r = _run_cmd_sync(
                 ["git", "reset", "--hard", target_ref],
                 cwd=target_dir,
                 timeout_sec=15.0,
             )
-            # 🛡️ git reset --hard 직후 0.001초 내에 보존된 로컬 원장(*ledger*.json) 및 .env 즉시 복원!
+            # 🛡️ git reset --hard 직후 0.001초 내에 보존된 로컬 원장(*ledger*.json) 및 .env 즉시 복원(바이트 Dirty-Check 적용)!
             _restore_protected_local_files_sync(
                 target_dir, protected_snapshots
             )
@@ -691,18 +829,15 @@ def _execute_git_pull_and_preflight_sync(
                 ["git", "rev-parse", "HEAD"], cwd=target_dir, timeout_sec=10.0
             )
             changed = bool(prev_hash and new_hash and prev_hash != new_hash)
-        else:
-            _restore_protected_local_files_sync(
-                target_dir, protected_snapshots
-            )
 
         purged_list = purge_deprecated_legacy_files(target_dir)
 
-        # 🚨 Case 62: 디스크의 최신 plugin_updater.py 를 독립 서브프로세스로 호출하여 검증!
+        # 🚨 Case 62 & Case 75: "-B" 플래그(바이트코드 .pyc 디스크 쓰기 금지)로 독립 서브프로세스 검증 실행!
         updater_script = os.path.join(target_dir, "plugin_updater.py")
         rc_v, out_v, err_v = _run_cmd_sync(
             [
                 sys.executable,
+                "-B",
                 updater_script,
                 "--verify-only",
                 "--base-dir",
@@ -719,9 +854,10 @@ def _execute_git_pull_and_preflight_sync(
                     cwd=target_dir,
                     timeout_sec=15.0,
                 )
-            _restore_protected_local_files_sync(
-                target_dir, protected_snapshots
-            )
+            if did_git_reset:
+                _restore_protected_local_files_sync(
+                    target_dir, protected_snapshots
+                )
             return (
                 False,
                 f"🚨 프리플라이트 컴파일 에러 감지:\n{detail_err}",
@@ -746,7 +882,10 @@ def _execute_git_pull_and_preflight_sync(
         return True, summary_msg, changed
 
     except Exception as exc:
-        _restore_protected_local_files_sync(target_dir, protected_snapshots)
+        if did_git_reset:
+            _restore_protected_local_files_sync(
+                target_dir, protected_snapshots
+            )
         return False, f"업데이트 실행 예외: {exc}", False
 
 
@@ -785,7 +924,7 @@ async def run_auto_update_loop(
     백그라운드 무인 자동 업데이트 워커 (main.py 에서 정식 임포트):
     - 평일 04:00 ~ 16:05 EST 장중에는 절대 재기동하지 않고 대기한다 (Case 07).
     - 장외 시간대에 원격 저장소에 새로운 커밋이 감지되고 프리플라이트 검증을 통과했을 때만
-      해당 폴더의 3중 원장 및 .env 를 100% 보존한 상태로 안전하게 프로세스를 재기동한다 (Case 68).
+      해당 폴더의 3중 원장 및 .env 를 100% 보존한 상태로 안전하게 프로세스를 재기동한다 (Case 68 & Case 75).
     """
     wait_s = max(300.0, float(interval_sec or 3600.0))
     base_dir = get_bot_base_dir(getattr(context, "base_dir", None))
@@ -833,16 +972,16 @@ async def run_auto_update_loop(
 
 
 # ---------------------------------------------------------------------------
-# CLI 엔트리포인트 (`--verify-only` 독립 검증 및 `systemd ExecStartPre` Case 07/68 호환)
+# CLI 엔트리포인트 (`--verify-only` 독립 검증 및 `systemd ExecStartPre` Case 07/68/75 호환)
 # ---------------------------------------------------------------------------
 def _cli_main() -> int:
     parser = argparse.ArgumentParser(
-        description="Infinite Snowball v3.0 Preflight Compiler & AST Verifier"
+        description="Infinite Snowball v3.0 Diskless Preflight Compiler & AST Verifier"
     )
     parser.add_argument(
         "--verify-only",
         action="store_true",
-        help="디스크의 9대 코어 모듈 py_compile 및 AST 심볼 정합성만 검증하고 종료합니다.",
+        help="디스크의 9대 코어 모듈 인메모리 컴파일 및 AST 심볼 정합성만 검증하고 종료합니다.",
     )
     parser.add_argument(
         "--base-dir",

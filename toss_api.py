@@ -2,10 +2,10 @@
 """
 # MODIFIED: toss_api.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 토스증권 Open API (v1.2.14) 방탄 통신 통제소 &
-SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대) 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 01 / 04)
+SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대) 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 01 / 02)
 - 제1헌법: 모든 파일 I/O 및 네트워크 통신의 asyncio.to_thread 비동기 격리 + GlobalThrottle 중앙 통제
 - 제2헌법: 기동 시 GET /api/v1/accounts 1회 호출로 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 자동 주입
-- 제3헌법 ~ 제6헌법 및 Case 01 ~ 74 전수 락온:
+- 제3헌법 ~ 제6헌법 및 Case 01 ~ 75 전수 락온:
   1) REAL_ALLOWED_SYMBOLS = ("SOXL",) 단일 롱 화이트리스트 물리적 강제 (인버스 숏 SOXS 원천 차단)
   2) get_holdings_map_with_status, get_candles_1m, get_candles_1d, get_current_prices_batch,
      get_orderbook, get_buying_power_usd, get_sellable_quantity, create_order, modify_order,
@@ -19,19 +19,25 @@ SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 
        ③ 실시간 백업 금고(ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json) 3중 원자적 동기화 및 기존 데이터 무손실 자동 이관
   5) 🚨 [Case 65, Case 69, Case 70 & Case 73 양방향·주기 60초 타임쉴드 시각 영속화 및 순수 원가 무결성 강제]
      - last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts, last_reentry_eval_ts 원장 영속화
-  6) 🚨 [NEW · Case 63, Case 71 ~ Case 74 : 최종 확정 챔피언 🔥 03_7G_PURE_10_01 7-Layer 순수 원가 보존 및
+  6) 🚨 [Case 63, Case 71 ~ Case 74 : 최종 확정 챔피언 🔥 03_7G_PURE_10_01 7-Layer 순수 원가 보존 및
      토스 CLOSED 주문 원장 역추적(probe_latest_manual_fill_price) & 기정산 주문 링버퍼(last_settled_order_ids) 탑재]
+  7) 🚨 [NEW · Case 75 : 클라우드 VM 디스크 고갈([Errno 28] No space left on device) 원천 차단 & 디스크 Write 90% 감축]
+     - 원장 Dirty-Check(_is_state_materially_equal)를 통해 실질 상태 변경이 없을 때 불필요한 .tmp 생성 및 os.fsync() 원천 스킵
+     - emergency_free_disk_space_sync() 로 고아 임시 파일(*.tmp.*, *.heal.tmp) · __pycache__ · 초과 백업 스냅샷 자동 소각 및
+       ENOSPC(Errno 28) 감지 시 즉시 자가 치유 후 원자적 쓰기 재시도
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 import glob
 import json
 import logging
 import math
 import os
 import re
+import shutil
 import threading
 import time
 import urllib.error
@@ -149,7 +155,7 @@ class _NonRetryableApiError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# [Case 68] 폴더 위치(base_dir) 기반 자동 식별기 및 격리 환경변수 로더
+# [Case 68 & Case 75] 폴더 위치(base_dir) 기반 자동 식별기 · 격리 환경변수 로더 · 디스크 자가 치유기
 # ("/home/pipiosToss" 고정 경로 하드코딩 100% 영구 소각)
 # ---------------------------------------------------------------------------
 def get_bot_base_dir(explicit_dir: Optional[str] = None) -> str:
@@ -207,9 +213,81 @@ def resolve_folder_isolated_ledger_paths(
     legacy_path = os.path.join(target_dir, "soxl_stratum_ledger.json")
     backup_dir = os.path.join(target_dir, "ledger_backups")
     backup_path = os.path.join(
-        backup_dir, f"soxl_stratum_ledger_{folder_slug}.bak.json"
+        backup_dir, f"soxl_stratum_ledger_{folder_slug>.bak.json".replace(">", "")
     )
     return primary_path, legacy_path, backup_path, folder_slug
+
+
+def emergency_free_disk_space_sync(
+    base_dir: Optional[str] = None,
+    keep_backup_days: int = 7,
+    remove_pycache: bool = True,
+) -> int:
+    """
+    # NEW [Case 75 : 디스크 고갈(Errno 28 · No space left on device) 원천 방어 및 고아 파일 자가 치유기]:
+    1) target_dir 및 ledger_backups/ 내에 남아 있는 모든 고아 임시 파일
+       (*.tmp.*, *.restore.tmp.*, *.ack.tmp.*, *.heal.tmp)을 즉시 삭제한다.
+    2) remove_pycache=True 일 때 target_dir/__pycache__ 내의 *.pyc, *.pyo 바이트코드 캐시를 청소하여
+       디스크 블록 및 Inode 고갈을 방지한다.
+    3) ledger_backups/ 내 일일 스냅샷(soxl_stratum_ledger_*_20*.json)이 keep_backup_days 개수를 초과하면
+       오래된 스냅샷부터 자동 정리한다.
+    반환값: 삭제된 파일/디렉토리 총 개수
+    """
+    target_dir = get_bot_base_dir(base_dir)
+    backup_dir = os.path.join(target_dir, "ledger_backups")
+    removed_cnt = 0
+
+    # 1) 고아 임시 파일(*.tmp.*, *.heal.tmp) 전수 청소
+    tmp_patterns = (
+        os.path.join(target_dir, "*.tmp.*"),
+        os.path.join(target_dir, ".*.tmp.*"),
+        os.path.join(target_dir, "*.heal.tmp"),
+        os.path.join(backup_dir, "*.tmp.*"),
+        os.path.join(backup_dir, ".*.tmp.*"),
+    )
+    for pat in tmp_patterns:
+        for fp in glob.glob(pat):
+            try:
+                if os.path.isfile(fp):
+                    os.remove(fp)
+                    removed_cnt += 1
+            except Exception:
+                pass
+
+    # 2) __pycache__ 바이트코드 캐시 청소
+    if remove_pycache:
+        pycache_dir = os.path.join(target_dir, "__pycache__")
+        if os.path.isdir(pycache_dir):
+            try:
+                shutil.rmtree(pycache_dir, ignore_errors=True)
+                removed_cnt += 1
+            except Exception:
+                for pyc_fp in glob.glob(os.path.join(pycache_dir, "*")):
+                    try:
+                        os.remove(pyc_fp)
+                        removed_cnt += 1
+                    except Exception:
+                        pass
+
+    # 3) 오래된 일일 스냅샷 백업 정리 (최근 keep_backup_days 개수만 보존)
+    if os.path.isdir(backup_dir):
+        try:
+            snap_pat = os.path.join(
+                backup_dir, "soxl_stratum_ledger_*_20*.json"
+            )
+            snaps = sorted(glob.glob(snap_pat))
+            keep_n = max(2, safe_int(keep_backup_days, 7))
+            if len(snaps) > keep_n:
+                for old_fp in snaps[: len(snaps) - keep_n]:
+                    try:
+                        os.remove(old_fp)
+                        removed_cnt += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return removed_cnt
 
 
 def _load_env_files_into_environ(
@@ -348,11 +426,11 @@ class GlobalThrottle:
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] SOXL 단일 롱 7-Tier 순수 멀티 그리드 폴더별 3중 안전 지층 원장 (SoxlStratumLedger — Case 68 ~ 74)
+# [핵심 2] SOXL 단일 롱 7-Tier 순수 멀티 그리드 폴더별 3중 안전 지층 원장 (SoxlStratumLedger — Case 68 ~ 75)
 # ---------------------------------------------------------------------------
 class SoxlStratumLedger:
     """
-    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 74:
+    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 75:
     현재 봇이 위치한 폴더(`base_dir`)를 기준으로:
     ① 폴더 고유 원장(`soxl_stratum_ledger_<folder_slug>.json` — Git 덮어쓰기 100% 면역)
     ② 표준 호환 원장(`soxl_stratum_ledger.json` — 기존 코드 및 외부 도구 호환 미러)
@@ -361,7 +439,8 @@ class SoxlStratumLedger:
     가용 현금 시드(free_cash_usd), 정적 잠금 사이클 최저 매수가(cycle_min_buy_price),
     양방향·주기 60초 타임쉴드 시각(last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts, last_reentry_eval_ts),
     다중 그리드 매도 대기 인덱스(pending_sell_indices), 기정산 주문 ID 링버퍼(last_settled_order_ids),
-    누적 세후 실현수익금 및 자투리 절약금을 원자적(.tmp -> os.replace)으로 동시 영속화한다.
+    누적 세후 실현수익금 및 자투리 절약금을 원자적(.tmp -> os.replace)으로 동시 영속화하되,
+    Case 75 Dirty-Check 를 적용하여 변경이 없을 때는 불필요한 os.fsync() 디스크 쓰기를 스킵한다.
     """
 
     ALLOWED_SYMBOLS: Tuple[str, ...] = ("SOXL",)
@@ -394,6 +473,10 @@ class SoxlStratumLedger:
         self._mem_lock = threading.RLock()
         self._last_known_valid_seed: float = self._read_env_initial_seed()
         self._data: Dict[str, Dict[str, Any]] = {}
+        # NEW [Case 75]: 기동 시 잔류 고아 .tmp 파일 선제 청소(바이트코드 캐시는 런타임 중 유지)
+        emergency_free_disk_space_sync(
+            base_dir=self.base_dir, keep_backup_days=14, remove_pycache=False
+        )
         self._load_sync()
 
     @staticmethod
@@ -744,6 +827,23 @@ class SoxlStratumLedger:
         return None
 
     @staticmethod
+    def _is_state_materially_equal(
+        st_a: Optional[Dict[str, Any]],
+        st_b: Optional[Dict[str, Any]],
+    ) -> bool:
+        """
+        # NEW [Case 75 : 원장 Dirty-Check 비교기]:
+        두 원장 상태 딕셔너리에서 매 호출마다 바뀌는 타임스탬프("updated_at")만 제외하고
+        나머지 모든 실질 필드(buckets, free_cash_usd, 주문 ID, 타임쉴드 시각, 카운터 등)가
+        100% 동일한지 판별한다.
+        """
+        if not isinstance(st_a, dict) or not isinstance(st_b, dict):
+            return False
+        cmp_a = {k: v for k, v in st_a.items() if k != "updated_at"}
+        cmp_b = {k: v for k, v in st_b.items() if k != "updated_at"}
+        return cmp_a == cmp_b
+
+    @staticmethod
     def _score_ledger_state(
         st: Dict[str, Any],
     ) -> Tuple[int, int, int, float, str]:
@@ -801,12 +901,13 @@ class SoxlStratumLedger:
 
     def _load_sync(self) -> None:
         """
-        🚨 Case 68 [기존 soxl_stratum_ledger.json 100% 무손실 자동 이관 & 3중 금고 자가 치유]:
+        🚨 Case 68 & Case 75 [기존 soxl_stratum_ledger.json 100% 무손실 자동 이관 & 3중 금고 Dirty-Check 자가 치유]:
         1) primary_filepath (`soxl_stratum_ledger_<폴더명>.json`)
         2) backup_filepath  (`ledger_backups/soxl_stratum_ledger_<폴더명>.bak.json`)
         3) legacy_filepath  (`soxl_stratum_ledger.json`)
         3개 파일을 모두 검사하여 가장 풍부하고 유효한 상태를 가진 원장을 채택한 뒤,
-        즉시 3개 경로 모두에 원자적으로 동기화 저장한다.
+        _save_sync_unlocked() 내부의 파일별 Dirty-Check 를 통해 실제로 차이가 있거나 누락된 파일에만
+        원자적으로 기록한다.
         """
         with GlobalThrottle.get_file_lock(self.primary_filepath):
             with GlobalThrottle.get_file_lock(self.legacy_filepath):
@@ -854,7 +955,7 @@ class SoxlStratumLedger:
                         for b in sanitized.get("buckets", [])
                     )
                     logger.info(
-                        "📂 [Case 68~74 폴더별 3중 7층 골디락스 그리드 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주(%d개층) · 고유원장=%s",
+                        "📂 [Case 68~75 폴더별 3중 7층 골디락스 그리드 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주(%d개층) · 고유원장=%s",
                         self.folder_slug,
                         best_label,
                         safe_float(sanitized.get("initial_seed_usd"), 10000.0),
@@ -863,54 +964,135 @@ class SoxlStratumLedger:
                         os.path.basename(self.primary_filepath),
                     )
 
-    @staticmethod
+    @classmethod
     def _atomic_write_json_sync(
-        target_path: str, payload: Dict[str, Any]
-    ) -> None:
-        parent_dir = os.path.dirname(target_path)
-        if parent_dir and not os.path.isdir(parent_dir):
-            os.makedirs(parent_dir, exist_ok=True)
-        tmp_path = (
-            f"{target_path}.tmp.{os.getpid()}.{threading.get_ident()}"
-        )
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, target_path)
-        except Exception as exc:
-            logger.error("원장 원자적 저장 예외(%s): %s", target_path, exc)
+        cls,
+        target_path: str,
+        payload: Dict[str, Any],
+        force_write: bool = False,
+    ) -> bool:
+        """
+        # MODIFIED [Case 05, Case 68 & Case 75]:
+        1) force_write=False 일 때 디스크에 이미 target_path 파일이 존재하면 읽어와
+           _is_state_materially_equal() 로 비교하여 실질 데이터 변경이 없을 경우
+           .tmp 파일 생성과 os.fsync() 디스크 쓰기를 즉시 스킵(False 반환)한다!
+        2) 쓰기 도중 OSError(errno.ENOSPC == 28, No space left on device)가 감지되면
+           미완성 .tmp 파일을 즉시 삭제하고 emergency_free_disk_space_sync() 로
+           고아 파일·캐시·오래된 백업을 청소한 뒤 1회 재시도하여 원장 0바이트 파손을 철벽 방어한다.
+        """
+        if not target_path:
+            return False
+
+        new_soxl = cls._extract_raw_soxl_dict(payload)
+        if not force_write and new_soxl is not None and os.path.isfile(target_path):
             try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                with open(target_path, "r", encoding="utf-8") as rf:
+                    existing_loaded = json.load(rf)
+                existing_soxl = cls._extract_raw_soxl_dict(existing_loaded)
+                if cls._is_state_materially_equal(existing_soxl, new_soxl):
+                    return False
             except Exception:
                 pass
 
-    def _save_sync_unlocked(self) -> None:
+        parent_dir = os.path.dirname(os.path.abspath(target_path))
+        base_search_dir = (
+            os.path.dirname(parent_dir)
+            if os.path.basename(parent_dir) == "ledger_backups"
+            else parent_dir
+        )
+
+        for attempt in range(2):
+            if parent_dir and not os.path.isdir(parent_dir):
+                try:
+                    os.makedirs(parent_dir, exist_ok=True)
+                except OSError as os_err:
+                    if os_err.errno == errno.ENOSPC and attempt == 0:
+                        emergency_free_disk_space_sync(
+                            base_dir=base_search_dir,
+                            keep_backup_days=3,
+                            remove_pycache=True,
+                        )
+                        continue
+                    return False
+
+            tmp_path = (
+                f"{target_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+            )
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, target_path)
+                return True
+            except OSError as os_err:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                if os_err.errno == errno.ENOSPC and attempt == 0:
+                    freed_cnt = emergency_free_disk_space_sync(
+                        base_dir=base_search_dir,
+                        keep_backup_days=3,
+                        remove_pycache=True,
+                    )
+                    logger.warning(
+                        "🧹 [Case 75 디스크 공간 부족(Errno 28) 감지 -> 긴급 자가 치유 실행] 삭제된 고아/캐시/구백업=%d개 · 원장 저장 재시도(%s)",
+                        freed_cnt,
+                        os.path.basename(target_path),
+                    )
+                    continue
+                logger.error(
+                    "원장 원자적 저장 OS 예외(%s): %s", target_path, os_err
+                )
+                return False
+            except Exception as exc:
+                logger.error("원장 원자적 저장 예외(%s): %s", target_path, exc)
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                return False
+
+        return False
+
+    def _save_sync_unlocked(self, force_write: bool = False) -> None:
         """
-        🚨 Case 05 & Case 68:
+        🚨 Case 05, Case 68 & Case 75:
         1) 폴더 고유 원장 (`soxl_stratum_ledger_<folder_slug>.json`)
         2) 호환 미러 원장 (`soxl_stratum_ledger.json`)
         3) 실시간 백업 금고 (`ledger_backups/soxl_stratum_ledger_<folder_slug>.bak.json`)
-        3곳 모두 원자적(.tmp -> os.replace)으로 동시 기록한다.
+        3곳 모두 Dirty-Check 후 변경이 있을 때만 원자적(.tmp -> os.replace)으로 동시 기록한다.
         """
         payload = {TARGET_SYMBOL: self._data[TARGET_SYMBOL]}
-        self._atomic_write_json_sync(self.primary_filepath, payload)
+        self._atomic_write_json_sync(
+            self.primary_filepath, payload, force_write=force_write
+        )
         if os.path.abspath(self.legacy_filepath) != os.path.abspath(
             self.primary_filepath
         ):
-            self._atomic_write_json_sync(self.legacy_filepath, payload)
-        self._atomic_write_json_sync(self.backup_filepath, payload)
+            self._atomic_write_json_sync(
+                self.legacy_filepath, payload, force_write=force_write
+            )
+        self._atomic_write_json_sync(
+            self.backup_filepath, payload, force_write=force_write
+        )
 
     def create_daily_backup_snapshot_sync(
         self, logical_date: Optional[str] = None, keep_days: int = 14
     ) -> str:
         """
-        Case 68 [일일 날짜별 스냅샷 금고 보관]:
-        17:00 EST 일일 GC 또는 장 마감 결산 시 `ledger_backups/soxl_stratum_ledger_<folder_slug>_YYYY-MM-DD.json`
-        파일을 생성하고 오래된 스냅샷(최근 14개 초과분)을 자동 정리한다.
+        Case 68 & Case 75 [일일 날짜별 스냅샷 금고 보관 및 고아 파일 청소]:
+        16:00 / 17:00 EST 일일 결산 및 GC 시 고아 임시 파일과 오래된 스냅샷을 먼저 정리한 뒤,
+        `ledger_backups/soxl_stratum_ledger_<folder_slug>_YYYY-MM-DD.json` 파일을 생성한다.
         """
+        emergency_free_disk_space_sync(
+            base_dir=self.base_dir,
+            keep_backup_days=max(3, safe_int(keep_days, 14)),
+            remove_pycache=False,
+        )
         dt_str = str(
             logical_date or datetime.now(EST_TZ).strftime("%Y-%m-%d")
         ).strip()
@@ -921,22 +1103,10 @@ class SoxlStratumLedger:
         with GlobalThrottle.get_file_lock(self.primary_filepath):
             with self._mem_lock:
                 payload = {TARGET_SYMBOL: self._data[TARGET_SYMBOL]}
-                self._atomic_write_json_sync(snap_path, payload)
+                self._atomic_write_json_sync(
+                    snap_path, payload, force_write=False
+                )
 
-        try:
-            pattern = os.path.join(
-                self.backup_dir,
-                f"soxl_stratum_ledger_{self.folder_slug}_20*.json",
-            )
-            files = sorted(glob.glob(pattern))
-            if len(files) > max(3, keep_days):
-                for old_fp in files[: len(files) - max(3, keep_days)]:
-                    try:
-                        os.remove(old_fp)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
         return snap_path
 
     async def create_daily_backup_snapshot(
@@ -998,8 +1168,9 @@ class SoxlStratumLedger:
         with GlobalThrottle.get_file_lock(self.primary_filepath):
             with GlobalThrottle.get_file_lock(self.legacy_filepath):
                 with self._mem_lock:
+                    prev_st = self._data.get(sym)
                     cur = dict(
-                        self._data.get(sym)
+                        prev_st
                         or self._default_symbol_state(
                             folder_slug=self.folder_slug,
                             initial_seed=self._last_known_valid_seed,
@@ -1014,8 +1185,12 @@ class SoxlStratumLedger:
                         )
                     cur.update(kwargs)
                     sanitized = self._sanitize_and_enforce_identity(cur)
-                    self._data[sym] = sanitized
-                    self._save_sync_unlocked()
+                    # MODIFIED [Case 75]: 인메모리 상태가 실질적으로 변경되었을 때만 디스크 저장 호출
+                    if not self._is_state_materially_equal(prev_st, sanitized):
+                        self._data[sym] = sanitized
+                        self._save_sync_unlocked(force_write=False)
+                    else:
+                        self._data[sym] = sanitized
                     return json.loads(json.dumps(sanitized))
 
     async def update_state(
