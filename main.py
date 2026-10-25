@@ -2,26 +2,29 @@
 """
 # MODIFIED: main.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 순수 롱(🐂 SOXL 단독) 04:07 ~ 16:00 EST 오버나이트 7층 골디락스 멀티 그리드 지층관리 스나이퍼
-메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 사용자 중심 초슬림 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 03 / 04)
-- 최종 확정 챔피언 (🔥 03_7G_PURE_10_01 / 01_7L_STATIC_CYCLE_MIN · Case 70 ~ Case 75) 100% 결속:
-  1) 8%(12.5분할) 황금비율 정액 기반 정량제 & min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67) &
-     자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
+메인 오케스트레이터 · TossApiClient 폴리필(close 포함) · 내장형 사용자 중심 초슬림 텔레그램 롱폴링/관제탑 컨트롤러 통합 코어 모듈 (Step 07 / 07)
+- 최종 확정 진화 챔피언 (💉 05_RESV_6P_GUARD30 × 🔓 06_STEP2X_15PCT_C20 / 🔥 03_7G_PURE_10_01 진화형 · Case 70 ~ Case 77) 100% 결속:
+  1) 8%(12.5분할) 황금비율 정액 기반 정량제 & 온디맨드 예비시드 수혈금(injected_reserve_usd)을 제외한 순수 코어 총자산(core_equity) 기반 정량 산출 &
+     min(1회분 예산 상한 주수, 기준가 고정 정량) 이중 캡핑(Case 67, Case 77) & 자투리 절약금 · 세후 실현수익금 실시간 시드 풀 복리 산입 (COMP_08PCT 고정)
   2) 0주 상태 60초 타임쉴드 확인 후 실시간 현재가 조회 및 현재가 지정가(LIMIT) 실물 1층(REENTRY_1FL) 산입
   3) 상단 2층 ~ 7층(GRID_L2 ~ GRID_L7) 보유 중 1층 공석 시 10분 게이트를 기다리지 않고 매 60.0초(1분) 타임쉴드 주기마다
      실시간 현재가를 조회하되 현재가 <= 2층 단가(buckets[0].book_price) 상한 가드(HOLD_PREVENT_INVERSION · Case 73) 하에서
      눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 실물 1층(REENTRY_1FL) 재장전 (상단 지층 비병합 · Case 67 이중 캡핑!)
-  4) 활성 1층 보유 중 정적 기억 사이클 최저 매수가(cycle_min_buy_price) 잠금 기반 10분 고정 4단 와이드 활주로 시드보호 매수 게이트
-     (WIDE_RUNWAY : 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 신저가 도달 시에만 현재가 지정가 추매 및
-      2~6층 개별 승격 · 8회차 이상 최상단 6층+7층을 통합 7층 본대[GRID_L7]로 가중평균 합병 · Case 72)
-  5) ⚡ [MODIFIED · Case 65, Case 70, Case 71 & Case 72] 매수 직후 최초 60.0초 타임쉴드 유지 & 이후 보유 중 매 1.5초 실시간 3중 다중 익절 스나이퍼 매도 모니터
+  4) 활성 1층 보유 중 정적 기억 사이클 최저 매수가(cycle_min_buy_price) 기본 잠금 기반 10분 고정 4단 와이드 활주로 시드보호 매수 게이트
+     (WIDE_RUNWAY : 1~4회 -1.0% / 5~8회 -2.0% / 9~10회 -3.5% / 11회+ -5.5% 신저가 도달 시 또는
+      STEP2X_15PCT_C20 3중 안전문[2층 이하 & 가용현금 20.0%+ & 저점대비 2.0배+ 반등] 통과 후 활성 1층 대비 -15.0% 도달 시에만
+      현재가 지정가 추매 및 2~6층 개별 승격 · 8회차 이상 최상단 6층+7층을 통합 7층 본대[GRID_L7]로 가중평균 합병 · Case 72, Case 76)
+  5) 💉 [NEW · Case 77 : 05_RESV_6P_GUARD30] 30% 자투리 1주 승격 방지 가드(GUARD30) · 시드고갈 시 단 1회 입금 요청 알림 영구 래치(waiting_reserve_deposit_alert_sent) ·
+     토스 실계좌 여유자금(1회분 이상) 입금 자동 감지 기반 최대 +6회분 온디맨드 예비시드 자동 수혈 및 0주 졸업 시 원금 자동 상환!
+  6) ⚡ [Case 65, Case 70, Case 71 & Case 72] 매수 직후 최초 60.0초 타임쉴드 유지 & 이후 보유 중 매 1.5초 실시간 3중 다중 익절 스나이퍼 매도 모니터
      (매수 후 60.0초 경과 시점부터 60초 블라인드 대기 락 없이 매 1.5초 루프마다 현재가를 상시 대조하여 ① 1층 +1.50% 이상 개별 익절 /
       ② 2~6층 개별 및 통합 7층 +1.00% 이상 개별 익절 / ③ 2~7층 통합 이동평균 단가 대비 +1.00% 이상 일괄 졸업을 동시 판정해 도래 즉시 현재가 지정가 매도!)
-  6) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
+  7) 🚨 [Case 66 미결 매수 선행 정산] 04:07 ~ 16:00 EST 루프 진입 시 reconcile 호출 전에 sync_pending_buy_order_plugin(Step 3-0)을
      최우선 실행하여, 거래소 즉시 체결 시에도 텔레그램 체결 알림 · 자투리 절약금 누적 · 60초 타임쉴드 각인이 100% 실행되도록 보장!
-  7) 📡 [Case 11, Case 15, Case 16, Case 62, Case 64 & Case 74 문단 하단 2중 중복 인라인 메뉴 전면 제거 · /reset 차단 및 /reset_profit 전용 대체 ·
-     04:00 EST 및 17:00 EST 당일 시드보호 패스 카운터 0회 리셋 보장]
-  8) 🚨 [Case 68, Case 69, Case 71 ~ Case 75 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 순수 원가 100% 보존]
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 75 전수 락온
+  8) 📡 [Case 11, Case 15, Case 16, Case 62, Case 64, Case 74, Case 76 & Case 77 문단 하단 2중 중복 인라인 메뉴 전면 제거 · /reset 차단 및 /reset_profit 전용 대체 ·
+     04:00 EST 및 17:00 EST 당일 시드보호 패스·스텝업 해금·예비수혈 카운터 0회 리셋(단 1회 입금 알림 래치 보존) 보장]
+  9) 🚨 [Case 68, Case 69, Case 71 ~ Case 77 폴더 위치(base_dir) 기반 멀티 봇 자동 식별 격리 & 3중 원장 금고 & 순수 원가 100% 보존]
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 77 전수 락온
 """
 
 from __future__ import annotations
@@ -65,6 +68,7 @@ from plugin_updater import (
     verify_all_modules_compile,
 )
 from quant_engine import (
+    MAX_RESERVE_PORTIONS,
     buckets_from_dicts,
     run_quant_engine_tdd,
     summarize_stratum_portfolio,
@@ -85,6 +89,8 @@ from sniper_exit_plugin import (
 from sniper_plugin import (
     execute_seed_protected_buy_gate_plugin,
     is_within_reentry_monitor_time_shield,
+    is_within_reserve_deposit_check_shield,
+    mark_reserve_deposit_check_shield,
     sync_pending_buy_order_plugin,
 )
 from toss_api import (
@@ -1389,7 +1395,7 @@ def _format_multi_grid_stratum_lines(
     summary: Dict[str, Any], live_price: float
 ) -> List[str]:
     """
-    MODIFIED [Case 71, Case 72 & Case 73]:
+    [Case 71, Case 72 & Case 73]:
     1층(활성 공격수 또는 60초 주기 공석 감시 & 2층 단가 상한) 및 상단 2층 ~ 6층 개별 완충층 ·
     통합 7층 본대와 2~7층 통합 이동평균 목표가를 모바일 화면에 최적화된 형태로 전수 렌더링한다.
     """
@@ -1494,7 +1500,7 @@ def _build_main_reply_keyboard() -> Dict[str, Any]:
 
 def _build_radar_inline_keyboard() -> Optional[Dict[str, Any]]:
     """
-    # MODIFIED: 하단 고정 메뉴(_build_main_reply_keyboard)와 2중으로 중복 출력되던
+    # 하단 고정 메뉴(_build_main_reply_keyboard)와 2중으로 중복 출력되던
     문단 아래 인라인 네비게이션 버튼을 전면 비활성화(None 반환)한다.
     """
     return None
@@ -1502,7 +1508,7 @@ def _build_radar_inline_keyboard() -> Optional[Dict[str, Any]]:
 
 def _build_settlement_inline_keyboard(is_active: bool) -> Dict[str, Any]:
     """
-    # MODIFIED [Case 64 엄수 & 하단 중복 메뉴 제거]:
+    # [Case 64 엄수 & 하단 중복 메뉴 제거]:
     전술 제어반(/settlement)에는 하단 고정 메뉴와 중복되는 [스나이퍼 레이더 / 지층 지시서] 버튼을 제거하고,
     오직 [작동 ON/OFF] 와 [시드머니 설정] 2가지 핵심 조작 버튼만 둔다.
     """
@@ -1530,7 +1536,7 @@ class _AdaptiveTelegramBridge:
     """
     외부 tg_ui_plugin 의 폴링 루프 구조에 구애받지 않고
     자체 내장 getUpdates 롱폴링 + /start, /avwap, /sync, /settlement, /reset_profit, /update +
-    인라인 버튼 콜백 + 시드 숫자 입력을 100% 직접 수행하는 완결형 텔레그램 컨트롤러 (Case 62 ~ 75).
+    인라인 버튼 콜백 + 시드 숫자 입력을 100% 직접 수행하는 완결형 텔레그램 컨트롤러 (Case 62 ~ 77).
     """
 
     def __init__(self, context: Any) -> None:
@@ -1766,7 +1772,7 @@ class _AdaptiveTelegramBridge:
 
     async def send_startup_alive_banner(self) -> None:
         """
-        # MODIFIED: 기동 완료 후 "✅ 서버가 정상 작동 중입니다." 단일 라인 생존 신호 타전 (Case 16)
+        # 기동 완료 후 "✅ 서버가 정상 작동 중입니다." 단일 라인 생존 신호 타전 (Case 16)
         """
         text = "<b>✅ 서버가 정상 작동 중입니다.</b>"
         sent = await self.send_message(
@@ -1785,7 +1791,7 @@ class _AdaptiveTelegramBridge:
         self, st: Dict[str, Any], now_est: datetime
     ) -> str:
         """
-        # MODIFIED: /reset 을 메뉴에서 완전 삭제하고 그 자리에 /reset_profit 만 배치
+        # /reset 을 메뉴에서 완전 삭제하고 그 자리에 /reset_profit 만 배치
         """
         dst_str = _get_dst_badge(now_est)
         lines = [
@@ -1816,15 +1822,14 @@ class _AdaptiveTelegramBridge:
         now_est: datetime,
     ) -> str:
         """
-        # MODIFIED [Case 65, Case 70, Case 71, Case 72, Case 73 & Case 74]:
+        # MODIFIED [Case 65, Case 70, Case 71, Case 72, Case 73, Case 74, Case 76 & Case 77]:
         📡 /avwap 사용자 중심 초슬림 레이더 메시지 생성:
         - 상단 배지를 ⚡1.5s 실시간타점 (미체결 체결 감시 중일 때는 ⚡0.4s 체결감시)으로 표출한다.
         - 매수 직후 최초 60.0초 타임쉴드(in_b) 가동 중일 때만 잔여 초를 표출하고,
           경과 후에는 보유 중 불필요한 60초 매도 대기 문구 없이 상시 1.5초 실시간 익절 감시 상태를 표출한다.
-        - 0주(held_sh <= 0)일 때는 0주 싸이클 종료 후 60초 타임쉴드 및 현재가 지정가 첫 1층 진입 모니터를 표출한다.
-        - 1층 공석(is_l2_only_anti_bloat == True)일 때는 60초(1분) 주기 재장전 타임쉴드 잔여 시간 및
-          2층 단가 상한선(l2_ceiling_price 이하 / HOLD_PREVENT_INVERSION 역전차단 배지)을 실시간 표출한다.
-        - 활성 1층 보유 중일 때는 10분 고정 와이드 시드보호 매수 게이트 및 정적 기억저가를 표출한다.
+        - 시드고갈 입금 대기(waiting_reserve_deposit == True) 중일 때는 권장 입금액 및 잔여 예비한도 배너를 표출한다.
+        - 하단 관제 지표에 🛡️시드보호 패스(30%자투리차단 횟수), 🔥13회차+·🔓스텝업해금,
+          💉예비시드 탄창(사용 M/6회분 · 수혈잔액), 💰자투리절약·세후실현익, 💵가용현금·총자산(순자산)을 직관적으로 표출한다.
         """
         met = refresh_metrics_with_live_tick(
             metrics, live_price, now_est=now_est
@@ -1849,7 +1854,7 @@ class _AdaptiveTelegramBridge:
         held_tiers = safe_int(summary.get("held_tiers"), 0)
         is_l2_only = bool(summary.get("is_l2_only_anti_bloat"))
 
-        # 🛡️ Case 65, Case 70 & Case 73: 매수 직후 최초 60초 / 1층 공석 60초 재장전 모니터 / 매도 후 60초 타임쉴드 확인
+        # 🛡️ Case 65, Case 70, Case 73 & Case 77: 매수 직후 60초 / 1층 공석 60초 / 매도 후 60초 / 입금 대기 60초 타임쉴드 확인
         in_b, rem_b = is_within_post_buy_time_shield(
             self.context, st, TARGET_SYMBOL
         )
@@ -1859,12 +1864,36 @@ class _AdaptiveTelegramBridge:
         in_re, rem_re = is_within_reentry_monitor_time_shield(
             self.context, st, TARGET_SYMBOL
         )
+        waiting_dep = bool(summary.get("waiting_reserve_deposit", False))
+        req_dep_usd = safe_float(
+            summary.get("required_reserve_deposit_usd"), 0.0
+        )
+        used_res_cnt = safe_int(summary.get("used_reserve_portions_cnt"), 0)
+        avail_res_cnt = safe_int(
+            summary.get("avail_reserve_portions"), MAX_RESERVE_PORTIONS
+        )
+        max_res_cnt = safe_int(
+            summary.get("max_reserve_portions"), MAX_RESERVE_PORTIONS
+        )
+        inj_res_usd = safe_float(summary.get("injected_reserve_usd"), 0.0)
+        min_req_g30 = safe_float(summary.get("min_req_cash_guard30"), 0.0)
 
         shield_line = ""
         if in_b:
             shield_line = (
                 f"🛡️ <b>[매수 직후 60초 타임쉴드 가동 중]</b> 잔여 <b>{rem_b:.1f}초</b> 후 "
                 "⚡1.5초 실시간 3중 다중익절 감시 개시"
+            )
+        elif waiting_dep:
+            _, rem_dep_s = is_within_reserve_deposit_check_shield(
+                self.context, st, TARGET_SYMBOL
+            )
+            wait_s_note = (
+                f" · 차기검문 {rem_dep_s:.0f}초" if rem_dep_s > 0.0 else ""
+            )
+            shield_line = (
+                f"🚨 <b>[💉 시드고갈 입금 대기 중 · 60초 자동감시{wait_s_note}]</b> "
+                f"권장입금 <b>${req_dep_usd:,.2f}</b> (잔여한도 {avail_res_cnt}/{max_res_cnt}회분 · 1회알림 발송완료)"
             )
         elif is_l2_only and in_re:
             shield_line = (
@@ -1894,7 +1923,7 @@ class _AdaptiveTelegramBridge:
         chg_anchor = safe_float(summary.get("chg_from_buy_anchor_pct"), 0.0)
         c_sign = "+" if chg_anchor >= 0.0 else ""
 
-        # MODIFIED [🎯 4 분기 1 & Case 65, Case 73]: 0주 상태 / 1층 공석 / 활성 1층 보유 3대 매수 모니터 상태 분리 표출
+        # [🎯 4 분기 1 & Case 65, Case 73, Case 76, Case 77]: 0주 상태 / 1층 공석 / 활성 1층 보유 3대 매수 모니터 상태 분리 표출
         if held_sh <= 0:
             z_wait_label = (
                 f"60초 타임쉴드 잔여 {rem_s:.1f}초"
@@ -1938,16 +1967,26 @@ class _AdaptiveTelegramBridge:
         else:
             drop_req = safe_float(summary.get("drop_buy_pct"), -1.0)
             trig_p = safe_float(summary.get("trigger_buy_price"), 0.0)
+            step_eligible = bool(summary.get("step_up_eligible", False))
+            step_trig_p = safe_float(summary.get("stepped_trigger_price"), 0.0)
+            reb_mult = safe_float(summary.get("rebound_mult"), 1.0)
             gate_header_line = (
-                f"🛡️ <b>[10분 고정 와이드 시드보호 매수 게이트]</b> (차기검문: {_escape_html(next_gate_str)})"
+                f"🛡️ <b>[10분 고정 와이드 &amp; 스텝업 시드보호 게이트]</b> (차기검문: {_escape_html(next_gate_str)})"
+            )
+            step_note = (
+                f" · 🔓<b>스텝업해금(-15%): ${step_trig_p:.2f} 이하</b>[반등 {reb_mult:.2f}x]"
+                if (step_eligible and step_trig_p > 0.0)
+                else ""
             )
             gate_cond_line = (
                 f"▫️ 정적기억저가 ${ref_anchor:.2f} 대비 현재 {c_sign}{chg_anchor:.2f}% "
-                f"(와이드단차 {drop_req:.2f}% · 신저가 <b>${trig_p:.2f}</b> 이하)"
+                f"(와이드단차 {drop_req:.2f}% · 신저가 <b>${trig_p:.2f}</b> 이하{step_note})"
             )
 
         pass_cnt = safe_int(summary.get("seed_protect_pass_cnt"), 0)
+        dust_blk_cnt = safe_int(summary.get("daily_dust_guard_blocked_cnt"), 0)
         extra_13 = safe_int(summary.get("extra_13plus_buy_events"), 0)
+        unlock_cnt = safe_int(summary.get("cond_unlock_buy_events"), 0)
         saved_u = safe_float(summary.get("cumulative_leftover_saved_usd"), 0.0)
         cum_net = safe_float(summary.get("cumulative_realized_net_usd"), 0.0)
         free_cash = safe_float(summary.get("free_cash_usd"), 0.0)
@@ -1955,6 +1994,14 @@ class _AdaptiveTelegramBridge:
         mark_roi = safe_float(summary.get("mark_roi_pct"), 0.0)
         n_sign = "+" if cum_net >= 0.0 else "-"
         m_sign = "+" if mark_roi >= 0.0 else ""
+
+        dust_note = (
+            f" (30%자투리차단 {dust_blk_cnt}회)" if dust_blk_cnt > 0 else ""
+        )
+        res_status_line = (
+            f"💉 예비시드 탄창: 사용 <b>{used_res_cnt}/{max_res_cnt}회분</b> "
+            f"(수혈잔액 ${inj_res_usd:,.2f} · 0주졸업 자동상환)"
+        )
 
         lines = [
             f"📡 <b>[레이더]</b> ({active_badge} · {fast_badge})",
@@ -1971,10 +2018,11 @@ class _AdaptiveTelegramBridge:
                 "──────────────",
                 gate_header_line,
                 gate_cond_line,
-                f"▫️ 차기 8% 정량: 예산 ${next_bud:,.2f} ➔ {quota_badge_str}",
+                f"▫️ 차기 8% 정량: 예산 ${next_bud:,.2f}(30%가드 ${min_req_g30:,.2f}) ➔ {quota_badge_str}",
                 "──────────────",
-                f"🛡️ 시드보호 패스: {pass_cnt:,}회",
-                f"🔥 13회차+ 확장매수: {extra_13}회",
+                f"🛡️ 시드보호 패스: {pass_cnt:,}회{dust_note}",
+                f"🔥 13회차+ 확장매수: {extra_13}회 · 🔓 스텝업해금: {unlock_cnt}회",
+                res_status_line,
                 f"💰 자투리절약 누적: +${saved_u:,.2f} · 세후실현익: {n_sign}${abs(cum_net):,.2f}",
                 f"💵 가용현금: <b>${free_cash:,.2f}</b> · 총자산: <b>${mark_eq:,.2f}</b> ({m_sign}{mark_roi:.2f}%)",
                 f"🕒 갱신: {now_est.strftime('%m-%d %H:%M:%S EST')}",
@@ -1992,7 +2040,7 @@ class _AdaptiveTelegramBridge:
         now_est: datetime,
     ) -> str:
         """
-        # MODIFIED: 📜 /sync 사용자 중심 초슬림 지층 지시서 메시지 생성 (7칸 공백 들여쓰기 및 줄바꿈 적용)
+        # 📜 /sync 사용자 중심 초슬림 지층 지시서 메시지 생성 (7칸 공백 들여쓰기 및 Case 77 예비시드 상태 적용)
         """
         h_info = (holdings or {}).get(TARGET_SYMBOL, {})
         lp = safe_float(
@@ -2015,11 +2063,22 @@ class _AdaptiveTelegramBridge:
         upper_wma = safe_float(summary.get("upper_wma_price"), 0.0)
         locked_min_p = safe_float(summary.get("cycle_min_buy_price"), 0.0)
 
+        used_res_cnt = safe_int(summary.get("used_reserve_portions_cnt"), 0)
+        max_res_cnt = safe_int(
+            summary.get("max_reserve_portions"), MAX_RESERVE_PORTIONS
+        )
+        inj_res_usd = safe_float(summary.get("injected_reserve_usd"), 0.0)
+        cum_repaid_usd = safe_float(
+            summary.get("cumulative_reserve_repaid_usd"), 0.0
+        )
+        unalloc_dep_usd = max(0.0, safe_float(broker_bp_usd, 0.0) - free_cash)
+
         lines = [
             "📜 <b>[스나이퍼 지시서]</b>",
             f"💵 설정 기준시드: <b>${init_seed:,.2f}</b>",
             f"🏦 스나이퍼 가용현금: <b>${free_cash:,.2f}</b>",
-            f"       토스 실주문가능: ${broker_bp_usd:,.2f}",
+            f"       토스 실주문가능: ${broker_bp_usd:,.2f} (입금여력 +${unalloc_dep_usd:,.2f})",
+            f"💉 예비시드 탄창: 사용 <b>{used_res_cnt}/{max_res_cnt}회분</b> (수혈잔액 ${inj_res_usd:,.2f} · 누적상환 ${cum_repaid_usd:,.2f})",
             f"📦 보유 그리드 합계: <b>{held_sh}주</b> ({held_tiers}개층 · {held_lots}회차 · 순수매수원금 ${actual_inv:,.2f})",
             f"📐 전체 순수평단: <b>${actual_avg:.2f}</b> · 2~7층 통합이평: <b>${upper_wma:.2f}</b> (기억저가 ${locked_min_p:.2f})",
             "──────────────",
@@ -2031,7 +2090,7 @@ class _AdaptiveTelegramBridge:
         self, st: Dict[str, Any], live_price: float, now_est: datetime
     ) -> str:
         """
-        # MODIFIED: ⚙️ /settlement 사용자 중심 초슬림 전술 제어반 메시지 생성 (0️⃣ ~ 3️⃣ 넘버링 및 10000 예시 적용)
+        # ⚙️ /settlement 사용자 중심 초슬림 전술 제어반 메시지 생성 (0️⃣ ~ 4️⃣ 넘버링 및 10000 예시 적용)
         """
         lp = safe_float(live_price, safe_float(st.get("anchor_price"), 100.0))
         summary = summarize_stratum_portfolio(st, live_price=lp)
@@ -2048,6 +2107,14 @@ class _AdaptiveTelegramBridge:
         held_sh = safe_int(summary.get("held_shares"), 0)
         held_tiers = safe_int(summary.get("held_tiers"), 0)
         held_lots = safe_int(summary.get("held_lots"), 0)
+        used_res_cnt = safe_int(summary.get("used_reserve_portions_cnt"), 0)
+        avail_res_cnt = safe_int(
+            summary.get("avail_reserve_portions"), MAX_RESERVE_PORTIONS
+        )
+        max_res_cnt = safe_int(
+            summary.get("max_reserve_portions"), MAX_RESERVE_PORTIONS
+        )
+        inj_res_usd = safe_float(summary.get("injected_reserve_usd"), 0.0)
 
         lines = [
             "⚙️ <b>[전술 제어반]</b>",
@@ -2055,6 +2122,7 @@ class _AdaptiveTelegramBridge:
             f"1️⃣ 기준 시드머니: <b>${init_seed:,.2f}</b> (실현기준 총자산 ${real_eq:,.2f})",
             f"2️⃣ 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str} (가용현금 ${free_cash:,.2f})",
             f"3️⃣ 현재 보유 지층: <b>{held_sh}주</b> ({held_tiers}개층 · {held_lots}회차)",
+            f"4️⃣ 예비시드 탄창: 사용 <b>{used_res_cnt}/{max_res_cnt}회분</b> (수혈잔액 ${inj_res_usd:,.2f} · 잔여한도 {avail_res_cnt}회분)",
             "──────────────",
             "💡 시드머니를 변경하시려면 아래 <b>[💵 기준 시드머니($) 설정]</b> 버튼을 누른 뒤 숫자(예: <code>10000</code>)를 입력하거나, <code>/seed 10000</code> 명령어를 입력하세요.",
             f"🕒 기준 시각: {now_est.strftime('%m-%d %H:%M:%S EST')}",
@@ -2095,7 +2163,7 @@ class _AdaptiveTelegramBridge:
         self, chat_id: str, edit_msg_id: Optional[int] = None
     ) -> None:
         """
-        # MODIFIED: 하단 고정 메뉴와 중복되는 문단 아래 인라인 버튼 부착 제거(reply_markup=None)
+        # 하단 고정 메뉴와 중복되는 문단 아래 인라인 버튼 부착 제거(reply_markup=None)
         """
         live_p, met = await self._refresh_live_price_and_metrics()
         st = self.context.ledger.get_state(TARGET_SYMBOL)
@@ -2116,7 +2184,9 @@ class _AdaptiveTelegramBridge:
         self, chat_id: str, edit_msg_id: Optional[int] = None
     ) -> None:
         """
-        # MODIFIED: 하단 고정 메뉴와 중복되는 문단 아래 인라인 버튼 부착 제거(reply_markup=None)
+        # 하단 고정 메뉴와 중복되는 문단 아래 인라인 버튼 부착 제거(reply_markup=None)
+        # NEW [Case 77]: 사용자가 입금 후 /sync 를 누르면 60초 입금 대기 타임쉴드를 즉시 해제하고
+        # wakeup_event.set() 을 호출하여 다음 루프에서 즉시 온디맨드 수혈 및 매수가 집행되도록 연동!
         """
         now_est = datetime.now(EST_TZ)
         live_p, _ = await self._refresh_live_price_and_metrics()
@@ -2142,6 +2212,15 @@ class _AdaptiveTelegramBridge:
         )
         fx_rate = await self.context.api.get_usd_krw_rate()
         st = self.context.ledger.get_state(TARGET_SYMBOL)
+
+        if bool(st.get("waiting_reserve_deposit", False)):
+            mark_reserve_deposit_check_shield(
+                self.context, TARGET_SYMBOL, clear_shield=True
+            )
+            st = await self.context.ledger.update_state(
+                TARGET_SYMBOL, last_reserve_check_ts=0.0
+            )
+            self.context.wakeup_event.set()
 
         msg = self._build_sync_instruction_message(
             st=st,
@@ -2197,17 +2276,18 @@ class _AdaptiveTelegramBridge:
             )
             return
 
-        if hasattr(self.context.ledger, "set_initial_seed_usd"):
-            updated_st = await _call_plugin_adaptive(
-                self.context.ledger.set_initial_seed_usd,
-                new_seed_usd=val,
-            )
-        else:
-            updated_st = await self.context.ledger.update_state(
-                TARGET_SYMBOL,
-                initial_seed_usd=round(val, 4),
-                seed_explicitly_set_100=bool(abs(val - 100.0) < 1e-6),
-            )
+        mark_reserve_deposit_check_shield(
+            self.context, TARGET_SYMBOL, clear_shield=True
+        )
+        updated_st = await self.context.ledger.update_state(
+            TARGET_SYMBOL,
+            initial_seed_usd=round(val, 4),
+            seed_explicitly_set_100=bool(abs(val - 100.0) < 1e-6),
+            waiting_reserve_deposit=False,
+            waiting_reserve_deposit_alert_sent=False,
+            required_reserve_deposit_usd=0.0,
+            last_reserve_check_ts=0.0,
+        )
         self.context.wakeup_event.set()
         live_p, _ = await self._refresh_live_price_and_metrics()
         summary = summarize_stratum_portfolio(updated_st, live_price=live_p)
@@ -2228,35 +2308,58 @@ class _AdaptiveTelegramBridge:
 
     async def _reset_realized_profit_only(self, chat_id: str) -> None:
         """
-        # MODIFIED [Case 02 & Case 74]:
+        # MODIFIED [Case 02, Case 74, Case 76 & Case 77]:
         보유 중인 주식 지층(buckets · 1~7층 개별 단가 · 정적 기억저가 cycle_min_buy_price)과
         설정된 기준 시드머니(initial_seed_usd)는 100% 보존하고, 오직 누적/당일 세후 실현수익금 및
-        자투리 절약금·카운터 통계만 0점으로 초기화하여 설정된 기준 시드머니의 8% 정량 투입으로 복귀시킨다.
+        자투리 절약금·스텝업 해금 횟수(cond_unlock_buy_events)·예비시드 통계·입금 알림 래치만 0점으로 초기화하여
+        설정된 기준 시드머니의 8% 정량 투입으로 복귀시킨다.
         """
+        mark_reserve_deposit_check_shield(
+            self.context, TARGET_SYMBOL, clear_shield=True
+        )
+        st_cur = self.context.ledger.get_state(TARGET_SYMBOL)
+        has_buckets = bool(st_cur.get("buckets"))
+        reset_kw: Dict[str, Any] = {
+            "cumulative_realized_gross_usd": 0.0,
+            "cumulative_realized_fee_usd": 0.0,
+            "cumulative_realized_net_usd": 0.0,
+            "daily_realized_net_usd": 0.0,
+            "cumulative_leftover_saved_usd": 0.0,
+            "daily_leftover_saved_usd": 0.0,
+            "seed_protect_pass_cnt": 0,
+            "daily_seed_protect_pass_cnt": 0,
+            "cond_unlock_buy_events": 0,
+            "daily_unlock_buy_events": 0,
+            "total_reserve_injected_cnt": 0,
+            "daily_reserve_injected_cnt": 0,
+            "cumulative_reserve_repaid_usd": 0.0,
+            "dust_guard_blocked_cnt": 0,
+            "daily_dust_guard_blocked_cnt": 0,
+            "waiting_reserve_deposit": False,
+            "waiting_reserve_deposit_alert_sent": False,
+            "required_reserve_deposit_usd": 0.0,
+            "last_reserve_check_ts": 0.0,
+            "extra_13plus_buy_events": 0,
+            "total_buy_events": 0,
+            "daily_buy_events": 0,
+            "total_sell_events": 0,
+            "total_sold_shares": 0,
+            "win_sell_events": 0,
+            "daily_sell_events": 0,
+            "indiv_grid_sell_cnt": 0,
+            "daily_indiv_grid_sell_cnt": 0,
+            "wma_grad_sell_cnt": 0,
+            "daily_wma_grad_sell_cnt": 0,
+            "reanchor_cnt": 0,
+            "daily_reanchor_cnt": 0,
+            "cumulative_reanchor_drop_usd": 0.0,
+        }
+        if not has_buckets:
+            reset_kw["used_reserve_portions_cnt"] = 0
+            reset_kw["injected_reserve_usd"] = 0.0
+
         st_reset = await self.context.ledger.update_state(
-            TARGET_SYMBOL,
-            cumulative_realized_gross_usd=0.0,
-            cumulative_realized_fee_usd=0.0,
-            cumulative_realized_net_usd=0.0,
-            daily_realized_net_usd=0.0,
-            cumulative_leftover_saved_usd=0.0,
-            daily_leftover_saved_usd=0.0,
-            seed_protect_pass_cnt=0,
-            daily_seed_protect_pass_cnt=0,
-            extra_13plus_buy_events=0,
-            total_buy_events=0,
-            daily_buy_events=0,
-            total_sell_events=0,
-            total_sold_shares=0,
-            win_sell_events=0,
-            daily_sell_events=0,
-            indiv_grid_sell_cnt=0,
-            daily_indiv_grid_sell_cnt=0,
-            wma_grad_sell_cnt=0,
-            daily_wma_grad_sell_cnt=0,
-            reanchor_cnt=0,
-            daily_reanchor_cnt=0,
-            cumulative_reanchor_drop_usd=0.0,
+            TARGET_SYMBOL, **reset_kw
         )
         snap_fn = getattr(
             self.context.ledger, "create_daily_backup_snapshot", None
@@ -2284,7 +2387,7 @@ class _AdaptiveTelegramBridge:
             chat_id=chat_id,
             text=(
                 "🧹 <b>[실현수익 0점 초기화 완료]</b>\n"
-                "🔸 누적 세후실현익: <b>$0.00</b> (자투리절약 <b>$0.00</b>)\n"
+                "🔸 누적 세후실현익: <b>$0.00</b> (자투리절약 <b>$0.00</b> · 🔓스텝업해금 <b>0회</b>)\n"
                 f"🔸 복귀 기준시드: <b>${init_seed:,.2f}</b> (가용현금 <b>${free_cash:,.2f}</b>)\n"
                 f"🔸 차기 1회(8%) 정량: 예산 <b>${next_bud:,.2f}</b> ➔ {quota_badge_str}\n"
                 f"🔸 보유 지층 보존: <b>{held_sh}주</b> ({held_tiers}개층 · {held_lots}회차 유지)"
@@ -2293,7 +2396,7 @@ class _AdaptiveTelegramBridge:
 
     async def _execute_manual_update_command(self, chat_id: str) -> None:
         """
-        # MODIFIED: 사용자 중심 초슬림 시스템 업데이트 개시 및 검증 통과 메시지 타전
+        # 사용자 중심 초슬림 시스템 업데이트 개시 및 검증 통과 메시지 타전
         """
         await self._ack_telegram_offset(self._last_update_id)
         await self.send_message(
@@ -2444,12 +2547,12 @@ class _AdaptiveTelegramBridge:
                 await self._render_and_send_settlement(chat_id=chat_id)
             return
 
-        # MODIFIED: 오직 /reset_profit 만 허용하여 보유 지층(buckets)은 100% 보존하고 실현수익만 0점 초기화!
+        # 오직 /reset_profit 만 허용하여 보유 지층(buckets)은 100% 보존하고 실현수익만 0점 초기화!
         if first_token == "/reset_profit":
             await self._reset_realized_profit_only(chat_id=chat_id)
             return
 
-        # MODIFIED: 사용자가 실수로 /reset 또는 /reset_seed 를 입력하더라도 보유 지층을 절대 초기화하지 못하도록 원천 차단!
+        # 사용자가 실수로 /reset 또는 /reset_seed 를 입력하더라도 보유 지층을 절대 초기화하지 못하도록 원천 차단!
         if first_token in ("/reset", "/reset_seed"):
             await self.send_message(
                 chat_id=chat_id,
@@ -2908,14 +3011,20 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     prices=prices,
                     now_est=now_est,
                 )
-                # 🚨 Case 74: 00:00 EST 에 logical_date 가 먼저 롤오버되었더라도 04:00 EST 오프닝 시점에 당일 시드패스를 0회로 확실히 리셋!
+                # 🚨 Case 74, Case 76 & Case 77: 00:00 EST 에 logical_date 가 먼저 롤오버되었더라도
+                # 04:00 EST 오프닝 시점에 일일 카운터는 0회로 확실히 리셋하되, 단 1회 입금 알림 래치는 보존!
                 if prev_0400_date != today_0400_str:
                     await context.ledger.update_state(
                         TARGET_SYMBOL,
                         daily_seed_protect_pass_cnt=0,
+                        daily_unlock_buy_events=0,
+                        daily_reserve_injected_cnt=0,
+                        daily_dust_guard_blocked_cnt=0,
+                        pending_step_up_min_price=0.0,
                         last_evaluated_buy_bucket_id=-1,
                         last_evaluated_date=today_0400_str,
                         last_reentry_eval_ts=0.0,
+                        last_reserve_check_ts=0.0,
                     )
 
             elif is_active_trading_window(hm):
@@ -2930,7 +3039,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                         now_est=now_est,
                     )
 
-                # 3-1) 로컬 7층 그리드 원장 ↔ 토스 실보유 잔고 무결성 화해 (Case 66/68/69/71/72 가드 내장)
+                # 3-1) 로컬 7층 그리드 원장 ↔ 토스 실보유 잔고 무결성 화해 (Case 66/68/69/71/72/76/77 가드 내장)
                 await _call_plugin_adaptive(
                     reconcile_stratum_with_broker_holdings_plugin,
                     context=context,
@@ -2939,7 +3048,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                     now_est=now_est,
                 )
 
-                # 3-2) 매수 후 최초 60초 타임쉴드 & 이후 보유 중 매 1.5초 실시간 3중 다중 익절 스나이퍼 매도 모니터 (Case 44, 65, 69, 70, 71, 72)
+                # 3-2) 매수 후 최초 60초 타임쉴드 & 이후 보유 중 매 1.5초 실시간 3중 다중 익절 스나이퍼 매도 모니터 (Case 44, 65, 69, 70, 71, 72, 77)
                 sell_res = await _call_plugin_adaptive(
                     execute_1m_sniper_sell_and_reanchor_plugin,
                     context=context,
@@ -3018,7 +3127,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# [핵심 5] 백그라운드 태스크 3 : 17:00 EST 일일 GC · 날짜별 금고 백업 및 롤오버 루프 (Case 74)
+# [핵심 5] 백그라운드 태스크 3 : 17:00 EST 일일 GC · 날짜별 금고 백업 및 롤오버 루프 (Case 74, Case 76, Case 77)
 # ---------------------------------------------------------------------------
 async def daily_gc_and_rollover_loop(context: SniperAppContext) -> None:
     last_gc_date = ""
@@ -3039,10 +3148,15 @@ async def daily_gc_and_rollover_loop(context: SniperAppContext) -> None:
                 await execute_daily_1700_gc_and_backup_plugin(
                     context=context, now_est=now_est
                 )
-                # 🚨 Case 74: 17:00 EST 일일 마감 롤오버 시 당일 시드보호 패스 카운터를 0회로 확실히 리셋!
+                # 🚨 Case 74, Case 76 & Case 77: 17:00 EST 일일 마감 롤오버 시 일일 카운터는 0회로 리셋하되
+                # 단 1회 입금 요청 알림 영구 래치(waiting_reserve_deposit_alert_sent)는 절대 리셋하지 않고 보존!
                 await context.ledger.update_state(
                     TARGET_SYMBOL,
                     daily_seed_protect_pass_cnt=0,
+                    daily_unlock_buy_events=0,
+                    daily_reserve_injected_cnt=0,
+                    daily_dust_guard_blocked_cnt=0,
+                    pending_step_up_min_price=0.0,
                     last_evaluated_buy_bucket_id=-1,
                     last_reentry_eval_ts=0.0,
                 )
@@ -3118,7 +3232,7 @@ async def async_main() -> None:
 
     run_quant_engine_tdd()
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 🔥 03_7G_PURE_10_01 (1~6층 개별 완충층 + 통합 7층 본대 · 1층 공석 60초 재장전 & 2층 역전 차단 · 1.5초 실시간 익절 감시 Case 59~75) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 💉 05_RESV_6P_GUARD30 × 🔓 06_STEP2X_15PCT_C20 (1~6층 개별 + 통합 7층 본대 · 30%% 자투리 가드 & +6회분 자동 수혈/상환 · 단 1회 입금알림 래치 Case 59~77) 검증 완료"
     )
 
     context = SniperAppContext(base_dir=base_dir)
@@ -3230,7 +3344,7 @@ async def async_main() -> None:
     ]
 
     logger.info(
-        "🚀 [SOXL 7층 골디락스 멀티그리드 스나이퍼 가동 완료 · 폴더=%s] 04:07 ~ 16:00 EST · 챔피언 🔥 03_7G_PURE_10_01 · 1~6층 개별 완충층 + 통합 7층 본대 · 매수후 60초 쉴드 뒤 1.5초 실시간 3중 익절 · 1층 공석 60초 재장전 & 2층 역전 차단 · 정적 저가 잠금 · 폴더별 3중 원장 금고(Case 65~75)",
+        "🚀 [SOXL 7층 골디락스 멀티그리드 스나이퍼 가동 완료 · 폴더=%s] 04:07 ~ 16:00 EST · 챔피언 💉 05_RESV_6P_GUARD30 × 🔓 06_STEP2X_15PCT_C20 · 30%% 자투리 가드 & 단 1회 입금알림 & +6회분 자동 수혈/0주 자동 상환(Case 65~77)",
         context.folder_slug,
     )
 
