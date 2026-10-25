@@ -235,8 +235,9 @@ def resolve_folder_isolated_ledger_paths(
     )
     legacy_path = os.path.join(target_dir, "soxl_stratum_ledger.json")
     backup_dir = os.path.join(target_dir, "ledger_backups")
+    # MODIFIED: f-string 닫는 중괄호(}) 구문 정밀 교정 완료
     backup_path = os.path.join(
-        backup_dir, f"soxl_stratum_ledger_{folder_slug>.bak.json".replace(">", "")
+        backup_dir, f"soxl_stratum_ledger_{folder_slug}.bak.json"
     )
     return primary_path, legacy_path, backup_path, folder_slug
 
