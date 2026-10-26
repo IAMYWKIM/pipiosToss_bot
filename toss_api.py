@@ -2,10 +2,10 @@
 """
 # MODIFIED: toss_api.py
 인피니트 스노우볼 (Infinite Snowball) v3.0 — 토스증권 Open API (v1.2.14) 방탄 통신 통제소 &
-SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대) 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 01 / 07)
+SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 완충층 + 통합 7층 본대) 폴더별 3중 지층 원장(SoxlStratumLedger) 코어 모듈 (Step 01 / 05)
 - 제1헌법: 모든 파일 I/O 및 네트워크 통신의 asyncio.to_thread 비동기 격리 + GlobalThrottle 중앙 통제
 - 제2헌법: 기동 시 GET /api/v1/accounts 1회 호출로 BROKERAGE accountSeq 메모리 락온 및 X-Tossinvest-Account 자동 주입
-- 제3헌법 ~ 제6헌법 및 Case 01 ~ 77 전수 락온:
+- 제3헌법 ~ 제6헌법 및 Case 01 ~ 78 전수 락온:
   1) REAL_ALLOWED_SYMBOLS = ("SOXL",) 단일 롱 화이트리스트 물리적 강제 (인버스 숏 SOXS 원천 차단)
   2) get_holdings_map_with_status, get_candles_1m, get_candles_1d, get_current_prices_batch,
      get_orderbook, get_buying_power_usd, get_sellable_quantity, create_order, modify_order,
@@ -28,13 +28,15 @@ SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 
   8) 🚨 [Case 76 : 🔓 06_STEP2X_15PCT_C20 3중 안전문 조건부 스텝업 저가 해금 상수 및 원장 상태 필드 탑재]
      - STEP_UP_2X_MIN_REBOUND_MULT(2.0x), STEP_UP_2X_MAX_TIERS(2), STEP_UP_2X_MIN_CASH_RATIO(0.20), STEP_UP_2X_DROP_PCT(15.0) 락온
      - unlock_mode, pending_step_up_min_price, cond_unlock_buy_events, daily_unlock_buy_events 원장 영속화 및 정규화
-  9) 🚨 [NEW · Case 77 : 💉 05_RESV_6P_GUARD30 (30% 자투리 1주 승격 방지 가드 + 시드고갈 단 1회 입금 요청 알림 래치 +
+  9) 🚨 [Case 77 : 💉 05_RESV_6P_GUARD30 (30% 자투리 1주 승격 방지 가드 + 시드고갈 단 1회 입금 요청 알림 래치 +
      토스 실계좌 여유자금 감지 기반 최대 +6회분 온디맨드 예비시드 자동 수혈 및 0주 졸업 시 원금 자동 상환) 상수 및 원장 필드 탑재]
      - MAX_RESERVE_PORTIONS(6), MIN_DIP_BUDGET_RATIO(0.30), MIN_DIP_VS_L1_RATIO(0.30), RESERVE_DEPOSIT_TOLERANCE_RATIO(0.95) 락온
      - used_reserve_portions_cnt, injected_reserve_usd, total_reserve_injected_cnt, daily_reserve_injected_cnt,
        cumulative_reserve_repaid_usd, dust_guard_blocked_cnt, daily_dust_guard_blocked_cnt,
        waiting_reserve_deposit, waiting_reserve_deposit_alert_sent(스팸 차단 영구 래치),
        required_reserve_deposit_usd, last_reserve_check_ts 원장 영속화 및 회계 항등식 확장
+  10) 🚨 [NEW · Case 78 : 지정가 부분 체결 후 미체결 잔량(l1_target_quota_qty) 보존 및 1.5초 모니터 기반 잔량(TOPUP_1FL) 지정가 60초 대기 완수]
+      - l1_target_quota_qty 원장 영속화 및 0주 졸업 / 1층 익절 공석 전환 시 자동 클리어 정규화 탑재
 """
 
 from __future__ import annotations
@@ -61,7 +63,7 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger("toss_sniper.toss_api")
 
 # ---------------------------------------------------------------------------
-# [핵심 상수] 제4헌법 EST 단일 타임존 & 최종 확정 진화 챔피언 (💉 05_RESV_6P_GUARD30 × 🔓 06_STEP2X_15PCT_C20 · Case 72 ~ 77) 전역 상수
+# [핵심 상수] 제4헌법 EST 단일 타임존 & 최종 확정 진화 챔피언 (💉 05_RESV_6P_GUARD30 × 🔓 06_STEP2X_15PCT_C20 · Case 72 ~ 78) 전역 상수
 # ---------------------------------------------------------------------------
 EST_TZ = ZoneInfo("America/New_York")
 KST_TZ = ZoneInfo("Asia/Seoul")
@@ -87,7 +89,7 @@ STEP_UP_2X_MAX_TIERS: int = 2
 STEP_UP_2X_MIN_CASH_RATIO: float = 0.20
 STEP_UP_2X_DROP_PCT: float = 15.0
 
-# NEW [Case 77]: 💉 05_RESV_6P_GUARD30 (30% 자투리 1주 승격 방지 가드 & 최대 +6회분 온디맨드 예비시드 자동 수혈) 상수 락온
+# Case 77: 💉 05_RESV_6P_GUARD30 (30% 자투리 1주 승격 방지 가드 & 최대 +6회분 온디맨드 예비시드 자동 수혈) 상수 락온
 MAX_RESERVE_PORTIONS: int = 6
 MIN_DIP_BUDGET_RATIO: float = 0.30
 MIN_DIP_VS_L1_RATIO: float = 0.30
@@ -235,7 +237,6 @@ def resolve_folder_isolated_ledger_paths(
     )
     legacy_path = os.path.join(target_dir, "soxl_stratum_ledger.json")
     backup_dir = os.path.join(target_dir, "ledger_backups")
-    # MODIFIED: f-string 닫는 중괄호(}) 구문 정밀 교정 완료
     backup_path = os.path.join(
         backup_dir, f"soxl_stratum_ledger_{folder_slug}.bak.json"
     )
@@ -450,11 +451,11 @@ class GlobalThrottle:
 
 
 # ---------------------------------------------------------------------------
-# [핵심 2] SOXL 단일 롱 7-Tier 순수 멀티 그리드 폴더별 3중 안전 지층 원장 (SoxlStratumLedger — Case 68 ~ 77)
+# [핵심 2] SOXL 단일 롱 7-Tier 순수 멀티 그리드 폴더별 3중 안전 지층 원장 (SoxlStratumLedger — Case 68 ~ 78)
 # ---------------------------------------------------------------------------
 class SoxlStratumLedger:
     """
-    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 77:
+    🎯 1 ~ 🎯 5 & Case 02, 05, 06, 58 ~ 78:
     현재 봇이 위치한 폴더(`base_dir`)를 기준으로:
     ① 폴더 고유 원장(`soxl_stratum_ledger_<folder_slug>.json` — Git 덮어쓰기 100% 면역)
     ② 표준 호환 원장(`soxl_stratum_ledger.json` — 기존 코드 및 외부 도구 호환 미러)
@@ -464,6 +465,7 @@ class SoxlStratumLedger:
     STEP2X_15PCT_C20 스텝업 해금 대기 가격(pending_step_up_min_price) 및 해금 횟수(cond_unlock_buy_events),
     💉 05_RESV_6P_GUARD30 예비시드 수혈 잔액(injected_reserve_usd) · 사용 회분(used_reserve_portions_cnt) ·
     시드고갈 입금 대기 플래그(waiting_reserve_deposit) · 단 1회 입금 알림 영구 래치(waiting_reserve_deposit_alert_sent),
+    🎯 Case 78 현재 1층 목표 정량 주수(l1_target_quota_qty — 부분 체결 시 미체결 잔량 계산 및 1.5초 모니터 재대기용),
     양방향·주기 60초 타임쉴드 시각(last_buy_fill_ts, last_sell_fill_ts, last_cycle_end_ts, last_sell_gate_eval_ts, last_reentry_eval_ts),
     다중 그리드 매도 대기 인덱스(pending_sell_indices), 기정산 주문 ID 링버퍼(last_settled_order_ids),
     누적 세후 실현수익금 및 자투리 절약금을 원자적(.tmp -> os.replace)으로 동시 영속화하되,
@@ -590,6 +592,8 @@ class SoxlStratumLedger:
             "cycle_min_buy_price": 0.0,
             "ratchet_anchor_price": 0.0,
             "cycle_reanchor_credit_usd": 0.0,
+            # NEW [Case 78 : 현재 1층의 목표 정량 주수 (부분 체결 시 미체결 잔량 계산 및 1.5초 모니터 재대기용)]
+            "l1_target_quota_qty": 0,
             "buy_order_id": "",
             "sell_order_id": "",
             "client_order_id": "",
@@ -612,7 +616,7 @@ class SoxlStratumLedger:
             "last_sell_gate_eval_ts": 0.0,
             # Case 73: 상단 2~7층 보유 중 1층 공석 전용 60초(1분) 주기 재장전 타임쉴드 시각 영속화
             "last_reentry_eval_ts": 0.0,
-            # NEW [Case 77 : 💉 05_RESV_6P_GUARD30 온디맨드 예비시드 수혈 · 상환 · 단 1회 입금 알림 영구 래치 필드]
+            # Case 77: 💉 05_RESV_6P_GUARD30 온디맨드 예비시드 수혈 · 상환 · 단 1회 입금 알림 영구 래치 필드
             "used_reserve_portions_cnt": 0,
             "injected_reserve_usd": 0.0,
             "total_reserve_injected_cnt": 0,
@@ -724,7 +728,7 @@ class SoxlStratumLedger:
         self, raw_st: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        🚨 Case 63, Case 64, Case 68, Case 69, Case 70, Case 71, Case 72, Case 73, Case 74, Case 76 & Case 77:
+        🚨 Case 63, Case 64, Case 68, Case 69, Case 70, Case 71, Case 72, Case 73, Case 74, Case 76, Case 77 & Case 78:
         1) buy_interval_min = 10, sell_interval_min = 1, max_grid_tiers = 7 (MAX_GRID_TIERS_7),
            portion_mode = "COMP_08PCT", threshold_mode = "WIDE_RUNWAY", unlock_mode = "STEP2X_15PCT_C20" 를 강제 동기화한다.
         2) 시드머니 결측 또는 0.0 유입 시 $100.0 으로 변조되지 않도록 _resolve_safe_initial_seed() 를 적용한다.
@@ -733,14 +737,15 @@ class SoxlStratumLedger:
              순수 실물 매수 원가(actual_avg_price = ac / q, actual_cost_usd = ac)와 100% 일치시켜,
              리앵커링 차감이나 이동평균 희석으로 인한 조기 손절 착시를 물리적으로 원천 봉쇄한다!
            - cycle_reanchor_credit_usd = 0.0 으로 항상 고정한다.
-        4) 🛡️ [Case 73 & Case 76 1층 공석 재장전 타임쉴드(last_reentry_eval_ts) 및 스텝업 대기값(pending_step_up_min_price) 정규화]:
+        4) 🛡️ [Case 73, Case 76 & Case 78 1층 공석 재장전 타임쉴드(last_reentry_eval_ts) · 스텝업 대기값(pending_step_up_min_price) ·
+           1층 목표 정량(l1_target_quota_qty) 정규화]:
            - 보유 지층이 0주이거나 이미 활성 1층 공격수가 존재하는 상태(has_active_l1 == True)이면
              last_reentry_eval_ts = 0.0 으로 클리어하고, 1층이 공석인 상태에서만 타임스탬프를 보존한다.
            - 미결 매수 주문(buy_order_id)이 없거나 0주 상태이면 pending_step_up_min_price = 0.0 으로 클리어한다.
-        5) 💉 [NEW · Case 77 온디맨드 예비시드 수혈 잔액(injected_reserve_usd) · 단 1회 알림 영구 래치 및 회계 항등식 확장]:
-           - injected_reserve_usd = round(max(0.0, safe_float(st.get("injected_reserve_usd"), 0.0)), 4)
-           - injected_reserve_usd <= 0.0 이면 used_reserve_portions_cnt = 0 으로 동기화하고,
-             양수이면 used_reserve_portions_cnt = max(1, min(MAX_RESERVE_PORTIONS, safe_int(st.get("used_reserve_portions_cnt"), 1))) 로 보존한다.
+           - NEW [Case 78]: 0주 상태이거나 1층이 익절되어 공석(not has_active_l1)이고 미결 매수 주문이 없을 때는
+             l1_target_quota_qty = 0 으로 자동 클리어하며, 활성 1층이 존재할 때는 max(cur_l1_qty, l1_target_quota_qty)로 보존하여
+             부분 체결(cur_l1_qty < l1_target_quota_qty) 시 미체결 잔량을 정확히 추적한다!
+        5) 💉 [Case 77 온디맨드 예비시드 수혈 잔액(injected_reserve_usd) · 단 1회 알림 영구 래치 및 회계 항등식 확장]:
            - 회계 항등식: free_cash_usd = round(max(0.0, (init_seed + cum_net + injected_reserve_usd) - actual_inv), 4) 를 정밀 유지한다.
         """
         st = self._default_symbol_state(
@@ -767,7 +772,7 @@ class SoxlStratumLedger:
             0, safe_int(st.get("daily_unlock_buy_events"), 0)
         )
 
-        # NEW [Case 77]: 예비시드 수혈·상환·자투리차단 카운터 및 단 1회 입금 알림 래치 정규화
+        # Case 77: 예비시드 수혈·상환·자투리차단 카운터 및 단 1회 입금 알림 래치 정규화
         inj_res_usd = round(
             max(0.0, safe_float(st.get("injected_reserve_usd"), 0.0)), 4
         )
@@ -877,27 +882,38 @@ class SoxlStratumLedger:
             st["last_settled_order_ids"] = []
 
         has_pending_buy = bool(str(st.get("buy_order_id") or "").strip())
+        raw_target_q = max(0, safe_int(st.get("l1_target_quota_qty"), 0))
+
         if not clean_buckets:
             st["last_sell_gate_eval_ts"] = 0.0
             # Case 73: 0주 상태에서는 1층 공석 재장전 타임쉴드 시각을 0.0 으로 클리어
             st["last_reentry_eval_ts"] = 0.0
             st["pending_sell_indices"] = []
             st["pending_step_up_min_price"] = 0.0
+            # NEW [Case 78]: 0주 상태에서 미결 매수가 없으면 l1_target_quota_qty 를 0 으로 클리어
+            st["l1_target_quota_qty"] = raw_target_q if has_pending_buy else 0
         else:
             st["last_sell_gate_eval_ts"] = round(
                 max(0.0, safe_float(st.get("last_sell_gate_eval_ts"), 0.0)), 4
             )
-            # Case 73: 활성 1층이 존재하면 0.0 리셋, 1층 공석(상단 2~7층만 보유) 상태이면 보존
+            # Case 73 & Case 78: 활성 1층 존재 여부에 따른 타임쉴드 및 목표 정량(l1_target_quota_qty) 정규화
             has_active_l1 = not self._is_upper_grid_tag(
                 str(clean_buckets[0].get("lot_type") or "")
             )
             if has_active_l1:
                 st["last_reentry_eval_ts"] = 0.0
+                cur_l1_q = max(1, safe_int(clean_buckets[0].get("qty"), 1))
+                st["l1_target_quota_qty"] = max(cur_l1_q, raw_target_q)
             else:
                 st["last_reentry_eval_ts"] = round(
                     max(0.0, safe_float(st.get("last_reentry_eval_ts"), 0.0)),
                     4,
                 )
+                # 1층이 익절되어 공석(상단 2~7층만 보유)이고 미결 매수가 없으면 l1_target_quota_qty 를 0 으로 클리어
+                st["l1_target_quota_qty"] = (
+                    raw_target_q if has_pending_buy else 0
+                )
+
             if has_pending_buy:
                 st["pending_step_up_min_price"] = round(
                     max(
@@ -926,7 +942,7 @@ class SoxlStratumLedger:
             sum(safe_float(b["actual_cost_usd"], 0.0) for b in clean_buckets),
             4,
         )
-        # MODIFIED [Case 77 회계 항등식 확장]:
+        # Case 77 회계 항등식 확장:
         # 가용현금(free_cash_usd) = max(0.0, (초기시드 + 누적세후실현순익 + 온디맨드 예비시드 수혈잔액) - 보유지층 실투입원금 합계)
         realized_equity = max(0.0, init_seed + cum_net)
         total_pool_equity = realized_equity + inj_res_usd
@@ -1080,7 +1096,7 @@ class SoxlStratumLedger:
                         for b in sanitized.get("buckets", [])
                     )
                     logger.info(
-                        "📂 [Case 68~77 폴더별 3중 7층 골디락스 그리드 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주(%d개층) · 예비수혈=%d/%d회분($%.2f) · 고유원장=%s",
+                        "📂 [Case 68~78 폴더별 3중 7층 골디락스 그리드 원장 락온 완료] 폴더=[%s] · 채택소스=%s · 시드=$%.2f · 보유=%d주(%d개층) · 예비수혈=%d/%d회분($%.2f) · 고유원장=%s",
                         self.folder_slug,
                         best_label,
                         safe_float(sanitized.get("initial_seed_usd"), 10000.0),
@@ -1335,12 +1351,13 @@ class SoxlStratumLedger:
         preserve_realized_profit: bool = True,
     ) -> Dict[str, Any]:
         """
-        🚨 Case 02, Case 65, Case 69, Case 70, Case 71, Case 72, Case 73, Case 76 & Case 77:
+        🚨 Case 02, Case 65, Case 69, Case 70, Case 71, Case 72, Case 73, Case 76, Case 77 & Case 78:
         하위 호환용 지층 초기화 메서드 (텔레그램 메뉴/명령어에서는 /reset_profit 으로 대체됨):
-        지층 큐(buckets), 기준가, 기억된 최저가, 리앵커링 크레딧, 다중 그리드 매도 대기 인덱스(pending_sell_indices),
-        스텝업 대기 기준가(pending_step_up_min_price), 예비시드 수혈 잔액 및 입금 대기 상태,
-        매도 모니터 검문 시각(last_sell_gate_eval_ts), 1층 공석 재장전 시각(last_reentry_eval_ts),
-        미체결 주문 ID를 원자적으로 0점 초기화하고, 0주 싸이클 종료 타임쉴드(last_sell_fill_ts, last_cycle_end_ts)를 각인한다.
+        지층 큐(buckets), 기준가, 기억된 최저가, 리앵커링 크레딧, 1층 목표 정량(l1_target_quota_qty),
+        다중 그리드 매도 대기 인덱스(pending_sell_indices), 스텝업 대기 기준가(pending_step_up_min_price),
+        예비시드 수혈 잔액 및 입금 대기 상태, 매도 모니터 검문 시각(last_sell_gate_eval_ts),
+        1층 공석 재장전 시각(last_reentry_eval_ts), 미체결 주문 ID를 원자적으로 0점 초기화하고,
+        0주 싸이클 종료 타임쉴드(last_sell_fill_ts, last_cycle_end_ts)를 각인한다.
         """
         sym = self._assert_allowed_symbol(symbol)
         st = self.get_state(sym)
@@ -1365,6 +1382,7 @@ class SoxlStratumLedger:
             cycle_min_buy_price=0.0,
             ratchet_anchor_price=0.0,
             cycle_reanchor_credit_usd=0.0,
+            l1_target_quota_qty=0,
             used_reserve_portions_cnt=0,
             injected_reserve_usd=0.0,
             waiting_reserve_deposit=False,
@@ -1696,7 +1714,7 @@ class TossApiClient:
         🚨 제1헌법, 제2헌법 & Case 20, 21:
         모든 토스 Open API 요청을 처리하는 중앙 비동기 디스패처.
         """
-        clean_path = path if path.startswith("/") else f"/{path}"
+        clean_path = path if path.startswith("/") else f/{path}"
         url = f"{self.base_url}{clean_path}"
         if params:
             filtered_params = {

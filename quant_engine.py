@@ -12,12 +12,12 @@
 상단 그리드(2층 ~ 7층) 보유 중 1층 공석 시 60초(1분) 타임쉴드 주기 눌림목(-1.00%) OR 상승돌파(+1.00%) 하이브리드 독립 1층(REENTRY_1FL) 재장전 판정기 &
 현재가 > 2층 단가(min_upper_tier_price) 시 1층 > 2층 단가 역전 원천 차단(HOLD_PREVENT_INVERSION · Case 73) 가드 ·
 1층 ~ 7층 순수 원가 골디락스 멀티 그리드 관리(MAX_GRID_TIERS_7 = 7 : 1층 공격수 + 2~6층 개별 완충층[5개] + 통합 7층 본대[GRID_L7] ·
-REENTRY_1FL 독립 1층 배치 vs DIP_1FL 2~6층 개별 승격 및 8회차 이상 최상단 6층+7층 통합 7층 병합 ·
-수동 매수 시 단가 비교 오름차순 층간 스마트 편입 & 수동 매도 시 층별 순수원가 1:1 매칭 정산기 탑재 · Case 53 하드 캡핑 · Case 63, Case 69, Case 71 ~ 77) ·
+REENTRY_1FL 독립 1층 배치 vs TOPUP_1FL 기존 1층 무승격 원자적 합산[Case 78] vs DIP_1FL 2~6층 개별 승격 및 8회차 이상 최상단 6층+7층 통합 7층 병합 ·
+수동 매수 시 단가 비교 오름차순 층간 스마트 편입 & 수동 매도 시 층별 순수원가 1:1 매칭 정산기 탑재 · Case 53 하드 캡핑 · Case 63, Case 69, Case 71 ~ 78) ·
 2층 ~ 7층 통합 이동평균(wma_2_to_7) 산출 및 3중 다중 익절 판정(① 1층 +1.50% / ② 2~6층 개별 및 통합 7층 +1.00% / ③ 2~7층 통합 이동평균 +1.00% · Case 71, Case 72) ·
 순수 실물 원가 무결성(book_price == actual_avg_price · 리앵커링 원가 차감 영구 폐기 · Case 69, Case 71) ·
-정적 기억 최저 매수가(cycle_min_buy_price) 기본 잠금/조건부 스텝업 및 당일 프리장~정규장 시드보호 패스(daily_seed_protect_pass_cnt · Case 74) 요약 · TDD 검증' 코어 모듈 (Step 02 / 07)
-- 제1헌법 ~ 제6헌법 및 Case 01 ~ 77 완벽 준수
+정적 기억 최저 매수가(cycle_min_buy_price) 기본 잠금/조건부 스텝업 및 당일 프리장~정규장 시드보호 패스(daily_seed_protect_pass_cnt · Case 74) 요약 · TDD 검증' 코어 모듈 (Step 02 / 05)
+- 제1헌법 ~ 제6헌법 및 Case 01 ~ 78 완벽 준수
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ STEP_UP_2X_DROP_PCT: float = float(
     getattr(toss_api, "STEP_UP_2X_DROP_PCT", 15.0)
 )
 
-# NEW [Case 77]: 💉 05_RESV_6P_GUARD30 (30% 자투리 승격 방지 가드 & 최대 +6회분 온디맨드 예비시드 자동 수혈) 상수
+# Case 77: 💉 05_RESV_6P_GUARD30 (30% 자투리 승격 방지 가드 & 최대 +6회분 온디맨드 예비시드 자동 수혈) 상수
 MAX_RESERVE_PORTIONS: int = int(
     getattr(toss_api, "MAX_RESERVE_PORTIONS", 6)
 )
@@ -95,14 +95,14 @@ RESERVE_DEPOSIT_TOLERANCE_RATIO: float = float(
 @dataclass
 class StratumBucket:
     """
-    🎯 3 & Case 46 ~ 77:
+    🎯 3 & Case 46 ~ 78:
     SOXL 1층 ~ 7층 골디락스 멀티 그리드(1층 공격수 L1 / 2층 ~ 6층 개별 완충층 GRID_L2 ~ GRID_L6 / 통합 7층 본대 GRID_L7) 데이터 구조체.
     - qty              : 보유 정수 주식 수 (주)
     - book_price       : 목표 탈출 기준 단가 ($, 순수 원가 모드에서는 actual_avg_price 와 100% 동일)
     - book_invested_usd: 장부상 투자금 ($, 순수 원가 모드에서는 actual_cost_usd 와 100% 동일)
     - actual_cost_usd  : 실제 가용 현금 시드에서 지출된 순수 매수 원금 ($, 회계 항등식 보존용)
     - lot_count        : 해당 그리드 층에 포함된 누적 매수 회차 수 (1~6층은 개별 회차, 7층은 7회차 이상 통합 회차 수)
-    - lot_type         : 지층 성격 태그 ("REENTRY_1FL", "DIP_1FL", "QUOTA_L1", "MANUAL_SYNC_L1", "GRID_L2" ~ "GRID_L7")
+    - lot_type         : 지층 성격 태그 ("REENTRY_1FL", "TOPUP_1FL", "DIP_1FL", "QUOTA_L1", "MANUAL_SYNC_L1", "GRID_L2" ~ "GRID_L7")
     """
 
     qty: int
@@ -208,7 +208,7 @@ def is_upper_grid_tier(bucket_or_lot_type: Any) -> bool:
     🚨 [Case 71 & Case 72 상단 그리드(2층 ~ 7층) 여부 결정론적 판별기]:
     - lot_type 이 "MERGED_UPPER" 이거나 "GRID_L2" ~ "GRID_L7" (즉, "GRID_L" 로 시작하되 "GRID_L1" 이 아닌 경우)이면
       상단 그리드(2층 ~ 7층) 버킷이므로 True 를 반환한다.
-    - "REENTRY_1FL", "DIP_1FL", "QUOTA_L1", "MANUAL_SYNC_L1", "SYNCED_1FL", "GRID_L1" 등은
+    - "REENTRY_1FL", "TOPUP_1FL", "DIP_1FL", "QUOTA_L1", "MANUAL_SYNC_L1", "SYNCED_1FL", "GRID_L1" 등은
       최하단 활성 공격수 1층이므로 False 를 반환한다.
     """
     if isinstance(bucket_or_lot_type, StratumBucket):
@@ -442,7 +442,7 @@ def evaluate_guard30_and_reserve_injection(
     deposit_tolerance_ratio: float = RESERVE_DEPOSIT_TOLERANCE_RATIO,
 ) -> Dict[str, Any]:
     """
-    # NEW [Case 77 : 💉 05_RESV_6P_GUARD30 — 30% 자투리 1주 승격 방지 가드 & 토스 실계좌 여유자금 감지 기반 최대 +6회분 온디맨드 예비시드 자동 수혈 판정기]:
+    # [Case 77 : 💉 05_RESV_6P_GUARD30 — 30% 자투리 1주 승격 방지 가드 & 토스 실계좌 여유자금 감지 기반 최대 +6회분 온디맨드 예비시드 자동 수혈 판정기]:
     매수 타점(0주 진입 / 1층 공석 재장전 / 10분 와이드·스텝업 추매) 도달 시:
     1) [30% 자투리 승격 방지 가드 최소 필요 현금(min_req_cash) 산출]:
        - 추매(is_dip_promotion == True) 시:
@@ -583,7 +583,7 @@ def compute_reserve_repayment_on_zero(
     max_reserve_portions: int = MAX_RESERVE_PORTIONS,
 ) -> Dict[str, Any]:
     """
-    # NEW [Case 77 : 0주 전량 졸업 시 온디맨드 예비시드 원금 자동 상환 및 6회분 한도 복구 연산기]:
+    # [Case 77 : 0주 전량 졸업 시 온디맨드 예비시드 원금 자동 상환 및 6회분 한도 복구 연산기]:
     스나이퍼 자동 매도 또는 수동 전량 청산으로 보유 지층이 0주(len(rem_buckets) == 0)가 되었을 때:
     - 수혈받았던 예비시드 잔액(injected_reserve_usd > 0.0)이 존재하면,
       상환 전 총 현금 풀(total_cash_before = initial_seed_usd + cumulative_realized_net_usd + injected_reserve_usd)에서
@@ -984,7 +984,7 @@ def evaluate_step_up_2x_dip_signal(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 4 · Case 63, Case 71 ~ 76] 1층 ~ 7층 골디락스 순수 멀티 그리드 배치(단가 비교 층간 편입 포함) & 매도 층 원가 매칭 정산기
+# [핵심 4 · Case 63, Case 71 ~ 78] 1층 ~ 7층 골디락스 순수 멀티 그리드 배치(TOPUP_1FL 무승격 합산 & 단가 비교 층간 편입 포함) & 매도 층 원가 매칭 정산기
 # ---------------------------------------------------------------------------
 def vrev_add_quota_lot_and_merge_2tier(
     queue: Sequence[StratumBucket],
@@ -995,7 +995,7 @@ def vrev_add_quota_lot_and_merge_2tier(
     max_tiers: int = MAX_GRID_TIERS_7,
 ) -> List[StratumBucket]:
     """
-    🎯 3 & 🎯 4 & Case 46 ~ 77 (함수명은 타 모듈 AST 호환을 위해 유지하되 내부는 1~7층 골디락스 멀티 그리드로 작동):
+    🎯 3 & 🎯 4 & Case 46 ~ 78 (함수명은 타 모듈 AST 호환을 위해 유지하되 내부는 1~7층 골디락스 멀티 그리드로 작동):
     신규 정량 매수 체결 시 최대 7개 지층(1층 공격수 + 2~6층 개별 완충층[5개] + 통합 7층 본대[GRID_L7])을 관리하는 핵심 함수:
     1) 기존 보유 지층이 없을 때(len(existing) == 0):
        신규 매수분을 단일 1층([new_l1])으로 생성한다.
@@ -1005,6 +1005,11 @@ def vrev_add_quota_lot_and_merge_2tier(
        실물 1층(lot_type == "REENTRY_1FL")이 체결되면:
        기존 상단 2층 ~ 7층(GRID_L2 ~ GRID_L7)을 전혀 병합하거나 이동시키지 않고 그대로 유지한 채,
        맨 앞(index 0)에 신규 1층(new_l1)을 독립 배치하여 [new_l1(REENTRY_1FL), GRID_L2, ..., GRID_Lk] 를 반환한다!
+    2-B) 🚨 NEW [Case 78 : 활성 1층 부분 체결 상태에서 미체결 잔량(TOPUP_1FL) 체결 시 기존 1층 무승격 원자적 합산]:
+       지정가 부분 체결 후 60초 타임쉴드 뒤 매 1.5초 모니터에서 해당 단가 이하 도래로 발주된
+       미체결 잔량(lot_type == "TOPUP_1FL")이 체결되면, 기존 1층(existing[0])을 2층(GRID_L2)으로 밀어 올리거나
+       회차(lot_count)를 증가시키지 않고 기존 1층에 수량과 순수 원금을 그대로 가중평균 합산하여
+       목표 정량이 완수된 단일 1층으로 결합하고 상단 2층 ~ 7층은 원형 그대로 보존한다!
     3) 🚨 [Case 63, Case 72 & Case 76 : 매수 가격 비교 기반 1층 ~ 7층 사이 오름차순 층간 스마트 편입]:
        - 신저가 추매 또는 STEP2X_15PCT_C20 스텝업 추매(DIP_1FL / QUOTA_L1)로 신규 매수가(pure_p)가 기존 1층 단가 이하일 때는
          신규 매수분을 1층(index 0)에 배치하고 기존 지층들을 2층 ~ 6층 개별 승격(7층 초과분은 통합 7층 합병)한다.
@@ -1032,7 +1037,7 @@ def vrev_add_quota_lot_and_merge_2tier(
         book_invested_usd=spent,
         actual_cost_usd=spent,
         lot_count=1,
-        lot_type=tag,
+        lot_type=(tag if tag != "TOPUP_1FL" else "REENTRY_1FL"),
     )
 
     existing = [
@@ -1046,11 +1051,39 @@ def vrev_add_quota_lot_and_merge_2tier(
     eff_max_tiers = max(2, safe_int(max_tiers, MAX_GRID_TIERS_7))
 
     # 🚨 Case 59, Case 71, Case 72 & Case 73: 상단 그리드(2층 ~ 7층)만 보유 중(1층 공석) REENTRY_1FL 유입 시 상단 비병합 독립 1층 배치!
-    if not has_active_l1_bucket(existing) and tag == "REENTRY_1FL":
+    if not has_active_l1_bucket(existing) and tag in (
+        "REENTRY_1FL",
+        "TOPUP_1FL",
+    ):
         preserved_uppers = relabel_upper_grid_tiers(
             existing, max_tiers=eff_max_tiers
         )
         return [new_l1] + preserved_uppers
+
+    # 🚨 NEW [Case 78]: 활성 1층 보유 중 미체결 잔량 보충(TOPUP_1FL) 체결 시
+    # 지층 승격(GRID_L2) 및 회차(lot_count) 증가 없이 기존 1층(existing[0])에 그대로 원자적 가중평균 합산!
+    if tag == "TOPUP_1FL" and has_active_l1_bucket(existing):
+        old_b1 = existing[0]
+        comb_qty = old_b1.qty + q_int
+        comb_cost = round(old_b1.actual_cost_usd + spent, 4)
+        comb_p = round(max(0.0001, comb_cost / float(comb_qty)), 4)
+        keep_tag = (
+            old_b1.lot_type
+            if not is_upper_grid_tier(old_b1.lot_type)
+            else "REENTRY_1FL"
+        )
+        merged_l1 = StratumBucket(
+            qty=comb_qty,
+            book_price=comb_p,
+            book_invested_usd=comb_cost,
+            actual_cost_usd=comb_cost,
+            lot_count=max(1, old_b1.lot_count),
+            lot_type=keep_tag,
+        )
+        preserved_uppers = relabel_upper_grid_tiers(
+            existing[1:], max_tiers=eff_max_tiers
+        )
+        return [merged_l1] + preserved_uppers
 
     # 2-Layer 레거시 모드 호환 분기
     if eff_max_tiers <= 2:
@@ -1333,7 +1366,7 @@ def evaluate_multi_grid_sell_targets(
     2) [조건 ② : 상단 2층 ~ 7층 통합 이동평균(wma_2_to_7) +1.00% 이상 도래]
        상단 그리드(2층 ~ 7층)가 존재하고 live_price >= ceil(wma_2_to_7 * 1.010 * 100) / 100 이면
        상단 2층 ~ 7층 전 지층 인덱스를 일괄 매도 목록에 추가!
-       (이때 활성 1층도 본전 이상 live_price >= round(buckets[0].book_price, 2) 이면 인덱스 0 도 포함하여 전량 동시 졸업!)
+       (이때 활성 1층도 본전 이상 live_price >= round(buckets[0].book_price, 2) 이면 인덱스 0 도 포함하여 전량 동시 졸업!).
     3) [조건 ③ : 상단 2층 ~ 6층 개별 완충층 및 통합 7층 본대 +1.00% 이상 도래]
        상단 2층 ~ 7층 통합 이동평균이 아직 +1.00% 에 도달하지 않았더라도,
        상단 개별 층 buckets[k] 중 live_price >= ceil(buckets[k].book_price * 1.010 * 100) / 100 에 도달한
@@ -1550,16 +1583,18 @@ def calc_sell_realized_pnl(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 5] 포트폴리오 · 1~7층 골디락스 멀티 그리드 · 2~7층 통합 이동평균 · STEP2X_15PCT_C20 · GUARD30/예비시드 통합 요약기
+# [핵심 5] 포트폴리오 · 1~7층 골디락스 멀티 그리드 · 2~7층 통합 이동평균 · STEP2X_15PCT_C20 · GUARD30/예비시드 · Case 78 잔량 통합 요약기
 # ---------------------------------------------------------------------------
 def summarize_stratum_portfolio(
     state_dict: Dict[str, Any],
     live_price: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    🎯 1 ~ 🎯 5 & Case 59, 60, 67, 69, 71, 72, 73, 74, 76, 77:
+    🎯 1 ~ 🎯 5 & Case 59, 60, 67, 69, 71, 72, 73, 74, 76, 77, 78:
     원장 상태(state_dict)와 현재가(live_price)를 받아:
     - 1층(활성 공격수) 및 상단 2층 ~ 6층 개별 완충층 · 통합 7층 본대(GRID_L2 ~ GRID_L7) 현황
+    - 🎯 Case 78: 활성 1층 현재 보유 주수(l1_cur_qty), 1층 목표 정량(l1_target_quota_qty),
+      미체결 잔량(l1_rem_quota_qty = max(0, l1_target_quota_qty - l1_cur_qty)) 산출
     - 상단 2층 ~ 7층 통합 이동평균 단가(upper_wma_price) 및 +1.00% 일괄 익절 목표가(l2_target_price / upper_wma_target_price)
     - 상단 2층 ~ 7층 중 최저 단가 개별 층(2층, min_indiv_upper_price) 및 +1.00% 개별 익절 목표가(min_indiv_upper_target_price)
     - 상단 그리드 단독 보유(1층 공석, is_l2_only_anti_bloat) 시 60초(1분) 주기 직전 익절가 대비 눌림(-1.0%)/돌파(+1.0%) 타점 및
@@ -1600,7 +1635,7 @@ def summarize_stratum_portfolio(
     actual_invested = round(sum(b.actual_cost_usd for b in buckets), 4)
     book_invested = round(sum(b.book_invested_usd for b in buckets), 4)
 
-    # MODIFIED [Case 77 회계 항등식 확장]:
+    # [Case 77 회계 항등식 확장]:
     expected_free_cash = round(
         max(
             0.0,
@@ -1642,6 +1677,21 @@ def summarize_stratum_portfolio(
 
     active_l1 = has_active_l1_bucket(buckets)
     is_l2_only = bool(len(buckets) > 0 and not active_l1)
+
+    # NEW [Case 78 : 활성 1층 현재 보유 주수, 목표 정량 및 미체결 잔량(l1_rem_quota_qty) 산출]
+    raw_l1_target_q = max(0, safe_int(st.get("l1_target_quota_qty"), 0))
+    if active_l1 and buckets:
+        l1_cur_qty = buckets[0].qty
+        l1_target_quota_qty = max(l1_cur_qty, raw_l1_target_q)
+        l1_rem_quota_qty = max(0, l1_target_quota_qty - l1_cur_qty)
+    else:
+        l1_cur_qty = 0
+        l1_target_quota_qty = (
+            raw_l1_target_q
+            if bool(str(st.get("buy_order_id") or "").strip())
+            else 0
+        )
+        l1_rem_quota_qty = 0
 
     wma_info = compute_upper_2_to_12_moving_avg(
         buckets, rise_upper_pct=rise_l2_pct
@@ -1783,7 +1833,7 @@ def summarize_stratum_portfolio(
             else 0.0
         )
 
-    # MODIFIED [Case 77 : 온디맨드 예비시드 수혈금(injected_reserve_usd)을 제외한 순수 코어 자산 기준으로 8% 정량 예산 산출]:
+    # [Case 77 : 온디맨드 예비시드 수혈금(injected_reserve_usd)을 제외한 순수 코어 자산 기준으로 8% 정량 예산 산출]:
     core_equity_for_quota = max(
         init_seed, (free_cash + actual_invested) - injected_reserve_usd
     )
@@ -1815,7 +1865,7 @@ def summarize_stratum_portfolio(
     )
     next_target_qty = min(budget_cap_qty, anchor_quota_qty)
 
-    # NEW [Case 77]: 현재 상태에서의 30% 자투리 승격 방지 가드 최소 필요 현금(min_req_cash_guard30) 산출
+    # [Case 77]: 현재 상태에서의 30% 자투리 승격 방지 가드 최소 필요 현금(min_req_cash_guard30) 산출
     l1_cost_now = (
         buckets[0].actual_cost_usd if (active_l1 and buckets) else 0.0
     )
@@ -1903,6 +1953,9 @@ def summarize_stratum_portfolio(
     return {
         "buckets": buckets,
         "has_active_l1": active_l1,
+        "l1_cur_qty": l1_cur_qty,
+        "l1_target_quota_qty": l1_target_quota_qty,
+        "l1_rem_quota_qty": l1_rem_quota_qty,
         "held_shares": held_shares,
         "held_lots": held_lots,
         "held_tiers": held_tiers,
@@ -1993,7 +2046,7 @@ def summarize_stratum_portfolio(
 
 
 # ---------------------------------------------------------------------------
-# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 77 & 💉 05_RESV_6P_GUARD30 전수 검증)
+# [핵심 6] TDD 사전 무결성 자동 검증 슈트 (Case 25 ~ 78 & 💉 05_RESV_6P_GUARD30 전수 검증)
 # ---------------------------------------------------------------------------
 def run_quant_engine_tdd() -> bool:
     """
@@ -2004,6 +2057,7 @@ def run_quant_engine_tdd() -> bool:
     상단 그리드 단독 보유(1층 공석) 시 2층 단가 상한 역전 차단(HOLD_PREVENT_INVERSION · Case 73) 및
     눌림/돌파 독립 1층 재장전(Case 59, 73), 정적 기억저가 잠금 및 🔓 06_STEP2X_15PCT_C20 3중 안전문 스텝업 해금(Case 60, 72, 76),
     💉 05_RESV_6P_GUARD30 30% 자투리 승격 방지 가드 · 토스 계좌 여유자금 감지 자동 수혈 · 0주 졸업 자동 상환(Case 77),
+    🎯 Case 78 지정가 부분 체결 후 미체결 잔량(TOPUP_1FL) 기존 1층 무승격 원자적 합산,
     당일 시드패스 바인딩(Case 74), 단가 비교 기반 층간 스마트 편입 및 매도 층 원가 매칭 정산을 전수 검증한다.
     """
     # 1) 8% 황금정량 및 Case 67 min(budget_cap_qty, anchor_quota_qty) 캡핑 검증
@@ -2231,8 +2285,7 @@ def run_quant_engine_tdd() -> bool:
         and match_res["pnl_info"]["net_pnl_usd"] > 0.0
     ), f"TDD 실패(수동 매도 층별 원가 매칭 정산): {match_res}"
 
-    # 9) NEW [Case 77 : 💉 05_RESV_6P_GUARD30 (30% 자투리 승격 방지 가드 · 토스 여유자금 자동 수혈 · 0주 졸업 자동 상환) 검증]
-    # 9-1) 가용현금 $180 (< 1회분 $1,440 의 30% = $432) & 계좌 미입금(broker_bp=$180) 시 자투리 차단 및 입금 알림 트리거
+    # 9) [Case 77 : 💉 05_RESV_6P_GUARD30 (30% 자투리 승격 방지 가드 · 토스 여유자금 자동 수혈 · 0주 졸업 자동 상환) 검증]
     g30_block = evaluate_guard30_and_reserve_injection(
         free_cash_usd=180.0,
         broker_bp_usd=180.0,
@@ -2250,7 +2303,6 @@ def run_quant_engine_tdd() -> bool:
         and abs(g30_block["recommended_deposit_usd"] - 1440.0) < 1e-4
     ), f"TDD 실패(Case 77 미입금 시 자투리 차단 오류): {g30_block}"
 
-    # 9-2) 사용자가 토스 계좌에 1회분($1,500) 입금 완료(broker_bp=$1,680) 시 즉시 1회분 자동 수혈 승인
     g30_inj = evaluate_guard30_and_reserve_injection(
         free_cash_usd=180.0,
         broker_bp_usd=1680.0,
@@ -2268,7 +2320,6 @@ def run_quant_engine_tdd() -> bool:
         and g30_inj["rem_portions_after"] == 5
     ), f"TDD 실패(Case 77 입금 감지 자동 수혈 오류): {g30_inj}"
 
-    # 9-3) 0주 전량 졸업 시 예비시드 원금 자동 상환 및 6/6회분 한도 복구 검증
     repay_res = compute_reserve_repayment_on_zero(
         initial_seed_usd=10000.0,
         cumulative_realized_net_usd=11418.55,
@@ -2284,7 +2335,36 @@ def run_quant_engine_tdd() -> bool:
         and abs(repay_res["free_cash_after_repay_usd"] - 21418.55) < 1e-4
     ), f"TDD 실패(Case 77 0주 졸업 예비시드 상환 오류): {repay_res}"
 
+    # 10) NEW [Case 78 : 지정가 부분 체결(2주/17주 @ $90.71) 후 잔량(15주 @ $90.71, TOPUP_1FL) 체결 시 무승격 단일 1층 합산 검증]
+    partial_q = vrev_add_quota_lot_and_merge_2tier(
+        [], 2, 90.71, round(2.0 * 90.71, 4), "REENTRY_1FL"
+    )
+    mock_part_st = {
+        "buckets": buckets_to_dicts(partial_q),
+        "initial_seed_usd": 19000.0,
+        "anchor_price": 90.71,
+        "cycle_min_buy_price": 90.71,
+        "l1_target_quota_qty": 17,
+    }
+    part_sum = summarize_stratum_portfolio(mock_part_st, live_price=90.75)
+    assert (
+        part_sum["l1_cur_qty"] == 2
+        and part_sum["l1_target_quota_qty"] == 17
+        and part_sum["l1_rem_quota_qty"] == 15
+    ), f"TDD 실패(Case 78 부분체결 잔량 요약 불일치): {part_sum}"
+
+    completed_q = vrev_add_quota_lot_and_merge_2tier(
+        partial_q, 15, 90.71, round(15.0 * 90.71, 4), "TOPUP_1FL"
+    )
+    assert (
+        len(completed_q) == 1
+        and completed_q[0].qty == 17
+        and completed_q[0].lot_count == 1
+        and abs(completed_q[0].book_price - 90.71) < 1e-4
+        and abs(completed_q[0].actual_cost_usd - 1542.07) < 1e-4
+    ), f"TDD 실패(Case 78 TOPUP_1FL 무승격 1층 합산 불일치): {completed_q}"
+
     logger.info(
-        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 💉 05_RESV_6P_GUARD30 × 🔓 06_STEP2X_15PCT_C20 (1~6층 개별 + 통합 7층 본대 · 30% 자투리 가드 & +6회분 자동 수혈/상환 Case 59~77) 검증 완료"
+        "✅ [QuantEngine TDD 사전 무결성 검증 통과] 챔피언 💉 05_RESV_6P_GUARD30 × 🔓 06_STEP2X_15PCT_C20 (1~6층 개별 + 통합 7층 본대 · 30% 자투리 가드 & +6회분 자동 수혈/상환 · Case 78 TOPUP_1FL 무승격 합산 Case 59~78) 검증 완료"
     )
     return True
