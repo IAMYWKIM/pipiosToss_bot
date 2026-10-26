@@ -35,7 +35,7 @@ SOXL 단일 롱 7-Tier 순수 멀티 그리드(1층 공격수 + 2 ~ 6층 개별 
        cumulative_reserve_repaid_usd, dust_guard_blocked_cnt, daily_dust_guard_blocked_cnt,
        waiting_reserve_deposit, waiting_reserve_deposit_alert_sent(스팸 차단 영구 래치),
        required_reserve_deposit_usd, last_reserve_check_ts 원장 영속화 및 회계 항등식 확장
-  10) 🚨 [NEW · Case 78 : 지정가 부분 체결 후 미체결 잔량(l1_target_quota_qty) 보존 및 1.5초 모니터 기반 잔량(TOPUP_1FL) 지정가 60초 대기 완수]
+  10) 🚨 [Case 78 : 지정가 부분 체결 후 미체결 잔량(l1_target_quota_qty) 보존 및 1.5초 모니터 기반 잔량(TOPUP_1FL) 지정가 60초 대기 완수]
       - l1_target_quota_qty 원장 영속화 및 0주 졸업 / 1층 익절 공석 전환 시 자동 클리어 정규화 탑재
 """
 
@@ -592,7 +592,7 @@ class SoxlStratumLedger:
             "cycle_min_buy_price": 0.0,
             "ratchet_anchor_price": 0.0,
             "cycle_reanchor_credit_usd": 0.0,
-            # NEW [Case 78 : 현재 1층의 목표 정량 주수 (부분 체결 시 미체결 잔량 계산 및 1.5초 모니터 재대기용)]
+            # [Case 78 : 현재 1층의 목표 정량 주수 (부분 체결 시 미체결 잔량 계산 및 1.5초 모니터 재대기용)]
             "l1_target_quota_qty": 0,
             "buy_order_id": "",
             "sell_order_id": "",
@@ -742,7 +742,7 @@ class SoxlStratumLedger:
            - 보유 지층이 0주이거나 이미 활성 1층 공격수가 존재하는 상태(has_active_l1 == True)이면
              last_reentry_eval_ts = 0.0 으로 클리어하고, 1층이 공석인 상태에서만 타임스탬프를 보존한다.
            - 미결 매수 주문(buy_order_id)이 없거나 0주 상태이면 pending_step_up_min_price = 0.0 으로 클리어한다.
-           - NEW [Case 78]: 0주 상태이거나 1층이 익절되어 공석(not has_active_l1)이고 미결 매수 주문이 없을 때는
+           - [Case 78]: 0주 상태이거나 1층이 익절되어 공석(not has_active_l1)이고 미결 매수 주문이 없을 때는
              l1_target_quota_qty = 0 으로 자동 클리어하며, 활성 1층이 존재할 때는 max(cur_l1_qty, l1_target_quota_qty)로 보존하여
              부분 체결(cur_l1_qty < l1_target_quota_qty) 시 미체결 잔량을 정확히 추적한다!
         5) 💉 [Case 77 온디맨드 예비시드 수혈 잔액(injected_reserve_usd) · 단 1회 알림 영구 래치 및 회계 항등식 확장]:
@@ -890,7 +890,7 @@ class SoxlStratumLedger:
             st["last_reentry_eval_ts"] = 0.0
             st["pending_sell_indices"] = []
             st["pending_step_up_min_price"] = 0.0
-            # NEW [Case 78]: 0주 상태에서 미결 매수가 없으면 l1_target_quota_qty 를 0 으로 클리어
+            # [Case 78]: 0주 상태에서 미결 매수가 없으면 l1_target_quota_qty 를 0 으로 클리어
             st["l1_target_quota_qty"] = raw_target_q if has_pending_buy else 0
         else:
             st["last_sell_gate_eval_ts"] = round(
@@ -1436,7 +1436,7 @@ class SoxlStratumLedger:
         self, logical_date: str
     ) -> Dict[str, Any]:
         """
-        # MODIFIED [Case 74, Case 76 & Case 77]:
+        # [Case 74, Case 76 & Case 77]:
         일일 카운터를 새 영업일 기준으로 0회 롤오버하되,
         시드고갈 입금 요청 알림 스팸 방지 래치(`waiting_reserve_deposit_alert_sent`)는
         일일 롤오버 시에도 절대 해제하지 않고 그대로 유지하여 날짜 변경 시 중복 알림 발송을 원천 차단한다!
@@ -1714,7 +1714,8 @@ class TossApiClient:
         🚨 제1헌법, 제2헌법 & Case 20, 21:
         모든 토스 Open API 요청을 처리하는 중앙 비동기 디스패처.
         """
-        clean_path = path if path.startswith("/") else f/{path}"
+        # MODIFIED: 여는 큰따옴표(") 누락 오타 완벽 복구
+        clean_path = path if path.startswith("/") else f"/{path}"
         url = f"{self.base_url}{clean_path}"
         if params:
             filtered_params = {
